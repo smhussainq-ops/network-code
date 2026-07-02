@@ -1,0 +1,440 @@
+{
+  "status": "pass",
+  "intent_path": "/tmp/netcode-platform-test/intents/examples/add_guest_vlan.yaml",
+  "device_id": "v2-store1",
+  "apply": true,
+  "pipeline": {
+    "status": "pass",
+    "intent": {
+      "change_type": "add_vlan",
+      "site": "store-1842",
+      "targets": {
+        "device_ids": [
+          "v2-store1"
+        ],
+        "device_group": "access-switches"
+      },
+      "vlan": {
+        "id": 90,
+        "name": "GUEST_WIFI",
+        "subnet": "10.42.90.0/24",
+        "purpose": "guest",
+        "svi": {
+          "enabled": false
+        }
+      },
+      "policy": {
+        "pci_reachable": false,
+        "internet_reachable": true
+      },
+      "metadata": {
+        "requested_by": "lab-engineer",
+        "learning_mode": true
+      }
+    },
+    "intent_yaml": "change_type: add_vlan\nsite: store-1842\ntargets:\n  device_ids:\n  - v2-store1\n  device_group: access-switches\nvlan:\n  id: 90\n  name: GUEST_WIFI\n  subnet: 10.42.90.0/24\n  purpose: guest\n  svi:\n    enabled: false\npolicy:\n  pci_reachable: false\n  internet_reachable: true\nmetadata:\n  requested_by: lab-engineer\n  learning_mode: true\n",
+    "render": {
+      "template_path": "/tmp/netcode-platform-test/templates/arista/add_vlan.j2",
+      "config": "vlan 90\n   name GUEST_WIFI\n",
+      "variables": {
+        "change_type": "add_vlan",
+        "site": "store-1842",
+        "targets": {
+          "device_ids": [
+            "v2-store1"
+          ],
+          "device_group": "access-switches"
+        },
+        "vlan": {
+          "id": 90,
+          "name": "GUEST_WIFI",
+          "subnet": "10.42.90.0/24",
+          "purpose": "guest",
+          "svi": {
+            "enabled": false,
+            "gateway_ip": null
+          },
+          "network": "10.42.90.0",
+          "prefixlen": 24,
+          "netmask": "255.255.255.0"
+        },
+        "policy": {
+          "pci_reachable": false,
+          "internet_reachable": true
+        },
+        "metadata": {
+          "requested_by": "lab-engineer",
+          "ticket_id": null,
+          "learning_mode": true
+        }
+      }
+    },
+    "validation": {
+      "status": "pass",
+      "checks": [
+        {
+          "id": "schema",
+          "title": "Intent Schema",
+          "status": "pass",
+          "severity": "info",
+          "message": "Intent loaded into the add_vlan model.",
+          "evidence": {
+            "change_type": "add_vlan",
+            "site": "store-1842"
+          }
+        },
+        {
+          "id": "targets",
+          "title": "Target Resolution",
+          "status": "pass",
+          "severity": "info",
+          "message": "All requested target devices resolve in inventory.",
+          "evidence": {
+            "devices": [
+              "v2-store1"
+            ]
+          }
+        },
+        {
+          "id": "vlan_policy",
+          "title": "VLAN Policy",
+          "status": "pass",
+          "severity": "info",
+          "message": "VLAN ID and name match policy.",
+          "evidence": {
+            "vlan_id": 90,
+            "name": "GUEST_WIFI"
+          }
+        },
+        {
+          "id": "subnet_overlap",
+          "title": "Subnet Overlap",
+          "status": "pass",
+          "severity": "info",
+          "message": "Requested subnet does not overlap known site subnets.",
+          "evidence": {
+            "subnet": "10.42.90.0/24"
+          }
+        },
+        {
+          "id": "segmentation",
+          "title": "PCI Segmentation",
+          "status": "pass",
+          "severity": "info",
+          "message": "Segmentation policy is preserved for this intent.",
+          "evidence": {
+            "purpose": "guest",
+            "pci_reachable": false
+          }
+        },
+        {
+          "id": "render_scope",
+          "title": "Rendered Config Scope",
+          "status": "pass",
+          "severity": "info",
+          "message": "Rendered config only touches the intended VLAN feature scope.",
+          "evidence": {
+            "line_count": 2
+          }
+        },
+        {
+          "id": "deterministic_render",
+          "title": "Deterministic Render",
+          "status": "pass",
+          "severity": "info",
+          "message": "Same intent renders to the same EOS config every time.",
+          "evidence": {}
+        }
+      ]
+    },
+    "git": {
+      "available": false,
+      "message": "Git evidence is unavailable because this workspace is not inside a Git repository.",
+      "branch": null,
+      "status_short": "",
+      "intent_diff": "",
+      "suggested_commands": [
+        "git checkout -b change/add_guest_vlan",
+        "git add intents/examples/add_guest_vlan.yaml",
+        "git commit -m \"Add network intent add_guest_vlan\""
+      ]
+    },
+    "artifacts": {
+      "intent_path": "/tmp/netcode-platform-test/intents/examples/add_guest_vlan.yaml",
+      "rendered_path": "/tmp/netcode-platform-test/rendered/store-1842-add_vlan-vlan-90.eos",
+      "report_markdown_path": "/tmp/netcode-platform-test/reports/store-1842-add_vlan-vlan-90.md",
+      "report_json_path": "/tmp/netcode-platform-test/reports/store-1842-add_vlan-vlan-90.json"
+    }
+  },
+  "phases": [
+    {
+      "id": "static_pipeline",
+      "title": "Static Pipeline",
+      "status": "pass",
+      "message": "YAML, Jinja rendering, Git evidence, and static validation completed.",
+      "evidence": {
+        "checks": [
+          {
+            "id": "schema",
+            "title": "Intent Schema",
+            "status": "pass",
+            "severity": "info",
+            "message": "Intent loaded into the add_vlan model.",
+            "evidence": {
+              "change_type": "add_vlan",
+              "site": "store-1842"
+            }
+          },
+          {
+            "id": "targets",
+            "title": "Target Resolution",
+            "status": "pass",
+            "severity": "info",
+            "message": "All requested target devices resolve in inventory.",
+            "evidence": {
+              "devices": [
+                "v2-store1"
+              ]
+            }
+          },
+          {
+            "id": "vlan_policy",
+            "title": "VLAN Policy",
+            "status": "pass",
+            "severity": "info",
+            "message": "VLAN ID and name match policy.",
+            "evidence": {
+              "vlan_id": 90,
+              "name": "GUEST_WIFI"
+            }
+          },
+          {
+            "id": "subnet_overlap",
+            "title": "Subnet Overlap",
+            "status": "pass",
+            "severity": "info",
+            "message": "Requested subnet does not overlap known site subnets.",
+            "evidence": {
+              "subnet": "10.42.90.0/24"
+            }
+          },
+          {
+            "id": "segmentation",
+            "title": "PCI Segmentation",
+            "status": "pass",
+            "severity": "info",
+            "message": "Segmentation policy is preserved for this intent.",
+            "evidence": {
+              "purpose": "guest",
+              "pci_reachable": false
+            }
+          },
+          {
+            "id": "render_scope",
+            "title": "Rendered Config Scope",
+            "status": "pass",
+            "severity": "info",
+            "message": "Rendered config only touches the intended VLAN feature scope.",
+            "evidence": {
+              "line_count": 2
+            }
+          },
+          {
+            "id": "deterministic_render",
+            "title": "Deterministic Render",
+            "status": "pass",
+            "severity": "info",
+            "message": "Same intent renders to the same EOS config every time.",
+            "evidence": {}
+          }
+        ]
+      }
+    },
+    {
+      "id": "adapter_contract",
+      "title": "Adapter Contract",
+      "status": "pass",
+      "message": "Execution adapter is registered and Rez state adapter supports this platform.",
+      "evidence": {
+        "device_id": "v2-store1",
+        "platform": "arista_eos",
+        "execution": {
+          "name": "netcode.arista_config_session",
+          "capabilities": [
+            "dry_run",
+            "diff",
+            "apply",
+            "rollback",
+            "verify"
+          ]
+        },
+        "state": {
+          "provider": "rez",
+          "available": true,
+          "supported": true,
+          "rez_root": "/home/syedhussain/resonance-core",
+          "error": null
+        }
+      }
+    },
+    {
+      "id": "lab_dry_run",
+      "title": "Arista Lab Dry-Run",
+      "status": "pass",
+      "message": "EOS accepted candidate config in a config session and the session was aborted.",
+      "evidence": {
+        "status": "pass",
+        "action": "dry-run",
+        "device_id": "v2-store1",
+        "message": "EOS accepted candidate config in a config session and the session was aborted.",
+        "session_name": "netcode_1782878953",
+        "evidence": {
+          "diff": "show session-config diffs\n--- system:/running-config\n+++ session:/netcode_1782878953-session-config\n+vlan 90\n+   name GUEST_WIFI\nv2-store1(config-s-netcode_17-vlan-90)#",
+          "transcript": [
+            {
+              "command": "configure session netcode_1782878953",
+              "output": "configure session netcode_1782878953\nv2-store1(config-s-netcode_17)#"
+            },
+            {
+              "command": "vlan 90",
+              "output": "vlan 90\nv2-store1(config-s-netcode_17-vlan-90)#"
+            },
+            {
+              "command": "   name GUEST_WIFI",
+              "output": "   name GUEST_WIFI\nv2-store1(config-s-netcode_17-vlan-90)#"
+            },
+            {
+              "command": "show session-config diffs",
+              "output": "show session-config diffs\n--- system:/running-config\n+++ session:/netcode_1782878953-session-config\n+vlan 90\n+   name GUEST_WIFI\nv2-store1(config-s-netcode_17-vlan-90)#"
+            },
+            {
+              "command": "abort",
+              "output": "abort\nv2-store1#"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "lab_apply_verify",
+      "title": "Arista Lab Apply And Verify",
+      "status": "pass",
+      "message": "VLAN 90 with name GUEST_WIFI is present on the lab device.",
+      "evidence": {
+        "status": "pass",
+        "action": "apply",
+        "device_id": "v2-store1",
+        "message": "VLAN 90 with name GUEST_WIFI is present on the lab device.",
+        "session_name": "netcode_1782878967",
+        "evidence": {
+          "session": {
+            "diff": "show session-config diffs\n--- system:/running-config\n+++ session:/netcode_1782878967-session-config\n+vlan 90\n+   name GUEST_WIFI\nv2-store1(config-s-netcode_17-vlan-90)#",
+            "transcript": [
+              {
+                "command": "configure session netcode_1782878967",
+                "output": "configure session netcode_1782878967\nv2-store1(config-s-netcode_17)#"
+              },
+              {
+                "command": "vlan 90",
+                "output": "vlan 90\nv2-store1(config-s-netcode_17-vlan-90)#"
+              },
+              {
+                "command": "   name GUEST_WIFI",
+                "output": "   name GUEST_WIFI\nv2-store1(config-s-netcode_17-vlan-90)#"
+              },
+              {
+                "command": "show session-config diffs",
+                "output": "show session-config diffs\n--- system:/running-config\n+++ session:/netcode_1782878967-session-config\n+vlan 90\n+   name GUEST_WIFI\nv2-store1(config-s-netcode_17-vlan-90)#"
+              },
+              {
+                "command": "commit",
+                "output": "commit\nv2-store1#"
+              }
+            ]
+          },
+          "verification": {
+            "commands": {
+              "show vlan id 90": "show vlan id 90\nVLAN  Name                             Status    Ports\n----- -------------------------------- --------- -------------------------------\n90    GUEST_WIFI                       active    \n\nv2-store1#",
+              "show running-config | section ^vlan 90": "show running-config | section ^vlan 90\nvlan 90\n   name GUEST_WIFI\nv2-store1#"
+            }
+          }
+        }
+      }
+    }
+  ],
+  "lab": {
+    "dry_run": {
+      "status": "pass",
+      "action": "dry-run",
+      "device_id": "v2-store1",
+      "message": "EOS accepted candidate config in a config session and the session was aborted.",
+      "session_name": "netcode_1782878953",
+      "evidence": {
+        "diff": "show session-config diffs\n--- system:/running-config\n+++ session:/netcode_1782878953-session-config\n+vlan 90\n+   name GUEST_WIFI\nv2-store1(config-s-netcode_17-vlan-90)#",
+        "transcript": [
+          {
+            "command": "configure session netcode_1782878953",
+            "output": "configure session netcode_1782878953\nv2-store1(config-s-netcode_17)#"
+          },
+          {
+            "command": "vlan 90",
+            "output": "vlan 90\nv2-store1(config-s-netcode_17-vlan-90)#"
+          },
+          {
+            "command": "   name GUEST_WIFI",
+            "output": "   name GUEST_WIFI\nv2-store1(config-s-netcode_17-vlan-90)#"
+          },
+          {
+            "command": "show session-config diffs",
+            "output": "show session-config diffs\n--- system:/running-config\n+++ session:/netcode_1782878953-session-config\n+vlan 90\n+   name GUEST_WIFI\nv2-store1(config-s-netcode_17-vlan-90)#"
+          },
+          {
+            "command": "abort",
+            "output": "abort\nv2-store1#"
+          }
+        ]
+      }
+    },
+    "apply": {
+      "status": "pass",
+      "action": "apply",
+      "device_id": "v2-store1",
+      "message": "VLAN 90 with name GUEST_WIFI is present on the lab device.",
+      "session_name": "netcode_1782878967",
+      "evidence": {
+        "session": {
+          "diff": "show session-config diffs\n--- system:/running-config\n+++ session:/netcode_1782878967-session-config\n+vlan 90\n+   name GUEST_WIFI\nv2-store1(config-s-netcode_17-vlan-90)#",
+          "transcript": [
+            {
+              "command": "configure session netcode_1782878967",
+              "output": "configure session netcode_1782878967\nv2-store1(config-s-netcode_17)#"
+            },
+            {
+              "command": "vlan 90",
+              "output": "vlan 90\nv2-store1(config-s-netcode_17-vlan-90)#"
+            },
+            {
+              "command": "   name GUEST_WIFI",
+              "output": "   name GUEST_WIFI\nv2-store1(config-s-netcode_17-vlan-90)#"
+            },
+            {
+              "command": "show session-config diffs",
+              "output": "show session-config diffs\n--- system:/running-config\n+++ session:/netcode_1782878967-session-config\n+vlan 90\n+   name GUEST_WIFI\nv2-store1(config-s-netcode_17-vlan-90)#"
+            },
+            {
+              "command": "commit",
+              "output": "commit\nv2-store1#"
+            }
+          ]
+        },
+        "verification": {
+          "commands": {
+            "show vlan id 90": "show vlan id 90\nVLAN  Name                             Status    Ports\n----- -------------------------------- --------- -------------------------------\n90    GUEST_WIFI                       active    \n\nv2-store1#",
+            "show running-config | section ^vlan 90": "show running-config | section ^vlan 90\nvlan 90\n   name GUEST_WIFI\nv2-store1#"
+          }
+        }
+      }
+    }
+  },
+  "artifacts": null
+}

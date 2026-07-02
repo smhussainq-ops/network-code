@@ -1,0 +1,373 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Netcode Platform</title>
+    <link rel="icon" href="/static/favicon.svg" type="image/svg+xml" />
+    <link rel="stylesheet" href="/static/styles.css?v=20260702-15" />
+  </head>
+  <body>
+    <main class="app-shell">
+      <aside class="request-panel">
+        <div class="brand">
+          <div class="mark">NC</div>
+          <div>
+            <h1>Netcode</h1>
+            <p>Safe network changes with proof.</p>
+          </div>
+        </div>
+
+        <section class="panel">
+          <h2>Change Request</h2>
+          <form id="change-form">
+            <label>Site<input name="site" value="store-1842" /></label>
+            <label>Device<input name="device_id" value="v2-store1" /></label>
+            <label>VLAN ID<input name="vlan_id" type="number" value="90" min="2" max="4094" /></label>
+            <label>Name<input name="name" value="GUEST_WIFI" /></label>
+            <label>Subnet<input name="subnet" value="10.42.90.0/24" /></label>
+            <label>Purpose<input name="purpose" value="guest" /></label>
+            <label>Requested By<input name="requested_by" value="lab-engineer" /></label>
+            <label class="check"><input name="pci_reachable" type="checkbox" /> PCI reachable</label>
+          </form>
+        </section>
+
+        <section class="panel compact">
+          <h2>Platform</h2>
+          <button id="refresh-platform" type="button" class="secondary">Refresh status</button>
+          <button id="show-source-of-truth" type="button" class="secondary">Source of truth</button>
+          <button id="show-adapter-matrix" type="button" class="secondary">Adapter matrix</button>
+          <button id="show-workflow-rules" type="button" class="secondary">Workflow rules</button>
+          <button id="show-gitops-plan" type="button" class="secondary">GitOps plan</button>
+          <button id="show-conformance" type="button" class="secondary">Adapter conformance</button>
+          <button id="show-verification-catalog" type="button" class="secondary">Verification catalog</button>
+          <button id="run-drift-check" type="button" class="secondary">Drift check</button>
+          <button id="show-scale-plan" type="button" class="secondary">Scale plan</button>
+          <button id="show-jobs" type="button" class="secondary">Show job history</button>
+          <button id="show-device-state" type="button" class="secondary">Show device state</button>
+          <button id="verify-vlan-state" type="button" class="secondary">Verify VLAN state</button>
+        </section>
+
+        <section class="panel compact assistant-panel">
+          <h2>AI Assistant</h2>
+          <textarea id="assistant-prompt" rows="4">Explain the current change, risk, and missing evidence.</textarea>
+          <button id="ask-assistant" type="button" class="secondary">Ask assistant</button>
+        </section>
+      </aside>
+
+      <section class="main-panel">
+        <nav class="mode-tabs" aria-label="Platform views">
+          <button id="mode-console" class="mode-tab active" type="button" data-mode="console">Change Console</button>
+          <button id="mode-journey" class="mode-tab" type="button" data-mode="journey">Guided Journey</button>
+        </nav>
+
+        <div id="console-view" class="mode-view active">
+        <header class="outcome-header">
+          <div>
+            <p class="eyebrow">Expected outcome</p>
+            <h2 id="outcome-title">No network change has been approved yet.</h2>
+            <p id="outcome-copy">Start by checking whether the requested change is safe. Device writes stay locked until policy checks and lab proof pass.</p>
+          </div>
+          <div class="header-status">
+            <div class="runtime-pill" id="runtime-pill">Checking runtime</div>
+            <div class="mode-pill">Lab validation mode</div>
+          </div>
+        </header>
+
+        <section class="assurance-strip" aria-label="Production readiness gates">
+          <article class="assurance-card state-waiting">
+            <span>Source of truth</span>
+            <strong id="assurance-source">Loading</strong>
+            <p id="assurance-source-detail">Inventory, policy, and templates.</p>
+          </article>
+          <article class="assurance-card state-waiting">
+            <span>Policy gate</span>
+            <strong id="assurance-policy">Not checked</strong>
+            <p id="assurance-policy-detail">Static validation must pass.</p>
+          </article>
+          <article class="assurance-card state-locked">
+            <span>Lab proof</span>
+            <strong id="assurance-lab">Required</strong>
+            <p id="assurance-lab-detail">Dry-run required before apply.</p>
+          </article>
+          <article class="assurance-card state-waiting">
+            <span>Commands</span>
+            <strong id="assurance-commands">None sent</strong>
+            <p id="assurance-commands-detail">Candidate commands appear first.</p>
+          </article>
+          <article class="assurance-card state-waiting">
+            <span>Audit record</span>
+            <strong id="assurance-audit">Pending</strong>
+            <p id="assurance-audit-detail">Jobs and reports will be recorded.</p>
+          </article>
+        </section>
+
+        <section class="workflow" aria-label="Safe change workflow">
+          <article class="step-card current" id="card-safety">
+            <span>1</span>
+            <h3>Check safety</h3>
+            <p id="safety-copy">Validate the request, build the candidate config, and prove the change is within policy.</p>
+            <button id="run-safety" type="button">Check safety</button>
+          </article>
+
+          <article class="step-card locked" id="card-lab">
+            <span>2</span>
+            <h3>Test on lab device</h3>
+            <p id="lab-copy">Load the candidate into an EOS config session and abort it after collecting the diff.</p>
+            <button id="run-dry-run" type="button">Test candidate</button>
+          </article>
+
+          <article class="step-card locked" id="card-apply">
+            <span>3</span>
+            <h3>Apply only after proof</h3>
+            <p id="apply-copy">Apply remains locked until safety checks and lab dry-run both pass.</p>
+            <button id="run-apply" type="button" class="danger">Apply in lab</button>
+            <button id="run-rollback" type="button" class="secondary">Rollback lab VLAN</button>
+          </article>
+        </section>
+
+        <section class="live-panel" aria-label="Live click outcome">
+          <div class="live-current">
+            <div class="live-current-header">
+              <div>
+                <p class="eyebrow">Live outcome</p>
+                <h3 id="live-action-title">Waiting for a click</h3>
+              </div>
+              <strong id="live-action-state">Idle</strong>
+            </div>
+            <div class="live-outcome-grid">
+              <article>
+                <span>Expected</span>
+                <p id="live-action-expected">Click an action to see exactly what should happen before anything changes.</p>
+              </article>
+              <article>
+                <span>Actual</span>
+                <p id="live-action-actual">No action has run yet.</p>
+              </article>
+              <article class="command-card">
+                <span>Device commands</span>
+                <p id="live-action-commands">No device commands have been sent.</p>
+              </article>
+              <article>
+                <span>Evidence</span>
+                <p id="live-action-evidence">Evidence appears here as soon as the platform has it.</p>
+              </article>
+              <article>
+                <span>Lock state</span>
+                <p id="live-lock-state">Dry-run locked. Apply locked.</p>
+              </article>
+            </div>
+          </div>
+          <div class="live-history">
+            <div class="live-history-header">
+              <h3>Action journal</h3>
+              <button id="clear-journal" type="button" class="secondary">Clear</button>
+            </div>
+            <div id="live-journal" class="journal-list">
+              <article class="journal-empty">Every click will be recorded here with expected outcome, actual result, and evidence.</article>
+            </div>
+          </div>
+        </section>
+
+        <section class="result-grid" aria-label="Outcome cards">
+          <article>
+            <span>Requested change</span>
+            <strong id="requested-change">Add VLAN 90 to v2-store1</strong>
+          </article>
+          <article>
+            <span>Safety verdict</span>
+            <strong id="safety-verdict">Not checked</strong>
+          </article>
+          <article>
+            <span>Device proof</span>
+            <strong id="device-proof">Required</strong>
+          </article>
+          <article>
+            <span>Audit trail</span>
+            <strong id="audit-trail">Pending</strong>
+          </article>
+        </section>
+
+        <section class="capability-panel" aria-label="Platform deliverables">
+          <div class="capability-header">
+            <div>
+              <p class="eyebrow">Platform model</p>
+              <h3>15 capabilities wired behind one simple workflow</h3>
+            </div>
+            <strong id="platform-count">Checking</strong>
+          </div>
+          <div class="capability-list" id="platform-checklist">
+            <article class="capability-placeholder">Loading platform checklist...</article>
+          </div>
+        </section>
+
+        <section class="evidence-panel">
+          <div class="evidence-header">
+            <div>
+              <p class="eyebrow">Evidence</p>
+              <h3 id="evidence-title">What the platform will prove</h3>
+            </div>
+            <button id="toggle-details" type="button" class="secondary">Show technical details</button>
+          </div>
+
+          <div class="plain-evidence" id="plain-evidence">
+            <div><strong>Policy:</strong> VLAN, subnet, target, segmentation, and config scope are checked before any device action.</div>
+            <div><strong>Candidate:</strong> The device config is generated from the request, not typed by hand.</div>
+            <div><strong>Proof:</strong> The lab device must accept the candidate in a dry-run before apply is unlocked.</div>
+            <div><strong>Record:</strong> Every dry-run and apply creates a job record with evidence.</div>
+          </div>
+
+          <div class="technical-details hidden" id="technical-details">
+            <div class="detail-tabs" aria-label="Technical evidence">
+              <button class="detail-tab active" data-detail="intent">Request YAML</button>
+              <button class="detail-tab" data-detail="config">Candidate Config</button>
+              <button class="detail-tab" data-detail="commands">Device Commands</button>
+              <button class="detail-tab" data-detail="checks">Safety Checks</button>
+              <button class="detail-tab" data-detail="lab">Device Proof</button>
+              <button class="detail-tab" data-detail="source">Source of Truth</button>
+              <button class="detail-tab" data-detail="adapters">Adapters</button>
+              <button class="detail-tab" data-detail="workflow">Workflow</button>
+              <button class="detail-tab" data-detail="gitops">GitOps</button>
+              <button class="detail-tab" data-detail="drift">Drift</button>
+              <button class="detail-tab" data-detail="scale">Scale</button>
+              <button class="detail-tab" data-detail="assistant">AI</button>
+              <button class="detail-tab" data-detail="jobs">Jobs</button>
+            </div>
+            <pre class="detail-output active" id="detail-intent"></pre>
+            <pre class="detail-output" id="detail-config"></pre>
+            <pre class="detail-output" id="detail-commands"></pre>
+            <div class="detail-output checks" id="detail-checks"></div>
+            <pre class="detail-output" id="detail-lab"></pre>
+            <pre class="detail-output" id="detail-source"></pre>
+            <pre class="detail-output" id="detail-adapters"></pre>
+            <pre class="detail-output" id="detail-workflow"></pre>
+            <pre class="detail-output" id="detail-gitops"></pre>
+            <pre class="detail-output" id="detail-drift"></pre>
+            <pre class="detail-output" id="detail-scale"></pre>
+            <pre class="detail-output" id="detail-assistant"></pre>
+            <pre class="detail-output" id="detail-jobs"></pre>
+          </div>
+        </section>
+        </div>
+
+        <section id="journey-view" class="mode-view hidden guided-journey" aria-label="Guided network as code journey">
+          <header class="journey-header">
+            <div>
+              <p class="eyebrow">Guided Journey</p>
+              <h2>Build the change path one artifact at a time.</h2>
+              <p>Each step runs a real platform action, then shows the exact file, command plan, validation result, or lab evidence it created or inspected.</p>
+            </div>
+            <div class="journey-progress">
+              <strong id="journey-progress">0/10 complete</strong>
+              <span id="journey-current-artifact">Ready to inspect source of truth</span>
+            </div>
+          </header>
+
+          <section class="journey-layout">
+            <aside class="journey-steps" id="journey-steps" aria-label="Guided journey steps">
+              <button class="journey-step active" type="button" data-journey-step="source">
+                <span>01</span><strong>Source of Truth</strong><small>Inspect trusted data</small>
+              </button>
+              <button class="journey-step" type="button" data-journey-step="intent">
+                <span>02</span><strong>Intent YAML</strong><small>Create request file</small>
+              </button>
+              <button class="journey-step" type="button" data-journey-step="gitops">
+                <span>03</span><strong>Git Setup</strong><small>Repo and review path</small>
+              </button>
+              <button class="journey-step" type="button" data-journey-step="template">
+                <span>04</span><strong>Jinja Template</strong><small>Inspect renderer</small>
+              </button>
+              <button class="journey-step" type="button" data-journey-step="candidate">
+                <span>05</span><strong>Candidate Config</strong><small>Inspect EOS config</small>
+              </button>
+              <button class="journey-step" type="button" data-journey-step="validation">
+                <span>06</span><strong>Static Validation</strong><small>Inspect guardrails</small>
+              </button>
+              <button class="journey-step" type="button" data-journey-step="dryrun">
+                <span>07</span><strong>Lab Dry-Run</strong><small>Test without commit</small>
+              </button>
+              <button class="journey-step" type="button" data-journey-step="apply">
+                <span>08</span><strong>Apply + Verify</strong><small>Commit in lab</small>
+              </button>
+              <button class="journey-step" type="button" data-journey-step="rollback">
+                <span>09</span><strong>Rollback</strong><small>Remove lab change</small>
+              </button>
+              <button class="journey-step" type="button" data-journey-step="evidence">
+                <span>10</span><strong>Evidence Package</strong><small>Inspect audit trail</small>
+              </button>
+            </aside>
+
+            <section class="journey-stage">
+              <div class="journey-stage-header">
+                <div>
+                  <p class="eyebrow" id="journey-step-eyebrow">Step 01</p>
+                  <h3 id="journey-step-title">Source of Truth</h3>
+                  <p id="journey-step-copy">Inspect the inventory, policy, and template catalog the platform trusts before it builds any change.</p>
+                </div>
+                <strong id="journey-step-status" class="journey-status-pill state-ready">Ready</strong>
+              </div>
+
+              <div class="journey-action-row">
+                <button id="journey-run-step" type="button">Inspect source of truth</button>
+                <button id="journey-open-console" type="button" class="secondary">Open Change Console</button>
+              </div>
+
+              <div class="journey-output-grid">
+                <article>
+                  <span>Platform action</span>
+                  <p id="journey-creates">Source-of-truth snapshot from local YAML inventory, policy, templates, sites, and platforms.</p>
+                </article>
+                <article>
+                  <span>Result</span>
+                  <p id="journey-artifact">Waiting for step output.</p>
+                </article>
+                <article>
+                  <span>Why it matters</span>
+                  <p id="journey-why">Network as code starts with trusted data. A change is only safe when targets, policies, and templates are known.</p>
+                </article>
+                <article>
+                  <span>Next safe click</span>
+                  <p id="journey-next">Create the intent YAML from the request form.</p>
+                </article>
+              </div>
+
+              <section class="journey-plain" aria-label="Plain English step outcome">
+                <div>
+                  <p class="eyebrow">What this means</p>
+                  <h4 id="journey-plain-title">Can the platform trust its starting data?</h4>
+                  <p id="journey-plain-summary">Click the step action to see what the platform knows before it builds a network change.</p>
+                </div>
+                <div id="journey-plain-checks" class="journey-plain-checks">
+                  <article>
+                    <strong>Waiting</strong>
+                    <span>No artifact has been inspected yet.</span>
+                  </article>
+                </div>
+                <p id="journey-decision" class="journey-decision">Decision appears here after the step runs.</p>
+              </section>
+
+              <details class="journey-raw-details">
+                <summary>Show raw artifact / audit evidence</summary>
+                <pre id="journey-output" class="journey-output">Click the step action to inspect the first real artifact.</pre>
+              </details>
+            </section>
+          </section>
+
+          <section class="journey-events" aria-label="Guided journey journal">
+            <div class="journey-events-header">
+              <div>
+                <p class="eyebrow">Journey journal</p>
+                <h3>Real artifacts created or inspected</h3>
+              </div>
+              <button id="journey-reset" type="button" class="secondary">Reset journey view</button>
+            </div>
+            <div id="journey-journal" class="journey-journal">
+              <article class="journey-empty">Run a step to see the artifact path, result, and next safe action.</article>
+            </div>
+          </section>
+        </section>
+      </section>
+    </main>
+    <script src="/static/app.js?v=20260702-15"></script>
+  </body>
+</html>

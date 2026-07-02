@@ -1,0 +1,7 @@
+vlan {{ vlan.id }}
+   name {{ vlan.name }}
+{% if vlan.svi.enabled %}
+interface Vlan{{ vlan.id }}
+   description {{ vlan.name }} gateway
+   ip address {{ vlan.svi.gateway_ip }} {{ vlan.netmask }}
+{% endif %}
