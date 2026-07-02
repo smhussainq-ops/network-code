@@ -303,6 +303,9 @@ def test_app_route_serves_ui():
     assert "Adapter matrix" in response.text
     assert "Guided Journey" in response.text
     assert "Build the change path one artifact at a time" in response.text
+    assert "0/11 complete" in response.text
+    assert "Define Change" in response.text
+    assert "Use this request" in response.text
     assert "What this means" in response.text
     assert "Show raw artifact / audit evidence" in response.text
     assert "Git Setup" in response.text

@@ -4,8 +4,9 @@ let safetyPassed = false;
 let dryRunPassed = false;
 let applyPassed = false;
 let applying = false;
-let journeyCurrentStep = "source";
+let journeyCurrentStep = "define";
 let journeyPipelineData = null;
+let journeyDefinedRequest = null;
 const journeyArtifacts = {};
 const journeyCompletedSteps = new Set();
 const journeyFailedSteps = new Set();
@@ -135,98 +136,108 @@ const WORKFLOW_STATES = [
 
 const JOURNEY_STEPS = [
   {
-    id: "source",
+    id: "define",
     number: "01",
+    title: "Define Change",
+    button: "Use this request",
+    copy: "Choose the network change you want to make before the platform inspects or creates artifacts.",
+    creates: "Confirms the request from the form: change type, site, target device, VLAN, name, subnet, purpose, and requester.",
+    why: "Network as code starts with user intent. The platform should not assume the engineer wants the default demo change.",
+    next: "Click Step 02 to check source of truth for this request.",
+  },
+  {
+    id: "source",
+    number: "02",
     title: "Source of Truth",
     button: "Inspect source of truth",
     copy: "First, confirm the platform knows the device, vendor, policies, and template before it builds anything.",
     creates: "Checks the trusted network data: devices, sites, vendor type, known subnets, policies, and templates.",
     why: "This prevents changes to unknown devices or changes built from missing policy data.",
-    next: "Click Step 02 to create the intent YAML.",
+    next: "Click Step 03 to create the intent YAML.",
   },
   {
     id: "intent",
-    number: "02",
+    number: "03",
     title: "Intent YAML",
     button: "Create intent YAML",
     copy: "Turn the form into a simple change request file that can be reviewed before config is generated.",
     creates: "Creates a YAML file that says what change is wanted, which device is targeted, and who requested it.",
     why: "The engineer reviews the request before thinking about vendor commands.",
-    next: "Click Step 03 to set up or inspect Git review.",
+    next: "Click Step 04 to set up or inspect Git review.",
   },
   {
     id: "gitops",
-    number: "03",
+    number: "04",
     title: "Git Setup",
     button: "Check Git setup",
     copy: "Check whether this platform folder is a Git repo and show the exact commands for reviewable network changes.",
     creates: "Inspects Git status and produces setup, branch, add, and commit commands for the current intent.",
     why: "Git gives the network team history, review, rollback context, and proof of exactly what changed.",
-    next: "Click Step 04 to inspect the Jinja template.",
+    next: "Click Step 05 to inspect the Jinja template.",
   },
   {
     id: "template",
-    number: "04",
+    number: "05",
     title: "Jinja Template",
     button: "Inspect Jinja template",
     copy: "Inspect the template that turns intent data into vendor config.",
     creates: "Reads the real Arista add-VLAN Jinja template used by the renderer.",
     why: "Templates make config consistent so engineers are not hand-typing the same commands differently every time.",
-    next: "Click Step 05 to inspect the generated candidate config.",
+    next: "Click Step 06 to inspect the generated candidate config.",
   },
   {
     id: "candidate",
-    number: "05",
+    number: "06",
     title: "Candidate Config",
     button: "Inspect candidate config",
     copy: "Inspect the actual EOS config the platform generated from the request and template.",
     creates: "Reads the rendered .eos candidate config and the template variables used to build it.",
     why: "You see the commands before they ever touch a switch.",
-    next: "Click Step 06 to inspect policy validation.",
+    next: "Click Step 07 to inspect policy validation.",
   },
   {
     id: "validation",
-    number: "06",
+    number: "07",
     title: "Static Validation",
     button: "Inspect validation checks",
     copy: "Check the request and generated config against policy before a device is contacted.",
     creates: "Reads the static validation report and each pass/fail guardrail.",
     why: "Unsafe requests should stop here, before a lab or production device sees any command.",
-    next: "Click Step 07 to test on the lab switch without committing.",
+    next: "Click Step 08 to test on the lab switch without committing.",
   },
   {
     id: "dryrun",
-    number: "07",
+    number: "08",
     title: "Lab Dry-Run",
     button: "Test candidate in lab",
     copy: "Send the candidate to an EOS config session, prove the switch accepts it, then abort.",
     creates: "Creates a dry-run job, command transcript, and session diff. No persistent change is made.",
     why: "The real device must accept the config before apply is unlocked.",
-    next: "Click Step 08 to apply and verify in the lab.",
+    next: "Click Step 09 to apply and verify in the lab.",
   },
   {
     id: "apply",
-    number: "08",
+    number: "09",
     title: "Apply + Verify",
     button: "Apply and verify in lab",
     copy: "Commit only the already-tested candidate in the lab, then verify the VLAN exists.",
     creates: "Creates an apply job, commit transcript, and post-change verification result.",
     why: "A change is not done until the platform proves the device reached the intended state.",
-    next: "Click Step 09 to prove rollback.",
+    next: "Click Step 10 to prove rollback.",
   },
   {
     id: "rollback",
-    number: "09",
+    number: "10",
     title: "Rollback",
     button: "Rollback lab change",
     copy: "Remove the lab VLAN and verify the switch returns to the expected state.",
     creates: "Creates a rollback job, rollback command transcript, and absence verification result.",
     why: "A safe platform must prove how it recovers, not just how it applies.",
-    next: "Click Step 10 to inspect the evidence package.",
+    next: "Click Step 11 to inspect the evidence package.",
   },
   {
     id: "evidence",
-    number: "10",
+    number: "11",
     title: "Evidence Package",
     button: "Inspect evidence package",
     copy: "Collect the proof: request, validation, commands, jobs, workflow events, and reports.",
@@ -269,8 +280,11 @@ function requestChanged() {
   applyPassed = false;
   applying = false;
   journeyPipelineData = null;
+  journeyDefinedRequest = null;
   journeyCompletedSteps.clear();
   journeyFailedSteps.clear();
+  Object.keys(journeyArtifacts).forEach((key) => delete journeyArtifacts[key]);
+  journeyCurrentStep = "define";
   syncRequestedChange();
   resetProofGates();
   setCard("card-safety", "current");
@@ -1155,7 +1169,7 @@ function renderJourneyProgress() {
   const latest = JOURNEY_STEPS.filter((step) => journeyCompletedSteps.has(step.id)).at(-1);
   $("journey-current-artifact").textContent = latest
     ? `Latest artifact: ${journeyArtifacts[latest.id]?.artifact || latest.title}`
-    : "Ready to inspect source of truth";
+    : "Define the change first";
 }
 
 function defaultJourneyPlain(step) {
@@ -1332,10 +1346,77 @@ function formatValidationChecks(checks) {
   return checks.map((check) => `${check.status.toUpperCase()} ${check.id}: ${check.message}`).join("\n");
 }
 
+function validateChangeRequest(payload) {
+  const errors = [];
+  if (!payload.site) errors.push("Site is required.");
+  if (!payload.device_id) errors.push("Device is required.");
+  if (!Number.isInteger(payload.vlan_id) || payload.vlan_id < 2 || payload.vlan_id > 4094) errors.push("VLAN ID must be between 2 and 4094.");
+  if (!payload.name) errors.push("VLAN name is required.");
+  if (!payload.subnet || !payload.subnet.includes("/")) errors.push("Subnet must be CIDR notation, for example 10.42.90.0/24.");
+  if (!payload.purpose) errors.push("Purpose is required.");
+  if (!payload.requested_by) errors.push("Requested By is required.");
+  return errors;
+}
+
 async function executeJourneyStep(stepId) {
+  if (stepId === "define") {
+    const payload = formPayload();
+    const errors = validateChangeRequest(payload);
+    const ok = errors.length === 0;
+    if (ok) journeyDefinedRequest = payload;
+    const requestSummary = `Add VLAN ${payload.vlan_id || "?"} (${payload.name || "unnamed"}) to ${payload.device_id || "no device"} at ${payload.site || "no site"}`;
+    return {
+      artifact: ok ? `Request defined: ${requestSummary}` : "Request is incomplete",
+      summary: ok ? "The requested network change is defined. No files were created and no device was contacted." : errors.join(" "),
+      output: formatJson({
+        change_type: "add_vlan",
+        status: ok ? "defined" : "incomplete",
+        request: payload,
+        errors,
+      }),
+      status: ok ? "pass" : "fail",
+      statusLabel: ok ? null : "Needs input",
+      plain: {
+        title: ok ? "What change did you ask the platform to make?" : "What is missing from the request?",
+        summary: ok
+          ? "You confirmed the change request. The platform can now check trusted data before creating YAML, config, or lab evidence."
+          : "The platform needs a complete request before it can safely inspect, build, or test anything.",
+        checks: ok
+          ? [
+              {
+                title: "Change type",
+                detail: "Add VLAN",
+                state: "pass",
+              },
+              {
+                title: "Target",
+                detail: `${payload.device_id} at ${payload.site}`,
+                state: "pass",
+              },
+              {
+                title: "VLAN",
+                detail: `VLAN ${payload.vlan_id}, name ${payload.name}, subnet ${payload.subnet}, purpose ${payload.purpose}`,
+                state: "pass",
+              },
+              {
+                title: "Device touched",
+                detail: "No. This only confirms what you want to do.",
+                state: "pass",
+              },
+            ]
+          : errors.map((error) => ({
+              title: "Missing input",
+              detail: error,
+              state: "fail",
+            })),
+        decision: ok ? "Decision: request is defined. Next, check source of truth for this target." : "Decision: complete the request fields before continuing.",
+      },
+    };
+  }
+
   if (stepId === "source") {
     const data = await getJson("/api/source-of-truth");
-    const payload = formPayload();
+    const payload = journeyDefinedRequest || formPayload();
     const target = (data.devices || []).find((device) => device.id === payload.device_id);
     const policyGroups = Object.keys(data.policies || {});
     const templates = data.templates || [];
@@ -1384,8 +1465,8 @@ async function executeJourneyStep(stepId) {
     startAction("check-safety");
     resetProofGates();
     setAssurance("policy", "running", "Checking", "Building candidate and running policy validation.");
-    const payload = formPayload();
-    const data = await postJson("/api/wizard/add-vlan", formPayload());
+    const payload = journeyDefinedRequest || formPayload();
+    const data = await postJson("/api/wizard/add-vlan", payload);
     journeyPipelineData = data;
     updateFromPipeline(data);
     return {
@@ -1427,7 +1508,7 @@ async function executeJourneyStep(stepId) {
     requireJourneyIntent();
     const data = await postJson("/api/gitops/plan", {
       intent_path: currentIntentPath,
-      device_id: formPayload().device_id,
+      device_id: (journeyDefinedRequest || formPayload()).device_id,
       change_id: currentChangeId || null,
     });
     $("detail-gitops").textContent = formatJson(data);
@@ -1584,7 +1665,7 @@ async function executeJourneyStep(stepId) {
     setAssurance("commands", "running", "Sending commands", "Command transcript will appear when the device responds.");
     const data = await postJson("/api/lab/dry-run", {
       intent_path: currentIntentPath,
-      device_id: formPayload().device_id,
+      device_id: (journeyDefinedRequest || formPayload()).device_id,
       change_id: currentChangeId || null,
     });
     updateFromLabResult(data);
@@ -1632,7 +1713,7 @@ async function executeJourneyStep(stepId) {
     setAssurance("commands", "running", "Sending commands", "Command transcript will appear when the device responds.");
     const data = await postJson("/api/lab/apply", {
       intent_path: currentIntentPath,
-      device_id: formPayload().device_id,
+      device_id: (journeyDefinedRequest || formPayload()).device_id,
       change_id: currentChangeId || null,
     });
     updateFromLabResult(data);
@@ -1681,7 +1762,7 @@ async function executeJourneyStep(stepId) {
     setAssurance("commands", "running", "Sending commands", "Command transcript will appear when the device responds.");
     const data = await postJson("/api/lab/rollback", {
       intent_path: currentIntentPath,
-      device_id: formPayload().device_id,
+      device_id: (journeyDefinedRequest || formPayload()).device_id,
       change_id: currentChangeId || null,
     });
     updateFromLabResult(data);
@@ -1727,7 +1808,7 @@ async function executeJourneyStep(stepId) {
     const [workflow, jobs, gitops] = await Promise.all([
       currentChangeId ? getJson(`/api/workflow/change/${currentChangeId}`) : Promise.resolve({ change: null, events: [] }),
       getJson("/api/jobs"),
-      postJson("/api/gitops/plan", { intent_path: currentIntentPath, device_id: formPayload().device_id, change_id: currentChangeId || null }),
+      postJson("/api/gitops/plan", { intent_path: currentIntentPath, device_id: (journeyDefinedRequest || formPayload()).device_id, change_id: currentChangeId || null }),
     ]);
     const evidence = {
       change_id: currentChangeId,
@@ -1844,13 +1925,15 @@ function resetJourneyView() {
   Object.keys(journeyArtifacts).forEach((key) => delete journeyArtifacts[key]);
   journeyCompletedSteps.clear();
   journeyFailedSteps.clear();
-  journeyCurrentStep = "source";
+  journeyDefinedRequest = null;
+  journeyCurrentStep = "define";
   $("journey-journal").innerHTML = '<article class="journey-empty">Run a step to see the artifact path, result, and next safe action.</article>';
   renderJourneyStep();
 }
 
 function openConsoleFromJourney() {
   const detailByStep = {
+    define: "intent",
     source: "source",
     intent: "intent",
     gitops: "gitops",

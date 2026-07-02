@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Netcode Platform</title>
     <link rel="icon" href="/static/favicon.svg" type="image/svg+xml" />
-    <link rel="stylesheet" href="/static/styles.css?v=20260702-15" />
+    <link rel="stylesheet" href="/static/styles.css?v=20260702-16" />
   </head>
   <body>
     <main class="app-shell">
@@ -258,42 +258,45 @@
               <p>Each step runs a real platform action, then shows the exact file, command plan, validation result, or lab evidence it created or inspected.</p>
             </div>
             <div class="journey-progress">
-              <strong id="journey-progress">0/10 complete</strong>
-              <span id="journey-current-artifact">Ready to inspect source of truth</span>
+              <strong id="journey-progress">0/11 complete</strong>
+              <span id="journey-current-artifact">Define the change first</span>
             </div>
           </header>
 
           <section class="journey-layout">
             <aside class="journey-steps" id="journey-steps" aria-label="Guided journey steps">
-              <button class="journey-step active" type="button" data-journey-step="source">
-                <span>01</span><strong>Source of Truth</strong><small>Inspect trusted data</small>
+              <button class="journey-step active" type="button" data-journey-step="define">
+                <span>01</span><strong>Define Change</strong><small>Choose what to do</small>
+              </button>
+              <button class="journey-step" type="button" data-journey-step="source">
+                <span>02</span><strong>Source of Truth</strong><small>Check trusted data</small>
               </button>
               <button class="journey-step" type="button" data-journey-step="intent">
-                <span>02</span><strong>Intent YAML</strong><small>Create request file</small>
+                <span>03</span><strong>Intent YAML</strong><small>Create request file</small>
               </button>
               <button class="journey-step" type="button" data-journey-step="gitops">
-                <span>03</span><strong>Git Setup</strong><small>Repo and review path</small>
+                <span>04</span><strong>Git Setup</strong><small>Repo and review path</small>
               </button>
               <button class="journey-step" type="button" data-journey-step="template">
-                <span>04</span><strong>Jinja Template</strong><small>Inspect renderer</small>
+                <span>05</span><strong>Jinja Template</strong><small>Inspect renderer</small>
               </button>
               <button class="journey-step" type="button" data-journey-step="candidate">
-                <span>05</span><strong>Candidate Config</strong><small>Inspect EOS config</small>
+                <span>06</span><strong>Candidate Config</strong><small>Inspect EOS config</small>
               </button>
               <button class="journey-step" type="button" data-journey-step="validation">
-                <span>06</span><strong>Static Validation</strong><small>Inspect guardrails</small>
+                <span>07</span><strong>Static Validation</strong><small>Inspect guardrails</small>
               </button>
               <button class="journey-step" type="button" data-journey-step="dryrun">
-                <span>07</span><strong>Lab Dry-Run</strong><small>Test without commit</small>
+                <span>08</span><strong>Lab Dry-Run</strong><small>Test without commit</small>
               </button>
               <button class="journey-step" type="button" data-journey-step="apply">
-                <span>08</span><strong>Apply + Verify</strong><small>Commit in lab</small>
+                <span>09</span><strong>Apply + Verify</strong><small>Commit in lab</small>
               </button>
               <button class="journey-step" type="button" data-journey-step="rollback">
-                <span>09</span><strong>Rollback</strong><small>Remove lab change</small>
+                <span>10</span><strong>Rollback</strong><small>Remove lab change</small>
               </button>
               <button class="journey-step" type="button" data-journey-step="evidence">
-                <span>10</span><strong>Evidence Package</strong><small>Inspect audit trail</small>
+                <span>11</span><strong>Evidence Package</strong><small>Inspect audit trail</small>
               </button>
             </aside>
 
@@ -301,21 +304,21 @@
               <div class="journey-stage-header">
                 <div>
                   <p class="eyebrow" id="journey-step-eyebrow">Step 01</p>
-                  <h3 id="journey-step-title">Source of Truth</h3>
-                  <p id="journey-step-copy">Inspect the inventory, policy, and template catalog the platform trusts before it builds any change.</p>
+                  <h3 id="journey-step-title">Define Change</h3>
+                  <p id="journey-step-copy">Choose the network change you want to make before the platform inspects or creates artifacts.</p>
                 </div>
                 <strong id="journey-step-status" class="journey-status-pill state-ready">Ready</strong>
               </div>
 
               <div class="journey-action-row">
-                <button id="journey-run-step" type="button">Inspect source of truth</button>
+                <button id="journey-run-step" type="button">Use this request</button>
                 <button id="journey-open-console" type="button" class="secondary">Open Change Console</button>
               </div>
 
               <div class="journey-output-grid">
                 <article>
                   <span>Platform action</span>
-                  <p id="journey-creates">Source-of-truth snapshot from local YAML inventory, policy, templates, sites, and platforms.</p>
+                  <p id="journey-creates">Confirms the change request from the form before creating files or touching the lab.</p>
                 </article>
                 <article>
                   <span>Result</span>
@@ -323,19 +326,19 @@
                 </article>
                 <article>
                   <span>Why it matters</span>
-                  <p id="journey-why">Network as code starts with trusted data. A change is only safe when targets, policies, and templates are known.</p>
+                  <p id="journey-why">The platform must know what you want before it can build, validate, test, or apply anything.</p>
                 </article>
                 <article>
                   <span>Next safe click</span>
-                  <p id="journey-next">Create the intent YAML from the request form.</p>
+                  <p id="journey-next">Check whether the platform knows this target and policy.</p>
                 </article>
               </div>
 
               <section class="journey-plain" aria-label="Plain English step outcome">
                 <div>
                   <p class="eyebrow">What this means</p>
-                  <h4 id="journey-plain-title">Can the platform trust its starting data?</h4>
-                  <p id="journey-plain-summary">Click the step action to see what the platform knows before it builds a network change.</p>
+                  <h4 id="journey-plain-title">What change do you want to make?</h4>
+                  <p id="journey-plain-summary">Edit the Change Request fields on the left, then click Use this request.</p>
                 </div>
                 <div id="journey-plain-checks" class="journey-plain-checks">
                   <article>
@@ -368,6 +371,6 @@
         </section>
       </section>
     </main>
-    <script src="/static/app.js?v=20260702-15"></script>
+    <script src="/static/app.js?v=20260702-16"></script>
   </body>
 </html>
