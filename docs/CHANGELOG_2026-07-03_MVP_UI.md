@@ -207,3 +207,75 @@ Implemented by Claude; validation owned by Codex.
   listing.
 - `test_health_endpoint_returns_lab_summary_not_raw_dump`.
 - `test_lab_summary_shapes_clab_output_into_counts`.
+
+## 2026-07-03 Guided User Stories Build (Claude implements, Codex validates)
+
+Rebuilt the product around the agreed 5 user stories and the rule:
+**every screen must answer "what decision can the engineer make now?"**
+
+### The 5 stories (Home cards, live progress)
+
+1. Get ready — Setup readiness gates (x/4)
+2. Bring devices under management — discovery/import
+3. Make a safe change — the 9-step golden path (see below)
+4. Prove it — one change record per change
+5. Catch drift — live vs intent, reconcile starts a new change
+
+### Story 3 golden path (Git woven in, not bolted on)
+
+Declare → Branch → Plan → Validate → Dry-run → Commit → Apply →
+Verify → Push. A progress rail shows these steps (done/next/todo) on
+the Desired State, Plan, Validate, and Apply views.
+
+- Branch step lives in Desired State: suggested
+  `change/<site>-<type>` name (from plan metadata), create/switch.
+- Commit + Push live in Apply ("Send for review"): editable commit
+  message, honest push result, PR-ready summary from the GitOps plan.
+- New endpoints: `POST /api/git/commit` (stage+commit with identity
+  fallback, `nothing_to_commit` idempotency), `POST /api/git/push`
+  (real attempt; credential failures reported honestly with the
+  command to run). Both record `git_commit`/`git_push` workflow
+  events on the change when `change_id` is supplied.
+
+### Plan shows risk before any device contact
+
+- Blast radius chips: affected devices and objects.
+- Rollback plan BEFORE apply: exact inverse commands + confidence
+  level with reason (high for VLAN, medium for interface/BGP/ACL,
+  none for inventory records).
+- Pre/post checks per change type, honest about which execute live
+  (`executable: false` = definition only, never fake green).
+- Plan metadata now includes `blast_radius`, `rollback`, `checks`,
+  and `suggested_branch` (netcode/intent_utils.py).
+
+### Setup = 4 readiness gates
+
+Gate 1 Git (editable repo URL/base branch), Gate 2 Source of truth
+(active provider + credential provenance stated), Gate 3 Read access,
+Gate 4 Safe test target (runner labeled: "this runtime — your browser
+never touches devices"). Each gate is pass/fail with one fix action.
+All green unlocks "Start a change". Config editor moved behind
+Advanced. Vendor lists, node counts, and template counts removed —
+they answered no decision.
+
+### Evidence = one change record
+
+`GET /api/change/{id}/record` packages Request / Plan / Safety /
+Lab proof / Apply proof / Verification / Rollback / Git record /
+Artifact manifest per change. The Evidence view renders it readably;
+raw artifact tabs moved behind Advanced.
+
+### Hygiene
+
+- Bootstrapped workspaces now seed a `.gitignore` (create-only, never
+  overwritten by --force) so `.netcode/` state is never committed to
+  change branches.
+- Asset version mvp9.
+
+### Tests (35 passing)
+
+- `test_git_commit_and_push_endpoints_report_honestly`.
+- `test_change_record_packages_request_plan_safety_git_and_manifest`
+  (blast radius, rollback commands + confidence, pre-checks,
+  suggested branch, manifest existence, git_commit event, 404).
+- UI route test updated to the new story board and screens.

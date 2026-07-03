@@ -76,6 +76,14 @@ SITE_DEVICE_INTENT_TEMPLATE = """! Source-of-truth only intent.
 """
 
 
+WORKSPACE_GITIGNORE = """.netcode/
+__pycache__/
+*.py[cod]
+.DS_Store
+._*
+"""
+
+
 def init_workspace(paths: WorkspacePaths, force: bool = False) -> list[Path]:
     paths.ensure()
     written: list[Path] = []
@@ -91,6 +99,12 @@ def init_workspace(paths: WorkspacePaths, force: bool = False) -> list[Path]:
         if force or not path.exists():
             path.write_text(content, encoding="utf-8")
             written.append(path)
+
+    # Create-only (never overwritten, even with force): protects a real repo's .gitignore.
+    gitignore_path = paths.root / ".gitignore"
+    if not gitignore_path.exists():
+        gitignore_path.write_text(WORKSPACE_GITIGNORE, encoding="utf-8")
+        written.append(gitignore_path)
 
     inventory = {
         "lab_type": "arista_containerlab_v2",

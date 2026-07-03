@@ -550,6 +550,83 @@ def test_git_branch_endpoint_creates_and_switches_change_branch(tmp_path: Path, 
     assert "main" in branches.json()["branches"]
 
 
+def test_git_commit_and_push_endpoints_report_honestly(tmp_path: Path, monkeypatch):
+    init_workspace(WorkspacePaths(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    client = TestClient(api.app)
+
+    blocked = client.post("/api/git/commit", json={"message": "before repo"})
+    assert blocked.status_code == 200
+    assert blocked.json()["ok"] is False
+    assert "not a Git repository" in blocked.json()["message"]
+
+    client.post("/api/git/setup", json={"repo_url": "https://example.invalid/network-code.git", "branch": "main"})
+
+    committed = client.post("/api/git/commit", json={"message": "Initial artifacts"})
+    assert committed.status_code == 200
+    assert committed.json()["ok"] is True
+    assert committed.json()["action"] == "committed"
+    assert committed.json()["commit"]
+
+    again = client.post("/api/git/commit", json={"message": "nothing new"})
+    assert again.json()["ok"] is True
+    assert again.json()["action"] == "nothing_to_commit"
+
+    push = client.post("/api/git/push", json={})
+    assert push.status_code == 200
+    assert push.json()["ok"] is False  # unreachable remote must fail honestly, never silently pass
+    assert push.json()["action"] == "failed"
+    assert push.json()["steps"][0]["command"].startswith("git push -u origin")
+
+
+def test_change_record_packages_request_plan_safety_git_and_manifest(tmp_path: Path, monkeypatch):
+    init_workspace(WorkspacePaths(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    client = TestClient(api.app)
+
+    plan = client.post(
+        "/api/desired-state/plan",
+        json={
+            "change_type": "add_vlan",
+            "site": "store-1842",
+            "device_id": "v2-store1",
+            "requested_by": "unit",
+            "values": {"vlan_id": 90, "name": "GUEST_WIFI", "subnet": "10.42.90.0/24", "purpose": "guest"},
+        },
+    )
+    assert plan.status_code == 200
+    assert plan.json()["ok"] is True
+    meta = plan.json()["plan"]
+    assert meta["blast_radius"]["devices"] == ["v2-store1"]
+    assert meta["rollback"]["commands"] == "no vlan 90\n"
+    assert meta["rollback"]["confidence"]["level"] == "high"
+    assert [check["id"] for check in meta["checks"]["pre"]] == ["vlan_absent"]
+    assert meta["suggested_branch"] == "change/store-1842-add-vlan-90"
+    change_id = plan.json()["change"]["id"]
+
+    client.post("/api/git/setup", json={"repo_url": "", "branch": "main"})
+    commit = client.post("/api/git/commit", json={"message": "change artifacts", "change_id": change_id})
+    assert commit.json()["ok"] is True
+    assert commit.json()["change_event_recorded"] is True
+
+    record = client.get(f"/api/change/{change_id}/record")
+    assert record.status_code == 200
+    body = record.json()
+    assert body["request"]["change_type"] == "add_vlan"
+    assert body["request"]["intent_yaml"]
+    assert "vlan 90" in body["plan"]["commands"]
+    assert body["safety"]["status"] == "pass"
+    assert len(body["safety"]["checks"]) == 7
+    assert body["lab_proof"]["present"] is False  # no lab in unit tests — honest absence
+    manifest = {item["artifact"]: item["exists"] for item in body["manifest"]}
+    assert manifest["intent.yaml"] is True
+    assert manifest["rendered_config.eos"] is True
+    assert any(event["action"] == "git_commit" for event in body["git"]["actions"])
+
+    missing = client.get("/api/change/not-a-real-change/record")
+    assert missing.status_code == 404
+
+
 def test_health_endpoint_returns_lab_summary_not_raw_dump(tmp_path: Path, monkeypatch):
     init_workspace(WorkspacePaths(tmp_path))
     monkeypatch.chdir(tmp_path)
@@ -670,11 +747,15 @@ def test_app_route_serves_ui():
     assert "Terraform-style network changes with audited lab proof" in response.text
     assert "Home" in response.text
     assert "Network as code user stories" in response.text
-    assert "Connect Git" in response.text
-    assert "Discover Devices" in response.text
-    assert "Build Source of Truth" in response.text
-    assert "Plan Safe Change" in response.text
-    assert "Prove and Audit" in response.text
+    assert "Get ready" in response.text
+    assert "Bring devices under management" in response.text
+    assert "Make a safe change" in response.text
+    assert "Prove it" in response.text
+    assert "Catch drift" in response.text
+    assert "readiness gates" in response.text
+    assert "Send for review" in response.text
+    assert "Rollback plan (known before apply)" in response.text
+    assert "change-record" in response.text
     assert "Setup" in response.text
     assert "Inventory" in response.text
     assert "Desired State" in response.text
@@ -683,7 +764,7 @@ def test_app_route_serves_ui():
     assert "Apply" in response.text
     assert "Drift" in response.text
     assert "Evidence" in response.text
-    assert "Choose VLAN, interface, BGP, ACL, or site/device intent" in response.text
+    assert "What do you want the network to look like?" in response.text
     assert "Editable platform configuration" in response.text
     assert "Connect Git repo" in response.text
     assert "Save configuration" in response.text

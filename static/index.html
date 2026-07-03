@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Netcode MVP</title>
     <link rel="icon" href="/static/favicon.svg" type="image/svg+xml" />
-    <link rel="stylesheet" href="/static/styles.css?v=20260703-mvp8" />
+    <link rel="stylesheet" href="/static/styles.css?v=20260703-mvp9" />
   </head>
   <body>
     <main class="app-shell">
@@ -52,89 +52,56 @@
 
           <section id="view-home" class="view active">
             <section class="story-board" aria-label="Network as code user stories">
-              <article class="story-card" id="story-git">
+              <article class="story-card" id="story-ready">
                 <span>Story 01</span>
-                <h3>Connect Git</h3>
-                <p>Use a repo so every network change can be reviewed, committed, and audited.</p>
+                <h3>Get ready</h3>
+                <p>Git, source of truth, read access, and a safe test target — verified before any change.</p>
                 <strong>Checking</strong>
-                <button type="button" data-go="setup">Work this story</button>
+                <button type="button" data-go="setup">Check readiness</button>
               </article>
               <article class="story-card" id="story-discovery">
                 <span>Story 02</span>
-                <h3>Discover Devices</h3>
-                <p>Read live devices with Rez and stage reviewed records for source of truth.</p>
+                <h3>Bring devices under management</h3>
+                <p>Point at an IP, read its live state, review the record, save it to source of truth.</p>
                 <strong>Checking</strong>
-                <button type="button" data-go="inventory">Work this story</button>
-              </article>
-              <article class="story-card" id="story-sot">
-                <span>Story 03</span>
-                <h3>Build Source of Truth</h3>
-                <p>Keep inventory, policy, and templates as the trusted model before any push.</p>
-                <strong>Checking</strong>
-                <button type="button" data-go="inventory">Review inventory</button>
+                <button type="button" data-go="inventory">Discover a device</button>
               </article>
               <article class="story-card" id="story-change">
-                <span>Story 04</span>
-                <h3>Plan Safe Change</h3>
-                <p>Define desired state, see exact commands, validate, dry-run, then apply.</p>
+                <span>Story 03</span>
+                <h3>Make a safe change</h3>
+                <p>Declare the outcome, branch it, see exact commands, prove it, apply, verify, push for review.</p>
                 <strong>Waiting</strong>
-                <button type="button" data-go="desired">Create desired state</button>
+                <button type="button" data-go="desired">Start a change</button>
               </article>
               <article class="story-card" id="story-audit">
-                <span>Story 05</span>
-                <h3>Prove and Audit</h3>
-                <p>Show job history, command sessions, validation, Git plan, and evidence.</p>
+                <span>Story 04</span>
+                <h3>Prove it</h3>
+                <p>One change record with every artifact and proof — ready to attach to a ticket.</p>
                 <strong>Waiting</strong>
-                <button type="button" data-go="evidence">Review evidence</button>
+                <button type="button" data-go="evidence">Open the record</button>
+              </article>
+              <article class="story-card" id="story-drift">
+                <span>Story 05</span>
+                <h3>Catch drift</h3>
+                <p>Compare live network state against trusted intent; reconcile with a new change.</p>
+                <strong>Not checked</strong>
+                <button type="button" data-go="drift">Check drift</button>
               </article>
             </section>
 
-            <div class="choice-grid">
-              <button class="choice-card" type="button" data-go="setup">
-                <span>1</span>
-                <strong>Set up platform</strong>
-                <p>Check Git, source of truth, Rez adapters, and lab reachability.</p>
-              </button>
-              <button class="choice-card" type="button" data-go="inventory">
-                <span>2</span>
-                <strong>Discover devices</strong>
-                <p>Use Rez to read the Arista lab device and import it into source of truth.</p>
-              </button>
-              <button class="choice-card" type="button" data-go="desired">
-                <span>3</span>
-                <strong>Create desired state</strong>
-                <p>Choose VLAN, interface, BGP, ACL, or site/device intent, then generate the plan.</p>
-              </button>
-              <button class="choice-card" type="button" data-go="drift">
-                <span>4</span>
-                <strong>Check drift</strong>
-                <p>Compare trusted intent against live state and show mismatch evidence.</p>
-              </button>
-              <button class="choice-card" type="button" data-go="evidence">
-                <span>5</span>
-                <strong>Review evidence</strong>
-                <p>See YAML, generated config, validation, lab proof, audit sessions, jobs, and Git plan.</p>
-              </button>
-            </div>
-
-            <section class="summary-strip" aria-label="Current MVP state">
-              <article><span>Git</span><strong id="home-git">Checking</strong></article>
-              <article><span>Source of truth</span><strong id="home-sot">Checking</strong></article>
-              <article><span>Rez adapters</span><strong id="home-rez">Checking</strong></article>
-              <article><span>Arista lab</span><strong id="home-lab">Checking</strong></article>
-            </section>
           </section>
 
           <section id="view-setup" class="view">
             <section class="section-heading">
-              <h3>Setup</h3>
-              <p>Make sure the platform has the four things it needs before any network change: Git, source of truth, adapters, and lab reachability.</p>
+              <h3>Setup — readiness gates</h3>
+              <p>Four things every safe change depends on. Each gate is pass/fail with one fix. When all four are green, start a change.</p>
             </section>
             <div class="setup-grid">
-              <article class="setup-item">
-                <span>Step 1</span>
-                <h4>Git repo &amp; change branch</h4>
-                <p id="setup-git-copy">Use your Git repo for reviewable network changes.</p>
+              <article class="setup-item gate" id="gate-git-card">
+                <span>Gate 1</span>
+                <h4>Git connected</h4>
+                <p class="gate-question">Can changes be reviewed and audited?</p>
+                <p id="setup-git-copy" class="gate-status">Checking.</p>
                 <div class="field-grid">
                   <label>Repo URL<input id="git-repo-url" placeholder="https://github.com/you/network-code.git" autocomplete="off" /></label>
                   <label>Base branch<input id="git-base-branch" placeholder="main" autocomplete="off" /></label>
@@ -142,39 +109,38 @@
                 <div class="button-row compact">
                   <button id="connect-git" type="button">Connect Git repo</button>
                 </div>
-                <div class="branch-panel">
-                  <p class="branch-current">Working branch <strong id="git-current-branch">not connected</strong></p>
-                  <div class="field-grid">
-                    <label>New change branch<input id="git-new-branch" placeholder="change/site-change-type" autocomplete="off" /></label>
-                    <label>Switch to existing<select id="git-branch-select"><option value="">Select branch</option></select></label>
-                  </div>
-                  <div class="button-row compact">
-                    <button id="create-branch" type="button">Create change branch</button>
-                    <button id="switch-branch" class="secondary" type="button">Switch</button>
-                  </div>
-                  <p id="git-branch-outcome" class="setup-hint">Each network change gets its own branch. Commit and push it for review before merge.</p>
-                </div>
-                <pre id="setup-git-commands" class="mini-code">Click Check workspace.</pre>
               </article>
-              <article class="setup-item">
-                <span>Step 2</span>
+              <article class="setup-item gate" id="gate-sot-card">
+                <span>Gate 2</span>
                 <h4>Source of truth</h4>
-                <p id="setup-sot-copy">Local YAML is the active source of truth for this MVP.</p>
-                <div id="setup-sot-summary" class="stat-chips">Click Check workspace.</div>
+                <p class="gate-question">Does the platform know your network?</p>
+                <p id="setup-sot-copy" class="gate-status">Checking.</p>
+                <p id="setup-sot-detail" class="setup-hint"></p>
+                <div class="button-row compact">
+                  <button class="secondary" type="button" data-go="inventory">Discover devices</button>
+                </div>
               </article>
-              <article class="setup-item">
-                <span>Step 3</span>
-                <h4>Rez adapters</h4>
-                <p id="setup-rez-copy">Rez provides multi-vendor read and discovery drivers.</p>
-                <div id="setup-rez-summary" class="stat-chips">Click Check workspace.</div>
+              <article class="setup-item gate" id="gate-read-card">
+                <span>Gate 3</span>
+                <h4>Read access</h4>
+                <p class="gate-question">Can the platform read live devices?</p>
+                <p id="setup-rez-copy" class="gate-status">Checking.</p>
+                <p id="setup-rez-detail" class="setup-hint"></p>
               </article>
-              <article class="setup-item">
-                <span>Step 4</span>
-                <h4>Arista lab</h4>
-                <p id="setup-lab-copy">Arista EOS is the write/apply target for the MVP.</p>
-                <div id="setup-lab-summary" class="stat-chips">Click Check workspace.</div>
+              <article class="setup-item gate" id="gate-lab-card">
+                <span>Gate 4</span>
+                <h4>Safe test target</h4>
+                <p class="gate-question">Is there a lab to prove changes before they matter?</p>
+                <p id="setup-lab-copy" class="gate-status">Checking.</p>
+                <p id="setup-lab-detail" class="setup-hint"></p>
               </article>
             </div>
+            <div class="button-row">
+              <button id="check-workspace" type="button">Check readiness</button>
+              <button id="start-change" type="button" data-go="desired" disabled>Start a change</button>
+            </div>
+            <details class="advanced-panel">
+              <summary>Advanced: platform configuration</summary>
             <section class="config-panel">
               <div class="config-head">
                 <div>
@@ -241,10 +207,7 @@
                 <textarea id="config-json" spellcheck="false"></textarea>
               </section>
             </section>
-            <div class="button-row">
-              <button id="check-workspace" type="button">Check workspace</button>
-              <button class="secondary" type="button" data-go="inventory">Next: Discover</button>
-            </div>
+            </details>
           </section>
 
           <section id="view-inventory" class="view">
@@ -283,6 +246,7 @@
               <h3>Desired State</h3>
               <p>Pick the outcome first. The platform builds the right YAML, template, validation, plan, and apply gates for that intent type.</p>
             </section>
+            <div class="story-rail" data-story-rail></div>
             <div class="desired-layout">
               <form id="change-form" class="form-panel">
                 <fieldset class="change-type-fieldset">
@@ -312,6 +276,18 @@
                 <h4 id="desired-title">Add VLAN</h4>
                 <p id="desired-summary">Choose a change type and fill in the outcome. YAML remains visible as an artifact, not as the primary workflow.</p>
                 <div id="desired-capability" class="capability-strip"></div>
+                <div class="branch-panel">
+                  <p class="branch-current">Change branch <strong id="git-current-branch">not created</strong></p>
+                  <div class="field-grid">
+                    <label>Branch name<input id="git-new-branch" placeholder="change/site-change-type" autocomplete="off" /></label>
+                    <label>Switch to existing<select id="git-branch-select"><option value="">Select branch</option></select></label>
+                  </div>
+                  <div class="button-row compact">
+                    <button id="create-branch" type="button">Create change branch</button>
+                    <button id="switch-branch" class="secondary" type="button">Switch</button>
+                  </div>
+                  <p id="git-branch-outcome" class="setup-hint">The change branch carries intent, config, validation, and proof for review.</p>
+                </div>
                 <pre id="desired-yaml" class="code-box">Create a plan to see the YAML intent.</pre>
               </article>
             </div>
@@ -320,14 +296,16 @@
           <section id="view-plan" class="view">
             <section class="section-heading">
               <h3>Plan</h3>
-              <p>Preview the exact impact before the lab switch sees anything.</p>
+              <p>Preview the exact impact — forward and rollback — before the lab switch sees anything.</p>
             </section>
+            <div class="story-rail" data-story-rail></div>
             <section class="plan-summary">
               <article><span>Action</span><strong id="plan-action">No plan yet</strong></article>
               <article><span>Affected device</span><strong id="plan-device">-</strong></article>
               <article><span>Risk</span><strong id="plan-risk">Unknown</strong></article>
               <article><span>Apply gate</span><strong id="plan-writes">None</strong></article>
             </section>
+            <div id="plan-blast" class="stat-chips"></div>
             <div class="artifact-grid">
               <article>
                 <div class="artifact-heading"><span>Terraform-style summary</span></div>
@@ -336,6 +314,16 @@
               <article>
                 <div class="artifact-heading"><span>Exact generated commands</span></div>
                 <pre id="plan-commands" class="code-box">No commands generated yet.</pre>
+              </article>
+            </div>
+            <div class="artifact-grid">
+              <article>
+                <div class="artifact-heading"><span>Rollback plan (known before apply)</span><strong id="rollback-confidence"></strong></div>
+                <pre id="plan-rollback" class="code-box">No rollback plan yet.</pre>
+              </article>
+              <article>
+                <div class="artifact-heading"><span>Pre / post checks for this change type</span></div>
+                <div id="plan-checks" class="check-list compact-list">Create a plan to see the checks.</div>
               </article>
             </div>
             <div class="button-row">
@@ -349,6 +337,7 @@
               <h3>Validate</h3>
               <p>Policy checks must pass for every intent. Lab dry-run is available only for intent types with an Arista write adapter.</p>
             </section>
+            <div class="story-rail" data-story-rail></div>
             <div id="validation-list" class="check-list"></div>
             <div class="artifact-grid">
               <article>
@@ -371,6 +360,7 @@
               <h3>Apply + Verify</h3>
               <p>Apply stays locked until the selected intent type supports lab writes, policy validation passes, and dry-run proof exists.</p>
             </section>
+            <div class="story-rail" data-story-rail></div>
             <section class="apply-gates">
               <article id="gate-plan"><span>Plan</span><strong>Waiting</strong></article>
               <article id="gate-validation"><span>Validation</span><strong>Waiting</strong></article>
@@ -383,6 +373,18 @@
               <button id="verify-change" class="secondary" type="button" disabled>Verify live state</button>
               <button id="rollback-change" class="secondary" type="button" disabled>Rollback lab change</button>
             </div>
+            <section class="review-handoff">
+              <h4>Send for review</h4>
+              <p class="setup-hint">Commit every artifact of this change to its branch, then push it so your team can review before merge.</p>
+              <div class="field-grid">
+                <label>Commit message<input id="commit-message" autocomplete="off" placeholder="Netcode change ..." /></label>
+              </div>
+              <div class="button-row compact">
+                <button id="commit-artifacts" type="button" disabled>Commit artifacts</button>
+                <button id="push-branch" class="secondary" type="button" disabled>Push for review</button>
+              </div>
+              <pre id="pr-summary" class="mini-code">Commit and push to produce a review-ready summary.</pre>
+            </section>
           </section>
 
           <section id="view-drift" class="view">
@@ -399,27 +401,37 @@
             <pre id="drift-output" class="code-box tall">Create a plan, then check drift for that intent.</pre>
             <div class="button-row">
               <button id="check-drift" type="button">Check drift</button>
+              <button class="secondary" type="button" data-go="desired">Reconcile: start a new change</button>
               <button class="secondary" type="button" data-go="evidence">Review evidence</button>
             </div>
           </section>
 
           <section id="view-evidence" class="view">
             <section class="section-heading">
-              <h3>Evidence</h3>
-              <p>Everything created or inspected by the UI is collected here for review.</p>
+              <h3>Evidence — the change record</h3>
+              <p>One readable package per change: request, plan, safety, lab proof, apply proof, verification, Git record, rollback. Attach it to a ticket.</p>
             </section>
-            <div class="evidence-tabs" aria-label="Evidence artifacts">
-              <button class="evidence-tab active" type="button" data-artifact="overview">Overview</button>
-              <button class="evidence-tab" type="button" data-artifact="intent">YAML</button>
-              <button class="evidence-tab" type="button" data-artifact="config">Commands</button>
-              <button class="evidence-tab" type="button" data-artifact="validation">Validation</button>
-              <button class="evidence-tab" type="button" data-artifact="lab">Lab</button>
-              <button class="evidence-tab" type="button" data-artifact="git">Git</button>
-              <button class="evidence-tab" type="button" data-artifact="configState">Config</button>
-              <button class="evidence-tab" type="button" data-artifact="audit">Audit</button>
-              <button class="evidence-tab" type="button" data-artifact="jobs">Jobs</button>
+            <div class="field-grid">
+              <label>Change<select id="record-select"><option value="">Select a change</option></select></label>
             </div>
-            <pre id="evidence-output" class="code-box evidence-output">No artifacts yet. Start with Setup or Desired State.</pre>
+            <div id="change-record" class="record-sections">
+              <p class="setup-hint">Pick a change to see its full record.</p>
+            </div>
+            <details class="advanced-panel">
+              <summary>Advanced: raw artifacts</summary>
+              <div class="evidence-tabs" aria-label="Evidence artifacts">
+                <button class="evidence-tab active" type="button" data-artifact="overview">Overview</button>
+                <button class="evidence-tab" type="button" data-artifact="intent">YAML</button>
+                <button class="evidence-tab" type="button" data-artifact="config">Commands</button>
+                <button class="evidence-tab" type="button" data-artifact="validation">Validation</button>
+                <button class="evidence-tab" type="button" data-artifact="lab">Lab</button>
+                <button class="evidence-tab" type="button" data-artifact="git">Git</button>
+                <button class="evidence-tab" type="button" data-artifact="configState">Config</button>
+                <button class="evidence-tab" type="button" data-artifact="audit">Audit</button>
+                <button class="evidence-tab" type="button" data-artifact="jobs">Jobs</button>
+              </div>
+              <pre id="evidence-output" class="code-box evidence-output">No artifacts yet. Start with Setup or Desired State.</pre>
+            </details>
             <div class="button-row">
               <button id="refresh-evidence" type="button">Refresh evidence</button>
               <button class="secondary" type="button" data-go="home">Back home</button>
@@ -459,6 +471,6 @@
         </aside>
       </section>
     </main>
-    <script src="/static/app.js?v=20260703-mvp8"></script>
+    <script src="/static/app.js?v=20260703-mvp9"></script>
   </body>
 </html>

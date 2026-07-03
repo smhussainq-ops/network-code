@@ -132,6 +132,142 @@ def verification_hint(intent: Intent) -> dict[str, Any]:
     return {"check": "source_of_truth_only", "params": {}}
 
 
+def rollback_confidence(intent: Intent) -> dict[str, str]:
+    if isinstance(intent, AddVlanIntent):
+        return {"level": "high", "reason": "Exact inverse command. VLAN absence is verified after rollback in the lab."}
+    if isinstance(intent, InterfaceConfigIntent):
+        return {"level": "medium", "reason": "Resets the interface to defaults; does not restore captured pre-change state."}
+    if isinstance(intent, BgpNeighborIntent):
+        return {"level": "medium", "reason": "Removes the neighbors added here; does not restore prior neighbor settings."}
+    if isinstance(intent, AclRuleIntent):
+        return {"level": "medium", "reason": "Removes this sequence; does not restore a rule it may have replaced."}
+    if isinstance(intent, SiteDeviceIntent):
+        return {"level": "none", "reason": "Inventory record only. No device config to roll back."}
+    return {"level": "unknown", "reason": "Rollback behavior is not defined for this change type."}
+
+
+def blast_radius(intent: Intent) -> dict[str, Any]:
+    devices = list(intent.targets.device_ids or [])
+    if not devices and intent.targets.device_group:
+        devices = [f"group:{intent.targets.device_group}"]
+    objects: list[str] = []
+    if isinstance(intent, AddVlanIntent):
+        objects.append(f"VLAN {intent.vlan.id} ({intent.vlan.name})")
+        if intent.vlan.svi and intent.vlan.svi.enabled:
+            objects.append(f"SVI interface Vlan{intent.vlan.id}")
+    elif isinstance(intent, InterfaceConfigIntent):
+        objects.append(f"Interface {intent.interface.name}")
+        if intent.interface.access_vlan:
+            objects.append(f"Access VLAN {intent.interface.access_vlan}")
+    elif isinstance(intent, BgpNeighborIntent):
+        objects.append(f"BGP AS {intent.bgp.asn}")
+        objects.extend(f"Neighbor {neighbor.address} (AS {neighbor.remote_as})" for neighbor in intent.bgp.neighbors)
+    elif isinstance(intent, AclRuleIntent):
+        objects.append(f"ACL {intent.acl.name} sequence {intent.acl.sequence}")
+    elif isinstance(intent, SiteDeviceIntent):
+        objects.append(f"Inventory record {intent.device.device_id}")
+    return {
+        "devices": devices,
+        "device_count": len(devices),
+        "objects": objects,
+        "site": intent.site,
+    }
+
+
+def pre_post_checks(intent: Intent) -> dict[str, list[dict[str, Any]]]:
+    """Pre/post check definitions per change type. `executable` means the platform can run it live today."""
+    if isinstance(intent, AddVlanIntent):
+        return {
+            "pre": [
+                {
+                    "id": "vlan_absent",
+                    "description": f"VLAN {intent.vlan.id} is not already configured on the target device.",
+                    "executable": True,
+                }
+            ],
+            "post": [
+                {
+                    "id": "vlan_present",
+                    "description": f"VLAN {intent.vlan.id} exists with name {intent.vlan.name}.",
+                    "executable": True,
+                },
+                {
+                    "id": "state_cross_check",
+                    "description": "Independent live-state collection confirms the VLAN.",
+                    "executable": True,
+                },
+            ],
+        }
+    if isinstance(intent, InterfaceConfigIntent):
+        return {
+            "pre": [
+                {
+                    "id": "interface_exists",
+                    "description": f"Interface {intent.interface.name} exists on the target device.",
+                    "executable": False,
+                    "note": "Live pre-check not wired yet.",
+                }
+            ],
+            "post": [
+                {
+                    "id": "running_config_contains",
+                    "description": f"Running config contains the interface {intent.interface.name} section.",
+                    "executable": True,
+                }
+            ],
+        }
+    if isinstance(intent, BgpNeighborIntent):
+        return {
+            "pre": [
+                {
+                    "id": "bgp_neighbor_absent",
+                    "description": "Neighbors are not already configured.",
+                    "executable": False,
+                    "note": "Live pre-check not wired yet.",
+                }
+            ],
+            "post": [
+                {
+                    "id": "running_config_contains",
+                    "description": f"Running config contains router bgp {intent.bgp.asn} with the neighbors.",
+                    "executable": True,
+                }
+            ],
+        }
+    if isinstance(intent, AclRuleIntent):
+        return {
+            "pre": [
+                {
+                    "id": "acl_sequence_absent",
+                    "description": f"ACL {intent.acl.name} sequence {intent.acl.sequence} is not already in use.",
+                    "executable": False,
+                    "note": "Live pre-check not wired yet.",
+                }
+            ],
+            "post": [
+                {
+                    "id": "running_config_contains",
+                    "description": f"Running config contains the ACL {intent.acl.name} rule.",
+                    "executable": True,
+                }
+            ],
+        }
+    return {
+        "pre": [],
+        "post": [
+            {
+                "id": "source_of_truth_updated",
+                "description": "The source-of-truth record is written and loadable.",
+                "executable": True,
+            }
+        ],
+    }
+
+
+def suggested_branch(intent: Intent) -> str:
+    return f"change/{intent_slug(intent)}"
+
+
 def plan_metadata(intent: Intent) -> dict[str, Any]:
     return {
         "change_type": intent.change_type,
@@ -143,4 +279,11 @@ def plan_metadata(intent: Intent) -> dict[str, Any]:
         "lab_write_supported": lab_write_supported(intent),
         "production_write_supported": production_write_supported(intent),
         "verification": verification_hint(intent),
+        "blast_radius": blast_radius(intent),
+        "rollback": {
+            "commands": rollback_config(intent),
+            "confidence": rollback_confidence(intent),
+        },
+        "checks": pre_post_checks(intent),
+        "suggested_branch": suggested_branch(intent),
     }

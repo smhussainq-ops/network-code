@@ -15,7 +15,15 @@ from netcode.adapters.registry import AdapterRegistry
 from netcode.bootstrap import init_workspace
 from netcode.discovery import DiscoveryService
 from netcode.drift import compliance_summary, vlan_drift_report
-from netcode.gitflow import create_change_branch, git_workspace_status, list_git_branches, setup_git_workspace
+from netcode.gitflow import (
+    commit_change_artifacts,
+    create_change_branch,
+    git_evidence,
+    git_workspace_status,
+    list_git_branches,
+    push_current_branch,
+    setup_git_workspace,
+)
 from netcode.gitops import gitops_plan
 from netcode.inventory import Inventory
 from netcode.intent_utils import lab_write_supported, plan_metadata, production_write_supported
@@ -122,6 +130,15 @@ class GitSetupRequest(BaseModel):
 class GitBranchRequest(BaseModel):
     name: str = ""
     base: str = ""
+
+
+class GitCommitRequest(BaseModel):
+    message: str = ""
+    change_id: str = ""
+
+
+class GitPushRequest(BaseModel):
+    change_id: str = ""
 
 
 app = FastAPI(title="Netcode Platform", version="0.1.0")
@@ -441,6 +458,49 @@ def api_git_branch(request: GitBranchRequest) -> dict[str, object]:
     return create_change_branch(paths().root, name=request.name, base=request.base)
 
 
+def _record_git_event(p, change_id: str, action: str, result: dict[str, object]) -> dict[str, object]:
+    """Attach a git action outcome to a change as a workflow event; honest about lookup failures."""
+    if not change_id:
+        return {"change_event_recorded": False, "reason": "no change_id supplied"}
+    store = PlatformStore(p)
+    try:
+        change = store.get_change(change_id)
+    except Exception as exc:
+        return {"change_event_recorded": False, "reason": f"unknown change {change_id}: {exc}"}
+    store.record_workflow_event(
+        change.id,
+        action,
+        change.workflow_state,
+        change.workflow_state,
+        str(result.get("message", "")),
+        {
+            "ok": bool(result.get("ok")),
+            "action": result.get("action"),
+            "branch": result.get("branch"),
+            "commit": result.get("commit"),
+        },
+    )
+    return {"change_event_recorded": True}
+
+
+@app.post("/api/git/commit")
+def api_git_commit(request: GitCommitRequest) -> dict[str, object]:
+    p = paths()
+    config = read_ui_config(p)
+    default_message = str((config.get("git") or {}).get("default_commit_message") or "Netcode network change")
+    result = commit_change_artifacts(p.root, message=request.message or default_message)
+    result.update(_record_git_event(p, request.change_id, "git_commit", result))
+    return result
+
+
+@app.post("/api/git/push")
+def api_git_push(request: GitPushRequest) -> dict[str, object]:
+    p = paths()
+    result = push_current_branch(p.root)
+    result.update(_record_git_event(p, request.change_id, "git_push", result))
+    return result
+
+
 @app.post("/api/discovery/scan")
 def api_discovery_scan(request: DiscoveryScanRequest) -> dict[str, object]:
     return DiscoveryService(paths()).scan(
@@ -698,6 +758,137 @@ def api_audit_sessions() -> dict[str, object]:
                 }
             )
     return {"changes": changes, "jobs": jobs, "events": events, "sessions": sessions}
+
+
+def _job_lab_result(job: dict[str, object]) -> dict[str, object]:
+    result = job.get("result") or {}
+    if isinstance(result, dict) and isinstance(result.get("result"), dict):
+        return result["result"]
+    return result if isinstance(result, dict) else {}
+
+
+def _job_transcript(job: dict[str, object]) -> list[dict[str, object]]:
+    lab_result = _job_lab_result(job)
+    evidence = lab_result.get("evidence", {}) if isinstance(lab_result, dict) else {}
+    if not isinstance(evidence, dict):
+        return []
+    transcript = evidence.get("transcript") or (evidence.get("session") or {}).get("transcript", [])
+    return transcript if isinstance(transcript, list) else []
+
+
+@app.get("/api/change/{change_id}/record")
+def api_change_record(change_id: str) -> dict[str, object]:
+    """One readable change package: request, plan, safety, lab/apply/verify proof, git, rollback, manifest."""
+    p = paths()
+    store = PlatformStore(p)
+    try:
+        change = store.get_change(change_id)
+    except Exception as exc:
+        raise HTTPException(status_code=404, detail=f"Unknown change {change_id}") from exc
+    change_dict = record_to_dict(change)
+    result = change_dict.get("result") or {}
+    plan = result.get("plan") or {}
+    validation = result.get("validation") or {}
+    render = result.get("render") or {}
+    intent_info = result.get("intent") or {}
+    jobs = [record_to_dict(j) for j in store.list_jobs(limit=200) if j.change_id == change_id]
+    events = [record_to_dict(e) for e in store.list_workflow_events(change_id)]
+
+    def proof_for(fragment: str) -> dict[str, object]:
+        for job in jobs:  # list_jobs returns newest first
+            if fragment in str(job.get("action", "")):
+                lab_result = _job_lab_result(job)
+                return {
+                    "present": True,
+                    "job_id": job["id"],
+                    "status": job["status"],
+                    "message": job["message"],
+                    "at": job["updated_at"],
+                    "session_name": lab_result.get("session_name", "") if isinstance(lab_result, dict) else "",
+                    "commands": _job_transcript(job),
+                }
+        return {"present": False}
+
+    def verify_proof() -> dict[str, object]:
+        for job in jobs:
+            if "apply" in str(job.get("action", "")):
+                lab_result = _job_lab_result(job)
+                evidence = lab_result.get("evidence", {}) if isinstance(lab_result, dict) else {}
+                details = {k: v for k, v in evidence.items() if k != "transcript"} if isinstance(evidence, dict) else {}
+                if details:
+                    return {"present": True, "job_id": job["id"], "status": job["status"], "details": details}
+        return {"present": False}
+
+    intent_path = Path(str(change_dict.get("intent_path") or ""))
+    slug = str(plan.get("slug") or intent_path.stem)
+    manifest: list[dict[str, object]] = []
+
+    def manifest_entry(artifact: str, path: Path) -> None:
+        manifest.append({"artifact": artifact, "path": str(path), "exists": path.exists()})
+
+    manifest_entry("intent.yaml", intent_path)
+    manifest_entry("rendered_config.eos", p.rendered / f"{slug}.eos")
+    manifest_entry("report.md", p.reports / f"{slug}.md")
+    manifest_entry("validation_report.json", p.reports / f"{slug}.json")
+
+    try:
+        evidence = git_evidence(p.root, intent_path)
+    except Exception as exc:
+        evidence = {"available": False, "message": f"Git evidence unavailable: {exc}"}
+    git_status = git_workspace_status(p.root)
+    git_actions = [e for e in events if str(e.get("action", "")) in ("git_commit", "git_push")]
+
+    return {
+        "ok": True,
+        "change_id": change_id,
+        "workflow_state": change_dict.get("workflow_state"),
+        "status": change_dict.get("status"),
+        "request": {
+            "title": plan.get("title") or slug,
+            "change_type": plan.get("change_type") or intent_info.get("change_type"),
+            "site": intent_info.get("site"),
+            "device_id": change_dict.get("device_id"),
+            "requested_by": change_dict.get("requested_by"),
+            "created_at": change_dict.get("created_at"),
+            "intent_path": str(intent_path),
+            "intent_yaml": result.get("intent_yaml") or "",
+        },
+        "plan": {
+            "commands": render.get("config") or "",
+            "risk": plan.get("risk"),
+            "blast_radius": plan.get("blast_radius") or {},
+            "rollback": plan.get("rollback") or {},
+            "checks": plan.get("checks") or {},
+            "suggested_branch": plan.get("suggested_branch"),
+            "lab_write_supported": plan.get("lab_write_supported"),
+            "production_write_supported": plan.get("production_write_supported"),
+        },
+        "safety": {
+            "status": validation.get("status"),
+            "checks": [
+                {
+                    "id": check.get("id"),
+                    "title": check.get("title"),
+                    "status": check.get("status"),
+                    "message": check.get("message"),
+                }
+                for check in (validation.get("checks") or [])
+            ],
+        },
+        "lab_proof": proof_for("dry"),
+        "apply_proof": proof_for("apply"),
+        "verify_proof": verify_proof(),
+        "rollback_record": proof_for("rollback"),
+        "git": {
+            "branch": git_status.get("branch"),
+            "upstream": git_status.get("upstream"),
+            "ahead": git_status.get("ahead"),
+            "actions": git_actions,
+            "evidence": evidence,
+        },
+        "manifest": manifest,
+        "events": events,
+    }
 
 
 app.mount("/static", StaticFiles(directory=str(paths().static)), name="static")

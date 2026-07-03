@@ -39,6 +39,11 @@ const appState = {
   uiConfigPath: "",
   configHistory: [],
   configApplied: false,
+  gitBranches: null,
+  activeChangeId: "",
+  lastCommit: null,
+  lastPush: null,
+  changeRecord: null,
 };
 
 function escapeHtml(value) {
@@ -579,6 +584,79 @@ async function switchGitBranch() {
   await runBranchAction(name, "", `Switch the workspace to branch ${name}.`);
 }
 
+async function commitArtifacts() {
+  const message = $("commit-message").value.trim();
+  startOutcome("Commit artifacts", "Commit intent, rendered config, validation, and reports to the change branch.");
+  try {
+    const data = await postJson("/api/git/commit", { message, change_id: appState.activeChangeId });
+    appState.lastCommit = data;
+    appState.git = await getJson("/api/git/status");
+    renderAll();
+    setOutcome({
+      state: data.ok ? "Passed" : "Review",
+      status: data.ok ? "pass" : "warn",
+      title: data.ok
+        ? data.action === "nothing_to_commit"
+          ? "Everything is already committed."
+          : `Committed ${data.commit}.`
+        : "Commit needs review.",
+      summary: data.message,
+      expected: "A reviewable commit containing every artifact of this change.",
+      actual: (data.steps || []).map((step) => `${step.ok ? "OK" : "CHECK"}: ${step.command}`).join("\n") || data.message,
+      artifact: data.commit || "no commit",
+      device: "No device config was changed.",
+      next: data.ok ? "Push the branch for review." : "Connect Git and create the change branch first.",
+    });
+  } catch (error) {
+    failOutcome("Commit failed.", error);
+  }
+}
+
+function renderPrSummary(push) {
+  const pr = appState.gitPlan?.pull_request || {};
+  if (!push?.ok) {
+    $("pr-summary").textContent = push?.message || "Commit and push to produce a review-ready summary.";
+    return;
+  }
+  $("pr-summary").textContent = [
+    `Branch pushed: ${push.branch}`,
+    `PR title: ${pr.title || "Network change"}`,
+    `Body sections: ${(pr.body_sections || []).join(", ") || "n/a"}`,
+    `Required review evidence: ${(pr.required_review_evidence || []).join(", ") || "n/a"}`,
+  ].join("\n");
+}
+
+async function pushBranch() {
+  startOutcome("Push for review", "Push the change branch to origin so the team can review before merge.");
+  try {
+    const data = await postJson("/api/git/push", { change_id: appState.activeChangeId });
+    appState.lastPush = data;
+    appState.git = await getJson("/api/git/status");
+    if (data.ok && appState.plan?.intent_path) {
+      appState.gitPlan = await postJson("/api/gitops/plan", {
+        intent_path: appState.plan.intent_path,
+        device_id: selectedDeviceId(),
+        change_id: appState.activeChangeId || null,
+      });
+    }
+    renderPrSummary(data);
+    renderAll();
+    setOutcome({
+      state: data.ok ? "Passed" : "Review",
+      status: data.ok ? "pass" : "warn",
+      title: data.ok ? `Pushed ${data.branch} for review.` : "Push needs attention.",
+      summary: data.message,
+      expected: "The change branch reaches origin so it can be reviewed and merged.",
+      actual: (data.steps || []).map((step) => `${step.ok ? "OK" : "CHECK"}: ${step.command}${!step.ok && step.stderr ? ` - ${step.stderr}` : ""}`).join("\n") || data.message,
+      artifact: data.branch || "no branch",
+      device: "No device config was changed.",
+      next: data.ok ? "Open the change record in Evidence, or merge after review." : "Push from an authenticated terminal, or fix the remote in Setup.",
+    });
+  } catch (error) {
+    failOutcome("Push failed.", error);
+  }
+}
+
 function commandListFromText(config) {
   return String(config || "")
     .split("\n")
@@ -611,12 +689,84 @@ function setStory(id, status, label) {
   card.querySelector("strong").textContent = label;
 }
 
+function setupGates() {
+  const gitPass = Boolean(appState.git?.available);
+  const sotPass = Boolean(appState.source?.ok && (appState.source.summary?.device_count || 0) > 0);
+  const readPass = Boolean(appState.rezHealth?.ok);
+  const labPass = Boolean(appState.health?.lab?.ok);
+  return { gitPass, sotPass, readPass, labPass, passed: [gitPass, sotPass, readPass, labPass].filter(Boolean).length };
+}
+
+const STORY3_STEPS = [
+  { id: "declare", label: "Declare" },
+  { id: "branch", label: "Branch" },
+  { id: "plan", label: "Plan" },
+  { id: "validate", label: "Validate" },
+  { id: "dryrun", label: "Dry-run" },
+  { id: "commit", label: "Commit" },
+  { id: "apply", label: "Apply" },
+  { id: "verify", label: "Verify" },
+  { id: "push", label: "Push" },
+];
+
+function story3Status() {
+  const plan = appState.plan;
+  const suggested = plan?.plan?.suggested_branch || "";
+  const current = appState.gitBranches?.current || "";
+  const onChangeBranch = Boolean(current && (current === suggested || current.startsWith("change/")));
+  const done = {
+    declare: Boolean(plan),
+    branch: onChangeBranch,
+    plan: Boolean(plan),
+    validate: Boolean(plan?.ok),
+    dryrun: Boolean(appState.dryRun?.ok),
+    commit: Boolean(appState.lastCommit?.ok),
+    apply: Boolean(appState.apply?.ok),
+    verify: Boolean(appState.verify?.ok || appState.apply?.ok),
+    push: Boolean(appState.lastPush?.ok),
+  };
+  let nextIndex = STORY3_STEPS.findIndex((step) => !done[step.id]);
+  if (nextIndex === -1) nextIndex = STORY3_STEPS.length;
+  return { done, nextIndex };
+}
+
+function renderStoryRail() {
+  const rails = $$("[data-story-rail]");
+  if (!rails.length) return;
+  const { done, nextIndex } = story3Status();
+  const html = STORY3_STEPS.map((step, index) => {
+    const state = done[step.id] ? "done" : index === nextIndex ? "next" : "todo";
+    return `<span class="story-step ${state}"><em>${index + 1}</em>${escapeHtml(step.label)}</span>`;
+  }).join("");
+  rails.forEach((rail) => {
+    rail.innerHTML = html;
+  });
+}
+
 function renderUserStories() {
-  setStory("story-git", appState.git?.available ? "pass" : "warn", appState.git?.available ? `Git connected · ${appState.gitBranches?.current || appState.git?.branch || "main"}` : "Needs connect");
-  setStory("story-discovery", appState.discovery?.ok ? "pass" : appState.rezHealth?.ok ? "warn" : "fail", appState.discovery?.ok ? "Discovered" : appState.rezHealth?.ok ? "Ready to discover" : "Adapter issue");
-  setStory("story-sot", appState.source?.ok ? "pass" : "fail", appState.source?.ok ? `${appState.source.summary?.device_count || 0} devices trusted` : "Not loaded");
-  setStory("story-change", appState.plan?.ok ? "pass" : appState.plan ? "fail" : "warn", appState.plan?.ok ? "Plan ready" : appState.plan ? "Plan blocked" : "Not planned");
-  setStory("story-audit", appState.audit?.sessions?.length ? "pass" : appState.audit ? "warn" : "warn", appState.audit?.sessions?.length ? `${appState.audit.sessions.length} sessions` : "No sessions yet");
+  const gates = setupGates();
+  setStory("story-ready", gates.passed === 4 ? "pass" : "warn", gates.passed === 4 ? "Ready" : `${gates.passed}/4 gates ready`);
+  setStory(
+    "story-discovery",
+    appState.discovery?.ok ? "pass" : gates.readPass ? "warn" : "fail",
+    appState.discovery?.ok ? "Device discovered" : gates.readPass ? "Ready to discover" : "Read access needed"
+  );
+  const { done, nextIndex } = story3Status();
+  const doneCount = STORY3_STEPS.filter((step) => done[step.id]).length;
+  const complete = doneCount >= STORY3_STEPS.length;
+  const nextLabel = nextIndex < STORY3_STEPS.length ? `next: ${STORY3_STEPS[nextIndex].label.toLowerCase()}` : "complete";
+  setStory(
+    "story-change",
+    appState.plan && appState.plan.ok === false ? "fail" : complete ? "pass" : doneCount ? "warn" : "warn",
+    appState.plan && appState.plan.ok === false ? "Plan blocked" : doneCount ? (complete ? "Complete" : `Step ${doneCount}/9 · ${nextLabel}`) : "Not started"
+  );
+  const changeCount = appState.audit?.changes?.length || 0;
+  setStory("story-audit", changeCount ? "pass" : "warn", changeCount ? `${changeCount} change record${changeCount === 1 ? "" : "s"}` : "No changes yet");
+  setStory(
+    "story-drift",
+    appState.drift ? (appState.drift?.drift?.ok === false ? "fail" : "pass") : "warn",
+    appState.drift ? (appState.drift?.drift?.ok === false ? "Drift found — reconcile" : "In sync") : "Not checked"
+  );
 }
 
 function adapterSummary() {
@@ -641,11 +791,7 @@ function labSummary() {
 }
 
 function renderHome() {
-  $("home-git").textContent = appState.git?.available ? "Ready" : "Needs setup";
-  $("home-sot").textContent = appState.source ? `${appState.source.summary?.device_count || 0} devices` : "Unknown";
-  $("home-rez").textContent = appState.rezHealth?.ok ? `${appState.rezHealth.platform_count} platforms` : "Unavailable";
-  $("home-lab").textContent = appState.health?.lab?.ok ? "Reachable" : "Local only";
-  $("sidebar-workspace").textContent = appState.git?.branch || "main";
+  $("sidebar-workspace").textContent = appState.gitBranches?.current || appState.git?.branch || "main";
   $("sidebar-lab").textContent = appState.health?.lab?.ok ? "Arista lab reachable" : "Lab not reachable from this runtime";
   renderUserStories();
 }
@@ -658,83 +804,66 @@ function chipRow(element, items, empty = "Unavailable") {
   element.innerHTML = items.map((item) => `<span class="chip${item.tone ? ` ${item.tone}` : ""}">${escapeHtml(item.text)}</span>`).join("");
 }
 
+function setGateCard(cardId, pass, copyId, copyText) {
+  const card = $(cardId);
+  if (card) card.className = `setup-item gate ${pass ? "pass" : "warn"}`;
+  const copy = $(copyId);
+  if (copy) copy.textContent = copyText;
+}
+
 function renderSetup() {
+  const gates = setupGates();
   const git = appState.git || {};
   const gitConfig = getPath(appState.uiConfig || {}, "git", {});
-  const branches = appState.gitBranches?.branches || [];
-  const currentBranch = appState.gitBranches?.current || git.branch || "";
-  $("setup-git-copy").textContent = git.available
-    ? `Git is ready on branch ${currentBranch || "unknown"}. Remote: ${git.remote || "not configured"}.`
-    : "Connect this runtime workspace once so changes can be reviewed and audited.";
+  setGateCard(
+    "gate-git-card",
+    gates.gitPass,
+    "setup-git-copy",
+    gates.gitPass
+      ? `Connected. Base branch ${git.branch || "main"}, remote ${git.remote || "not set"}.`
+      : "Not connected. Enter the repo URL and connect once — every change needs a reviewable home."
+  );
   const repoInput = $("git-repo-url");
   if (document.activeElement !== repoInput && !repoInput.value) repoInput.value = git.remote || gitConfig.repo_url || "";
   const baseInput = $("git-base-branch");
   if (document.activeElement !== baseInput && !baseInput.value) baseInput.value = gitConfig.branch || git.branch || "main";
-  $("git-new-branch").placeholder = suggestedChangeBranch();
-  $("git-current-branch").textContent = git.available ? currentBranch || "detached" : "not connected";
-  $("git-branch-select").innerHTML = ['<option value="">Select branch</option>']
-    .concat(branches.map((name) => `<option value="${escapeHtml(name)}"${name === currentBranch ? " selected" : ""}>${escapeHtml(name)}</option>`))
-    .join("");
-  $("connect-git").textContent = git.available ? "Update Git connection" : "Connect Git repo";
-  $("create-branch").disabled = !git.available;
-  $("switch-branch").disabled = !git.available || !branches.length;
-  $("setup-git-commands").textContent = git.available
-    ? commandListBlock([
-        `git checkout -b ${$("git-new-branch").value.trim() || suggestedChangeBranch()}`,
-        "git add <artifacts>",
-        `git commit -m "${gitConfig.default_commit_message || "Describe network change"}"`,
-        "git push -u origin <change-branch>",
-      ])
-    : commandListBlock([
-        "git init",
-        `git checkout -B ${gitConfig.branch || "main"}`,
-        gitConfig.repo_url ? `git remote add origin ${gitConfig.repo_url}` : "git remote add origin <repo-url>",
-        "git status --short",
-      ]);
+  $("connect-git").textContent = gates.gitPass ? "Update Git connection" : "Connect Git repo";
 
   const source = appState.source || {};
-  $("setup-sot-copy").textContent = source.ok
-    ? `${source.provider || "local_yaml"} source of truth is active. Inventory, policy, and templates are loaded.`
-    : "Source of truth is not loaded.";
-  chipRow(
-    $("setup-sot-summary"),
-    source.ok
-      ? [
-          { text: `${source.summary?.device_count || 0} devices`, tone: "good" },
-          { text: `${source.summary?.site_count || 0} sites` },
-          { text: `${source.summary?.platform_count || 0} platforms` },
-          { text: `${source.summary?.template_count || 0} templates` },
-        ]
-      : [],
-    "Source of truth not loaded"
+  setGateCard(
+    "gate-sot-card",
+    gates.sotPass,
+    "setup-sot-copy",
+    gates.sotPass
+      ? `${source.summary?.device_count || 0} devices are trusted. Targeting and policy checks use this inventory.`
+      : "No trusted devices yet. Discover and import at least one device before making changes."
   );
+  $("setup-sot-detail").textContent = `Active provider: ${source.provider || "local_yaml"}. Lab credentials come from inventory defaults (lab only) and are never copied into imported records.`;
 
-  const rez = appState.rezHealth || {};
-  const rezPlatforms = appState.rezPlatforms?.platforms || [];
-  $("setup-rez-copy").textContent = rez.ok
-    ? `${rezPlatforms.length} vendor read/discovery drivers are loaded for device state collection.`
-    : `Read/discovery drivers are unavailable: ${rez.error || "unknown error"}`;
-  chipRow(
-    $("setup-rez-summary"),
-    rez.ok ? [{ text: `${rezPlatforms.length} vendors`, tone: "good" }].concat(rezPlatforms.map((item) => ({ text: item.platform }))) : [],
-    "No read adapters loaded"
+  const rezPlatformCount = (appState.rezPlatforms?.platforms || []).length;
+  setGateCard(
+    "gate-read-card",
+    gates.readPass,
+    "setup-rez-copy",
+    gates.readPass
+      ? `Read drivers are loaded (${rezPlatformCount} vendors). Pick the vendor when you discover a device.`
+      : `Read drivers are unavailable: ${appState.rezHealth?.error || "unknown error"}.`
   );
+  $("setup-rez-detail").textContent = "Used by discovery, verification, and drift. Read-only — never pushes config.";
 
   const lab = appState.health?.lab || {};
-  $("setup-lab-copy").textContent = lab.ok
-    ? "Containerlab is reachable from this runtime."
-    : "Containerlab is not reachable from this runtime. Use the ORB URL for lab actions.";
-  chipRow(
-    $("setup-lab-summary"),
-    lab.ok
-      ? [
-          { text: "Reachable", tone: "good" },
-          { text: `${labRunningCount()} nodes running` },
-          { text: "Write target: Arista EOS lab" },
-        ]
-      : [{ text: lab.message || "Not reachable from this runtime", tone: "warn" }],
-    "Lab status unknown"
+  setGateCard(
+    "gate-lab-card",
+    gates.labPass,
+    "setup-lab-copy",
+    gates.labPass
+      ? "Arista lab is reachable. Every change is proven here before it counts."
+      : "Lab is not reachable from this runtime. Open the ORB URL for dry-run and apply."
   );
+  $("setup-lab-detail").textContent = "Runner: this runtime. Your browser never touches devices directly.";
+
+  const startChange = $("start-change");
+  if (startChange) startChange.disabled = gates.passed !== 4;
   renderConfigPanel();
 }
 
@@ -773,6 +902,26 @@ function renderDesiredSummary() {
   if (appState.plan?.pipeline?.intent_yaml) {
     $("desired-yaml").textContent = appState.plan.pipeline.intent_yaml;
   }
+
+  const git = appState.git || {};
+  const branches = appState.gitBranches?.branches || [];
+  const current = appState.gitBranches?.current || git.branch || "";
+  const suggested = appState.plan?.plan?.suggested_branch || suggestedChangeBranch();
+  $("git-current-branch").textContent = git.available
+    ? current
+      ? current.startsWith("change/")
+        ? current
+        : `${current} (base — create a change branch)`
+      : "detached"
+    : "connect Git first (Setup)";
+  const newBranch = $("git-new-branch");
+  newBranch.placeholder = suggested;
+  if (document.activeElement !== newBranch && !newBranch.value && appState.plan) newBranch.value = suggested;
+  $("git-branch-select").innerHTML = ['<option value="">Select branch</option>']
+    .concat(branches.map((name) => `<option value="${escapeHtml(name)}"${name === current ? " selected" : ""}>${escapeHtml(name)}</option>`))
+    .join("");
+  $("create-branch").disabled = !git.available;
+  $("switch-branch").disabled = !git.available || !branches.length;
 }
 
 function renderPlan() {
@@ -784,6 +933,10 @@ function renderPlan() {
     $("plan-writes").textContent = "None";
     $("plan-summary-text").textContent = "Create desired state first.";
     $("plan-commands").textContent = "No commands generated yet.";
+    $("plan-blast").innerHTML = "";
+    $("plan-rollback").textContent = "No rollback plan yet.";
+    $("rollback-confidence").textContent = "";
+    $("plan-checks").innerHTML = "Create a plan to see the checks.";
     return;
   }
   const meta = plan.plan || {};
@@ -809,6 +962,32 @@ function renderPlan() {
   ].join("\n");
   $("plan-commands").textContent = commandListBlock(commands, "No device commands. This intent is source-of-truth only.");
   $("desired-yaml").textContent = pipeline.intent_yaml;
+
+  const blast = meta.blast_radius || {};
+  chipRow(
+    $("plan-blast"),
+    [
+      { text: `Blast radius: ${blast.device_count || 0} device${(blast.device_count || 0) === 1 ? "" : "s"}`, tone: "warn" },
+      ...(blast.devices || []).map((device) => ({ text: device })),
+      ...(blast.objects || []).map((object) => ({ text: object, tone: "good" })),
+    ],
+    "No blast radius data"
+  );
+  const rollback = meta.rollback || {};
+  $("plan-rollback").textContent = rollback.commands
+    ? commandListBlock(commandListFromText(rollback.commands))
+    : "No device rollback for this change type.";
+  $("rollback-confidence").textContent = rollback.confidence
+    ? `${rollback.confidence.level} confidence — ${rollback.confidence.reason}`
+    : "";
+  const checks = meta.checks || {};
+  const checkItem = (check, phase) =>
+    `<article class="check-item ${check.executable ? "pass" : "warn"}"><strong>${phase}: ${escapeHtml(check.description)}</strong><p>${
+      check.executable ? "Runs live during the lab flow." : escapeHtml(check.note || "Definition only — execution not wired yet.")
+    }</p></article>`;
+  $("plan-checks").innerHTML =
+    [...(checks.pre || []).map((check) => checkItem(check, "Pre")), ...(checks.post || []).map((check) => checkItem(check, "Post"))].join("") ||
+    '<article class="check-item"><strong>No checks defined for this change type.</strong></article>';
 }
 
 function renderValidation() {
@@ -857,6 +1036,12 @@ function renderApply() {
   $("apply-change").disabled = !(appState.plan?.ok && labSupported && appState.dryRun?.ok);
   $("verify-change").disabled = !(appState.apply?.ok && appState.changeLive);
   $("rollback-change").disabled = !(appState.apply?.ok && appState.changeLive);
+  $("commit-artifacts").disabled = !(appState.plan && appState.git?.available);
+  $("push-branch").disabled = !(appState.lastCommit?.ok || (appState.git?.ahead || 0) > 0);
+  const commitMessage = $("commit-message");
+  if (document.activeElement !== commitMessage && !commitMessage.value && appState.plan?.plan?.slug) {
+    commitMessage.value = `Netcode change ${appState.plan.plan.slug}`;
+  }
   if (!labSupported && appState.plan) {
     $("apply-transcript").textContent = "Apply is locked for this intent type in the current MVP. Plan, validation, Git evidence, and audit records are still available.";
   } else if (appState.rollback) {
@@ -891,6 +1076,7 @@ function renderAll() {
   renderApply();
   renderDrift();
   renderEvidence();
+  renderStoryRail();
 }
 
 async function checkWorkspace({ silent = false } = {}) {
@@ -1004,6 +1190,9 @@ async function createPlan() {
     const payload = changePayload();
     const data = await postJson("/api/desired-state/plan", payload);
     appState.plan = data;
+    appState.activeChangeId = data.change?.id || "";
+    appState.lastCommit = null;
+    appState.lastPush = null;
     appState.dryRun = null;
     appState.apply = null;
     appState.verify = null;
@@ -1317,8 +1506,105 @@ function evidencePayload() {
   };
 }
 
+function populateRecordSelect() {
+  const select = $("record-select");
+  if (!select) return;
+  const changes = appState.audit?.changes || [];
+  const current = select.value || appState.activeChangeId;
+  select.innerHTML = ['<option value="">Select a change</option>']
+    .concat(
+      changes.map((change) => {
+        const label = `${String(change.id).slice(0, 8)} · ${String(change.intent_path || "").split("/").pop()} · ${change.workflow_state}`;
+        return `<option value="${escapeHtml(String(change.id))}"${String(change.id) === String(current) ? " selected" : ""}>${escapeHtml(label)}</option>`;
+      })
+    )
+    .join("");
+}
+
+async function loadChangeRecord(changeId) {
+  if (!changeId) {
+    appState.changeRecord = null;
+    renderChangeRecord();
+    return;
+  }
+  try {
+    appState.changeRecord = await getJson(`/api/change/${changeId}/record`);
+  } catch (error) {
+    appState.changeRecord = { ok: false, error: String(error) };
+  }
+  renderChangeRecord();
+}
+
+function recordBlock(title, lines) {
+  const body = lines.filter(Boolean).map((line) => `<p>${line}</p>`).join("");
+  return `<article class="record-block"><h5>${escapeHtml(title)}</h5>${body || "<p>Not available.</p>"}</article>`;
+}
+
+function renderChangeRecord() {
+  const container = $("change-record");
+  if (!container) return;
+  const record = appState.changeRecord;
+  if (!record) {
+    container.innerHTML = '<p class="setup-hint">Pick a change to see its full record.</p>';
+    return;
+  }
+  if (!record.ok) {
+    container.innerHTML = `<p class="setup-hint">Could not load the record: ${escapeHtml(record.error || "unknown error")}</p>`;
+    return;
+  }
+  const esc = escapeHtml;
+  const req = record.request || {};
+  const plan = record.plan || {};
+  const safety = record.safety || {};
+  const failedChecks = (safety.checks || []).filter((check) => check.status !== "pass");
+  const proofLine = (proof, label) =>
+    proof?.present
+      ? `${esc(label)}: ${esc(proof.status || "")} — ${esc(proof.message || "")} (${(proof.commands || []).length} device commands)`
+      : `${esc(label)}: not run`;
+  container.innerHTML = [
+    recordBlock("Request", [
+      `<strong>${esc(req.title || "")}</strong> (${esc(req.change_type || "")})`,
+      `Site ${esc(req.site || "-")} · device ${esc(req.device_id || "-")} · requested by ${esc(req.requested_by || "-")}`,
+      `Created ${esc(req.created_at || "-")} · state <strong>${esc(record.workflow_state || "-")}</strong>`,
+    ]),
+    `<article class="record-block"><h5>Plan</h5><p>Risk: ${esc(plan.risk || "-")} · Devices: ${esc((plan.blast_radius?.devices || []).join(", ") || "-")} · Objects: ${esc(
+      (plan.blast_radius?.objects || []).join(", ") || "-"
+    )}</p>${plan.commands ? `<pre class="mini-code">${esc(plan.commands.trim())}</pre>` : "<p>No device commands.</p>"}</article>`,
+    recordBlock("Safety checks", [
+      `Status: <strong>${esc(safety.status || "unknown")}</strong> (${(safety.checks || []).length} checks)`,
+      failedChecks.length ? `Failed: ${failedChecks.map((check) => esc(`${check.id}: ${check.message}`)).join("; ")}` : "All checks passed.",
+    ]),
+    recordBlock("Lab proof", [proofLine(record.lab_proof, "Dry-run")]),
+    recordBlock("Apply proof", [proofLine(record.apply_proof, "Apply")]),
+    recordBlock("Verification", [
+      record.verify_proof?.present
+        ? `Verified with the apply job ${esc(record.verify_proof.job_id || "")} (${esc(record.verify_proof.status || "")}).`
+        : "Not verified yet.",
+    ]),
+    `<article class="record-block"><h5>Rollback</h5><p>${
+      record.rollback_record?.present
+        ? proofLine(record.rollback_record, "Rollback executed")
+        : `Planned before apply — ${esc(plan.rollback?.confidence?.level || "unknown")} confidence.`
+    }</p>${plan.rollback?.commands ? `<pre class="mini-code">${esc(plan.rollback.commands.trim())}</pre>` : ""}</article>`,
+    recordBlock("Git record", [
+      `Branch ${esc(record.git?.branch || "-")}${record.git?.upstream ? ` → ${esc(record.git.upstream)}` : " (not pushed yet)"}${
+        typeof record.git?.ahead === "number" ? ` · ${record.git.ahead} commit(s) ahead` : ""
+      }`,
+      (record.git?.actions || []).map((action) => esc(`${action.action}: ${action.message || ""}`)).join("<br />") ||
+        "No git actions recorded for this change yet.",
+    ]),
+    recordBlock(
+      "Artifact manifest",
+      (record.manifest || []).map(
+        (item) => `${item.exists ? "OK" : "MISSING"} · ${esc(item.artifact)} · <code>${esc(item.path)}</code>`
+      )
+    ),
+  ].join("");
+}
+
 function renderEvidence() {
   if (!$("evidence-output")) return;
+  populateRecordSelect();
   const artifact = appState.artifact || "overview";
   $$(".evidence-tab").forEach((button) => button.classList.toggle("active", button.dataset.artifact === artifact));
   const pipeline = appState.plan?.pipeline;
@@ -1393,6 +1679,9 @@ function bindEvents() {
   $("connect-git").addEventListener("click", connectGitRepo);
   $("create-branch").addEventListener("click", createChangeBranch);
   $("switch-branch").addEventListener("click", switchGitBranch);
+  $("commit-artifacts").addEventListener("click", commitArtifacts);
+  $("push-branch").addEventListener("click", pushBranch);
+  $("record-select").addEventListener("change", (event) => loadChangeRecord(event.target.value));
   $$("#platform-config-form input, #platform-config-form select, #platform-config-form textarea").forEach((input) => input.addEventListener("input", syncQuickConfigToJson));
   $("discover-device").addEventListener("click", discoverDevice);
   $("save-discovered-device").addEventListener("click", saveDiscoveredDevice);

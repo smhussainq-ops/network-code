@@ -103,6 +103,19 @@ def git_workspace_status(root: Path) -> dict[str, object]:
     branch = _run_git(root, ["branch", "--show-current"])
     remote = _run_git(root, ["remote", "get-url", "origin"])
     status = _run_git(root, ["status", "--short"])
+    upstream_probe = subprocess.run(
+        ["git", "rev-parse", "--abbrev-ref", "@{upstream}"],
+        cwd=root,
+        check=False,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    upstream = upstream_probe.stdout.strip() if upstream_probe.returncode == 0 else None
+    ahead = None
+    if upstream:
+        ahead_raw = _run_git(root, ["rev-list", "--count", "@{upstream}..HEAD"])
+        ahead = int(ahead_raw) if ahead_raw.isdigit() else None
     return {
         "ok": True,
         "available": True,
@@ -111,6 +124,9 @@ def git_workspace_status(root: Path) -> dict[str, object]:
         "branch": branch,
         "remote": "" if "No such remote" in remote else remote,
         "status_short": status,
+        "dirty": bool(status.strip()),
+        "upstream": upstream,
+        "ahead": ahead,
         "commands": ["git status", "git add <artifacts>", "git commit -m \"Describe network change\"", "git push"],
     }
 
@@ -226,6 +242,115 @@ def create_change_branch(root: Path, name: str, base: str = "") -> dict[str, obj
         "steps": steps,
         "current": listing.get("current"),
         "branches": listing.get("branches", []),
+    }
+
+
+_COMMIT_IDENTITY = [
+    "-c", "user.email=netcode-platform@local",
+    "-c", "user.name=Netcode Platform",
+    "-c", "commit.gpgsign=false",
+]
+
+
+def commit_change_artifacts(root: Path, message: str, add_paths: list[str] | None = None) -> dict[str, object]:
+    """Stage and commit change artifacts on the current branch, with an honest command transcript."""
+    message = message.strip() or "Netcode network change"
+    if not _inside_work_tree(root):
+        return {
+            "ok": False,
+            "action": "blocked",
+            "message": "This workspace is not a Git repository yet. Connect Git before committing.",
+            "steps": [],
+            "commit": None,
+            "branch": None,
+        }
+    branch = _run_git(root, ["branch", "--show-current"]) or None
+    steps: list[dict[str, Any]] = []
+    add_args = ["add", "-A"] if not add_paths else ["add", *add_paths]
+    steps.append(_run_git_step(root, add_args))
+    staged_probe = subprocess.run(
+        ["git", "diff", "--cached", "--quiet"],
+        cwd=root,
+        check=False,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    if staged_probe.returncode == 0:
+        return {
+            "ok": True,
+            "action": "nothing_to_commit",
+            "message": "Nothing new to commit. All artifacts are already committed.",
+            "steps": steps,
+            "commit": _run_git(root, ["rev-parse", "--short", "HEAD"]) or None,
+            "branch": branch,
+        }
+    commit_step = _run_git_step(root, [*_COMMIT_IDENTITY, "commit", "-m", message])
+    steps.append(commit_step)
+    if not commit_step["ok"]:
+        return {
+            "ok": False,
+            "action": "failed",
+            "message": f"Commit failed: {commit_step['stderr'] or commit_step['stdout'] or 'unknown error'}",
+            "steps": steps,
+            "commit": None,
+            "branch": branch,
+        }
+    commit_hash = _run_git(root, ["rev-parse", "--short", "HEAD"])
+    return {
+        "ok": True,
+        "action": "committed",
+        "message": f"Committed {commit_hash} on {branch or 'current branch'}: {message}",
+        "steps": steps,
+        "commit": commit_hash,
+        "branch": branch,
+    }
+
+
+def push_current_branch(root: Path) -> dict[str, object]:
+    """Push the current branch to origin, reporting the real result (including missing credentials)."""
+    if not _inside_work_tree(root):
+        return {
+            "ok": False,
+            "action": "blocked",
+            "message": "This workspace is not a Git repository yet. Connect Git before pushing.",
+            "steps": [],
+            "branch": None,
+        }
+    branch = _run_git(root, ["branch", "--show-current"])
+    if not branch:
+        return {
+            "ok": False,
+            "action": "blocked",
+            "message": "No branch is checked out, so there is nothing to push.",
+            "steps": [],
+            "branch": None,
+        }
+    remote = _run_git(root, ["remote", "get-url", "origin"])
+    if not remote or "No such remote" in remote:
+        return {
+            "ok": False,
+            "action": "blocked",
+            "message": "No origin remote is configured. Connect Git with a repo URL first.",
+            "steps": [],
+            "branch": branch,
+        }
+    push_step = _run_git_step(root, ["push", "-u", "origin", branch])
+    ok = push_step["ok"]
+    if ok:
+        message = f"Pushed {branch} to origin. The change is ready for review."
+    else:
+        detail = push_step["stderr"] or push_step["stdout"] or "unknown error"
+        message = (
+            f"Push failed: {detail}".strip()
+            + f" If this runtime has no GitHub credentials, run from an authenticated terminal: git push -u origin {branch}"
+        )
+    return {
+        "ok": ok,
+        "action": "pushed" if ok else "failed",
+        "message": message,
+        "steps": [push_step],
+        "branch": branch,
     }
 
 

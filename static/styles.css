@@ -496,6 +496,162 @@ textarea:focus-visible {
   color: var(--muted);
 }
 
+.setup-item.gate {
+  border-left: 3px solid var(--line);
+}
+
+.setup-item.gate.pass {
+  border-left-color: #2f9e5f;
+}
+
+.setup-item.gate.warn {
+  border-left-color: #d9930d;
+}
+
+.gate-question {
+  color: var(--muted);
+  font-size: 12px;
+  font-style: italic;
+  margin: 2px 0 6px;
+}
+
+.gate-status {
+  font-size: 13px;
+  font-weight: 650;
+  margin: 0 0 8px;
+}
+
+.story-rail {
+  align-items: center;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 0 0 14px;
+}
+
+.story-step {
+  align-items: center;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  color: var(--muted);
+  display: inline-flex;
+  font-size: 12px;
+  font-weight: 650;
+  gap: 6px;
+  padding: 4px 10px;
+}
+
+.story-step em {
+  background: var(--line);
+  border-radius: 50%;
+  color: var(--text);
+  font-size: 10px;
+  font-style: normal;
+  font-weight: 750;
+  height: 16px;
+  line-height: 16px;
+  text-align: center;
+  width: 16px;
+}
+
+.story-step.done {
+  background: #e8f6ee;
+  border-color: #b8e2c8;
+  color: #14683a;
+}
+
+.story-step.done em {
+  background: #2f9e5f;
+  color: white;
+}
+
+.story-step.next {
+  background: #eef3fd;
+  border-color: #bcd0f5;
+  color: #1d4fb8;
+}
+
+.story-step.next em {
+  background: #1d4fb8;
+  color: white;
+}
+
+.advanced-panel {
+  border: 1px dashed var(--line);
+  border-radius: var(--radius);
+  margin-top: 16px;
+  padding: 0;
+}
+
+.advanced-panel > summary {
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 13px;
+  font-weight: 700;
+  padding: 12px 16px;
+}
+
+.advanced-panel[open] > summary {
+  border-bottom: 1px dashed var(--line);
+}
+
+.advanced-panel > *:not(summary) {
+  margin: 12px;
+}
+
+.review-handoff {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  margin-top: 16px;
+  padding: 16px;
+}
+
+.review-handoff h4 {
+  margin: 0 0 4px;
+}
+
+.record-sections {
+  display: grid;
+  gap: 12px;
+  margin-top: 12px;
+}
+
+.record-block {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 14px 16px;
+}
+
+.record-block h5 {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 750;
+  letter-spacing: 0.03em;
+  margin: 0 0 8px;
+  text-transform: uppercase;
+}
+
+.record-block p {
+  font-size: 13px;
+  margin: 4px 0;
+}
+
+.record-block code {
+  font-size: 11px;
+}
+
+.record-block .mini-code {
+  margin-top: 8px;
+}
+
+.check-list.compact-list {
+  display: grid;
+  gap: 8px;
+}
+
 .config-panel {
   background: var(--surface);
   border: 1px solid var(--line);
