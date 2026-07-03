@@ -41,6 +41,21 @@ class JobRecord:
     created_at: str
     updated_at: str
     result: dict[str, Any] | None
+    pool: str | None = None
+    payload: dict[str, Any] | None = None
+    claimed_by: str | None = None
+    signature: str | None = None
+
+
+@dataclass(frozen=True)
+class RunnerRecord:
+    id: str
+    name: str
+    pool: str
+    status: str
+    version: str
+    created_at: str
+    last_seen: str | None
 
 
 @dataclass(frozen=True)
@@ -65,6 +80,8 @@ class PlatformStore:
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.db_path)
         conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA busy_timeout=5000")
         return conn
 
     def _init(self) -> None:
@@ -116,6 +133,35 @@ class PlatformStore:
                 )
                 """
             )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS runners (
+                    id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    pool TEXT NOT NULL,
+                    token_hash TEXT NOT NULL,
+                    hmac_secret TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    version TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL,
+                    last_seen TEXT
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS join_tokens (
+                    token_hash TEXT PRIMARY KEY,
+                    pool TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    used_at TEXT
+                )
+                """
+            )
+            self._ensure_column(conn, "jobs", "pool", "TEXT")
+            self._ensure_column(conn, "jobs", "payload_json", "TEXT")
+            self._ensure_column(conn, "jobs", "claimed_by", "TEXT")
+            self._ensure_column(conn, "jobs", "signature", "TEXT")
 
     def _ensure_column(self, conn: sqlite3.Connection, table: str, column: str, definition: str) -> None:
         columns = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
@@ -281,6 +327,8 @@ class PlatformStore:
 
     def _job(self, row: sqlite3.Row) -> JobRecord:
         result = json.loads(row["result_json"]) if row["result_json"] else None
+        keys = row.keys()
+        payload = json.loads(row["payload_json"]) if "payload_json" in keys and row["payload_json"] else None
         return JobRecord(
             id=row["id"],
             change_id=row["change_id"],
@@ -290,7 +338,117 @@ class PlatformStore:
             created_at=row["created_at"],
             updated_at=row["updated_at"],
             result=result,
+            pool=row["pool"] if "pool" in keys else None,
+            payload=payload,
+            claimed_by=row["claimed_by"] if "claimed_by" in keys else None,
+            signature=row["signature"] if "signature" in keys else None,
         )
+
+    def _runner(self, row: sqlite3.Row) -> RunnerRecord:
+        return RunnerRecord(
+            id=row["id"],
+            name=row["name"],
+            pool=row["pool"],
+            status=row["status"],
+            version=row["version"],
+            created_at=row["created_at"],
+            last_seen=row["last_seen"],
+        )
+
+    # ── Runner registry & job queue (Phase 0 SaaS split) ──────────────────
+
+    def create_join_token(self, token_hash: str, pool: str) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT INTO join_tokens (token_hash, pool, created_at, used_at) VALUES (?, ?, ?, NULL)",
+                (token_hash, pool, utc_now()),
+            )
+
+    def consume_join_token(self, token_hash: str) -> str | None:
+        """Atomically mark a join token used; returns its pool or None if invalid/replayed."""
+        with self._connect() as conn:
+            cursor = conn.execute(
+                "UPDATE join_tokens SET used_at = ? WHERE token_hash = ? AND used_at IS NULL",
+                (utc_now(), token_hash),
+            )
+            if cursor.rowcount != 1:
+                return None
+            row = conn.execute("SELECT pool FROM join_tokens WHERE token_hash = ?", (token_hash,)).fetchone()
+            return row["pool"] if row else None
+
+    def create_runner(self, name: str, pool: str, token_hash: str, hmac_secret: str) -> RunnerRecord:
+        runner_id = str(uuid.uuid4())
+        now = utc_now()
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT INTO runners (id, name, pool, token_hash, hmac_secret, status, version, created_at, last_seen) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (runner_id, name, pool, token_hash, hmac_secret, "enrolled", "", now, now),
+            )
+        return self.get_runner(runner_id)
+
+    def get_runner(self, runner_id: str) -> RunnerRecord:
+        with self._connect() as conn:
+            row = conn.execute("SELECT * FROM runners WHERE id = ?", (runner_id,)).fetchone()
+        if not row:
+            raise ValueError(f"Unknown runner {runner_id}")
+        return self._runner(row)
+
+    def runner_by_token_hash(self, token_hash: str) -> RunnerRecord | None:
+        with self._connect() as conn:
+            row = conn.execute("SELECT * FROM runners WHERE token_hash = ?", (token_hash,)).fetchone()
+        return self._runner(row) if row else None
+
+    def runner_hmac_secret(self, runner_id: str) -> str:
+        with self._connect() as conn:
+            row = conn.execute("SELECT hmac_secret FROM runners WHERE id = ?", (runner_id,)).fetchone()
+        if not row:
+            raise ValueError(f"Unknown runner {runner_id}")
+        return row["hmac_secret"]
+
+    def touch_runner(self, runner_id: str, status: str = "online", version: str | None = None) -> None:
+        with self._connect() as conn:
+            if version is None:
+                conn.execute("UPDATE runners SET status = ?, last_seen = ? WHERE id = ?", (status, utc_now(), runner_id))
+            else:
+                conn.execute(
+                    "UPDATE runners SET status = ?, version = ?, last_seen = ? WHERE id = ?",
+                    (status, version, utc_now(), runner_id),
+                )
+
+    def list_runners(self) -> list[RunnerRecord]:
+        with self._connect() as conn:
+            rows = conn.execute("SELECT * FROM runners ORDER BY created_at DESC").fetchall()
+        return [self._runner(row) for row in rows]
+
+    def queue_job(self, change_id: str, action: str, pool: str, payload: dict[str, Any]) -> JobRecord:
+        job = self.create_job(change_id, action)
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE jobs SET pool = ?, payload_json = ?, message = ? WHERE id = ?",
+                (pool, json.dumps(payload), f"Queued for runner pool {pool}", job.id),
+            )
+        return self.get_job(job.id)
+
+    def claim_next_job(self, pool: str, runner_id: str) -> JobRecord | None:
+        """Atomically claim the oldest queued job for a pool. Safe for concurrent runners."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT id FROM jobs WHERE status = 'queued' AND pool = ? ORDER BY created_at ASC LIMIT 1",
+                (pool,),
+            ).fetchone()
+            if not row:
+                return None
+            cursor = conn.execute(
+                "UPDATE jobs SET status = 'running', claimed_by = ?, message = ?, updated_at = ? WHERE id = ? AND status = 'queued'",
+                (runner_id, f"Claimed by runner {runner_id}", utc_now(), row["id"]),
+            )
+            if cursor.rowcount != 1:
+                return None  # another runner won the race
+        return self.get_job(row["id"])
+
+    def record_job_signature(self, job_id: str, signature: str) -> None:
+        with self._connect() as conn:
+            conn.execute("UPDATE jobs SET signature = ? WHERE id = ?", (signature, job_id))
 
     def _workflow_event(self, row: sqlite3.Row) -> WorkflowEventRecord:
         evidence = json.loads(row["evidence_json"]) if row["evidence_json"] else None

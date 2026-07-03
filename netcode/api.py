@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import os
 import re
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, Header, HTTPException, Response
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -30,6 +31,14 @@ from netcode.intent_utils import lab_write_supported, plan_metadata, production_
 from netcode.jobs import JobRunner
 from netcode.lab import AristaEOSLabAdapter, lab_status, run_arista_end_to_end, run_lab_action
 from netcode.models import load_intent
+from netcode.runner_hub import (
+    authenticate_runner,
+    enroll_runner,
+    mint_join_token,
+    poll_for_job,
+    runner_summary,
+    submit_job_result,
+)
 from netcode.orchestrator import create_add_vlan_intent, create_desired_state_intent, run_static_pipeline
 from netcode.paths import paths
 from netcode.platform import platform_capabilities
@@ -139,6 +148,28 @@ class GitCommitRequest(BaseModel):
 
 class GitPushRequest(BaseModel):
     change_id: str = ""
+
+
+class JoinTokenRequest(BaseModel):
+    pool: str = "store-lab"
+
+
+class RunnerEnrollRequest(BaseModel):
+    join_token: str
+    name: str = "runner"
+
+
+class RunnerPollRequest(BaseModel):
+    wait_seconds: float = 20.0
+
+
+class RunnerResultRequest(BaseModel):
+    result: dict[str, object]
+    signature: str = ""
+
+
+class RunnerHeartbeatRequest(BaseModel):
+    version: str = ""
 
 
 app = FastAPI(title="Netcode Platform", version="0.1.0")
@@ -499,6 +530,64 @@ def api_git_push(request: GitPushRequest) -> dict[str, object]:
     result = push_current_branch(p.root)
     result.update(_record_git_event(p, request.change_id, "git_push", result))
     return result
+
+
+def _admin_guard(authorization: str | None) -> None:
+    """Admin endpoints are open when NETCODE_ADMIN_TOKEN is unset (local dev), token-gated otherwise."""
+    required = os.environ.get("NETCODE_ADMIN_TOKEN", "").strip()
+    if not required:
+        return
+    if authorization != f"Bearer {required}":
+        raise HTTPException(status_code=401, detail="Admin token required.")
+
+
+def _require_runner(store: PlatformStore, authorization: str | None):
+    token = (authorization or "").removeprefix("Bearer ").strip()
+    runner = authenticate_runner(store, token)
+    if runner is None:
+        raise HTTPException(status_code=401, detail="Runner token is invalid or revoked.")
+    return runner
+
+
+@app.post("/api/runners/join-token")
+def api_mint_join_token(request: JoinTokenRequest, authorization: str | None = Header(default=None)) -> dict[str, object]:
+    _admin_guard(authorization)
+    return mint_join_token(PlatformStore(paths()), request.pool)
+
+
+@app.get("/api/runners")
+def api_list_runners() -> dict[str, object]:
+    return runner_summary(PlatformStore(paths()))
+
+
+@app.post("/api/runner/enroll")
+def api_runner_enroll(request: RunnerEnrollRequest) -> dict[str, object]:
+    return enroll_runner(PlatformStore(paths()), request.join_token, request.name)
+
+
+@app.post("/api/runner/poll")
+def api_runner_poll(request: RunnerPollRequest, authorization: str | None = Header(default=None)):
+    store = PlatformStore(paths())
+    runner = _require_runner(store, authorization)
+    job = poll_for_job(store, runner, request.wait_seconds)
+    if job is None:
+        return Response(status_code=204)
+    return {"ok": True, "job": record_to_dict(job)}
+
+
+@app.post("/api/runner/jobs/{job_id}/result")
+def api_runner_job_result(job_id: str, request: RunnerResultRequest, authorization: str | None = Header(default=None)) -> dict[str, object]:
+    store = PlatformStore(paths())
+    runner = _require_runner(store, authorization)
+    return submit_job_result(store, runner, job_id, dict(request.result), request.signature)
+
+
+@app.post("/api/runner/heartbeat")
+def api_runner_heartbeat(request: RunnerHeartbeatRequest, authorization: str | None = Header(default=None)) -> dict[str, object]:
+    store = PlatformStore(paths())
+    runner = _require_runner(store, authorization)
+    store.touch_runner(runner.id, status="online", version=request.version)
+    return {"ok": True, "runner_id": runner.id, "pool": runner.pool}
 
 
 @app.post("/api/readiness/devices")

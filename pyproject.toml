@@ -27,6 +27,7 @@ dev = [
 
 [project.scripts]
 netcode = "netcode.cli:app"
+netcode-runner = "netcode.runner_agent:main"
 
 [tool.setuptools.packages.find]
 where = ["."]

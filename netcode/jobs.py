@@ -1,17 +1,33 @@
 """Synchronous job runner with durable state.
 
 The interface is job-shaped now so it can be moved behind a queue/worker pool
-without changing the API/UI contract later.
+without changing the API/UI contract later. Phase 0 SaaS split: with
+NETCODE_EXECUTION=runner, lab actions are gate-checked here (the cloud gate)
+and then QUEUED for an on-prem runner instead of executed locally.
 """
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
+from netcode.inventory import Inventory
 from netcode.lab import run_arista_end_to_end, run_lab_action
+from netcode.models import load_intent
 from netcode.paths import WorkspacePaths
+from netcode.rendering import render_intent
 from netcode.store import PlatformStore, record_to_dict
+from netcode.ui_config import configured_inventory_path, configured_policy_path
 from netcode.workflow import require_action_allowed, state_after_lab_action
+
+
+def execution_mode() -> str:
+    """'local' (default): execute lab actions in-process. 'runner': queue for an on-prem runner."""
+    return os.environ.get("NETCODE_EXECUTION", "local").strip().lower() or "local"
+
+
+def runner_pool() -> str:
+    return os.environ.get("NETCODE_RUNNER_POOL", "store-lab").strip() or "store-lab"
 
 
 class JobRunner:
@@ -68,6 +84,29 @@ class JobRunner:
                 "result": blocked,
             }
 
+        if execution_mode() == "runner":
+            pool = runner_pool()
+            payload = self._runner_payload(intent_path, action, device_id, change.id)
+            job = self.store.queue_job(change.id, f"lab_{action}", pool, payload)
+            self.store.record_workflow_event(
+                change.id,
+                action,
+                change.workflow_state,
+                change.workflow_state,
+                f"Queued lab {action} for runner pool '{pool}'.",
+                {"job_id": job.id, "queued": True, "pool": pool},
+            )
+            return {
+                "ok": True,
+                "queued": True,
+                "change": record_to_dict(self.store.get_change(change.id)),
+                "job": record_to_dict(job),
+                "result": {
+                    "status": "queued",
+                    "message": f"Queued for runner pool '{pool}'. The on-prem runner executes it and reports back with signed evidence.",
+                },
+            }
+
         job = self.store.create_job(change.id, f"lab_{action}")
         self.store.update_job(job.id, "running", f"Running lab {action}")
         try:
@@ -101,3 +140,27 @@ class JobRunner:
                 "job": record_to_dict(final_job),
                 "result": error,
             }
+
+    def _runner_payload(self, intent_path: Path, action: str, device_id: str | None, change_id: str) -> dict[str, object]:
+        """Build the job spec shipped to the runner. Deliberately credential-free:
+        the runner resolves credentials from its own local store by device id."""
+        intent = load_intent(intent_path)
+        render = render_intent(intent, self.paths)
+        inventory = Inventory(configured_inventory_path(self.paths))
+        device = inventory.by_id.get(device_id) if device_id else None
+        if device is None:
+            device = inventory.resolve_targets(intent.targets, site=intent.site)[0]
+        policy_path = configured_policy_path(self.paths)
+        return {
+            "action": action,
+            "change_id": change_id,
+            "device": {
+                "id": device.id,
+                "host": device.host,
+                "platform": device.platform,
+                "port": device.port,
+            },
+            "intent_yaml": intent_path.read_text(encoding="utf-8"),
+            "rendered_config": render.config,
+            "policy_yaml": policy_path.read_text(encoding="utf-8") if policy_path.exists() else "",
+        }

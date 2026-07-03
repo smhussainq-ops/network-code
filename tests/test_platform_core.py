@@ -1,3 +1,4 @@
+import json
 import subprocess
 from pathlib import Path
 
@@ -259,6 +260,100 @@ def test_job_runner_records_failed_lab_action(monkeypatch, tmp_path: Path):
     assert result["ok"] is False
     assert result["job"]["status"] == "failed"
     assert jobs[0].message == "blocked"
+
+
+def test_runner_enroll_queue_claim_signed_result_roundtrip(tmp_path: Path, monkeypatch):
+    """M1/M2: full SaaS-split round trip — enroll, queue (runner mode), claim, sign, submit."""
+    import hashlib
+    import hmac as hmac_mod
+
+    from netcode.runner_hub import canonical_json
+
+    init_workspace(WorkspacePaths(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("NETCODE_EXECUTION", "runner")
+    monkeypatch.setenv("NETCODE_RUNNER_POOL", "store-lab")
+    client = TestClient(api.app)
+
+    # Enroll: bad token rejected, good token works, replay rejected.
+    mint = client.post("/api/runners/join-token", json={"pool": "store-lab"}).json()
+    assert mint["ok"] and mint["join_token"].startswith("njt_")
+    assert client.post("/api/runner/enroll", json={"join_token": "bogus", "name": "x"}).json()["ok"] is False
+    enroll = client.post("/api/runner/enroll", json={"join_token": mint["join_token"], "name": "clab-runner-1"}).json()
+    assert enroll["ok"] and enroll["pool"] == "store-lab"
+    token, secret = enroll["runner_token"], enroll["hmac_secret"]
+    replay = client.post("/api/runner/enroll", json={"join_token": mint["join_token"], "name": "y"}).json()
+    assert replay["ok"] is False  # single-use
+
+    auth = {"Authorization": f"Bearer {token}"}
+
+    # Plan a change (local pipeline, no device) and queue a dry-run for the runner.
+    plan = client.post(
+        "/api/desired-state/plan",
+        json={"change_type": "add_vlan", "site": "store-1842", "device_id": "v2-store1", "requested_by": "unit",
+              "values": {"vlan_id": 90, "name": "GUEST_WIFI", "subnet": "10.42.90.0/24", "purpose": "guest"}},
+    ).json()
+    change_id = plan["change"]["id"]
+    dry = client.post("/api/lab/dry-run", json={"intent_path": plan["intent_path"], "device_id": "v2-store1", "change_id": change_id}).json()
+    assert dry["queued"] is True
+    assert dry["job"]["status"] == "queued"
+
+    # CREDENTIAL CUSTODY INVARIANT: the queued payload must never carry a password.
+    payload = dry["job"]["payload"]
+    assert "admin" not in json.dumps(payload)  # inventory default password is "admin"
+    assert set(payload["device"].keys()) == {"id", "host", "platform", "port"}
+
+    # Runner claims the job via long-poll.
+    claim = client.post("/api/runner/poll", json={"wait_seconds": 0}, headers=auth).json()
+    assert claim["ok"] and claim["job"]["id"] == dry["job"]["id"]
+    assert claim["job"]["status"] == "running"
+    assert claim["job"]["claimed_by"]
+
+    # A second poll returns 204 (no more work).
+    assert client.post("/api/runner/poll", json={"wait_seconds": 0}, headers=auth).status_code == 204
+
+    # Bad signature is rejected (control plane does not trust an unsigned result).
+    good_result = {"status": "pass", "action": "dry-run", "device_id": "v2-store1", "message": "diff captured, session aborted",
+                   "evidence": {"transcript": [{"command": "show session-config diffs", "output": "+vlan 90"}]}}
+    bad = client.post(f"/api/runner/jobs/{dry['job']['id']}/result", json={"result": good_result, "signature": "deadbeef"}, headers=auth).json()
+    assert bad["ok"] is False and "signature" in bad["message"].lower()
+
+    # Correctly-signed result advances the change to dry_run_passed.
+    sig = hmac_mod.new(secret.encode(), canonical_json(good_result).encode(), hashlib.sha256).hexdigest()
+    submit = client.post(f"/api/runner/jobs/{dry['job']['id']}/result", json={"result": good_result, "signature": sig}, headers=auth).json()
+    assert submit["ok"] is True
+    assert submit["workflow_state"] == "dry_run_passed"
+    assert submit["job"]["status"] == "completed"
+
+    # Runner shows up in the registry as online.
+    runners = client.get("/api/runners").json()
+    assert runners["count"] == 1 and runners["runners"][0]["status"] == "online"
+
+    # Unauthenticated runner calls are refused.
+    assert client.post("/api/runner/poll", json={"wait_seconds": 0}).status_code == 401
+
+
+def test_runner_local_policy_gate_blocks_forbidden_config(tmp_path: Path):
+    """The runner's own fail-closed gate must reject credential/out-of-scope config
+    even if the control plane said it was fine."""
+    from netcode.models import RenderResult, load_intent
+    from netcode.runner_checks import local_policy_gate
+
+    paths = WorkspacePaths(tmp_path)
+    init_workspace(paths)
+    policy_yaml = (paths.root / "policies" / "invariants.yaml").read_text()
+    intent = load_intent(paths.intents / "examples" / "add_guest_vlan.yaml")
+
+    clean = RenderResult(template_path="x", config="vlan 90\n   name GUEST_WIFI\n", variables={})
+    assert local_policy_gate(intent, clean, policy_yaml)["ok"] is True
+
+    smuggled = RenderResult(template_path="x", config="vlan 90\n   name GUEST_WIFI\nusername backdoor secret oops\n", variables={})
+    gate = local_policy_gate(intent, smuggled, policy_yaml)
+    assert gate["ok"] is False
+    assert gate["blocked_lines"]
+
+    # Malformed policy must fail closed, not open.
+    assert local_policy_gate(intent, clean, "{{ not: valid: yaml")["ok"] is False
 
 
 def test_backend_blocks_apply_before_dry_run(tmp_path: Path, monkeypatch):
