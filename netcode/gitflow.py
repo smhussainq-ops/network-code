@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import subprocess
 from pathlib import Path
+from typing import Any
 
 
 def _run_git(root: Path, args: list[str]) -> str:
@@ -18,6 +19,24 @@ def _run_git(root: Path, args: list[str]) -> str:
     if completed.returncode != 0:
         return completed.stderr.strip()
     return completed.stdout.strip()
+
+
+def _run_git_step(root: Path, args: list[str]) -> dict[str, Any]:
+    completed = subprocess.run(
+        ["git", *args],
+        cwd=root,
+        check=False,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    return {
+        "command": "git " + " ".join(args),
+        "returncode": completed.returncode,
+        "stdout": completed.stdout.strip(),
+        "stderr": completed.stderr.strip(),
+        "ok": completed.returncode == 0,
+    }
 
 
 def git_evidence(root: Path, intent_path: Path) -> dict[str, object]:
@@ -93,4 +112,42 @@ def git_workspace_status(root: Path) -> dict[str, object]:
         "remote": "" if "No such remote" in remote else remote,
         "status_short": status,
         "commands": ["git status", "git add <artifacts>", "git commit -m \"Describe network change\"", "git push"],
+    }
+
+
+def setup_git_workspace(root: Path, repo_url: str = "", branch: str = "main") -> dict[str, object]:
+    """Initialize or connect the current workspace to the configured Git repo."""
+    root.mkdir(parents=True, exist_ok=True)
+    branch = branch.strip() or "main"
+    repo_url = repo_url.strip()
+    steps: list[dict[str, Any]] = []
+
+    inside = subprocess.run(
+        ["git", "rev-parse", "--is-inside-work-tree"],
+        cwd=root,
+        check=False,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    if inside.returncode != 0 or inside.stdout.strip() != "true":
+        steps.append(_run_git_step(root, ["init", "-b", branch]))
+    else:
+        steps.append(_run_git_step(root, ["checkout", "-B", branch]))
+    if repo_url:
+        current_remote = _run_git(root, ["remote", "get-url", "origin"])
+        if current_remote and "No such remote" not in current_remote:
+            steps.append(_run_git_step(root, ["remote", "set-url", "origin", repo_url]))
+        else:
+            steps.append(_run_git_step(root, ["remote", "add", "origin", repo_url]))
+    steps.append(_run_git_step(root, ["status", "--short"]))
+
+    status = git_workspace_status(root)
+    return {
+        "ok": bool(status.get("available")) and all(step["ok"] for step in steps if step["command"] != "git status --short"),
+        "workspace": str(root),
+        "repo_url": repo_url,
+        "branch": branch,
+        "steps": steps,
+        "status": status,
     }

@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Netcode MVP</title>
     <link rel="icon" href="/static/favicon.svg" type="image/svg+xml" />
-    <link rel="stylesheet" href="/static/styles.css?v=20260703-mvp5" />
+    <link rel="stylesheet" href="/static/styles.css?v=20260703-mvp7" />
   </head>
   <body>
     <main class="app-shell">
@@ -51,6 +51,44 @@
           </header>
 
           <section id="view-home" class="view active">
+            <section class="story-board" aria-label="Network as code user stories">
+              <article class="story-card" id="story-git">
+                <span>Story 01</span>
+                <h3>Connect Git</h3>
+                <p>Use a repo so every network change can be reviewed, committed, and audited.</p>
+                <strong>Checking</strong>
+                <button type="button" data-go="setup">Work this story</button>
+              </article>
+              <article class="story-card" id="story-discovery">
+                <span>Story 02</span>
+                <h3>Discover Devices</h3>
+                <p>Read live devices with Rez and stage reviewed records for source of truth.</p>
+                <strong>Checking</strong>
+                <button type="button" data-go="inventory">Work this story</button>
+              </article>
+              <article class="story-card" id="story-sot">
+                <span>Story 03</span>
+                <h3>Build Source of Truth</h3>
+                <p>Keep inventory, policy, and templates as the trusted model before any push.</p>
+                <strong>Checking</strong>
+                <button type="button" data-go="inventory">Review inventory</button>
+              </article>
+              <article class="story-card" id="story-change">
+                <span>Story 04</span>
+                <h3>Plan Safe Change</h3>
+                <p>Define desired state, see exact commands, validate, dry-run, then apply.</p>
+                <strong>Waiting</strong>
+                <button type="button" data-go="desired">Create desired state</button>
+              </article>
+              <article class="story-card" id="story-audit">
+                <span>Story 05</span>
+                <h3>Prove and Audit</h3>
+                <p>Show job history, command sessions, validation, Git plan, and evidence.</p>
+                <strong>Waiting</strong>
+                <button type="button" data-go="evidence">Review evidence</button>
+              </article>
+            </section>
+
             <div class="choice-grid">
               <button class="choice-card" type="button" data-go="setup">
                 <span>1</span>
@@ -98,6 +136,9 @@
                 <h4>Git repo</h4>
                 <p id="setup-git-copy">Use your Git repo for reviewable network changes.</p>
                 <pre id="setup-git-commands" class="mini-code">Click Check workspace.</pre>
+                <div class="button-row compact">
+                  <button id="connect-git" type="button">Connect Git repo</button>
+                </div>
               </article>
               <article class="setup-item">
                 <span>Step 2</span>
@@ -402,6 +443,6 @@
         </aside>
       </section>
     </main>
-    <script src="/static/app.js?v=20260703-mvp5"></script>
+    <script src="/static/app.js?v=20260703-mvp7"></script>
   </body>
 </html>

@@ -484,6 +484,22 @@ def test_ui_configured_source_of_truth_path_is_used(tmp_path: Path, monkeypatch)
     assert source.json()["devices"][0]["id"] == "custom-leaf1"
 
 
+def test_git_setup_endpoint_initializes_runtime_workspace(tmp_path: Path, monkeypatch):
+    init_workspace(WorkspacePaths(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    client = TestClient(api.app)
+
+    setup = client.post("/api/git/setup", json={"repo_url": "https://example.invalid/network-code.git", "branch": "main"})
+    status = client.get("/api/git/status")
+
+    assert setup.status_code == 200
+    assert setup.json()["ok"] is True
+    assert any(step["command"].startswith("git init") for step in setup.json()["steps"])
+    assert status.json()["available"] is True
+    assert status.json()["branch"] == "main"
+    assert status.json()["remote"] == "https://example.invalid/network-code.git"
+
+
 def test_audit_sessions_endpoint_exposes_command_transcripts(tmp_path: Path, monkeypatch):
     paths = WorkspacePaths(tmp_path)
     init_workspace(paths)
@@ -516,6 +532,39 @@ def test_audit_sessions_endpoint_exposes_command_transcripts(tmp_path: Path, mon
     assert data["sessions"][0]["commands"][1]["command"] == "commit"
 
 
+def test_audit_sessions_endpoint_exposes_direct_lab_result_transcripts(tmp_path: Path, monkeypatch):
+    paths = WorkspacePaths(tmp_path)
+    init_workspace(paths)
+    monkeypatch.chdir(tmp_path)
+    store = PlatformStore(paths)
+    change = store.create_change(paths.intents / "examples" / "add_guest_vlan.yaml", "v2-store1")
+    job = store.create_job(change.id, "lab_rollback")
+    store.update_job(
+        job.id,
+        "completed",
+        "rolled back",
+        {
+            "session_name": "netcode_direct",
+            "evidence": {
+                "session": {
+                    "transcript": [
+                        {"command": "configure session netcode_direct", "output": "ok"},
+                        {"command": "no vlan 90", "output": "ok"},
+                        {"command": "commit", "output": "ok"},
+                    ]
+                }
+            },
+        },
+    )
+
+    response = TestClient(api.app).get("/api/audit/sessions")
+    data = response.json()
+
+    assert response.status_code == 200
+    assert data["sessions"][0]["session_name"] == "netcode_direct"
+    assert data["sessions"][0]["commands"][1]["command"] == "no vlan 90"
+
+
 def test_rez_collect_state_endpoint_accepts_device_only_request(monkeypatch, tmp_path: Path):
     paths = WorkspacePaths(tmp_path)
     init_workspace(paths)
@@ -543,6 +592,12 @@ def test_app_route_serves_ui():
     assert "Netcode" in response.text
     assert "Terraform-style network changes with audited lab proof" in response.text
     assert "Home" in response.text
+    assert "Network as code user stories" in response.text
+    assert "Connect Git" in response.text
+    assert "Discover Devices" in response.text
+    assert "Build Source of Truth" in response.text
+    assert "Plan Safe Change" in response.text
+    assert "Prove and Audit" in response.text
     assert "Setup" in response.text
     assert "Inventory" in response.text
     assert "Desired State" in response.text
@@ -553,6 +608,7 @@ def test_app_route_serves_ui():
     assert "Evidence" in response.text
     assert "Choose VLAN, interface, BGP, ACL, or site/device intent" in response.text
     assert "Editable platform configuration" in response.text
+    assert "Connect Git repo" in response.text
     assert "Save configuration" in response.text
     assert "config-json" in response.text
     assert "SSH port" in response.text

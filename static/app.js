@@ -495,6 +495,34 @@ async function resetPlatformConfig() {
   }
 }
 
+async function connectGitRepo() {
+  const gitConfig = getPath(appState.uiConfig || {}, "git", {});
+  startOutcome("Connect Git repo", "Initialize this runtime workspace and attach the configured Git remote and branch.");
+  try {
+    const data = await postJson("/api/git/setup", {
+      repo_url: gitConfig.repo_url || "",
+      branch: gitConfig.branch || "main",
+    });
+    appState.git = data.status;
+    renderAll();
+    setOutcome({
+      state: data.ok ? "Passed" : "Review",
+      status: data.ok ? "pass" : "warn",
+      title: data.ok ? "Git connected." : "Git setup needs review.",
+      summary: data.ok
+        ? "This workspace is now a Git repo connected to the configured remote."
+        : "The platform attempted Git setup and captured the command results.",
+      expected: "Create a reviewable repository path before network changes are pushed.",
+      actual: (data.steps || []).map((step) => `${step.ok ? "OK" : "CHECK"}: ${step.command}${!step.ok && step.stderr ? ` - ${step.stderr}` : ""}`).join("\n"),
+      artifact: data.workspace,
+      device: "No device config was changed.",
+      next: data.ok ? "Discover devices or create desired state." : "Review Git command output and configuration.",
+    });
+  } catch (error) {
+    failOutcome("Git setup failed.", error);
+  }
+}
+
 function commandListFromText(config) {
   return String(config || "")
     .split("\n")
@@ -520,6 +548,36 @@ function transcriptText(data, fallback = "No device transcript available.") {
   return transcript.map((entry) => `$ ${entry.command}\n${entry.output || ""}`.trim()).join("\n\n");
 }
 
+function setStory(id, status, label) {
+  const card = $(id);
+  if (!card) return;
+  card.className = `story-card ${status}`;
+  card.querySelector("strong").textContent = label;
+}
+
+function renderUserStories() {
+  setStory("story-git", appState.git?.available ? "pass" : "warn", appState.git?.available ? "Git connected" : "Needs connect");
+  setStory("story-discovery", appState.discovery?.ok ? "pass" : appState.rezHealth?.ok ? "warn" : "fail", appState.discovery?.ok ? "Discovered" : appState.rezHealth?.ok ? "Ready to discover" : "Adapter issue");
+  setStory("story-sot", appState.source?.ok ? "pass" : "fail", appState.source?.ok ? `${appState.source.summary?.device_count || 0} devices trusted` : "Not loaded");
+  setStory("story-change", appState.plan?.ok ? "pass" : appState.plan ? "fail" : "warn", appState.plan?.ok ? "Plan ready" : appState.plan ? "Plan blocked" : "Not planned");
+  setStory("story-audit", appState.audit?.sessions?.length ? "pass" : appState.audit ? "warn" : "warn", appState.audit?.sessions?.length ? `${appState.audit.sessions.length} sessions` : "No sessions yet");
+}
+
+function adapterSummary() {
+  const platforms = appState.rezPlatforms?.platforms || [];
+  if (!platforms.length) return "No Rez platforms loaded.";
+  const names = platforms.map((item) => item.platform).slice(0, 7).join(", ");
+  const extra = platforms.length > 7 ? `, +${platforms.length - 7} more` : "";
+  return `${platforms.length} read/discovery adapters loaded: ${names}${extra}.`;
+}
+
+function labSummary() {
+  const lab = appState.health?.lab || {};
+  if (!lab.ok) return lab.message || lab.stderr || "Lab unavailable.";
+  const running = (String(lab.stdout || "").match(/\brunning\b/g) || []).length;
+  return running ? `${running} containerlab nodes are running. Arista EOS lab writes are available after plan, validation, and dry-run.` : "Containerlab is reachable.";
+}
+
 function renderHome() {
   $("home-git").textContent = appState.git?.available ? "Ready" : "Needs setup";
   $("home-sot").textContent = appState.source ? `${appState.source.summary?.device_count || 0} devices` : "Unknown";
@@ -527,32 +585,50 @@ function renderHome() {
   $("home-lab").textContent = appState.health?.lab?.ok ? "Reachable" : "Local only";
   $("sidebar-workspace").textContent = appState.git?.branch || "main";
   $("sidebar-lab").textContent = appState.health?.lab?.ok ? "Arista lab reachable" : "Lab not reachable from this runtime";
+  renderUserStories();
 }
 
 function renderSetup() {
   const git = appState.git || {};
+  const gitConfig = getPath(appState.uiConfig || {}, "git", {});
   $("setup-git-copy").textContent = git.available
     ? `Git is ready on branch ${git.branch || "unknown"}. Remote: ${git.remote || "not configured"}.`
-    : "Git is not initialized for this workspace yet.";
-  $("setup-git-commands").textContent = commandListBlock(git.commands || []);
+    : `Configured repo is ${gitConfig.repo_url || "not set"}. Connect this runtime workspace once so changes can be reviewed and audited.`;
+  $("setup-git-commands").textContent = git.available
+    ? commandListBlock(git.commands || [])
+    : commandListBlock([
+        "git init",
+        `git checkout -B ${gitConfig.branch || "main"}`,
+        gitConfig.repo_url ? `git remote add origin ${gitConfig.repo_url}` : "git remote add origin <repo-url>",
+        "git status --short",
+      ]);
+  $("connect-git").disabled = Boolean(git.available);
 
   const source = appState.source || {};
   $("setup-sot-copy").textContent = source.ok
-    ? `Local YAML source of truth is active with ${source.summary?.device_count || 0} devices.`
+    ? `${source.provider || "local_yaml"} source of truth is active. Inventory, policy, and templates are loaded.`
     : "Source of truth is not loaded.";
-  $("setup-sot-summary").textContent = source.ok ? formatJson(source.summary) : "Unavailable";
+  $("setup-sot-summary").textContent = source.ok
+    ? [
+        `${source.summary?.device_count || 0} devices`,
+        `${source.summary?.site_count || 0} sites`,
+        `${source.summary?.platform_count || 0} platforms`,
+        `${source.summary?.template_count || 0} templates`,
+        `Inventory: ${source.files?.inventory || "unknown"}`,
+      ].join("\n")
+    : "Unavailable";
 
   const rez = appState.rezHealth || {};
   $("setup-rez-copy").textContent = rez.ok
     ? `Rez driver registry loaded from ${rez.root}.`
     : `Rez drivers unavailable: ${rez.error || "unknown error"}`;
-  $("setup-rez-summary").textContent = appState.rezPlatforms ? formatJson(appState.rezPlatforms.platforms) : "Unavailable";
+  $("setup-rez-summary").textContent = appState.rezPlatforms ? adapterSummary() : "Unavailable";
 
   const lab = appState.health?.lab || {};
   $("setup-lab-copy").textContent = lab.ok
     ? "Containerlab is reachable from this runtime."
     : "Containerlab is not reachable from this runtime. Use the ORB URL for lab actions.";
-  $("setup-lab-summary").textContent = lab.ok ? lab.stdout || "Lab reachable." : lab.message || lab.stderr || "Unavailable";
+  $("setup-lab-summary").textContent = labSummary();
   renderConfigPanel();
 }
 
@@ -770,6 +846,7 @@ async function discoverDevice() {
       ? `${data.state_summary?.hostname || data.host} at ${data.host}. Import candidate is ready.`
       : data.error || "Rez could not collect state.";
     appState.artifact = "overview";
+    renderUserStories();
     renderEvidence();
     setOutcome({
       state: data.ok ? "Passed" : "Failed",
@@ -1205,6 +1282,7 @@ function bindEvents() {
   $("save-config").addEventListener("click", savePlatformConfig);
   $("reload-config").addEventListener("click", () => reloadPlatformConfig());
   $("reset-config").addEventListener("click", resetPlatformConfig);
+  $("connect-git").addEventListener("click", connectGitRepo);
   $$("#platform-config-form input, #platform-config-form select, #platform-config-form textarea").forEach((input) => input.addEventListener("input", syncQuickConfigToJson));
   $("discover-device").addEventListener("click", discoverDevice);
   $("save-discovered-device").addEventListener("click", saveDiscoveredDevice);

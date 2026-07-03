@@ -287,6 +287,7 @@ textarea:focus-visible {
 }
 
 .choice-grid,
+.story-board,
 .setup-grid,
 .summary-strip,
 .plan-summary,
@@ -298,6 +299,70 @@ textarea:focus-visible {
 
 .choice-grid {
   grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.story-board {
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  margin-bottom: 16px;
+}
+
+.story-card {
+  background: var(--surface-soft);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+  padding: 14px;
+}
+
+.story-card span {
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 750;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+}
+
+.story-card h3 {
+  font-size: 16px;
+  margin: 0;
+}
+
+.story-card p {
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.4;
+  margin: 0;
+}
+
+.story-card strong {
+  border-radius: 999px;
+  display: inline-flex;
+  font-size: 12px;
+  justify-self: start;
+  padding: 5px 8px;
+}
+
+.story-card.pass strong {
+  background: var(--green-soft);
+  color: var(--green);
+}
+
+.story-card.warn strong {
+  background: var(--amber-soft);
+  color: var(--amber);
+}
+
+.story-card.fail strong {
+  background: var(--red-soft);
+  color: var(--red);
+}
+
+.story-card button {
+  align-self: end;
+  min-height: 34px;
+  padding: 7px 10px;
 }
 
 .choice-card {
@@ -849,6 +914,7 @@ legend,
   }
 
   .choice-grid,
+  .story-board,
   .setup-grid,
   .config-form,
   .config-form section,

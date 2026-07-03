@@ -10,17 +10,18 @@ network-as-code platform.
 Let a network engineer use the UI to:
 
 1. Check workspace readiness.
-2. Edit platform settings from the UI.
-3. Discover the Arista lab switch.
-4. Save the device into source of truth.
-5. Define desired network state from multiple intent types.
-6. Create a plan.
-7. Review validation.
-8. Dry-run the candidate in an EOS config session.
-9. Apply only after dry-run proof.
-10. Verify live state.
-11. Detect drift.
-12. Review evidence and audit sessions.
+2. Connect the runtime workspace to Git.
+3. Edit platform settings from the UI.
+4. Discover the Arista lab switch.
+5. Save the device into source of truth.
+6. Define desired network state from multiple intent types.
+7. Create a plan.
+8. Review validation.
+9. Dry-run the candidate in an EOS config session.
+10. Apply only after dry-run proof.
+11. Verify live state.
+12. Detect drift.
+13. Review evidence and audit sessions.
 
 ## MVP Scope
 
@@ -61,6 +62,7 @@ The defaults are editable from the Setup screen and persisted in
 The MVP uses:
 
 - Git workspace status from the local repo.
+- Git workspace setup from the UI for the current runtime workspace.
 - Configured local YAML source of truth, defaulting to `inventories/lab.yaml`.
 - Rez read adapters for discovery and state collection.
 - Jinja template rendering from the configured template directory.
@@ -75,10 +77,11 @@ The MVP uses:
 
 Shows the simple product entry points:
 
-- Set up platform
+- Connect Git
 - Discover devices
-- Create network change
-- Review evidence
+- Build source of truth
+- Plan safe change
+- Prove and audit
 
 ### Setup
 
@@ -88,6 +91,15 @@ Checks:
 - Source-of-truth health
 - Rez adapter registry
 - Arista lab reachability
+
+The Git card can initialize the runtime workspace and attach the configured
+remote. Successful setup shows only the commands that ran, for example:
+
+```text
+OK: git init -b main
+OK: git remote add origin https://github.com/smhussainq-ops/network-code.git
+OK: git status --short
+```
 
 Also exposes editable platform configuration:
 
@@ -194,6 +206,10 @@ Shows:
 - UI configuration and configuration history
 - Jobs
 - Audit sessions with command transcripts
+
+Audit sessions are extracted from durable lab job records for dry-run, apply,
+and rollback. Both historical nested job results and current direct lab result
+records are supported.
 
 ## Current Limits
 

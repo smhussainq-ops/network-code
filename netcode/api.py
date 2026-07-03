@@ -14,7 +14,7 @@ from netcode.adapters.registry import AdapterRegistry
 from netcode.bootstrap import init_workspace
 from netcode.discovery import DiscoveryService
 from netcode.drift import compliance_summary, vlan_drift_report
-from netcode.gitflow import git_workspace_status
+from netcode.gitflow import git_workspace_status, setup_git_workspace
 from netcode.gitops import gitops_plan
 from netcode.inventory import Inventory
 from netcode.intent_utils import lab_write_supported, plan_metadata, production_write_supported
@@ -111,6 +111,11 @@ class ScalePlanRequest(BaseModel):
 
 class UiConfigRequest(BaseModel):
     config: dict[str, object]
+
+
+class GitSetupRequest(BaseModel):
+    repo_url: str = ""
+    branch: str = ""
 
 
 app = FastAPI(title="Netcode Platform", version="0.1.0")
@@ -388,6 +393,16 @@ def api_git_status() -> dict[str, object]:
     return git_workspace_status(paths().root)
 
 
+@app.post("/api/git/setup")
+def api_git_setup(request: GitSetupRequest) -> dict[str, object]:
+    p = paths()
+    config = read_ui_config(p)
+    git_config = config.get("git", {})
+    repo_url = request.repo_url or str(git_config.get("repo_url") or "")
+    branch = request.branch or str(git_config.get("branch") or "main")
+    return setup_git_workspace(p.root, repo_url=repo_url, branch=branch)
+
+
 @app.post("/api/discovery/scan")
 def api_discovery_scan(request: DiscoveryScanRequest) -> dict[str, object]:
     return DiscoveryService(paths()).scan(
@@ -627,7 +642,7 @@ def api_audit_sessions() -> dict[str, object]:
     sessions = []
     for job in jobs:
         result = job.get("result") or {}
-        lab_result = result.get("result") if isinstance(result, dict) else {}
+        lab_result = result.get("result") if isinstance(result, dict) and isinstance(result.get("result"), dict) else result
         evidence = lab_result.get("evidence", {}) if isinstance(lab_result, dict) else {}
         transcript = evidence.get("transcript") or evidence.get("session", {}).get("transcript", [])
         if transcript:

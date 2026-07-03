@@ -16,6 +16,8 @@ for the Arista lab and the local Git repo.
 ## Backend Changes
 
 - Added `GET /api/git/status`.
+- Added `POST /api/git/setup` so the UI can initialize the current runtime
+  workspace and attach the configured Git remote.
 - Added `GET /api/desired-state/catalog`.
 - Added `POST /api/desired-state/plan`.
 - Added `POST /api/verify/intent`.
@@ -28,6 +30,7 @@ for the Arista lab and the local Git repo.
 - Added `.netcode/ui_config.yaml` for persisted platform/UI settings.
 - Added `.netcode/ui_config_history.yaml` for configuration audit history.
 - Added `git_workspace_status()` helper.
+- Added `setup_git_workspace()` helper.
 - Added typed desired-state models for:
   - VLAN
   - Interface config
@@ -121,6 +124,8 @@ for the Arista lab and the local Git repo.
 - Updated UI route test to assert the new MVP flow.
 - Added desired-state catalog and multi-intent plan tests.
 - Added audit session transcript test.
+- Added direct lab-result audit transcript test for the current job storage
+  shape.
 - Added UI configuration persistence test.
 - Added configured source-of-truth path test.
 - Existing backend tests remain in place.
@@ -132,3 +137,20 @@ for the Arista lab and the local Git repo.
 - NetBox/Nautobot write integration.
 - Enterprise secrets management.
 - Change-window enforcement.
+
+## 2026-07-03 User Story Repair
+
+- Added Home user-story cards for Connect Git, Discover Devices, Build Source
+  of Truth, Plan Safe Change, and Prove/Audit.
+- Wired Connect Git to the new setup endpoint and the configured
+  `network-code` GitHub remote.
+- Changed Setup summaries so Rez adapter and containerlab readiness are shown
+  as concise outcomes instead of raw backend payloads.
+- Fixed Discovery story status so a successful Rez scan updates the card to
+  `Discovered`.
+- Fixed audit session extraction so dry-run, apply, and rollback transcripts
+  from the current lab job format appear in Evidence.
+- Verified in the ORB Arista lab UI at `http://127.0.0.1:8091/app`:
+  Git connect passed, Rez discovery passed, plan/validation passed, dry-run
+  passed, lab apply passed, live verification passed, rollback passed, and
+  Evidence showed four command sessions.

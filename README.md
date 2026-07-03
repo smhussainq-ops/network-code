@@ -9,6 +9,18 @@ The current MVP UI is organized around a Terraform-style network flow:
 Home -> Setup -> Inventory -> Desired State -> Plan -> Validate -> Apply -> Drift -> Evidence
 ```
 
+Home now leads with five network-engineer user stories:
+
+- Connect Git.
+- Discover devices.
+- Build source of truth.
+- Plan a safe change.
+- Prove and audit the change.
+
+Each story is wired to real platform actions and updates its status from live
+state. Setup summarizes Git, source of truth, Rez adapters, and lab readiness
+instead of showing raw backend dumps.
+
 Desired State is now dynamic. The UI can create typed intent, generated config,
 validation, Git review evidence, and audit records for VLAN, interface, BGP,
 ACL, and site/device source-of-truth workflows. Arista lab write/apply gates are
@@ -20,6 +32,10 @@ credential profile metadata, discovery defaults, desired-state field schemas,
 vendor options, workflow gates, canary/batch controls, and audit settings.
 Configuration saves and resets are logged in `.netcode/ui_config_history.yaml`
 and shown in Evidence.
+
+The Setup screen can initialize the current runtime workspace as a Git repo and
+connect it to the configured remote. The current MVP default remote is
+`https://github.com/smhussainq-ops/network-code.git` on branch `main`.
 
 For the detailed MVP scope and UI behavior, see
 [`docs/ARISTA_MVP_UI.md`](docs/ARISTA_MVP_UI.md). For the dated rebuild notes,
