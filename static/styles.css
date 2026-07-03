@@ -428,6 +428,74 @@ textarea:focus-visible {
   padding: 16px;
 }
 
+.field-grid {
+  display: grid;
+  gap: 10px;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  margin: 10px 0;
+}
+
+.branch-panel {
+  border-top: 1px dashed var(--line);
+  margin-top: 12px;
+  padding-top: 12px;
+}
+
+.branch-current {
+  color: var(--muted);
+  font-size: 13px;
+  margin: 0 0 8px;
+}
+
+.branch-current strong {
+  color: var(--text);
+  font-family: "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+}
+
+.setup-hint {
+  color: var(--muted);
+  font-size: 12px;
+  margin: 8px 0 0;
+}
+
+.stat-chips {
+  align-items: center;
+  color: var(--muted);
+  display: flex;
+  flex-wrap: wrap;
+  font-size: 12px;
+  gap: 6px;
+  margin: 10px 0 0;
+}
+
+.chip {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 650;
+  padding: 4px 10px;
+  white-space: nowrap;
+}
+
+.chip.good {
+  background: #e8f6ee;
+  border-color: #b8e2c8;
+  color: #14683a;
+}
+
+.chip.warn {
+  background: #fdf3e2;
+  border-color: #f0d8a8;
+  color: #8a5b09;
+}
+
+.chip.muted {
+  color: var(--muted);
+}
+
 .config-panel {
   background: var(--surface);
   border: 1px solid var(--line);

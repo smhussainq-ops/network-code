@@ -92,14 +92,30 @@ Checks:
 - Rez adapter registry
 - Arista lab reachability
 
-The Git card can initialize the runtime workspace and attach the configured
-remote. Successful setup shows only the commands that ran, for example:
+The Git card is a small workflow, not a status readout:
+
+- Editable Repo URL and Base branch fields feed the Connect action.
+- After connect, the card shows the working branch and offers a
+  change-branch workflow: type (or accept the suggested)
+  `change/<site>-<change-type>` name and click Create change branch,
+  or switch between existing branches from the dropdown.
+- Each network change is meant to live on its own branch:
+  `git checkout -b change/... && git add && git commit && git push -u`.
+- Branch names are validated (`git check-ref-format`); creating an
+  existing branch just switches to it; failures return the exact git
+  command output.
+
+Successful setup shows only the commands that ran, for example:
 
 ```text
 OK: git init -b main
 OK: git remote add origin https://github.com/smhussainq-ops/network-code.git
 OK: git status --short
 ```
+
+Source of truth, read adapters, and lab reachability render as
+structured chips (counts, vendor names, node counts) — never raw
+backend payloads.
 
 Also exposes editable platform configuration:
 

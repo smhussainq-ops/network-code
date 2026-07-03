@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
@@ -14,7 +15,7 @@ from netcode.adapters.registry import AdapterRegistry
 from netcode.bootstrap import init_workspace
 from netcode.discovery import DiscoveryService
 from netcode.drift import compliance_summary, vlan_drift_report
-from netcode.gitflow import git_workspace_status, setup_git_workspace
+from netcode.gitflow import create_change_branch, git_workspace_status, list_git_branches, setup_git_workspace
 from netcode.gitops import gitops_plan
 from netcode.inventory import Inventory
 from netcode.intent_utils import lab_write_supported, plan_metadata, production_write_supported
@@ -118,6 +119,11 @@ class GitSetupRequest(BaseModel):
     branch: str = ""
 
 
+class GitBranchRequest(BaseModel):
+    name: str = ""
+    base: str = ""
+
+
 app = FastAPI(title="Netcode Platform", version="0.1.0")
 
 
@@ -140,13 +146,35 @@ def app_index() -> FileResponse:
     return index()
 
 
+def _lab_summary(status: dict[str, object]) -> dict[str, object]:
+    """Shape raw lab status into a UI-safe summary so no raw payload reaches the browser."""
+    stdout = str(status.get("stdout") or "")
+    running_nodes = len(re.findall(r"\brunning\b", stdout))
+    nodes: list[str] = []
+    for name in re.findall(r"clab-[A-Za-z0-9_.-]+", stdout):
+        if name not in nodes:
+            nodes.append(name)
+    ok = bool(status.get("ok"))
+    if ok:
+        message = f"Containerlab reachable. {running_nodes} nodes running." if running_nodes else "Containerlab is reachable."
+    else:
+        raw_error = str(status.get("message") or status.get("stderr") or "Lab not reachable from this runtime.").strip()
+        message = raw_error.splitlines()[0][:200] if raw_error else "Lab not reachable from this runtime."
+    return {
+        "ok": ok,
+        "message": message,
+        "running_nodes": running_nodes,
+        "nodes": nodes[:24],
+    }
+
+
 @app.get("/api/health")
 def health() -> dict[str, object]:
     p = paths()
     return {
         "ok": True,
         "workspace": str(p.root),
-        "lab": lab_status(),
+        "lab": _lab_summary(lab_status()),
     }
 
 
@@ -401,6 +429,16 @@ def api_git_setup(request: GitSetupRequest) -> dict[str, object]:
     repo_url = request.repo_url or str(git_config.get("repo_url") or "")
     branch = request.branch or str(git_config.get("branch") or "main")
     return setup_git_workspace(p.root, repo_url=repo_url, branch=branch)
+
+
+@app.get("/api/git/branches")
+def api_git_branches() -> dict[str, object]:
+    return list_git_branches(paths().root)
+
+
+@app.post("/api/git/branch")
+def api_git_branch(request: GitBranchRequest) -> dict[str, object]:
+    return create_change_branch(paths().root, name=request.name, base=request.base)
 
 
 @app.post("/api/discovery/scan")

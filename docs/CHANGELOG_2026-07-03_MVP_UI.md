@@ -154,3 +154,56 @@ for the Arista lab and the local Git repo.
   Git connect passed, Rez discovery passed, plan/validation passed, dry-run
   passed, lab apply passed, live verification passed, rollback passed, and
   Evidence showed four command sessions.
+
+## 2026-07-03 Git Change-Branch Workflow + Editable Setup (Claude)
+
+Implemented by Claude; validation owned by Codex.
+
+### Backend
+
+- Added `list_git_branches()` and `create_change_branch()` to
+  `netcode/gitflow.py`:
+  - Branch names are validated with `git check-ref-format --branch`.
+  - Creating an existing branch switches to it instead (idempotent).
+  - Optional base branch supported (`git checkout -b <name> <base>`).
+  - Non-repo workspaces and invalid names return honest `ok=false`
+    outcomes with the exact git steps that ran — nothing crashes.
+- Added `GET /api/git/branches` (current branch + local branches).
+- Added `POST /api/git/branch` (`{name, base}` create-or-switch).
+- `GET /api/health` now returns a UI-safe lab summary
+  (`message`, `running_nodes`, `nodes`) instead of the raw
+  `clab inspect` stdout — defense-in-depth so no future UI change can
+  re-expose a raw dump.
+
+### UI (Setup Step 1 is now a workflow, not a status card)
+
+- Editable Repo URL and Base branch fields inline on the Git card
+  (prefilled from config/status; used by Connect).
+- Working-branch indicator, New change branch input with a suggested
+  `change/<site>-<change-type>` name, existing-branch dropdown, and
+  Create change branch / Switch buttons.
+- Git commands block now shows the branch-first flow:
+  `git checkout -b change/... && git add && git commit && git push -u`.
+- Steps 2-4 (source of truth, read adapters, lab) render structured
+  stat chips instead of text blobs; removed the Rez filesystem path
+  from user-facing copy.
+- Connect button stays enabled as "Update Git connection" after
+  connect so the remote can be changed from the UI.
+- Story 01 card now shows the active branch
+  (`Git connected · change/...`).
+- Asset version bumped to `mvp8`.
+
+### Hygiene
+
+- `.gitignore` now ignores macOS `._*` AppleDouble files.
+- ORB deploys should use `COPYFILE_DISABLE=1 tar ...` so runtime
+  `git status` stays clean.
+
+### Tests (33 passing)
+
+- `test_git_branch_endpoint_creates_and_switches_change_branch`:
+  blocked before repo exists, create, switch back, idempotent
+  re-create, invalid name rejected, empty name rejected, branch
+  listing.
+- `test_health_endpoint_returns_lab_summary_not_raw_dump`.
+- `test_lab_summary_shapes_clab_output_into_counts`.

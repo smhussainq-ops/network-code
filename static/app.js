@@ -497,13 +497,16 @@ async function resetPlatformConfig() {
 
 async function connectGitRepo() {
   const gitConfig = getPath(appState.uiConfig || {}, "git", {});
-  startOutcome("Connect Git repo", "Initialize this runtime workspace and attach the configured Git remote and branch.");
+  const repoUrl = $("git-repo-url").value.trim() || gitConfig.repo_url || "";
+  const baseBranch = $("git-base-branch").value.trim() || gitConfig.branch || "main";
+  startOutcome("Connect Git repo", "Initialize this runtime workspace and attach the Git remote and base branch.");
   try {
     const data = await postJson("/api/git/setup", {
-      repo_url: gitConfig.repo_url || "",
-      branch: gitConfig.branch || "main",
+      repo_url: repoUrl,
+      branch: baseBranch,
     });
     appState.git = data.status;
+    appState.gitBranches = await getJson("/api/git/branches");
     renderAll();
     setOutcome({
       state: data.ok ? "Passed" : "Review",
@@ -516,11 +519,64 @@ async function connectGitRepo() {
       actual: (data.steps || []).map((step) => `${step.ok ? "OK" : "CHECK"}: ${step.command}${!step.ok && step.stderr ? ` - ${step.stderr}` : ""}`).join("\n"),
       artifact: data.workspace,
       device: "No device config was changed.",
-      next: data.ok ? "Discover devices or create desired state." : "Review Git command output and configuration.",
+      next: data.ok ? "Create a change branch, then discover devices or create desired state." : "Review Git command output and configuration.",
     });
   } catch (error) {
     failOutcome("Git setup failed.", error);
   }
+}
+
+function suggestedChangeBranch() {
+  const slug = (value) => String(value || "").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
+  const payload = changePayload();
+  const site = slug(payload.site) || "site";
+  const type = slug(appState.selectedChangeType || "change") || "change";
+  return `change/${site}-${type}`;
+}
+
+async function runBranchAction(name, base, intro) {
+  startOutcome("Change branch", intro);
+  try {
+    const data = await postJson("/api/git/branch", { name, base });
+    appState.gitBranches = {
+      ok: true,
+      available: true,
+      current: data.current,
+      branches: data.branches || [],
+      message: data.message,
+    };
+    if (appState.git && data.current) appState.git.branch = data.current;
+    renderAll();
+    $("git-branch-outcome").textContent = data.message;
+    setOutcome({
+      state: data.ok ? "Passed" : "Review",
+      status: data.ok ? "pass" : "warn",
+      title: data.ok ? (data.action === "created" ? "Change branch created." : "Switched branch.") : "Branch step needs review.",
+      summary: data.message,
+      expected: "Work each network change on its own reviewable Git branch.",
+      actual: (data.steps || []).map((step) => `${step.ok ? "OK" : "CHECK"}: ${step.command}${!step.ok && step.stderr ? ` - ${step.stderr}` : ""}`).join("\n") || data.message,
+      artifact: data.branch || "No branch",
+      device: "No device config was changed.",
+      next: data.ok ? "Create desired state, then commit artifacts to this branch." : "Fix the branch name or connect Git first.",
+    });
+  } catch (error) {
+    failOutcome("Branch step failed.", error);
+  }
+}
+
+async function createChangeBranch() {
+  const name = $("git-new-branch").value.trim() || suggestedChangeBranch();
+  const base = $("git-base-branch").value.trim() || "";
+  await runBranchAction(name, base, `Create ${name} so this change is reviewable on its own branch.`);
+}
+
+async function switchGitBranch() {
+  const name = $("git-branch-select").value;
+  if (!name) {
+    $("git-branch-outcome").textContent = "Pick a branch to switch to.";
+    return;
+  }
+  await runBranchAction(name, "", `Switch the workspace to branch ${name}.`);
 }
 
 function commandListFromText(config) {
@@ -556,7 +612,7 @@ function setStory(id, status, label) {
 }
 
 function renderUserStories() {
-  setStory("story-git", appState.git?.available ? "pass" : "warn", appState.git?.available ? "Git connected" : "Needs connect");
+  setStory("story-git", appState.git?.available ? "pass" : "warn", appState.git?.available ? `Git connected · ${appState.gitBranches?.current || appState.git?.branch || "main"}` : "Needs connect");
   setStory("story-discovery", appState.discovery?.ok ? "pass" : appState.rezHealth?.ok ? "warn" : "fail", appState.discovery?.ok ? "Discovered" : appState.rezHealth?.ok ? "Ready to discover" : "Adapter issue");
   setStory("story-sot", appState.source?.ok ? "pass" : "fail", appState.source?.ok ? `${appState.source.summary?.device_count || 0} devices trusted` : "Not loaded");
   setStory("story-change", appState.plan?.ok ? "pass" : appState.plan ? "fail" : "warn", appState.plan?.ok ? "Plan ready" : appState.plan ? "Plan blocked" : "Not planned");
@@ -571,11 +627,17 @@ function adapterSummary() {
   return `${platforms.length} read/discovery adapters loaded: ${names}${extra}.`;
 }
 
+function labRunningCount() {
+  const lab = appState.health?.lab || {};
+  if (typeof lab.running_nodes === "number") return lab.running_nodes;
+  return (String(lab.stdout || "").match(/\brunning\b/g) || []).length;
+}
+
 function labSummary() {
   const lab = appState.health?.lab || {};
-  if (!lab.ok) return lab.message || lab.stderr || "Lab unavailable.";
-  const running = (String(lab.stdout || "").match(/\brunning\b/g) || []).length;
-  return running ? `${running} containerlab nodes are running. Arista EOS lab writes are available after plan, validation, and dry-run.` : "Containerlab is reachable.";
+  if (!lab.ok) return lab.message || "Lab not reachable from this runtime.";
+  const running = labRunningCount();
+  return running ? `${running} containerlab nodes are running.` : lab.message || "Containerlab is reachable.";
 }
 
 function renderHome() {
@@ -588,47 +650,91 @@ function renderHome() {
   renderUserStories();
 }
 
+function chipRow(element, items, empty = "Unavailable") {
+  if (!items.length) {
+    element.innerHTML = `<span class="chip muted">${escapeHtml(empty)}</span>`;
+    return;
+  }
+  element.innerHTML = items.map((item) => `<span class="chip${item.tone ? ` ${item.tone}` : ""}">${escapeHtml(item.text)}</span>`).join("");
+}
+
 function renderSetup() {
   const git = appState.git || {};
   const gitConfig = getPath(appState.uiConfig || {}, "git", {});
+  const branches = appState.gitBranches?.branches || [];
+  const currentBranch = appState.gitBranches?.current || git.branch || "";
   $("setup-git-copy").textContent = git.available
-    ? `Git is ready on branch ${git.branch || "unknown"}. Remote: ${git.remote || "not configured"}.`
-    : `Configured repo is ${gitConfig.repo_url || "not set"}. Connect this runtime workspace once so changes can be reviewed and audited.`;
+    ? `Git is ready on branch ${currentBranch || "unknown"}. Remote: ${git.remote || "not configured"}.`
+    : "Connect this runtime workspace once so changes can be reviewed and audited.";
+  const repoInput = $("git-repo-url");
+  if (document.activeElement !== repoInput && !repoInput.value) repoInput.value = git.remote || gitConfig.repo_url || "";
+  const baseInput = $("git-base-branch");
+  if (document.activeElement !== baseInput && !baseInput.value) baseInput.value = gitConfig.branch || git.branch || "main";
+  $("git-new-branch").placeholder = suggestedChangeBranch();
+  $("git-current-branch").textContent = git.available ? currentBranch || "detached" : "not connected";
+  $("git-branch-select").innerHTML = ['<option value="">Select branch</option>']
+    .concat(branches.map((name) => `<option value="${escapeHtml(name)}"${name === currentBranch ? " selected" : ""}>${escapeHtml(name)}</option>`))
+    .join("");
+  $("connect-git").textContent = git.available ? "Update Git connection" : "Connect Git repo";
+  $("create-branch").disabled = !git.available;
+  $("switch-branch").disabled = !git.available || !branches.length;
   $("setup-git-commands").textContent = git.available
-    ? commandListBlock(git.commands || [])
+    ? commandListBlock([
+        `git checkout -b ${$("git-new-branch").value.trim() || suggestedChangeBranch()}`,
+        "git add <artifacts>",
+        `git commit -m "${gitConfig.default_commit_message || "Describe network change"}"`,
+        "git push -u origin <change-branch>",
+      ])
     : commandListBlock([
         "git init",
         `git checkout -B ${gitConfig.branch || "main"}`,
         gitConfig.repo_url ? `git remote add origin ${gitConfig.repo_url}` : "git remote add origin <repo-url>",
         "git status --short",
       ]);
-  $("connect-git").disabled = Boolean(git.available);
 
   const source = appState.source || {};
   $("setup-sot-copy").textContent = source.ok
     ? `${source.provider || "local_yaml"} source of truth is active. Inventory, policy, and templates are loaded.`
     : "Source of truth is not loaded.";
-  $("setup-sot-summary").textContent = source.ok
-    ? [
-        `${source.summary?.device_count || 0} devices`,
-        `${source.summary?.site_count || 0} sites`,
-        `${source.summary?.platform_count || 0} platforms`,
-        `${source.summary?.template_count || 0} templates`,
-        `Inventory: ${source.files?.inventory || "unknown"}`,
-      ].join("\n")
-    : "Unavailable";
+  chipRow(
+    $("setup-sot-summary"),
+    source.ok
+      ? [
+          { text: `${source.summary?.device_count || 0} devices`, tone: "good" },
+          { text: `${source.summary?.site_count || 0} sites` },
+          { text: `${source.summary?.platform_count || 0} platforms` },
+          { text: `${source.summary?.template_count || 0} templates` },
+        ]
+      : [],
+    "Source of truth not loaded"
+  );
 
   const rez = appState.rezHealth || {};
+  const rezPlatforms = appState.rezPlatforms?.platforms || [];
   $("setup-rez-copy").textContent = rez.ok
-    ? `Rez driver registry loaded from ${rez.root}.`
-    : `Rez drivers unavailable: ${rez.error || "unknown error"}`;
-  $("setup-rez-summary").textContent = appState.rezPlatforms ? adapterSummary() : "Unavailable";
+    ? `${rezPlatforms.length} vendor read/discovery drivers are loaded for device state collection.`
+    : `Read/discovery drivers are unavailable: ${rez.error || "unknown error"}`;
+  chipRow(
+    $("setup-rez-summary"),
+    rez.ok ? [{ text: `${rezPlatforms.length} vendors`, tone: "good" }].concat(rezPlatforms.map((item) => ({ text: item.platform }))) : [],
+    "No read adapters loaded"
+  );
 
   const lab = appState.health?.lab || {};
   $("setup-lab-copy").textContent = lab.ok
     ? "Containerlab is reachable from this runtime."
     : "Containerlab is not reachable from this runtime. Use the ORB URL for lab actions.";
-  $("setup-lab-summary").textContent = labSummary();
+  chipRow(
+    $("setup-lab-summary"),
+    lab.ok
+      ? [
+          { text: "Reachable", tone: "good" },
+          { text: `${labRunningCount()} nodes running` },
+          { text: "Write target: Arista EOS lab" },
+        ]
+      : [{ text: lab.message || "Not reachable from this runtime", tone: "warn" }],
+    "Lab status unknown"
+  );
   renderConfigPanel();
 }
 
@@ -790,10 +896,11 @@ function renderAll() {
 async function checkWorkspace({ silent = false } = {}) {
   if (!silent) startOutcome("Check workspace", "Load Git, source of truth, Rez adapter, desired-state catalog, lab, jobs, and audit status.");
   try {
-    const [uiConfig, health, git, source, rezHealth, rezPlatforms, catalog, jobs, audit] = await Promise.all([
+    const [uiConfig, health, git, gitBranches, source, rezHealth, rezPlatforms, catalog, jobs, audit] = await Promise.all([
       getJson("/api/config/ui"),
       getJson("/api/health"),
       getJson("/api/git/status"),
+      getJson("/api/git/branches"),
       getJson("/api/source-of-truth"),
       getJson("/api/adapters/rez/health"),
       getJson("/api/adapters/rez/platforms"),
@@ -806,6 +913,7 @@ async function checkWorkspace({ silent = false } = {}) {
     appState.configHistory = uiConfig.history || [];
     appState.health = health;
     appState.git = git;
+    appState.gitBranches = gitBranches;
     appState.source = source;
     appState.rezHealth = rezHealth;
     appState.rezPlatforms = rezPlatforms;
@@ -1283,6 +1391,8 @@ function bindEvents() {
   $("reload-config").addEventListener("click", () => reloadPlatformConfig());
   $("reset-config").addEventListener("click", resetPlatformConfig);
   $("connect-git").addEventListener("click", connectGitRepo);
+  $("create-branch").addEventListener("click", createChangeBranch);
+  $("switch-branch").addEventListener("click", switchGitBranch);
   $$("#platform-config-form input, #platform-config-form select, #platform-config-form textarea").forEach((input) => input.addEventListener("input", syncQuickConfigToJson));
   $("discover-device").addEventListener("click", discoverDevice);
   $("save-discovered-device").addEventListener("click", saveDiscoveredDevice);

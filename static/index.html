@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Netcode MVP</title>
     <link rel="icon" href="/static/favicon.svg" type="image/svg+xml" />
-    <link rel="stylesheet" href="/static/styles.css?v=20260703-mvp7" />
+    <link rel="stylesheet" href="/static/styles.css?v=20260703-mvp8" />
   </head>
   <body>
     <main class="app-shell">
@@ -133,30 +133,46 @@
             <div class="setup-grid">
               <article class="setup-item">
                 <span>Step 1</span>
-                <h4>Git repo</h4>
+                <h4>Git repo &amp; change branch</h4>
                 <p id="setup-git-copy">Use your Git repo for reviewable network changes.</p>
-                <pre id="setup-git-commands" class="mini-code">Click Check workspace.</pre>
+                <div class="field-grid">
+                  <label>Repo URL<input id="git-repo-url" placeholder="https://github.com/you/network-code.git" autocomplete="off" /></label>
+                  <label>Base branch<input id="git-base-branch" placeholder="main" autocomplete="off" /></label>
+                </div>
                 <div class="button-row compact">
                   <button id="connect-git" type="button">Connect Git repo</button>
                 </div>
+                <div class="branch-panel">
+                  <p class="branch-current">Working branch <strong id="git-current-branch">not connected</strong></p>
+                  <div class="field-grid">
+                    <label>New change branch<input id="git-new-branch" placeholder="change/site-change-type" autocomplete="off" /></label>
+                    <label>Switch to existing<select id="git-branch-select"><option value="">Select branch</option></select></label>
+                  </div>
+                  <div class="button-row compact">
+                    <button id="create-branch" type="button">Create change branch</button>
+                    <button id="switch-branch" class="secondary" type="button">Switch</button>
+                  </div>
+                  <p id="git-branch-outcome" class="setup-hint">Each network change gets its own branch. Commit and push it for review before merge.</p>
+                </div>
+                <pre id="setup-git-commands" class="mini-code">Click Check workspace.</pre>
               </article>
               <article class="setup-item">
                 <span>Step 2</span>
                 <h4>Source of truth</h4>
                 <p id="setup-sot-copy">Local YAML is the active source of truth for this MVP.</p>
-                <pre id="setup-sot-summary" class="mini-code">Click Check workspace.</pre>
+                <div id="setup-sot-summary" class="stat-chips">Click Check workspace.</div>
               </article>
               <article class="setup-item">
                 <span>Step 3</span>
                 <h4>Rez adapters</h4>
                 <p id="setup-rez-copy">Rez provides multi-vendor read and discovery drivers.</p>
-                <pre id="setup-rez-summary" class="mini-code">Click Check workspace.</pre>
+                <div id="setup-rez-summary" class="stat-chips">Click Check workspace.</div>
               </article>
               <article class="setup-item">
                 <span>Step 4</span>
                 <h4>Arista lab</h4>
                 <p id="setup-lab-copy">Arista EOS is the write/apply target for the MVP.</p>
-                <pre id="setup-lab-summary" class="mini-code">Click Check workspace.</pre>
+                <div id="setup-lab-summary" class="stat-chips">Click Check workspace.</div>
               </article>
             </div>
             <section class="config-panel">
@@ -443,6 +459,6 @@
         </aside>
       </section>
     </main>
-    <script src="/static/app.js?v=20260703-mvp7"></script>
+    <script src="/static/app.js?v=20260703-mvp8"></script>
   </body>
 </html>

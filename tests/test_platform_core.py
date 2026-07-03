@@ -1,3 +1,4 @@
+import subprocess
 from pathlib import Path
 
 from fastapi.testclient import TestClient
@@ -498,6 +499,82 @@ def test_git_setup_endpoint_initializes_runtime_workspace(tmp_path: Path, monkey
     assert status.json()["available"] is True
     assert status.json()["branch"] == "main"
     assert status.json()["remote"] == "https://example.invalid/network-code.git"
+
+
+def test_git_branch_endpoint_creates_and_switches_change_branch(tmp_path: Path, monkeypatch):
+    init_workspace(WorkspacePaths(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    client = TestClient(api.app)
+
+    blocked = client.post("/api/git/branch", json={"name": "change/store-1842-add-vlan-90"})
+    assert blocked.status_code == 200
+    assert blocked.json()["ok"] is False
+    assert "not a Git repository" in blocked.json()["message"]
+
+    client.post("/api/git/setup", json={"repo_url": "https://example.invalid/network-code.git", "branch": "main"})
+    subprocess.run(
+        ["git", "-c", "user.email=test@netcode.local", "-c", "user.name=netcode-test", "-c", "commit.gpgsign=false", "commit", "--allow-empty", "-m", "init"],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+    )
+
+    created = client.post("/api/git/branch", json={"name": "change/store-1842-add-vlan-90"})
+    assert created.status_code == 200
+    assert created.json()["ok"] is True
+    assert created.json()["action"] == "created"
+    assert created.json()["current"] == "change/store-1842-add-vlan-90"
+    assert any(step["command"].startswith("git checkout -b") for step in created.json()["steps"])
+
+    back = client.post("/api/git/branch", json={"name": "main"})
+    assert back.json()["ok"] is True
+    assert back.json()["action"] == "switched"
+
+    again = client.post("/api/git/branch", json={"name": "change/store-1842-add-vlan-90"})
+    assert again.json()["ok"] is True
+    assert again.json()["action"] == "switched"
+    assert again.json()["current"] == "change/store-1842-add-vlan-90"
+
+    invalid = client.post("/api/git/branch", json={"name": "bad name!"})
+    assert invalid.json()["ok"] is False
+    assert invalid.json()["action"] == "blocked"
+    assert "not a valid Git branch name" in invalid.json()["message"]
+
+    empty = client.post("/api/git/branch", json={"name": "  "})
+    assert empty.json()["ok"] is False
+
+    branches = client.get("/api/git/branches")
+    assert branches.status_code == 200
+    assert branches.json()["available"] is True
+    assert branches.json()["current"] == "change/store-1842-add-vlan-90"
+    assert "main" in branches.json()["branches"]
+
+
+def test_health_endpoint_returns_lab_summary_not_raw_dump(tmp_path: Path, monkeypatch):
+    init_workspace(WorkspacePaths(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    client = TestClient(api.app)
+
+    health = client.get("/api/health")
+
+    assert health.status_code == 200
+    lab = health.json()["lab"]
+    assert "stdout" not in lab
+    assert "stderr" not in lab
+    assert "message" in lab
+    assert "running_nodes" in lab
+
+
+def test_lab_summary_shapes_clab_output_into_counts():
+    summary = api._lab_summary(
+        {"ok": True, "stdout": "clab-arista-lab-v2-store1 ceos running 172.100.1.41\nclab-arista-lab-v2-store2 ceos running 172.100.1.42"}
+    )
+
+    assert summary["ok"] is True
+    assert summary["running_nodes"] == 2
+    assert "clab-arista-lab-v2-store1" in summary["nodes"]
+    assert "stdout" not in summary
+    assert "2 nodes running" in summary["message"]
 
 
 def test_audit_sessions_endpoint_exposes_command_transcripts(tmp_path: Path, monkeypatch):
