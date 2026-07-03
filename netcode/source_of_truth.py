@@ -6,6 +6,7 @@ from typing import Any
 
 from netcode.inventory import Inventory
 from netcode.paths import WorkspacePaths
+from netcode.ui_config import configured_inventory_path, configured_policy_path, configured_template_dir, read_ui_config
 from netcode.yamlio import read_yaml
 
 
@@ -16,23 +17,25 @@ class LocalSourceOfTruth:
 
     def __init__(self, paths: WorkspacePaths):
         self.paths = paths
-        self.inventory_path = paths.inventories / "lab.yaml"
-        self.policy_path = paths.policies / "invariants.yaml"
+        self.config = read_ui_config(paths)
+        self.inventory_path = configured_inventory_path(paths)
+        self.policy_path = configured_policy_path(paths)
+        self.template_dir = configured_template_dir(paths)
 
     def snapshot(self) -> dict[str, Any]:
         inventory = Inventory(self.inventory_path)
         policies = read_yaml(self.policy_path)
-        templates = sorted(str(path.relative_to(self.paths.root)) for path in self.paths.templates.rglob("*") if path.is_file())
+        templates = sorted(str(path.relative_to(self.paths.root)) if path.is_relative_to(self.paths.root) else str(path) for path in self.template_dir.rglob("*") if path.is_file())
         sites = sorted({device.site for device in inventory.devices if device.site})
         groups = sorted({group for device in inventory.devices for group in device.groups})
         platforms = sorted({device.platform for device in inventory.devices})
         return {
             "ok": True,
-            "provider": self.provider,
+            "provider": str(self.config.get("source_of_truth", {}).get("provider") or self.provider),
             "files": {
                 "inventory": str(self.inventory_path),
                 "policies": str(self.policy_path),
-                "templates": str(self.paths.templates),
+                "templates": str(self.template_dir),
             },
             "sites": sites,
             "groups": groups,

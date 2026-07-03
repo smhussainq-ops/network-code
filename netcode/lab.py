@@ -19,6 +19,7 @@ from netcode.paths import WorkspacePaths
 from netcode.rendering import render_intent
 from netcode.reporting import write_end_to_end_reports
 from netcode.orchestrator import run_static_pipeline
+from netcode.ui_config import configured_inventory_path
 from netcode.validation import StaticValidator
 from netcode.verification import verify_vlan_state
 
@@ -346,7 +347,7 @@ def lab_status() -> dict[str, object]:
 
 
 def _device_for_intent(paths: WorkspacePaths, intent: Intent, device_id: str | None) -> Device:
-    inventory = Inventory(paths.inventories / "lab.yaml")
+    inventory = Inventory(configured_inventory_path(paths))
     if device_id:
         if device_id not in inventory.by_id:
             raise ValueError(f"Unknown device {device_id}")

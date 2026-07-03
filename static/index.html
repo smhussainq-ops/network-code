@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Netcode MVP</title>
     <link rel="icon" href="/static/favicon.svg" type="image/svg+xml" />
-    <link rel="stylesheet" href="/static/styles.css?v=20260703-mvp4" />
+    <link rel="stylesheet" href="/static/styles.css?v=20260703-mvp5" />
   </head>
   <body>
     <main class="app-shell">
@@ -118,6 +118,72 @@
                 <pre id="setup-lab-summary" class="mini-code">Click Check workspace.</pre>
               </article>
             </div>
+            <section class="config-panel">
+              <div class="config-head">
+                <div>
+                  <span>Editable platform configuration</span>
+                  <h4>Control the options this UI uses</h4>
+                  <p id="config-path">Configuration has not been loaded yet.</p>
+                </div>
+                <div class="button-row compact">
+                  <button id="save-config" type="button">Save configuration</button>
+                  <button id="reload-config" class="secondary" type="button">Reload</button>
+                  <button id="reset-config" class="secondary" type="button">Reset defaults</button>
+                </div>
+              </div>
+              <form id="platform-config-form" class="config-form">
+                <section>
+                  <h5>Git</h5>
+                  <label>Repo URL<input name="git.repo_url" /></label>
+                  <label>Branch<input name="git.branch" /></label>
+                  <label>Commit message<input name="git.default_commit_message" /></label>
+                </section>
+                <section>
+                  <h5>Source of truth</h5>
+                  <label>Provider<input name="source_of_truth.provider" /></label>
+                  <label>Inventory path<input name="source_of_truth.inventory_path" /></label>
+                  <label>Policy path<input name="source_of_truth.policy_path" /></label>
+                  <label>Template directory<input name="source_of_truth.template_dir" /></label>
+                </section>
+                <section>
+                  <h5>Credentials</h5>
+                  <label>Credential profile<input name="credentials.profile" /></label>
+                  <label>Username<input name="credentials.username" /></label>
+                  <label>Default SSH port<input name="credentials.port" type="number" min="1" max="65535" /></label>
+                </section>
+                <section>
+                  <h5>Discovery defaults</h5>
+                  <label>Host<input name="discovery.defaults.host" /></label>
+                  <label>Vendor<input name="discovery.defaults.platform" /></label>
+                  <label>Device name<input name="discovery.defaults.device_id" /></label>
+                  <label>Site<input name="discovery.defaults.site" /></label>
+                  <label>Groups<input name="discovery.defaults.groups" /></label>
+                  <label>Port<input name="discovery.defaults.port" type="number" min="1" max="65535" /></label>
+                </section>
+                <section>
+                  <h5>Change defaults</h5>
+                  <label>Default site<input name="desired_state.common.site" /></label>
+                  <label>Default device<input name="desired_state.common.device_id" /></label>
+                  <label>Requested by<input name="desired_state.common.requested_by" /></label>
+                  <label>Default ticket<input name="desired_state.common.ticket_id" /></label>
+                </section>
+                <section>
+                  <h5>Workflow gates</h5>
+                  <label>Environment<input name="workflow.environment" /></label>
+                  <label>Canary size<input name="workflow.canary_size" type="number" min="1" /></label>
+                  <label>Batch size<input name="workflow.batch_size" type="number" min="1" /></label>
+                  <label class="check-row"><input name="workflow.dry_run_required" type="checkbox" /> Dry-run required</label>
+                  <label class="check-row"><input name="workflow.production_writes_locked" type="checkbox" /> Production writes locked</label>
+                </section>
+              </form>
+              <section class="json-editor">
+                <div>
+                  <h5>Full configuration JSON</h5>
+                  <p>Edit change cards, field labels, defaults, vendor choices, gates, paths, and audit settings.</p>
+                </div>
+                <textarea id="config-json" spellcheck="false"></textarea>
+              </section>
+            </section>
             <div class="button-row">
               <button id="check-workspace" type="button">Check workspace</button>
               <button class="secondary" type="button" data-go="inventory">Next: Discover</button>
@@ -131,21 +197,15 @@
             </section>
             <div class="two-column">
               <form id="discover-form" class="form-panel">
-                <label>Device IP / host<input name="host" value="172.100.1.41" /></label>
+                <label>Device IP / host<input name="host" /></label>
                 <label>Vendor
-                  <select name="platform">
-                    <option value="arista_eos">Arista EOS</option>
-                    <option value="">Auto detect with Rez</option>
-                    <option value="cisco_ios">Cisco IOS/XE</option>
-                    <option value="cisco_nxos">Cisco NX-OS</option>
-                    <option value="juniper_junos">Juniper Junos</option>
-                    <option value="fortinet">Fortinet</option>
-                    <option value="palo_alto">Palo Alto</option>
-                  </select>
+                  <select name="platform"></select>
                 </label>
-                <label>Device name<input name="device_id" value="v2-store1" /></label>
-                <label>Site<input name="site" value="store-1842" /></label>
-                <label>Username<input name="username" placeholder="Use inventory default" /></label>
+                <label>Device name<input name="device_id" /></label>
+                <label>Site<input name="site" /></label>
+                <label>Groups<input name="groups" placeholder="comma separated" /></label>
+                <label>SSH port<input name="port" type="number" min="1" max="65535" /></label>
+                <label>Username<input name="username" placeholder="Use configured or inventory default" /></label>
                 <label>Password<input name="password" type="password" placeholder="Use inventory default" /></label>
                 <div class="button-row">
                   <button id="discover-device" type="button">Discover device</button>
@@ -175,9 +235,9 @@
                 <section class="form-section">
                   <h4>Target</h4>
                   <div class="form-grid">
-                    <label>Site<input name="site" value="store-1842" /></label>
-                    <label>Device<input name="device_id" value="v2-store1" /></label>
-                    <label>Requested by<input name="requested_by" value="lab-engineer" /></label>
+                    <label>Site<input name="site" /></label>
+                    <label>Device<input name="device_id" /></label>
+                    <label>Requested by<input name="requested_by" /></label>
                     <label>Ticket / change ID<input name="ticket_id" placeholder="optional" /></label>
                   </div>
                 </section>
@@ -298,6 +358,7 @@
               <button class="evidence-tab" type="button" data-artifact="validation">Validation</button>
               <button class="evidence-tab" type="button" data-artifact="lab">Lab</button>
               <button class="evidence-tab" type="button" data-artifact="git">Git</button>
+              <button class="evidence-tab" type="button" data-artifact="configState">Config</button>
               <button class="evidence-tab" type="button" data-artifact="audit">Audit</button>
               <button class="evidence-tab" type="button" data-artifact="jobs">Jobs</button>
             </div>
@@ -341,6 +402,6 @@
         </aside>
       </section>
     </main>
-    <script src="/static/app.js?v=20260703-mvp4"></script>
+    <script src="/static/app.js?v=20260703-mvp5"></script>
   </body>
 </html>

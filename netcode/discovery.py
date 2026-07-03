@@ -9,6 +9,7 @@ from typing import Any
 from netcode.adapters.rez import RezAdapterBridge
 from netcode.inventory import Device, Inventory
 from netcode.paths import WorkspacePaths
+from netcode.ui_config import configured_inventory_path
 from netcode.yamlio import dumps_yaml, read_yaml, write_yaml
 
 SSH_AUTODETECT_ORDER = [
@@ -106,7 +107,7 @@ class DiscoveryService:
         if not host:
             return {"ok": False, "error": "Device IP/hostname is required."}
 
-        inventory = Inventory(self.paths.inventories / "lab.yaml")
+        inventory = Inventory(configured_inventory_path(self.paths))
         existing = self._match_existing_device(inventory, host, device_id)
         defaults = inventory.defaults
         effective_username = username or (existing.username if existing else str(defaults.get("username") or ""))
@@ -228,7 +229,7 @@ class DiscoveryService:
         if missing:
             return {"ok": False, "error": f"Missing required source-of-truth fields: {', '.join(missing)}"}
 
-        inventory_path = self.paths.inventories / "lab.yaml"
+        inventory_path = configured_inventory_path(self.paths)
         inventory = read_yaml(inventory_path)
         devices = list(inventory.get("devices") or [])
         sanitized = {

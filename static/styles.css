@@ -363,6 +363,86 @@ textarea:focus-visible {
   padding: 16px;
 }
 
+.config-panel {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  margin-top: 16px;
+  padding: 16px;
+}
+
+.config-head {
+  align-items: start;
+  display: flex;
+  gap: 14px;
+  justify-content: space-between;
+  margin-bottom: 14px;
+}
+
+.config-head span,
+.json-editor h5,
+.config-form h5 {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 750;
+  letter-spacing: 0.03em;
+  margin: 0;
+  text-transform: uppercase;
+}
+
+.config-head h4 {
+  font-size: 18px;
+  margin: 5px 0;
+}
+
+.config-head p,
+.json-editor p {
+  color: var(--muted);
+  line-height: 1.45;
+  margin: 0;
+}
+
+.button-row.compact {
+  margin-top: 0;
+  white-space: nowrap;
+}
+
+.config-form {
+  display: grid;
+  gap: 12px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.config-form section,
+.json-editor {
+  background: var(--surface-soft);
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  display: grid;
+  gap: 10px;
+  padding: 12px;
+}
+
+.config-form section {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.config-form h5 {
+  grid-column: 1 / -1;
+}
+
+.json-editor {
+  margin-top: 12px;
+}
+
+#config-json {
+  background: var(--code);
+  border-color: var(--code-line);
+  color: #d8e5f8;
+  font-family: "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+  min-height: 360px;
+}
+
 .setup-item h4,
 .result-panel h4 {
   font-size: 17px;
@@ -770,6 +850,8 @@ legend,
 
   .choice-grid,
   .setup-grid,
+  .config-form,
+  .config-form section,
   .two-column,
   .desired-layout,
   .change-type-grid,
@@ -785,6 +867,11 @@ legend,
     align-items: flex-start;
     flex-direction: column;
     gap: 12px;
+  }
+
+  .config-head {
+    align-items: stretch;
+    flex-direction: column;
   }
 
   .content-shell {

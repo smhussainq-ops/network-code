@@ -27,6 +27,16 @@ from netcode.platform import platform_capabilities
 from netcode.scale import rollout_plan
 from netcode.source_of_truth import provider_catalog, source_of_truth
 from netcode.store import PlatformStore, record_to_dict
+from netcode.ui_config import (
+    configured_inventory_path,
+    configured_template_dir,
+    desired_state_catalog_from_config,
+    read_ui_config,
+    reset_ui_config,
+    ui_config_history,
+    ui_config_path,
+    write_ui_config,
+)
 from netcode.verification import verify_state, verify_vlan_state
 from netcode.workflow import state_after_lab_action, state_after_static_validation, workflow_snapshot
 
@@ -99,53 +109,8 @@ class ScalePlanRequest(BaseModel):
     batch_size: int = 100
 
 
-DESIRED_STATE_CATALOG: list[dict[str, object]] = [
-    {
-        "id": "add_vlan",
-        "label": "Add VLAN",
-        "outcome": "Create a Layer 2 segment and optional SVI.",
-        "risk": "Low for lab",
-        "lab_write_supported": True,
-        "production_write_supported": False,
-        "fields": ["vlan_id", "name", "subnet", "purpose", "svi_enabled", "gateway_ip", "pci_reachable"],
-    },
-    {
-        "id": "interface_config",
-        "label": "Interface Config",
-        "outcome": "Configure access, trunk, or routed interface intent.",
-        "risk": "Medium: can affect connected hosts",
-        "lab_write_supported": True,
-        "production_write_supported": False,
-        "fields": ["interface", "description", "mode", "access_vlan", "trunk_allowed_vlans", "ip_address", "enabled"],
-    },
-    {
-        "id": "bgp_neighbor",
-        "label": "BGP Neighbor",
-        "outcome": "Define routing adjacency intent and generated router BGP commands.",
-        "risk": "High: can affect reachability",
-        "lab_write_supported": True,
-        "production_write_supported": False,
-        "fields": ["asn", "router_id", "neighbor", "remote_as", "description", "update_source", "shutdown"],
-    },
-    {
-        "id": "acl_rule",
-        "label": "ACL Rule",
-        "outcome": "Add a sequenced permit or deny rule to a named ACL.",
-        "risk": "High: can permit or block traffic",
-        "lab_write_supported": True,
-        "production_write_supported": False,
-        "fields": ["acl_name", "sequence", "action", "protocol", "source", "destination", "destination_port", "remark"],
-    },
-    {
-        "id": "site_device_intent",
-        "label": "Site / Device Intent",
-        "outcome": "Capture source-of-truth intent for a site/device before config exists.",
-        "risk": "Inventory only",
-        "lab_write_supported": False,
-        "production_write_supported": False,
-        "fields": ["new_device_id", "role", "platform", "management_ip", "groups", "notes"],
-    },
-]
+class UiConfigRequest(BaseModel):
+    config: dict[str, object]
 
 
 app = FastAPI(title="Netcode Platform", version="0.1.0")
@@ -184,6 +149,49 @@ def health() -> dict[str, object]:
 def init() -> dict[str, object]:
     written = init_workspace(paths())
     return {"ok": True, "written": [str(p) for p in written]}
+
+
+@app.get("/api/config/ui")
+def api_get_ui_config() -> dict[str, object]:
+    p = paths()
+    return {
+        "ok": True,
+        "path": str(ui_config_path(p)),
+        "config": read_ui_config(p),
+        "history": ui_config_history(p),
+    }
+
+
+@app.post("/api/config/ui")
+def api_save_ui_config(request: UiConfigRequest) -> dict[str, object]:
+    p = paths()
+    try:
+        config = write_ui_config(p, request.config, actor="ui")
+        return {
+            "ok": True,
+            "path": str(ui_config_path(p)),
+            "config": config,
+            "history": ui_config_history(p),
+        }
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/config/ui/reset")
+def api_reset_ui_config() -> dict[str, object]:
+    p = paths()
+    config = reset_ui_config(p, actor="ui")
+    return {
+        "ok": True,
+        "path": str(ui_config_path(p)),
+        "config": config,
+        "history": ui_config_history(p),
+    }
+
+
+@app.get("/api/config/ui/history")
+def api_ui_config_history() -> dict[str, object]:
+    return {"history": ui_config_history(paths())}
 
 
 @app.post("/api/wizard/add-vlan")
@@ -228,7 +236,10 @@ def wizard_add_vlan(request: AddVlanRequest) -> dict[str, object]:
 
 @app.get("/api/desired-state/catalog")
 def desired_state_catalog() -> dict[str, object]:
-    return {"change_types": DESIRED_STATE_CATALOG}
+    return {
+        "change_types": desired_state_catalog_from_config(read_ui_config(paths())),
+        "config_path": str(ui_config_path(paths())),
+    }
 
 
 @app.post("/api/desired-state/plan")
@@ -401,7 +412,7 @@ def api_template(platform: str, name: str) -> dict[str, object]:
     if "/" in platform or "/" in name or ".." in platform or ".." in name:
         raise HTTPException(status_code=400, detail="Invalid template path")
     filename = name if name.endswith(".j2") else f"{name}.j2"
-    template_path = paths().templates / platform / filename
+    template_path = configured_template_dir(paths()) / platform / filename
     if not template_path.exists():
         raise HTTPException(status_code=404, detail=f"Template not found: {platform}/{filename}")
     return {
@@ -446,7 +457,7 @@ def api_workflow_change(change_id: str) -> dict[str, object]:
 @app.get("/api/adapters/device/{device_id}")
 def api_device_adapters(device_id: str) -> dict[str, object]:
     p = paths()
-    inventory = Inventory(p.inventories / "lab.yaml")
+    inventory = Inventory(configured_inventory_path(p))
     device = inventory.by_id.get(device_id)
     if not device:
         raise HTTPException(status_code=404, detail=f"Unknown device {device_id}")
@@ -471,7 +482,7 @@ def api_adapter_conformance() -> dict[str, object]:
 @app.get("/api/adapters/rez/state/{device_id}")
 def api_rez_device_state(device_id: str) -> dict[str, object]:
     p = paths()
-    inventory = Inventory(p.inventories / "lab.yaml")
+    inventory = Inventory(configured_inventory_path(p))
     device = inventory.by_id.get(device_id)
     if not device:
         raise HTTPException(status_code=404, detail=f"Unknown device {device_id}")
@@ -481,7 +492,7 @@ def api_rez_device_state(device_id: str) -> dict[str, object]:
 @app.post("/api/adapters/rez/collect-state")
 def api_rez_collect_state(request: DeviceRequest) -> dict[str, object]:
     p = paths()
-    inventory = Inventory(p.inventories / "lab.yaml")
+    inventory = Inventory(configured_inventory_path(p))
     device_id = request.device_id
     device = inventory.by_id.get(device_id)
     if not device:
@@ -492,7 +503,7 @@ def api_rez_collect_state(request: DeviceRequest) -> dict[str, object]:
 @app.post("/api/verify/vlan")
 def api_verify_vlan(request: VlanVerifyRequest) -> dict[str, object]:
     p = paths()
-    inventory = Inventory(p.inventories / "lab.yaml")
+    inventory = Inventory(configured_inventory_path(p))
     device = inventory.by_id.get(request.device_id)
     if not device:
         raise HTTPException(status_code=404, detail=f"Unknown device {request.device_id}")
@@ -517,7 +528,7 @@ def api_verify_vlan(request: VlanVerifyRequest) -> dict[str, object]:
 @app.post("/api/verify")
 def api_verify(request: GenericVerifyRequest) -> dict[str, object]:
     p = paths()
-    inventory = Inventory(p.inventories / "lab.yaml")
+    inventory = Inventory(configured_inventory_path(p))
     device = inventory.by_id.get(request.device_id)
     if not device:
         raise HTTPException(status_code=404, detail=f"Unknown device {request.device_id}")
@@ -544,7 +555,7 @@ def api_verify(request: GenericVerifyRequest) -> dict[str, object]:
 def api_verify_intent(request: IntentPathRequest) -> dict[str, object]:
     p = paths()
     intent = load_intent(Path(request.intent_path))
-    inventory = Inventory(p.inventories / "lab.yaml")
+    inventory = Inventory(configured_inventory_path(p))
     device_id = request.device_id or (intent.targets.device_ids[0] if intent.targets.device_ids else "")
     device = inventory.by_id.get(device_id)
     if not device:
@@ -569,8 +580,8 @@ def api_verify_intent(request: IntentPathRequest) -> dict[str, object]:
 @app.post("/api/drift/vlan")
 def api_vlan_drift(request: IntentPathRequest) -> dict[str, object]:
     p = paths()
-    inventory = Inventory(p.inventories / "lab.yaml")
-    device_id = request.device_id or "v2-store1"
+    inventory = Inventory(configured_inventory_path(p))
+    device_id = request.device_id or str(read_ui_config(p).get("desired_state", {}).get("common", {}).get("device_id") or "")
     device = inventory.by_id.get(device_id)
     if not device:
         raise HTTPException(status_code=404, detail=f"Unknown device {device_id}")

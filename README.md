@@ -14,6 +14,13 @@ validation, Git review evidence, and audit records for VLAN, interface, BGP,
 ACL, and site/device source-of-truth workflows. Arista lab write/apply gates are
 shown per intent type; production writes remain locked in this MVP.
 
+Setup is also dynamic. The UI persists editable platform settings in
+`.netcode/ui_config.yaml`, including Git repo settings, source-of-truth paths,
+credential profile metadata, discovery defaults, desired-state field schemas,
+vendor options, workflow gates, canary/batch controls, and audit settings.
+Configuration saves and resets are logged in `.netcode/ui_config_history.yaml`
+and shown in Evidence.
+
 For the detailed MVP scope and UI behavior, see
 [`docs/ARISTA_MVP_UI.md`](docs/ARISTA_MVP_UI.md). For the dated rebuild notes,
 see [`docs/CHANGELOG_2026-07-03_MVP_UI.md`](docs/CHANGELOG_2026-07-03_MVP_UI.md).
@@ -27,6 +34,7 @@ wizard -> YAML intent -> Jinja template -> EOS config -> validation -> Git diff 
 The current platform core includes:
 
 - Guided UI and CLI workflow for an Arista EOS VLAN change.
+- Editable UI/platform configuration consumed by the backend and browser.
 - YAML/Jinja/static validation artifact chain, visible to the engineer.
 - Durable SQLite change and job records under `.netcode/netcode.db`.
 - Execution adapter registry for Arista EOS config-session dry-run, apply,

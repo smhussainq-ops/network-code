@@ -11,6 +11,7 @@ from jinja2 import Environment, FileSystemLoader, StrictUndefined
 from netcode.intent_utils import config_filename, template_for_intent
 from netcode.models import Intent, RenderResult
 from netcode.paths import WorkspacePaths
+from netcode.ui_config import configured_template_dir
 
 
 def _variables(intent: Intent) -> dict[str, Any]:
@@ -28,7 +29,7 @@ def _variables(intent: Intent) -> dict[str, Any]:
 
 def render_intent(intent: Intent, paths: WorkspacePaths) -> RenderResult:
     template_name = template_for_intent(intent)
-    template_path = paths.templates / "arista" / template_name
+    template_path = configured_template_dir(paths) / "arista" / template_name
     env = Environment(
         loader=FileSystemLoader(str(template_path.parent)),
         undefined=StrictUndefined,

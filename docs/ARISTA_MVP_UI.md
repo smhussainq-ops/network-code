@@ -10,20 +10,21 @@ network-as-code platform.
 Let a network engineer use the UI to:
 
 1. Check workspace readiness.
-2. Discover the Arista lab switch.
-3. Save the device into source of truth.
-4. Define desired network state from multiple intent types.
-5. Create a plan.
-6. Review validation.
-7. Dry-run the candidate in an EOS config session.
-8. Apply only after dry-run proof.
-9. Verify live state.
-10. Detect drift.
-11. Review evidence and audit sessions.
+2. Edit platform settings from the UI.
+3. Discover the Arista lab switch.
+4. Save the device into source of truth.
+5. Define desired network state from multiple intent types.
+6. Create a plan.
+7. Review validation.
+8. Dry-run the candidate in an EOS config session.
+9. Apply only after dry-run proof.
+10. Verify live state.
+11. Detect drift.
+12. Review evidence and audit sessions.
 
 ## MVP Scope
 
-Supported write/apply change for full Arista lab proof:
+The default configuration is the Arista lab slice:
 
 - Site: `store-1842`
 - Device: `v2-store1`
@@ -44,13 +45,26 @@ Supported desired-state plan/validate types:
 Arista lab dry-run/apply/rollback gates are exposed per intent type. Site/device
 intent is source-of-truth only and keeps device writes locked.
 
+The defaults are editable from the Setup screen and persisted in
+`.netcode/ui_config.yaml`. The UI uses that configuration for:
+
+- Git repo URL, branch, commit message, and artifact globs.
+- Source-of-truth provider, inventory path, policy path, and template directory.
+- Credential profile, username, and default SSH port.
+- Discovery host, vendor, device name, site, groups, and port.
+- Desired-state common defaults.
+- Desired-state cards, field labels, defaults, select choices, and write gates.
+- Workflow controls such as dry-run requirement, production lock, canary size,
+  and batch size.
+- Audit settings and config change history.
+
 The MVP uses:
 
 - Git workspace status from the local repo.
-- Local YAML source of truth in `inventories/lab.yaml`.
+- Configured local YAML source of truth, defaulting to `inventories/lab.yaml`.
 - Rez read adapters for discovery and state collection.
-- Jinja template rendering from `templates/arista/add_vlan.j2`.
-- Static validation from `policies/invariants.yaml`.
+- Jinja template rendering from the configured template directory.
+- Static validation from the configured policy file.
 - Arista EOS config sessions for dry-run, apply, rollback, and verification.
 - SQLite job/change records under `.netcode/netcode.db`.
 - Audit session extraction from durable job transcripts.
@@ -74,6 +88,13 @@ Checks:
 - Source-of-truth health
 - Rez adapter registry
 - Arista lab reachability
+
+Also exposes editable platform configuration:
+
+- Quick controls for Git, source of truth, credentials, discovery defaults,
+  desired-state defaults, and workflow gates.
+- Full JSON editor for every option the UI consumes.
+- Save, reload, and reset actions.
 
 Device config writes: none.
 
@@ -170,6 +191,7 @@ Shows:
 - Validation
 - Lab proof
 - Git review plan
+- UI configuration and configuration history
 - Jobs
 - Audit sessions with command transcripts
 

@@ -1,77 +1,14 @@
 const $ = (id) => document.getElementById(id);
 const $$ = (selector) => Array.from(document.querySelectorAll(selector));
 
-const LOCAL_CHANGE_TYPES = {
-  add_vlan: {
-    label: "Add VLAN",
-    outcome: "Create a Layer 2 segment and optional SVI.",
-    risk: "Low for lab",
-    fields: [
-      { name: "vlan_id", label: "VLAN ID", type: "number", value: 90, min: 2, max: 4094 },
-      { name: "name", label: "Name", type: "text", value: "GUEST_WIFI" },
-      { name: "subnet", label: "Subnet", type: "text", value: "10.42.90.0/24" },
-      { name: "purpose", label: "Purpose", type: "text", value: "guest" },
-      { name: "svi_enabled", label: "Create SVI", type: "checkbox", value: false },
-      { name: "gateway_ip", label: "Gateway IP", type: "text", value: "", placeholder: "auto from subnet" },
-      { name: "pci_reachable", label: "PCI reachable", type: "checkbox", value: false },
-    ],
-  },
-  interface_config: {
-    label: "Interface Config",
-    outcome: "Configure access, trunk, or routed interface intent.",
-    risk: "Medium: can affect connected hosts",
-    fields: [
-      { name: "interface", label: "Interface", type: "text", value: "Ethernet1" },
-      { name: "description", label: "Description", type: "text", value: "NETCODE_LAB_ENDPOINT" },
-      { name: "mode", label: "Mode", type: "select", value: "access", options: [["access", "Access"], ["trunk", "Trunk"], ["routed", "Routed"]] },
-      { name: "access_vlan", label: "Access VLAN", type: "number", value: 90, min: 2, max: 4094 },
-      { name: "trunk_allowed_vlans", label: "Trunk VLANs", type: "text", value: "90,91", placeholder: "comma separated" },
-      { name: "ip_address", label: "Routed IP", type: "text", value: "", placeholder: "10.0.0.1/31" },
-      { name: "enabled", label: "No shutdown", type: "checkbox", value: true },
-    ],
-  },
-  bgp_neighbor: {
-    label: "BGP Neighbor",
-    outcome: "Define routing adjacency intent and generated router BGP commands.",
-    risk: "High: can affect reachability",
-    fields: [
-      { name: "asn", label: "Local ASN", type: "number", value: 65001, min: 1 },
-      { name: "router_id", label: "Router ID", type: "text", value: "10.255.0.1" },
-      { name: "neighbor", label: "Neighbor IP", type: "text", value: "10.255.0.2" },
-      { name: "remote_as", label: "Remote ASN", type: "number", value: 65002, min: 1 },
-      { name: "description", label: "Description", type: "text", value: "NETCODE_LAB_PEER" },
-      { name: "update_source", label: "Update source", type: "text", value: "", placeholder: "Loopback0" },
-      { name: "shutdown", label: "Keep neighbor shutdown", type: "checkbox", value: false },
-    ],
-  },
-  acl_rule: {
-    label: "ACL Rule",
-    outcome: "Add a sequenced permit or deny rule to a named ACL.",
-    risk: "High: can permit or block traffic",
-    fields: [
-      { name: "acl_name", label: "ACL name", type: "text", value: "NETCODE_LAB" },
-      { name: "sequence", label: "Sequence", type: "number", value: 10, min: 1 },
-      { name: "action", label: "Action", type: "select", value: "permit", options: [["permit", "Permit"], ["deny", "Deny"]] },
-      { name: "protocol", label: "Protocol", type: "select", value: "ip", options: [["ip", "IP"], ["tcp", "TCP"], ["udp", "UDP"], ["icmp", "ICMP"]] },
-      { name: "source", label: "Source", type: "text", value: "any" },
-      { name: "destination", label: "Destination", type: "text", value: "any" },
-      { name: "destination_port", label: "Destination port", type: "text", value: "", placeholder: "443" },
-      { name: "remark", label: "Remark", type: "text", value: "managed by netcode" },
-    ],
-  },
-  site_device_intent: {
-    label: "Site / Device Intent",
-    outcome: "Capture source-of-truth intent before config exists.",
-    risk: "Inventory only",
-    fields: [
-      { name: "new_device_id", label: "New device ID", type: "text", value: "v2-store4" },
-      { name: "role", label: "Role", type: "text", value: "access-switch" },
-      { name: "platform", label: "Platform", type: "select", value: "arista_eos", options: [["arista_eos", "Arista EOS"], ["cisco_ios", "Cisco IOS/XE"], ["cisco_nxos", "Cisco NX-OS"], ["juniper_junos", "Juniper Junos"]] },
-      { name: "management_ip", label: "Management IP", type: "text", value: "172.100.1.44" },
-      { name: "groups", label: "Groups", type: "text", value: "stores,access-switches" },
-      { name: "notes", label: "Notes", type: "textarea", value: "source-of-truth proposal only" },
-    ],
-  },
+const EMPTY_CHANGE_TYPE = {
+  id: "",
+  label: "Select change type",
+  outcome: "Load configuration to show editable desired-state workflows.",
+  risk: "Unknown",
+  lab_write_supported: false,
+  production_write_supported: false,
+  fields: [],
 };
 
 const appState = {
@@ -98,6 +35,10 @@ const appState = {
   workflow: null,
   audit: null,
   drift: null,
+  uiConfig: null,
+  uiConfigPath: "",
+  configHistory: [],
+  configApplied: false,
 };
 
 function escapeHtml(value) {
@@ -202,17 +143,55 @@ function setView(view) {
   if (view === "drift") renderDrift();
 }
 
+function getPath(object, path, fallback = "") {
+  return path.split(".").reduce((cursor, key) => (cursor && Object.prototype.hasOwnProperty.call(cursor, key) ? cursor[key] : undefined), object) ?? fallback;
+}
+
+function setPath(object, path, value) {
+  const keys = path.split(".");
+  let cursor = object;
+  keys.slice(0, -1).forEach((key) => {
+    if (!cursor[key] || typeof cursor[key] !== "object" || Array.isArray(cursor[key])) cursor[key] = {};
+    cursor = cursor[key];
+  });
+  cursor[keys[keys.length - 1]] = value;
+}
+
+function parseList(value) {
+  if (Array.isArray(value)) return value.map(String).filter(Boolean);
+  return String(value || "")
+    .split(",")
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
+
+function cloneConfig() {
+  return JSON.parse(JSON.stringify(appState.uiConfig || {}));
+}
+
+function changeTypeList() {
+  if (appState.catalog?.change_types?.length) return appState.catalog.change_types;
+  const changeTypes = getPath(appState.uiConfig || {}, "desired_state.change_types", {});
+  return Object.entries(changeTypes).map(([id, item]) => ({ id, ...item }));
+}
+
 function catalogItem(id = appState.selectedChangeType) {
-  const remote = appState.catalog?.change_types?.find((item) => item.id === id);
-  return { ...(LOCAL_CHANGE_TYPES[id] || LOCAL_CHANGE_TYPES.add_vlan), ...(remote || {}) };
+  return changeTypeList().find((item) => item.id === id) || changeTypeList()[0] || EMPTY_CHANGE_TYPE;
 }
 
 function localSchema(id = appState.selectedChangeType) {
-  return LOCAL_CHANGE_TYPES[id] || LOCAL_CHANGE_TYPES.add_vlan;
+  return catalogItem(id);
 }
 
 function renderChangeTypeGrid() {
-  const catalog = appState.catalog?.change_types?.length ? appState.catalog.change_types : Object.entries(LOCAL_CHANGE_TYPES).map(([id, item]) => ({ id, ...item }));
+  const catalog = changeTypeList();
+  if (!catalog.length) {
+    $("change-type-grid").innerHTML = '<article class="check-item"><strong>No workflows loaded</strong><p>Open Setup and load or save configuration.</p></article>';
+    return;
+  }
+  if (!catalog.some((item) => item.id === appState.selectedChangeType)) {
+    appState.selectedChangeType = catalog[0].id;
+  }
   $("change-type-grid").innerHTML = catalog
     .map((item) => {
       const active = item.id === appState.selectedChangeType ? "active" : "";
@@ -237,7 +216,7 @@ function renderChangeTypeGrid() {
 function renderDynamicFields() {
   const schema = localSchema();
   $("dynamic-title").textContent = `${schema.label} details`;
-  $("dynamic-fields").innerHTML = schema.fields.map(renderField).join("");
+  $("dynamic-fields").innerHTML = (schema.fields || []).map(normalizeField).map(renderField).join("");
   $$("#dynamic-fields input, #dynamic-fields select, #dynamic-fields textarea").forEach((input) =>
     input.addEventListener("input", () => {
       storeDynamicValues();
@@ -254,13 +233,33 @@ function renderField(field) {
     return `<label class="check-row"><input name="${name}" type="checkbox" ${value ? "checked" : ""} /> ${label}</label>`;
   }
   if (field.type === "select") {
-    const options = field.options.map(([optionValue, text]) => `<option value="${escapeHtml(optionValue)}" ${optionValue === value ? "selected" : ""}>${escapeHtml(text)}</option>`).join("");
+    const options = (field.options || []).map(optionPair).map(([optionValue, text]) => `<option value="${escapeHtml(optionValue)}" ${String(optionValue) === String(value) ? "selected" : ""}>${escapeHtml(text)}</option>`).join("");
     return `<label>${label}<select name="${name}">${options}</select></label>`;
   }
   if (field.type === "textarea") {
     return `<label class="wide">${label}<textarea name="${name}" placeholder="${escapeHtml(field.placeholder || "")}">${escapeHtml(value || "")}</textarea></label>`;
   }
   return `<label>${label}<input name="${name}" type="${escapeHtml(field.type || "text")}" value="${escapeHtml(value ?? "")}" min="${escapeHtml(field.min ?? "")}" max="${escapeHtml(field.max ?? "")}" placeholder="${escapeHtml(field.placeholder || "")}" /></label>`;
+}
+
+function normalizeField(field) {
+  if (typeof field === "string") return { name: field, label: field, type: "text", value: "" };
+  return {
+    name: field.name || "field",
+    label: field.label || field.name || "Field",
+    type: field.type || "text",
+    value: field.value ?? "",
+    placeholder: field.placeholder || "",
+    min: field.min,
+    max: field.max,
+    options: Array.isArray(field.options) ? field.options : [],
+  };
+}
+
+function optionPair(option) {
+  if (Array.isArray(option)) return [option[0], option[1] ?? option[0]];
+  if (option && typeof option === "object") return [option.value ?? option.id ?? "", option.label ?? option.name ?? option.value ?? ""];
+  return [option, option];
 }
 
 function storedFieldValue(field) {
@@ -272,7 +271,8 @@ function storeDynamicValues() {
   const schema = localSchema();
   const form = new FormData($("change-form"));
   const values = {};
-  for (const field of schema.fields) {
+  for (const rawField of schema.fields || []) {
+    const field = normalizeField(rawField);
     if (field.type === "checkbox") {
       values[field.name] = form.get(field.name) === "on";
     } else if (field.type === "number") {
@@ -318,9 +318,181 @@ function discoveryPayload() {
     password: String(form.get("password") || ""),
     device_id: String(form.get("device_id") || ""),
     site: String(form.get("site") || ""),
-    groups: [],
-    port: 22,
+    groups: parseList(form.get("groups")),
+    port: Number(form.get("port") || getPath(appState.uiConfig || {}, "credentials.port", 22)),
   };
+}
+
+function setNamedField(form, name, value) {
+  const field = form.elements[name];
+  if (!field) return;
+  if (field.type === "checkbox") {
+    field.checked = Boolean(value);
+  } else if (Array.isArray(value)) {
+    field.value = value.join(",");
+  } else {
+    field.value = value ?? "";
+  }
+}
+
+function fieldValue(field) {
+  if (field.type === "checkbox") return field.checked;
+  if (field.type === "number") return field.value === "" ? null : Number(field.value);
+  return field.value;
+}
+
+function vendorOptions() {
+  const configured = getPath(appState.uiConfig || {}, "discovery.vendor_options", []);
+  if (Array.isArray(configured) && configured.length) return configured;
+  const rez = appState.rezPlatforms?.platforms || [];
+  return [["", "Auto detect with Rez"], ...rez.map((item) => [item.platform, item.platform])];
+}
+
+function renderDiscoveryVendorOptions(selected = "") {
+  const select = $("discover-form").elements.platform;
+  select.innerHTML = vendorOptions()
+    .map(optionPair)
+    .map(([value, label]) => `<option value="${escapeHtml(value)}" ${String(value) === String(selected) ? "selected" : ""}>${escapeHtml(label)}</option>`)
+    .join("");
+}
+
+function applyConfigToOperationalForms({ force = false } = {}) {
+  if (!appState.uiConfig || (appState.configApplied && !force)) return;
+  const discover = $("discover-form");
+  const discoveryDefaults = getPath(appState.uiConfig, "discovery.defaults", {});
+  renderDiscoveryVendorOptions(discoveryDefaults.platform || "");
+  ["host", "platform", "device_id", "site", "groups", "port", "username"].forEach((name) => {
+    setNamedField(discover, name, discoveryDefaults[name] ?? getPath(appState.uiConfig, `credentials.${name}`, ""));
+  });
+
+  const change = $("change-form");
+  const common = getPath(appState.uiConfig, "desired_state.common", {});
+  ["site", "device_id", "requested_by", "ticket_id"].forEach((name) => setNamedField(change, name, common[name] || ""));
+  const configuredType = getPath(appState.uiConfig, "desired_state.selected_change_type", "");
+  const availableTypes = changeTypeList().map((item) => item.id);
+  appState.selectedChangeType = availableTypes.includes(configuredType) ? configuredType : availableTypes[0] || "";
+  appState.formValues = {};
+  appState.configApplied = true;
+}
+
+function renderConfigPanel() {
+  if (!$("platform-config-form")) return;
+  $("config-path").textContent = appState.uiConfigPath ? `Saved at ${appState.uiConfigPath}` : "Configuration is loaded from the platform API.";
+  const form = $("platform-config-form");
+  if (!appState.uiConfig) return;
+  Array.from(form.elements).forEach((field) => {
+    if (!field.name) return;
+    const value = field.name.endsWith(".groups") ? parseList(getPath(appState.uiConfig, field.name, [])) : getPath(appState.uiConfig, field.name, "");
+    setNamedField(form, field.name, value);
+  });
+  $("config-json").value = formatJson(appState.uiConfig);
+}
+
+function configFromQuickForm() {
+  const config = cloneConfig();
+  const form = $("platform-config-form");
+  Array.from(form.elements).forEach((field) => {
+    if (!field.name) return;
+    let value = fieldValue(field);
+    if (field.name.endsWith(".groups")) value = parseList(value);
+    setPath(config, field.name, value);
+  });
+  return config;
+}
+
+function syncQuickConfigToJson() {
+  appState.uiConfig = configFromQuickForm();
+  $("config-json").value = formatJson(appState.uiConfig);
+}
+
+async function reloadPlatformConfig({ silent = false, forceForms = true } = {}) {
+  if (!silent) startOutcome("Reload configuration", "Read the saved UI configuration and re-render editable platform options.");
+  try {
+    const [config, catalog] = await Promise.all([getJson("/api/config/ui"), getJson("/api/desired-state/catalog")]);
+    appState.uiConfig = config.config;
+    appState.uiConfigPath = config.path;
+    appState.configHistory = config.history || [];
+    appState.catalog = catalog;
+    appState.configApplied = false;
+    applyConfigToOperationalForms({ force: forceForms });
+    renderAll();
+    if (!silent) {
+      setOutcome({
+        state: "Passed",
+        status: "pass",
+        title: "Configuration reloaded.",
+        summary: "Editable UI settings were loaded from the platform configuration artifact.",
+        expected: "Use saved Git, source-of-truth, discovery, workflow, and desired-state options.",
+        actual: `${changeTypeList().length} desired-state workflows loaded from config.`,
+        artifact: appState.uiConfigPath,
+        device: "No device config was changed.",
+        next: "Edit and save configuration, or create desired state.",
+      });
+    }
+  } catch (error) {
+    failOutcome("Configuration reload failed.", error);
+  }
+}
+
+async function savePlatformConfig() {
+  startOutcome("Save configuration", "Persist every editable UI option as a platform configuration artifact.");
+  let config;
+  try {
+    config = JSON.parse($("config-json").value || "{}");
+  } catch (error) {
+    failOutcome("Configuration is not valid JSON.", error, "Fix the JSON syntax, then save again.");
+    return;
+  }
+  try {
+    const data = await postJson("/api/config/ui", { config });
+    appState.uiConfig = data.config;
+    appState.uiConfigPath = data.path;
+    appState.configHistory = data.history || [];
+    appState.catalog = await getJson("/api/desired-state/catalog");
+    appState.configApplied = false;
+    applyConfigToOperationalForms({ force: true });
+    renderAll();
+    setOutcome({
+      state: "Passed",
+      status: "pass",
+      title: "Configuration saved.",
+      summary: "The UI, discovery defaults, source-of-truth paths, workflow gates, and desired-state schemas now use the saved settings.",
+      expected: "Make platform options editable and reusable.",
+      actual: `Saved ${changeTypeList().length} workflow definitions to ${appState.uiConfigPath}.`,
+      artifact: appState.uiConfigPath,
+      device: "No device config was changed.",
+      next: "Run workspace check or create a plan with the updated options.",
+    });
+  } catch (error) {
+    failOutcome("Configuration save failed.", error);
+  }
+}
+
+async function resetPlatformConfig() {
+  startOutcome("Reset configuration", "Restore the editable UI configuration to platform defaults.");
+  try {
+    const data = await postJson("/api/config/ui/reset", {});
+    appState.uiConfig = data.config;
+    appState.uiConfigPath = data.path;
+    appState.configHistory = data.history || [];
+    appState.catalog = await getJson("/api/desired-state/catalog");
+    appState.configApplied = false;
+    applyConfigToOperationalForms({ force: true });
+    renderAll();
+    setOutcome({
+      state: "Passed",
+      status: "pass",
+      title: "Configuration reset.",
+      summary: "Default editable platform settings were restored and logged.",
+      expected: "Return to a known-good Arista MVP configuration.",
+      actual: `Reset saved at ${appState.uiConfigPath}.`,
+      artifact: appState.uiConfigPath,
+      device: "No device config was changed.",
+      next: "Edit settings or run workspace check.",
+    });
+  } catch (error) {
+    failOutcome("Configuration reset failed.", error);
+  }
 }
 
 function commandListFromText(config) {
@@ -381,6 +553,7 @@ function renderSetup() {
     ? "Containerlab is reachable from this runtime."
     : "Containerlab is not reachable from this runtime. Use the ORB URL for lab actions.";
   $("setup-lab-summary").textContent = lab.ok ? lab.stdout || "Lab reachable." : lab.message || lab.stderr || "Unavailable";
+  renderConfigPanel();
 }
 
 function renderInventory() {
@@ -524,6 +697,7 @@ function renderDrift() {
 }
 
 function renderAll() {
+  applyConfigToOperationalForms();
   renderChangeTypeGrid();
   renderDynamicFields();
   renderHome();
@@ -540,7 +714,8 @@ function renderAll() {
 async function checkWorkspace({ silent = false } = {}) {
   if (!silent) startOutcome("Check workspace", "Load Git, source of truth, Rez adapter, desired-state catalog, lab, jobs, and audit status.");
   try {
-    const [health, git, source, rezHealth, rezPlatforms, catalog, jobs, audit] = await Promise.all([
+    const [uiConfig, health, git, source, rezHealth, rezPlatforms, catalog, jobs, audit] = await Promise.all([
+      getJson("/api/config/ui"),
       getJson("/api/health"),
       getJson("/api/git/status"),
       getJson("/api/source-of-truth"),
@@ -550,6 +725,9 @@ async function checkWorkspace({ silent = false } = {}) {
       getJson("/api/jobs"),
       getJson("/api/audit/sessions"),
     ]);
+    appState.uiConfig = uiConfig.config;
+    appState.uiConfigPath = uiConfig.path;
+    appState.configHistory = uiConfig.history || [];
     appState.health = health;
     appState.git = git;
     appState.source = source;
@@ -558,6 +736,8 @@ async function checkWorkspace({ silent = false } = {}) {
     appState.catalog = catalog;
     appState.jobs = jobs;
     appState.audit = audit;
+    appState.configApplied = false;
+    applyConfigToOperationalForms({ force: true });
     setRunState("Workspace checked", health.lab?.ok ? "pass" : "warn");
     renderAll();
     if (!silent) {
@@ -565,10 +745,10 @@ async function checkWorkspace({ silent = false } = {}) {
         state: health.lab?.ok ? "Passed" : "Review",
         status: health.lab?.ok ? "pass" : "warn",
         title: "Workspace check complete.",
-        summary: "Git, source of truth, Rez adapters, desired-state catalog, lab status, and audit records were loaded.",
+        summary: "Configuration, Git, source of truth, Rez adapters, desired-state catalog, lab status, and audit records were loaded.",
         expected: "Confirm the platform is ready before making a network change.",
         actual: `${git.available ? "Git ready" : "Git needs setup"}. ${source.summary?.device_count || 0} devices. ${catalog.change_types?.length || 0} desired-state types. ${audit.sessions?.length || 0} command sessions logged.`,
-        artifact: "Workspace and audit status loaded from API.",
+        artifact: appState.uiConfigPath,
         device: "No device config was changed.",
         next: "Discover devices or create desired state.",
       });
@@ -868,8 +1048,12 @@ async function checkDrift() {
 async function refreshEvidence() {
   startOutcome("Refresh evidence", "Load latest jobs, workflow events, audit sessions, reports, and Git plan.");
   try {
-    appState.jobs = await getJson("/api/jobs");
-    appState.audit = await getJson("/api/audit/sessions");
+    const [jobs, audit, config] = await Promise.all([getJson("/api/jobs"), getJson("/api/audit/sessions"), getJson("/api/config/ui")]);
+    appState.jobs = jobs;
+    appState.audit = audit;
+    appState.uiConfig = config.config;
+    appState.uiConfigPath = config.path;
+    appState.configHistory = config.history || [];
     if (appState.plan?.change?.id) {
       appState.workflow = await getJson(`/api/workflow/change/${appState.plan.change.id}`);
       appState.gitPlan = await postJson("/api/gitops/plan", {
@@ -937,6 +1121,14 @@ function evidencePayload() {
         }
       : null,
     audit_sessions: appState.audit?.sessions?.length || 0,
+    ui_config: appState.uiConfigPath
+      ? {
+          path: appState.uiConfigPath,
+          history_events: appState.configHistory.length,
+          selected_change_type: getPath(appState.uiConfig || {}, "desired_state.selected_change_type", ""),
+          workflow_count: changeTypeList().length,
+        }
+      : null,
   };
 }
 
@@ -957,6 +1149,7 @@ function renderEvidence() {
       rollback: appState.rollback,
     }),
     git: appState.gitPlan ? formatJson(appState.gitPlan) : appState.git ? formatJson(appState.git) : "No Git evidence yet.",
+    configState: appState.uiConfig ? formatJson({ path: appState.uiConfigPath, config: appState.uiConfig, history: appState.configHistory }) : "No UI configuration loaded yet.",
     audit: appState.audit ? formatJson(appState.audit) : "No audit data loaded yet.",
     jobs: appState.jobs ? formatJson(appState.jobs) : "No jobs loaded yet.",
   };
@@ -1009,6 +1202,10 @@ function bindEvents() {
     })
   );
   $("check-workspace").addEventListener("click", () => checkWorkspace());
+  $("save-config").addEventListener("click", savePlatformConfig);
+  $("reload-config").addEventListener("click", () => reloadPlatformConfig());
+  $("reset-config").addEventListener("click", resetPlatformConfig);
+  $$("#platform-config-form input, #platform-config-form select, #platform-config-form textarea").forEach((input) => input.addEventListener("input", syncQuickConfigToJson));
   $("discover-device").addEventListener("click", discoverDevice);
   $("save-discovered-device").addEventListener("click", saveDiscoveredDevice);
   $("create-plan").addEventListener("click", createPlan);
@@ -1023,5 +1220,4 @@ function bindEvents() {
 }
 
 bindEvents();
-renderAll();
 checkWorkspace({ silent: true });

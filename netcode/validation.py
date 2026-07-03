@@ -21,14 +21,15 @@ from netcode.models import (
 )
 from netcode.paths import WorkspacePaths
 from netcode.rendering import render_intent
+from netcode.ui_config import configured_inventory_path, configured_policy_path
 from netcode.yamlio import read_yaml
 
 
 class StaticValidator:
     def __init__(self, paths: WorkspacePaths, inventory_path: Path | None = None, policy_path: Path | None = None):
         self.paths = paths
-        self.inventory = Inventory(inventory_path or paths.inventories / "lab.yaml")
-        self.policy = read_yaml(policy_path or paths.policies / "invariants.yaml")
+        self.inventory = Inventory(inventory_path or configured_inventory_path(paths))
+        self.policy = read_yaml(policy_path or configured_policy_path(paths))
 
     def validate(self, intent: Intent, render: RenderResult) -> ValidationReport:
         checks: list[CheckResult] = []

@@ -20,6 +20,13 @@ for the Arista lab and the local Git repo.
 - Added `POST /api/desired-state/plan`.
 - Added `POST /api/verify/intent`.
 - Added `GET /api/audit/sessions`.
+- Added editable UI configuration APIs:
+  - `GET /api/config/ui`
+  - `POST /api/config/ui`
+  - `POST /api/config/ui/reset`
+  - `GET /api/config/ui/history`
+- Added `.netcode/ui_config.yaml` for persisted platform/UI settings.
+- Added `.netcode/ui_config_history.yaml` for configuration audit history.
 - Added `git_workspace_status()` helper.
 - Added typed desired-state models for:
   - VLAN
@@ -57,6 +64,17 @@ for the Arista lab and the local Git repo.
   - Evidence
 - Rebuilt Desired State as a dynamic intent builder instead of a fixed VLAN
   form.
+- Removed hardcoded visible lab defaults from the browser forms; defaults now
+  load from the editable platform configuration.
+- Added Setup controls for:
+  - Git repo URL, branch, and commit message
+  - Source-of-truth provider and paths
+  - Credential profile, username, and port
+  - Discovery defaults
+  - Desired-state defaults
+  - Workflow gates, canary size, and batch size
+- Added full configuration JSON editor so every UI-consumed option can be
+  changed without code edits.
 - Added change-type cards for VLAN, interface, BGP, ACL, and site/device intent.
 - Added dynamic form fields per selected change type.
 - Added apply-gate visibility so unsupported write paths are locked in the UI.
@@ -79,7 +97,7 @@ for the Arista lab and the local Git repo.
 - Added apply/verify/rollback gate view.
 - Added drift view.
 - Added evidence tabs for YAML, generated commands, validation, lab proof, Git,
-  audit sessions, and jobs.
+  UI configuration, audit sessions, and jobs.
 
 ## Safety Behavior
 
@@ -95,12 +113,16 @@ for the Arista lab and the local Git repo.
 - Rollback is available after apply.
 - Every dry-run/apply/rollback command session is stored in job evidence and
   exposed through the Audit evidence tab.
+- Every UI configuration save/reset is written to config history and exposed
+  through the Config evidence tab.
 
 ## Tests
 
 - Updated UI route test to assert the new MVP flow.
 - Added desired-state catalog and multi-intent plan tests.
 - Added audit session transcript test.
+- Added UI configuration persistence test.
+- Added configured source-of-truth path test.
 - Existing backend tests remain in place.
 
 ## Out of Scope

@@ -6,17 +6,23 @@ from netcode.adapters.registry import AdapterRegistry
 from netcode.inventory import Inventory
 from netcode.paths import WorkspacePaths
 from netcode.store import PlatformStore
+from netcode.ui_config import configured_inventory_path, configured_policy_path, configured_template_dir, read_ui_config
 
 
 def platform_capabilities(paths: WorkspacePaths) -> dict[str, object]:
-    inventory = Inventory(paths.inventories / "lab.yaml")
+    config = read_ui_config(paths)
+    inventory_path = configured_inventory_path(paths)
+    policy_path = configured_policy_path(paths)
+    template_dir = configured_template_dir(paths)
+    inventory = Inventory(inventory_path)
     adapters = AdapterRegistry().summary()
     jobs = PlatformStore(paths).list_jobs(limit=1)
     latest_job = jobs[0] if jobs else None
     sot_summary = {
-        "inventory": str(paths.inventories / "lab.yaml"),
-        "policies": str(paths.policies / "invariants.yaml"),
-        "templates": str(paths.templates / "arista"),
+        "provider": config.get("source_of_truth", {}).get("provider"),
+        "inventory": str(inventory_path),
+        "policies": str(policy_path),
+        "templates": str(template_dir / "arista"),
         "device_count": len(inventory.devices),
         "sites": sorted({device.site for device in inventory.devices if device.site}),
     }

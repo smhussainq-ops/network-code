@@ -15,6 +15,7 @@ from netcode.source_of_truth import source_of_truth
 from netcode.store import PlatformStore
 from netcode.verification import verify_vlan_state
 from netcode.workflow import state_after_lab_action, state_after_static_validation, workflow_snapshot
+from netcode.yamlio import write_yaml
 
 
 def test_platform_store_persists_changes_and_jobs(tmp_path: Path):
@@ -424,6 +425,65 @@ def test_desired_state_catalog_and_dynamic_plans(tmp_path: Path, monkeypatch):
     assert "Source-of-truth only intent" in site_plan.json()["pipeline"]["render"]["config"]
 
 
+def test_ui_config_persists_editable_options_and_catalog(tmp_path: Path, monkeypatch):
+    init_workspace(WorkspacePaths(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    client = TestClient(api.app)
+
+    original = client.get("/api/config/ui")
+    config = original.json()["config"]
+    config["desired_state"]["common"]["device_id"] = "v2-store2"
+    config["desired_state"]["change_types"]["add_vlan"]["fields"][1]["value"] = "CORP_WIFI"
+    config["discovery"]["defaults"]["groups"] = ["lab", "edge"]
+
+    saved = client.post("/api/config/ui", json={"config": config})
+    catalog = client.get("/api/desired-state/catalog")
+    reloaded = client.get("/api/config/ui")
+
+    assert original.status_code == 200
+    assert saved.status_code == 200
+    assert Path(saved.json()["path"]).exists()
+    assert reloaded.json()["config"]["desired_state"]["common"]["device_id"] == "v2-store2"
+    assert reloaded.json()["history"][-1]["action"] == "updated"
+    add_vlan = next(item for item in catalog.json()["change_types"] if item["id"] == "add_vlan")
+    assert add_vlan["fields"][1]["value"] == "CORP_WIFI"
+    assert reloaded.json()["config"]["discovery"]["defaults"]["groups"] == ["lab", "edge"]
+
+
+def test_ui_configured_source_of_truth_path_is_used(tmp_path: Path, monkeypatch):
+    paths = WorkspacePaths(tmp_path)
+    init_workspace(paths)
+    monkeypatch.chdir(tmp_path)
+    write_yaml(
+        paths.inventories / "custom.yaml",
+        {
+            "defaults": {"username": "admin", "password": "admin", "port": 22, "platform": "arista_eos"},
+            "lab_type": "unit",
+            "devices": [
+                {
+                    "id": "custom-leaf1",
+                    "hostname": "custom-leaf1",
+                    "host": "192.0.2.50",
+                    "platform": "arista_eos",
+                    "site": "custom-site",
+                    "groups": ["custom"],
+                }
+            ],
+        },
+    )
+    client = TestClient(api.app)
+    config = client.get("/api/config/ui").json()["config"]
+    config["source_of_truth"]["inventory_path"] = "inventories/custom.yaml"
+
+    saved = client.post("/api/config/ui", json={"config": config})
+    source = client.get("/api/source-of-truth")
+
+    assert saved.status_code == 200
+    assert source.status_code == 200
+    assert source.json()["files"]["inventory"].endswith("inventories/custom.yaml")
+    assert source.json()["devices"][0]["id"] == "custom-leaf1"
+
+
 def test_audit_sessions_endpoint_exposes_command_transcripts(tmp_path: Path, monkeypatch):
     paths = WorkspacePaths(tmp_path)
     init_workspace(paths)
@@ -492,6 +552,11 @@ def test_app_route_serves_ui():
     assert "Drift" in response.text
     assert "Evidence" in response.text
     assert "Choose VLAN, interface, BGP, ACL, or site/device intent" in response.text
+    assert "Editable platform configuration" in response.text
+    assert "Save configuration" in response.text
+    assert "config-json" in response.text
+    assert "SSH port" in response.text
+    assert "Groups" in response.text
     assert "change-type-grid" in response.text
     assert "dynamic-fields" in response.text
     assert "Live outcome" in response.text
@@ -503,6 +568,7 @@ def test_app_route_serves_ui():
     assert "Create plan" in response.text
     assert "Run lab dry-run" in response.text
     assert "Apply in Arista lab" in response.text
+    assert "Config" in response.text
     assert "Audit" in response.text
 
 
