@@ -140,6 +140,8 @@ def list_git_branches(root: Path) -> dict[str, object]:
     current = _run_git(root, ["branch", "--show-current"])
     raw = _run_git(root, ["for-each-ref", "refs/heads", "--format=%(refname:short)"])
     branches = [line.strip() for line in raw.splitlines() if line.strip()]
+    if current and current not in branches:
+        branches.insert(0, current)  # unborn branch (no commits yet) still counts as the working branch
     return {
         "ok": True,
         "available": True,
