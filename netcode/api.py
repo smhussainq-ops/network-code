@@ -14,6 +14,7 @@ from netcode.adapters.registry import AdapterRegistry
 from netcode.bootstrap import init_workspace
 from netcode.discovery import DiscoveryService
 from netcode.drift import compliance_summary, vlan_drift_report
+from netcode.gitflow import git_workspace_status
 from netcode.gitops import gitops_plan
 from netcode.inventory import Inventory
 from netcode.jobs import JobRunner
@@ -252,6 +253,11 @@ def api_source_of_truth() -> dict[str, object]:
 @app.get("/api/source-of-truth/providers")
 def api_source_of_truth_providers() -> dict[str, object]:
     return {"providers": provider_catalog()}
+
+
+@app.get("/api/git/status")
+def api_git_status() -> dict[str, object]:
+    return git_workspace_status(paths().root)
 
 
 @app.post("/api/discovery/scan")

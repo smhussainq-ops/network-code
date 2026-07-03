@@ -3,6 +3,16 @@
 Network-as-code training platform for guided changes, transparent artifacts,
 validation, Arista lab testing, and evidence reports.
 
+The current MVP UI is organized around a Terraform-style network flow:
+
+```text
+Home -> Setup -> Inventory -> Desired State -> Plan -> Validate -> Apply -> Evidence
+```
+
+For the detailed MVP scope and UI behavior, see
+[`docs/ARISTA_MVP_UI.md`](docs/ARISTA_MVP_UI.md). For the dated rebuild notes,
+see [`docs/CHANGELOG_2026-07-03_MVP_UI.md`](docs/CHANGELOG_2026-07-03_MVP_UI.md).
+
 The first vertical slice is the `add_vlan` workflow:
 
 ```text

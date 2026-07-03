@@ -378,26 +378,24 @@ def test_app_route_serves_ui():
 
     assert response.status_code == 200
     assert "Netcode" in response.text
-    assert "15 capabilities wired behind one simple workflow" in response.text
+    assert "Terraform-style network changes for the Arista lab" in response.text
+    assert "Home" in response.text
+    assert "Setup" in response.text
+    assert "Inventory" in response.text
+    assert "Desired State" in response.text
+    assert "Plan" in response.text
+    assert "Validate" in response.text
+    assert "Apply" in response.text
+    assert "Evidence" in response.text
     assert "Live outcome" in response.text
-    assert "Action journal" in response.text
-    assert "Production readiness gates" in response.text
-    assert "Policy gate" in response.text
-    assert "Device commands" in response.text
-    assert "Device Commands" in response.text
+    assert "Next safe action" in response.text
+    assert "Check workspace" in response.text
     assert "Source of truth" in response.text
-    assert "Adapter matrix" in response.text
     assert "Discovery" in response.text
     assert "Discover device" in response.text
-    assert "Guided Journey" in response.text
-    assert "Build the change path one artifact at a time" in response.text
-    assert "0/11 complete" in response.text
-    assert "Define Change" in response.text
-    assert "Use this request" in response.text
-    assert "What this means" in response.text
-    assert "Show raw artifact / audit evidence" in response.text
-    assert "Git Setup" in response.text
-    assert "Jinja Template" in response.text
+    assert "Create plan" in response.text
+    assert "Run lab dry-run" in response.text
+    assert "Apply in Arista lab" in response.text
 
 
 def test_platform_capabilities_exposes_all_core_deliverables(tmp_path: Path):

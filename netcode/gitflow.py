@@ -56,3 +56,41 @@ def git_evidence(root: Path, intent_path: Path) -> dict[str, object]:
         "intent_diff": diff,
         "suggested_commands": suggested_commands,
     }
+
+
+def git_workspace_status(root: Path) -> dict[str, object]:
+    """Return Git repository status for workspace setup screens."""
+    inside = subprocess.run(
+        ["git", "rev-parse", "--is-inside-work-tree"],
+        cwd=root,
+        check=False,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    setup_commands = ["git init", "git status"]
+    if inside.returncode != 0 or inside.stdout.strip() != "true":
+        return {
+            "ok": True,
+            "available": False,
+            "workspace": str(root),
+            "message": "This workspace is not a Git repository yet.",
+            "branch": None,
+            "remote": "",
+            "status_short": "",
+            "commands": setup_commands,
+        }
+
+    branch = _run_git(root, ["branch", "--show-current"])
+    remote = _run_git(root, ["remote", "get-url", "origin"])
+    status = _run_git(root, ["status", "--short"])
+    return {
+        "ok": True,
+        "available": True,
+        "workspace": str(root),
+        "message": "This workspace is already a Git repository.",
+        "branch": branch,
+        "remote": "" if "No such remote" in remote else remote,
+        "status_short": status,
+        "commands": ["git status", "git add <artifacts>", "git commit -m \"Describe network change\"", "git push"],
+    }

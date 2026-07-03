@@ -3,396 +3,309 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Netcode Platform</title>
+    <title>Netcode MVP</title>
     <link rel="icon" href="/static/favicon.svg" type="image/svg+xml" />
-    <link rel="stylesheet" href="/static/styles.css?v=20260702-18" />
+    <link rel="stylesheet" href="/static/styles.css?v=20260703-mvp2" />
   </head>
   <body>
     <main class="app-shell">
-      <aside class="request-panel">
+      <aside class="sidebar" aria-label="MVP navigation">
         <div class="brand">
-          <div class="mark">NC</div>
+          <div class="brand-mark">NC</div>
           <div>
             <h1>Netcode</h1>
-            <p>Safe network changes with proof.</p>
+            <p>Terraform-style network changes for the Arista lab.</p>
           </div>
         </div>
 
-        <section class="panel">
-          <h2>Change Request</h2>
-          <form id="change-form">
-            <label>Site<input name="site" value="store-1842" /></label>
-            <label>Device<input name="device_id" value="v2-store1" /></label>
-            <label>VLAN ID<input name="vlan_id" type="number" value="90" min="2" max="4094" /></label>
-            <label>Name<input name="name" value="GUEST_WIFI" /></label>
-            <label>Subnet<input name="subnet" value="10.42.90.0/24" /></label>
-            <label>Purpose<input name="purpose" value="guest" /></label>
-            <label>Requested By<input name="requested_by" value="lab-engineer" /></label>
-            <label class="check"><input name="pci_reachable" type="checkbox" /> PCI reachable</label>
-          </form>
-        </section>
+        <nav class="nav-list">
+          <button class="nav-item active" type="button" data-view="home">Home</button>
+          <button class="nav-item" type="button" data-view="setup">Setup</button>
+          <button class="nav-item" type="button" data-view="inventory">Inventory</button>
+          <button class="nav-item" type="button" data-view="desired">Desired State</button>
+          <button class="nav-item" type="button" data-view="plan">Plan</button>
+          <button class="nav-item" type="button" data-view="validate">Validate</button>
+          <button class="nav-item" type="button" data-view="apply">Apply</button>
+          <button class="nav-item" type="button" data-view="evidence">Evidence</button>
+        </nav>
 
-        <section class="panel compact">
-          <h2>Platform</h2>
-          <button id="refresh-platform" type="button" class="secondary">Refresh status</button>
-          <button id="show-source-of-truth" type="button" class="secondary">Source of truth</button>
-          <button id="show-adapter-matrix" type="button" class="secondary">Adapter matrix</button>
-          <button id="show-workflow-rules" type="button" class="secondary">Workflow rules</button>
-          <button id="show-gitops-plan" type="button" class="secondary">GitOps plan</button>
-          <button id="show-conformance" type="button" class="secondary">Adapter conformance</button>
-          <button id="show-verification-catalog" type="button" class="secondary">Verification catalog</button>
-          <button id="run-drift-check" type="button" class="secondary">Drift check</button>
-          <button id="show-scale-plan" type="button" class="secondary">Scale plan</button>
-          <button id="show-jobs" type="button" class="secondary">Show job history</button>
-          <button id="show-device-state" type="button" class="secondary">Show device state</button>
-          <button id="verify-vlan-state" type="button" class="secondary">Verify VLAN state</button>
-        </section>
-
-        <section class="panel compact discovery-panel">
-          <h2>Discovery</h2>
-          <label>Device IP / Host<input id="discovery-host" value="172.100.1.41" /></label>
-          <label>Vendor
-            <select id="discovery-platform">
-              <option value="">Auto detect with Rez</option>
-              <option value="arista_eos">Arista EOS</option>
-              <option value="cisco_ios">Cisco IOS/XE</option>
-              <option value="cisco_nxos">Cisco NX-OS</option>
-              <option value="juniper_junos">Juniper Junos</option>
-              <option value="fortinet">Fortinet</option>
-              <option value="palo_alto">Palo Alto</option>
-            </select>
-          </label>
-          <label>Username<input id="discovery-username" placeholder="Use inventory default" /></label>
-          <label>Password<input id="discovery-password" type="password" placeholder="Use inventory default" /></label>
-          <button id="run-discovery" type="button" class="secondary">Discover device</button>
-          <button id="import-discovered-device" type="button" class="secondary" disabled>Save to source of truth</button>
-        </section>
-
-        <section class="panel compact assistant-panel">
-          <h2>AI Assistant</h2>
-          <textarea id="assistant-prompt" rows="4">Explain the current change, risk, and missing evidence.</textarea>
-          <button id="ask-assistant" type="button" class="secondary">Ask assistant</button>
+        <section class="workspace-card">
+          <span>Workspace</span>
+          <strong id="sidebar-workspace">Checking</strong>
+          <p id="sidebar-lab">Lab status unknown</p>
         </section>
       </aside>
 
-      <section class="main-panel">
-        <nav class="mode-tabs" aria-label="Platform views">
-          <button id="mode-console" class="mode-tab active" type="button" data-mode="console">Change Console</button>
-          <button id="mode-journey" class="mode-tab" type="button" data-mode="journey">Guided Journey</button>
-        </nav>
-
-        <div id="console-view" class="mode-view active">
-        <header class="outcome-header">
-          <div>
-            <p class="eyebrow">Expected outcome</p>
-            <h2 id="outcome-title">No network change has been approved yet.</h2>
-            <p id="outcome-copy">Start by checking whether the requested change is safe. Device writes stay locked until policy checks and lab proof pass.</p>
-          </div>
-          <div class="header-status">
-            <div class="runtime-pill" id="runtime-pill">Checking runtime</div>
-            <div class="mode-pill">Lab validation mode</div>
-          </div>
-        </header>
-
-        <section class="assurance-strip" aria-label="Production readiness gates">
-          <article class="assurance-card state-waiting">
-            <span>Source of truth</span>
-            <strong id="assurance-source">Loading</strong>
-            <p id="assurance-source-detail">Inventory, policy, and templates.</p>
-          </article>
-          <article class="assurance-card state-waiting">
-            <span>Policy gate</span>
-            <strong id="assurance-policy">Not checked</strong>
-            <p id="assurance-policy-detail">Static validation must pass.</p>
-          </article>
-          <article class="assurance-card state-locked">
-            <span>Lab proof</span>
-            <strong id="assurance-lab">Required</strong>
-            <p id="assurance-lab-detail">Dry-run required before apply.</p>
-          </article>
-          <article class="assurance-card state-waiting">
-            <span>Commands</span>
-            <strong id="assurance-commands">None sent</strong>
-            <p id="assurance-commands-detail">Candidate commands appear first.</p>
-          </article>
-          <article class="assurance-card state-waiting">
-            <span>Audit record</span>
-            <strong id="assurance-audit">Pending</strong>
-            <p id="assurance-audit-detail">Jobs and reports will be recorded.</p>
-          </article>
-        </section>
-
-        <section class="workflow" aria-label="Safe change workflow">
-          <article class="step-card current" id="card-safety">
-            <span>1</span>
-            <h3>Check safety</h3>
-            <p id="safety-copy">Validate the request, build the candidate config, and prove the change is within policy.</p>
-            <button id="run-safety" type="button">Check safety</button>
-          </article>
-
-          <article class="step-card locked" id="card-lab">
-            <span>2</span>
-            <h3>Test on lab device</h3>
-            <p id="lab-copy">Load the candidate into an EOS config session and abort it after collecting the diff.</p>
-            <button id="run-dry-run" type="button">Test candidate</button>
-          </article>
-
-          <article class="step-card locked" id="card-apply">
-            <span>3</span>
-            <h3>Apply only after proof</h3>
-            <p id="apply-copy">Apply remains locked until safety checks and lab dry-run both pass.</p>
-            <button id="run-apply" type="button" class="danger">Apply in lab</button>
-            <button id="run-rollback" type="button" class="secondary">Rollback lab VLAN</button>
-          </article>
-        </section>
-
-        <section class="live-panel" aria-label="Live click outcome">
-          <div class="live-current">
-            <div class="live-current-header">
-              <div>
-                <p class="eyebrow">Live outcome</p>
-                <h3 id="live-action-title">Waiting for a click</h3>
-              </div>
-              <strong id="live-action-state">Idle</strong>
-            </div>
-            <div class="live-outcome-grid">
-              <article>
-                <span>Expected</span>
-                <p id="live-action-expected">Click an action to see exactly what should happen before anything changes.</p>
-              </article>
-              <article>
-                <span>Actual</span>
-                <p id="live-action-actual">No action has run yet.</p>
-              </article>
-              <article class="command-card">
-                <span>Device commands</span>
-                <p id="live-action-commands">No device commands have been sent.</p>
-              </article>
-              <article>
-                <span>Evidence</span>
-                <p id="live-action-evidence">Evidence appears here as soon as the platform has it.</p>
-              </article>
-              <article>
-                <span>Lock state</span>
-                <p id="live-lock-state">Dry-run locked. Apply locked.</p>
-              </article>
-            </div>
-          </div>
-          <div class="live-history">
-            <div class="live-history-header">
-              <h3>Action journal</h3>
-              <button id="clear-journal" type="button" class="secondary">Clear</button>
-            </div>
-            <div id="live-journal" class="journal-list">
-              <article class="journal-empty">Every click will be recorded here with expected outcome, actual result, and evidence.</article>
-            </div>
-          </div>
-        </section>
-
-        <section class="result-grid" aria-label="Outcome cards">
-          <article>
-            <span>Requested change</span>
-            <strong id="requested-change">Add VLAN 90 to v2-store1</strong>
-          </article>
-          <article>
-            <span>Safety verdict</span>
-            <strong id="safety-verdict">Not checked</strong>
-          </article>
-          <article>
-            <span>Device proof</span>
-            <strong id="device-proof">Required</strong>
-          </article>
-          <article>
-            <span>Audit trail</span>
-            <strong id="audit-trail">Pending</strong>
-          </article>
-        </section>
-
-        <section class="capability-panel" aria-label="Platform deliverables">
-          <div class="capability-header">
+      <section class="content-shell">
+        <section class="main-stage">
+          <header class="page-header">
             <div>
-              <p class="eyebrow">Platform model</p>
-              <h3>15 capabilities wired behind one simple workflow</h3>
+              <p class="eyebrow">Arista MVP</p>
+              <h2 id="view-title">Define, plan, validate, apply, verify.</h2>
+              <p id="view-subtitle">A simple network-as-code flow using your Git repo, local YAML source of truth, Rez discovery, and the Arista ORB lab.</p>
             </div>
-            <strong id="platform-count">Checking</strong>
-          </div>
-          <div class="capability-list" id="platform-checklist">
-            <article class="capability-placeholder">Loading platform checklist...</article>
-          </div>
-        </section>
-
-        <section class="evidence-panel">
-          <div class="evidence-header">
-            <div>
-              <p class="eyebrow">Evidence</p>
-              <h3 id="evidence-title">What the platform will prove</h3>
-            </div>
-            <button id="toggle-details" type="button" class="secondary">Show technical details</button>
-          </div>
-
-          <div class="plain-evidence" id="plain-evidence">
-            <div><strong>Policy:</strong> VLAN, subnet, target, segmentation, and config scope are checked before any device action.</div>
-            <div><strong>Candidate:</strong> The device config is generated from the request, not typed by hand.</div>
-            <div><strong>Proof:</strong> The lab device must accept the candidate in a dry-run before apply is unlocked.</div>
-            <div><strong>Record:</strong> Every dry-run and apply creates a job record with evidence.</div>
-          </div>
-
-          <div class="technical-details hidden" id="technical-details">
-            <div class="detail-tabs" aria-label="Technical evidence">
-              <button class="detail-tab active" data-detail="intent">Request YAML</button>
-              <button class="detail-tab" data-detail="config">Candidate Config</button>
-              <button class="detail-tab" data-detail="commands">Device Commands</button>
-              <button class="detail-tab" data-detail="checks">Safety Checks</button>
-              <button class="detail-tab" data-detail="lab">Device Proof</button>
-              <button class="detail-tab" data-detail="source">Source of Truth</button>
-              <button class="detail-tab" data-detail="discovery">Discovery</button>
-              <button class="detail-tab" data-detail="adapters">Adapters</button>
-              <button class="detail-tab" data-detail="workflow">Workflow</button>
-              <button class="detail-tab" data-detail="gitops">GitOps</button>
-              <button class="detail-tab" data-detail="drift">Drift</button>
-              <button class="detail-tab" data-detail="scale">Scale</button>
-              <button class="detail-tab" data-detail="assistant">AI</button>
-              <button class="detail-tab" data-detail="jobs">Jobs</button>
-            </div>
-            <pre class="detail-output active" id="detail-intent"></pre>
-            <pre class="detail-output" id="detail-config"></pre>
-            <pre class="detail-output" id="detail-commands"></pre>
-            <div class="detail-output checks" id="detail-checks"></div>
-            <pre class="detail-output" id="detail-lab"></pre>
-            <pre class="detail-output" id="detail-source"></pre>
-            <pre class="detail-output" id="detail-discovery"></pre>
-            <pre class="detail-output" id="detail-adapters"></pre>
-            <pre class="detail-output" id="detail-workflow"></pre>
-            <pre class="detail-output" id="detail-gitops"></pre>
-            <pre class="detail-output" id="detail-drift"></pre>
-            <pre class="detail-output" id="detail-scale"></pre>
-            <pre class="detail-output" id="detail-assistant"></pre>
-            <pre class="detail-output" id="detail-jobs"></pre>
-          </div>
-        </section>
-        </div>
-
-        <section id="journey-view" class="mode-view hidden guided-journey" aria-label="Guided network as code journey">
-          <header class="journey-header">
-            <div>
-              <p class="eyebrow">Guided Journey</p>
-              <h2>Build the change path one artifact at a time.</h2>
-              <p>Each step runs a real platform action, then shows the exact file, command plan, validation result, or lab evidence it created or inspected.</p>
-            </div>
-            <div class="journey-progress">
-              <strong id="journey-progress">0/11 complete</strong>
-              <span id="journey-current-artifact">Define the change first</span>
+            <div class="run-state">
+              <span id="run-state-label">Draft</span>
             </div>
           </header>
 
-          <section class="journey-layout">
-            <aside class="journey-steps" id="journey-steps" aria-label="Guided journey steps">
-              <button class="journey-step active" type="button" data-journey-step="define">
-                <span>01</span><strong>Define Change</strong><small>Choose what to do</small>
+          <section id="view-home" class="view active">
+            <div class="choice-grid">
+              <button class="choice-card" type="button" data-go="setup">
+                <span>1</span>
+                <strong>Set up platform</strong>
+                <p>Check Git, source of truth, Rez adapters, and lab reachability.</p>
               </button>
-              <button class="journey-step" type="button" data-journey-step="source">
-                <span>02</span><strong>Source of Truth</strong><small>Check trusted data</small>
+              <button class="choice-card" type="button" data-go="inventory">
+                <span>2</span>
+                <strong>Discover devices</strong>
+                <p>Use Rez to read the Arista lab device and import it into source of truth.</p>
               </button>
-              <button class="journey-step" type="button" data-journey-step="intent">
-                <span>03</span><strong>Intent YAML</strong><small>Create request file</small>
+              <button class="choice-card" type="button" data-go="desired">
+                <span>3</span>
+                <strong>Create network change</strong>
+                <p>Define VLAN 90 as desired state, then generate the plan.</p>
               </button>
-              <button class="journey-step" type="button" data-journey-step="gitops">
-                <span>04</span><strong>Git Setup</strong><small>Repo and review path</small>
+              <button class="choice-card" type="button" data-go="evidence">
+                <span>4</span>
+                <strong>Review evidence</strong>
+                <p>See YAML, generated config, validation, lab proof, jobs, and Git plan.</p>
               </button>
-              <button class="journey-step" type="button" data-journey-step="template">
-                <span>05</span><strong>Jinja Template</strong><small>Inspect renderer</small>
-              </button>
-              <button class="journey-step" type="button" data-journey-step="candidate">
-                <span>06</span><strong>Candidate Config</strong><small>Inspect EOS config</small>
-              </button>
-              <button class="journey-step" type="button" data-journey-step="validation">
-                <span>07</span><strong>Static Validation</strong><small>Inspect guardrails</small>
-              </button>
-              <button class="journey-step" type="button" data-journey-step="dryrun">
-                <span>08</span><strong>Lab Dry-Run</strong><small>Test without commit</small>
-              </button>
-              <button class="journey-step" type="button" data-journey-step="apply">
-                <span>09</span><strong>Apply + Verify</strong><small>Commit in lab</small>
-              </button>
-              <button class="journey-step" type="button" data-journey-step="rollback">
-                <span>10</span><strong>Rollback</strong><small>Remove lab change</small>
-              </button>
-              <button class="journey-step" type="button" data-journey-step="evidence">
-                <span>11</span><strong>Evidence Package</strong><small>Inspect audit trail</small>
-              </button>
-            </aside>
+            </div>
 
-            <section class="journey-stage">
-              <div class="journey-stage-header">
-                <div>
-                  <p class="eyebrow" id="journey-step-eyebrow">Step 01</p>
-                  <h3 id="journey-step-title">Define Change</h3>
-                  <p id="journey-step-copy">Choose the network change you want to make before the platform inspects or creates artifacts.</p>
-                </div>
-                <strong id="journey-step-status" class="journey-status-pill state-ready">Ready</strong>
-              </div>
-
-              <div class="journey-action-row">
-                <button id="journey-run-step" type="button">Use this request</button>
-                <button id="journey-open-console" type="button" class="secondary">Open Change Console</button>
-              </div>
-
-              <div class="journey-output-grid">
-                <article>
-                  <span>Platform action</span>
-                  <p id="journey-creates">Confirms the change request from the form before creating files or touching the lab.</p>
-                </article>
-                <article>
-                  <span>Result</span>
-                  <p id="journey-artifact">Waiting for step output.</p>
-                </article>
-                <article>
-                  <span>Why it matters</span>
-                  <p id="journey-why">The platform must know what you want before it can build, validate, test, or apply anything.</p>
-                </article>
-                <article>
-                  <span>Next safe click</span>
-                  <p id="journey-next">Check whether the platform knows this target and policy.</p>
-                </article>
-              </div>
-
-              <section class="journey-plain" aria-label="Plain English step outcome">
-                <div>
-                  <p class="eyebrow">What this means</p>
-                  <h4 id="journey-plain-title">What change do you want to make?</h4>
-                  <p id="journey-plain-summary">Edit the Change Request fields on the left, then click Use this request.</p>
-                </div>
-                <div id="journey-plain-checks" class="journey-plain-checks">
-                  <article>
-                    <strong>Waiting</strong>
-                    <span>No artifact has been inspected yet.</span>
-                  </article>
-                </div>
-                <p id="journey-decision" class="journey-decision">Decision appears here after the step runs.</p>
-              </section>
-
-              <details class="journey-raw-details">
-                <summary>Show raw artifact / audit evidence</summary>
-                <pre id="journey-output" class="journey-output">Click the step action to inspect the first real artifact.</pre>
-              </details>
+            <section class="summary-strip" aria-label="Current MVP state">
+              <article><span>Git</span><strong id="home-git">Checking</strong></article>
+              <article><span>Source of truth</span><strong id="home-sot">Checking</strong></article>
+              <article><span>Rez adapters</span><strong id="home-rez">Checking</strong></article>
+              <article><span>Arista lab</span><strong id="home-lab">Checking</strong></article>
             </section>
           </section>
 
-          <section class="journey-events" aria-label="Guided journey journal">
-            <div class="journey-events-header">
-              <div>
-                <p class="eyebrow">Journey journal</p>
-                <h3>Real artifacts created or inspected</h3>
-              </div>
-              <button id="journey-reset" type="button" class="secondary">Reset journey view</button>
+          <section id="view-setup" class="view">
+            <section class="section-heading">
+              <h3>Setup</h3>
+              <p>Make sure the platform has the four things it needs before any network change: Git, source of truth, adapters, and lab reachability.</p>
+            </section>
+            <div class="setup-grid">
+              <article class="setup-item">
+                <span>Step 1</span>
+                <h4>Git repo</h4>
+                <p id="setup-git-copy">Use your Git repo for reviewable network changes.</p>
+                <pre id="setup-git-commands" class="mini-code">Click Check workspace.</pre>
+              </article>
+              <article class="setup-item">
+                <span>Step 2</span>
+                <h4>Source of truth</h4>
+                <p id="setup-sot-copy">Local YAML is the active source of truth for this MVP.</p>
+                <pre id="setup-sot-summary" class="mini-code">Click Check workspace.</pre>
+              </article>
+              <article class="setup-item">
+                <span>Step 3</span>
+                <h4>Rez adapters</h4>
+                <p id="setup-rez-copy">Rez provides multi-vendor read and discovery drivers.</p>
+                <pre id="setup-rez-summary" class="mini-code">Click Check workspace.</pre>
+              </article>
+              <article class="setup-item">
+                <span>Step 4</span>
+                <h4>Arista lab</h4>
+                <p id="setup-lab-copy">Arista EOS is the write/apply target for the MVP.</p>
+                <pre id="setup-lab-summary" class="mini-code">Click Check workspace.</pre>
+              </article>
             </div>
-            <div id="journey-journal" class="journey-journal">
-              <article class="journey-empty">Run a step to see the artifact path, result, and next safe action.</article>
+            <div class="button-row">
+              <button id="check-workspace" type="button">Check workspace</button>
+              <button class="secondary" type="button" data-go="inventory">Next: Discover</button>
+            </div>
+          </section>
+
+          <section id="view-inventory" class="view">
+            <section class="section-heading">
+              <h3>Inventory</h3>
+              <p>Discover the lab switch with Rez, then save the reviewed device record into source of truth.</p>
+            </section>
+            <div class="two-column">
+              <form id="discover-form" class="form-panel">
+                <label>Device IP / host<input name="host" value="172.100.1.41" /></label>
+                <label>Vendor
+                  <select name="platform">
+                    <option value="arista_eos">Arista EOS</option>
+                    <option value="">Auto detect with Rez</option>
+                    <option value="cisco_ios">Cisco IOS/XE</option>
+                    <option value="cisco_nxos">Cisco NX-OS</option>
+                    <option value="juniper_junos">Juniper Junos</option>
+                    <option value="fortinet">Fortinet</option>
+                    <option value="palo_alto">Palo Alto</option>
+                  </select>
+                </label>
+                <label>Device name<input name="device_id" value="v2-store1" /></label>
+                <label>Site<input name="site" value="store-1842" /></label>
+                <label>Username<input name="username" placeholder="Use inventory default" /></label>
+                <label>Password<input name="password" type="password" placeholder="Use inventory default" /></label>
+                <div class="button-row">
+                  <button id="discover-device" type="button">Discover device</button>
+                  <button id="save-discovered-device" class="secondary" type="button" disabled>Save to source of truth</button>
+                </div>
+              </form>
+              <article class="result-panel">
+                <span>Discovered device</span>
+                <h4 id="discovery-title">No discovery run yet.</h4>
+                <p id="discovery-summary">Discovery is read-only. It collects device state and creates an import candidate; it does not change device config.</p>
+                <div id="inventory-table" class="device-list"></div>
+              </article>
+            </div>
+          </section>
+
+          <section id="view-desired" class="view">
+            <section class="section-heading">
+              <h3>Desired State</h3>
+              <p>Describe the network outcome. The platform turns this into YAML intent and generated Arista EOS config.</p>
+            </section>
+            <div class="two-column">
+              <form id="change-form" class="form-panel">
+                <label>Site<input name="site" value="store-1842" /></label>
+                <label>Device<input name="device_id" value="v2-store1" /></label>
+                <label>VLAN ID<input name="vlan_id" type="number" min="2" max="4094" value="90" /></label>
+                <label>Name<input name="name" value="GUEST_WIFI" /></label>
+                <label>Subnet<input name="subnet" value="10.42.90.0/24" /></label>
+                <label>Purpose<input name="purpose" value="guest" /></label>
+                <label>Requested by<input name="requested_by" value="lab-engineer" /></label>
+                <label class="check-row"><input name="pci_reachable" type="checkbox" /> PCI reachable</label>
+                <div class="button-row">
+                  <button id="create-plan" type="button">Create plan</button>
+                  <button class="secondary" type="button" data-go="plan">Open plan</button>
+                </div>
+              </form>
+              <article class="result-panel">
+                <span>Desired state</span>
+                <h4 id="desired-title">Add VLAN 90 to v2-store1</h4>
+                <p id="desired-summary">The UI starts with a form. YAML remains visible as an artifact, not as the primary workflow.</p>
+                <pre id="desired-yaml" class="code-box">Create a plan to see the YAML intent.</pre>
+              </article>
+            </div>
+          </section>
+
+          <section id="view-plan" class="view">
+            <section class="section-heading">
+              <h3>Plan</h3>
+              <p>Preview the exact impact before the lab switch sees anything.</p>
+            </section>
+            <section class="plan-summary">
+              <article><span>Action</span><strong id="plan-action">No plan yet</strong></article>
+              <article><span>Affected device</span><strong id="plan-device">-</strong></article>
+              <article><span>Risk</span><strong id="plan-risk">Unknown</strong></article>
+              <article><span>Device writes</span><strong id="plan-writes">None</strong></article>
+            </section>
+            <div class="artifact-grid">
+              <article>
+                <div class="artifact-heading"><span>Terraform-style summary</span></div>
+                <pre id="plan-summary-text" class="code-box">Create a desired state first.</pre>
+              </article>
+              <article>
+                <div class="artifact-heading"><span>Exact generated commands</span></div>
+                <pre id="plan-commands" class="code-box">No commands generated yet.</pre>
+              </article>
+            </div>
+            <div class="button-row">
+              <button id="review-validation" type="button">Review validation</button>
+              <button class="secondary" type="button" data-go="validate">Open validation</button>
+            </div>
+          </section>
+
+          <section id="view-validate" class="view">
+            <section class="section-heading">
+              <h3>Validate</h3>
+              <p>Policy checks and Arista dry-run must pass before apply is unlocked.</p>
+            </section>
+            <div id="validation-list" class="check-list"></div>
+            <div class="artifact-grid">
+              <article>
+                <div class="artifact-heading"><span>Git review plan</span></div>
+                <pre id="git-plan" class="code-box">Create a plan first.</pre>
+              </article>
+              <article>
+                <div class="artifact-heading"><span>Lab dry-run proof</span></div>
+                <pre id="dryrun-proof" class="code-box">Run dry-run after validation is reviewed.</pre>
+              </article>
+            </div>
+            <div class="button-row">
+              <button id="run-dry-run" type="button" disabled>Run lab dry-run</button>
+              <button class="secondary" type="button" data-go="apply">Open apply</button>
+            </div>
+          </section>
+
+          <section id="view-apply" class="view">
+            <section class="section-heading">
+              <h3>Apply + Verify</h3>
+              <p>Apply stays locked until policy validation and lab dry-run proof pass.</p>
+            </section>
+            <section class="apply-gates">
+              <article id="gate-plan"><span>Plan</span><strong>Waiting</strong></article>
+              <article id="gate-validation"><span>Validation</span><strong>Waiting</strong></article>
+              <article id="gate-dryrun"><span>Dry-run</span><strong>Waiting</strong></article>
+              <article id="gate-verify"><span>Verify</span><strong>Waiting</strong></article>
+            </section>
+            <pre id="apply-transcript" class="code-box tall">No device command has been committed.</pre>
+            <div class="button-row">
+              <button id="apply-change" class="danger" type="button" disabled>Apply in Arista lab</button>
+              <button id="verify-change" class="secondary" type="button" disabled>Verify live state</button>
+              <button id="rollback-change" class="secondary" type="button" disabled>Rollback lab change</button>
+            </div>
+          </section>
+
+          <section id="view-evidence" class="view">
+            <section class="section-heading">
+              <h3>Evidence</h3>
+              <p>Everything created or inspected by the UI is collected here for review.</p>
+            </section>
+            <div class="evidence-tabs" aria-label="Evidence artifacts">
+              <button class="evidence-tab active" type="button" data-artifact="overview">Overview</button>
+              <button class="evidence-tab" type="button" data-artifact="intent">YAML</button>
+              <button class="evidence-tab" type="button" data-artifact="config">Commands</button>
+              <button class="evidence-tab" type="button" data-artifact="validation">Validation</button>
+              <button class="evidence-tab" type="button" data-artifact="lab">Lab</button>
+              <button class="evidence-tab" type="button" data-artifact="git">Git</button>
+              <button class="evidence-tab" type="button" data-artifact="jobs">Jobs</button>
+            </div>
+            <pre id="evidence-output" class="code-box evidence-output">No artifacts yet. Start with Setup or Desired State.</pre>
+            <div class="button-row">
+              <button id="refresh-evidence" type="button">Refresh evidence</button>
+              <button class="secondary" type="button" data-go="home">Back home</button>
             </div>
           </section>
         </section>
+
+        <aside class="outcome-panel" aria-label="Live outcome">
+          <div class="outcome-head">
+            <span>Live outcome</span>
+            <strong id="outcome-state">Idle</strong>
+          </div>
+          <h3 id="outcome-title">Ready.</h3>
+          <p id="outcome-summary">Choose a step. The platform will show what happened, what artifact changed, and whether any device config was touched.</p>
+          <section class="outcome-facts">
+            <article>
+              <span>Expected</span>
+              <p id="outcome-expected">No action selected.</p>
+            </article>
+            <article>
+              <span>Actual</span>
+              <p id="outcome-actual">Waiting for a UI click.</p>
+            </article>
+            <article>
+              <span>Artifact</span>
+              <p id="outcome-artifact">None yet.</p>
+            </article>
+            <article>
+              <span>Device config</span>
+              <p id="outcome-device">No device writes.</p>
+            </article>
+          </section>
+          <section class="next-action">
+            <span>Next safe action</span>
+            <strong id="next-action">Check workspace or create a plan.</strong>
+          </section>
+        </aside>
       </section>
     </main>
-    <script src="/static/app.js?v=20260702-18"></script>
+    <script src="/static/app.js?v=20260703-mvp2"></script>
   </body>
 </html>
