@@ -154,8 +154,25 @@ password stripped from its inventory) + on-prem runner on the ORB clab VM
   the change stayed `validated`, and VLAN 95 never appeared on the device —
   the control plane structurally cannot self-execute.
 
-Remaining in Phase 0: **M3** (UI async job polling + Runners panel — the API
-is done; the browser still renders sync/local-mode lab actions) and **M5**.
+### ✅ M3 DONE (2026-07-03)
+
+The browser now drives the runner. `awaitLabResult()` detects a queued
+(runner-mode) response and polls `GET /api/jobs/{id}` to a terminal state,
+normalizing it into the exact shape local mode returns — so dry-run/apply/
+rollback render identically whether executed in-process or on the runner, with
+a live "on runner…" progress state. Setup gained a **Runners panel** (mint
+single-use join token + enroll command, live runner list with online/offline
+chips), the Proof-mode gate is runner-aware (Runner-backed / No runner online),
+and standalone Verify is disabled in runner mode (apply already verifies on the
+runner). `/api/health` exposes `execution.mode`. Verified: control plane on Mac
+(mvp11, runner mode) served the panel, runner online, and the browser polling
+path ran `queued → running → completed|pass` with full transcript; lab left
+clean (VLANs 93–96 all absent).
+
+Remaining in Phase 0: **M5** (Postgres, auth/RBAC/multi-tenancy, change-type
+registry refactor, security whitepaper + failure-domain doc). Also deferred:
+routing read paths (verify/readiness/drift/discovery) through the runner — today
+they run control-plane-side and so are local-mode only.
 
 ### M5 — SaaS-able hardening (starts after M4 demo, still Phase 0)
 Postgres migration (SQLAlchemy or thin driver swap), minimal login (single
