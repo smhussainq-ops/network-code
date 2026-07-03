@@ -12,17 +12,18 @@ Let a network engineer use the UI to:
 1. Check workspace readiness.
 2. Discover the Arista lab switch.
 3. Save the device into source of truth.
-4. Define desired network state.
+4. Define desired network state from multiple intent types.
 5. Create a plan.
 6. Review validation.
 7. Dry-run the candidate in an EOS config session.
 8. Apply only after dry-run proof.
 9. Verify live state.
-10. Review evidence.
+10. Detect drift.
+11. Review evidence and audit sessions.
 
 ## MVP Scope
 
-Supported end-to-end change:
+Supported write/apply change for full Arista lab proof:
 
 - Site: `store-1842`
 - Device: `v2-store1`
@@ -31,6 +32,17 @@ Supported end-to-end change:
 - Change: add VLAN `90`
 - VLAN name: `GUEST_WIFI`
 - Subnet: `10.42.90.0/24`
+
+Supported desired-state plan/validate types:
+
+- Add VLAN
+- Interface config
+- BGP neighbor
+- ACL rule
+- Site/device source-of-truth intent
+
+Arista lab dry-run/apply/rollback gates are exposed per intent type. Site/device
+intent is source-of-truth only and keeps device writes locked.
 
 The MVP uses:
 
@@ -41,6 +53,7 @@ The MVP uses:
 - Static validation from `policies/invariants.yaml`.
 - Arista EOS config sessions for dry-run, apply, rollback, and verification.
 - SQLite job/change records under `.netcode/netcode.db`.
+- Audit session extraction from durable job transcripts.
 
 ## UI Flow
 
@@ -81,14 +94,23 @@ Passwords entered for discovery are not written to source of truth.
 
 ### Desired State
 
-The engineer defines the network outcome in a form.
+The engineer first chooses the network outcome:
+
+- Add VLAN
+- Interface config
+- BGP neighbor
+- ACL rule
+- Site/device intent
+
+The form then changes to show only fields relevant to that intent.
 
 The UI generates:
 
 - Intent YAML
-- Rendered Arista EOS candidate config
+- Rendered Arista EOS candidate config where the intent has device commands
 - Static validation report
 - Git review plan
+- Apply gate metadata
 
 Device config writes: none.
 
@@ -123,11 +145,20 @@ Apply remains locked until:
 - Plan exists
 - Validation passed
 - Lab dry-run passed
+- Selected intent type supports Arista lab writes
 
 After apply, the UI allows:
 
 - Rez live-state verification
 - Rollback
+
+### Drift
+
+Drift checks are read-only.
+
+For VLAN intent, the UI compares desired VLAN state against live Rez state.
+For non-VLAN intent, the UI collects live state and records that deep drift
+comparison still needs the next typed verifier.
 
 ### Evidence
 
@@ -140,6 +171,7 @@ Shows:
 - Lab proof
 - Git review plan
 - Jobs
+- Audit sessions with command transcripts
 
 ## Current Limits
 
@@ -148,6 +180,9 @@ This MVP is intentionally honest about scope:
 - Multi-vendor read/discovery is available through Rez.
 - Multi-vendor config push is not complete.
 - Arista EOS is the only wired write/apply path.
+- VLAN has the strongest current end-to-end verification through Rez.
+- Non-VLAN Arista intents have plan/validate and lab command-session plumbing,
+  but production rollout remains locked.
 - NetBox/Nautobot are not active source-of-truth providers yet.
 - Approval/RBAC is out of scope for this single-user MVP.
 - Production change windows and enterprise credential handling are not complete.
@@ -158,3 +193,8 @@ The UI is successful when an engineer can say:
 
 > I defined the desired state, saw the exact plan, validated it, dry-ran it,
 > applied it only after proof, verified live state, and have evidence for review.
+
+For any device write, the success criteria also require:
+
+> Every command session is recorded as a durable job and visible from the Audit
+> evidence view.

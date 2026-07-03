@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Netcode MVP</title>
     <link rel="icon" href="/static/favicon.svg" type="image/svg+xml" />
-    <link rel="stylesheet" href="/static/styles.css?v=20260703-mvp2" />
+    <link rel="stylesheet" href="/static/styles.css?v=20260703-mvp4" />
   </head>
   <body>
     <main class="app-shell">
@@ -14,7 +14,7 @@
           <div class="brand-mark">NC</div>
           <div>
             <h1>Netcode</h1>
-            <p>Terraform-style network changes for the Arista lab.</p>
+            <p>Terraform-style network changes with audited lab proof.</p>
           </div>
         </div>
 
@@ -26,6 +26,7 @@
           <button class="nav-item" type="button" data-view="plan">Plan</button>
           <button class="nav-item" type="button" data-view="validate">Validate</button>
           <button class="nav-item" type="button" data-view="apply">Apply</button>
+          <button class="nav-item" type="button" data-view="drift">Drift</button>
           <button class="nav-item" type="button" data-view="evidence">Evidence</button>
         </nav>
 
@@ -63,13 +64,18 @@
               </button>
               <button class="choice-card" type="button" data-go="desired">
                 <span>3</span>
-                <strong>Create network change</strong>
-                <p>Define VLAN 90 as desired state, then generate the plan.</p>
+                <strong>Create desired state</strong>
+                <p>Choose VLAN, interface, BGP, ACL, or site/device intent, then generate the plan.</p>
+              </button>
+              <button class="choice-card" type="button" data-go="drift">
+                <span>4</span>
+                <strong>Check drift</strong>
+                <p>Compare trusted intent against live state and show mismatch evidence.</p>
               </button>
               <button class="choice-card" type="button" data-go="evidence">
-                <span>4</span>
+                <span>5</span>
                 <strong>Review evidence</strong>
-                <p>See YAML, generated config, validation, lab proof, jobs, and Git plan.</p>
+                <p>See YAML, generated config, validation, lab proof, audit sessions, jobs, and Git plan.</p>
               </button>
             </div>
 
@@ -158,27 +164,37 @@
           <section id="view-desired" class="view">
             <section class="section-heading">
               <h3>Desired State</h3>
-              <p>Describe the network outcome. The platform turns this into YAML intent and generated Arista EOS config.</p>
+              <p>Pick the outcome first. The platform builds the right YAML, template, validation, plan, and apply gates for that intent type.</p>
             </section>
-            <div class="two-column">
+            <div class="desired-layout">
               <form id="change-form" class="form-panel">
-                <label>Site<input name="site" value="store-1842" /></label>
-                <label>Device<input name="device_id" value="v2-store1" /></label>
-                <label>VLAN ID<input name="vlan_id" type="number" min="2" max="4094" value="90" /></label>
-                <label>Name<input name="name" value="GUEST_WIFI" /></label>
-                <label>Subnet<input name="subnet" value="10.42.90.0/24" /></label>
-                <label>Purpose<input name="purpose" value="guest" /></label>
-                <label>Requested by<input name="requested_by" value="lab-engineer" /></label>
-                <label class="check-row"><input name="pci_reachable" type="checkbox" /> PCI reachable</label>
+                <fieldset class="change-type-fieldset">
+                  <legend>What do you want the network to look like?</legend>
+                  <div id="change-type-grid" class="change-type-grid"></div>
+                </fieldset>
+                <section class="form-section">
+                  <h4>Target</h4>
+                  <div class="form-grid">
+                    <label>Site<input name="site" value="store-1842" /></label>
+                    <label>Device<input name="device_id" value="v2-store1" /></label>
+                    <label>Requested by<input name="requested_by" value="lab-engineer" /></label>
+                    <label>Ticket / change ID<input name="ticket_id" placeholder="optional" /></label>
+                  </div>
+                </section>
+                <section class="form-section">
+                  <h4 id="dynamic-title">Intent details</h4>
+                  <div id="dynamic-fields" class="form-grid"></div>
+                </section>
                 <div class="button-row">
                   <button id="create-plan" type="button">Create plan</button>
                   <button class="secondary" type="button" data-go="plan">Open plan</button>
                 </div>
               </form>
               <article class="result-panel">
-                <span>Desired state</span>
-                <h4 id="desired-title">Add VLAN 90 to v2-store1</h4>
-                <p id="desired-summary">The UI starts with a form. YAML remains visible as an artifact, not as the primary workflow.</p>
+                <span>Selected workflow</span>
+                <h4 id="desired-title">Add VLAN</h4>
+                <p id="desired-summary">Choose a change type and fill in the outcome. YAML remains visible as an artifact, not as the primary workflow.</p>
+                <div id="desired-capability" class="capability-strip"></div>
                 <pre id="desired-yaml" class="code-box">Create a plan to see the YAML intent.</pre>
               </article>
             </div>
@@ -193,7 +209,7 @@
               <article><span>Action</span><strong id="plan-action">No plan yet</strong></article>
               <article><span>Affected device</span><strong id="plan-device">-</strong></article>
               <article><span>Risk</span><strong id="plan-risk">Unknown</strong></article>
-              <article><span>Device writes</span><strong id="plan-writes">None</strong></article>
+              <article><span>Apply gate</span><strong id="plan-writes">None</strong></article>
             </section>
             <div class="artifact-grid">
               <article>
@@ -214,7 +230,7 @@
           <section id="view-validate" class="view">
             <section class="section-heading">
               <h3>Validate</h3>
-              <p>Policy checks and Arista dry-run must pass before apply is unlocked.</p>
+              <p>Policy checks must pass for every intent. Lab dry-run is available only for intent types with an Arista write adapter.</p>
             </section>
             <div id="validation-list" class="check-list"></div>
             <div class="artifact-grid">
@@ -236,7 +252,7 @@
           <section id="view-apply" class="view">
             <section class="section-heading">
               <h3>Apply + Verify</h3>
-              <p>Apply stays locked until policy validation and lab dry-run proof pass.</p>
+              <p>Apply stays locked until the selected intent type supports lab writes, policy validation passes, and dry-run proof exists.</p>
             </section>
             <section class="apply-gates">
               <article id="gate-plan"><span>Plan</span><strong>Waiting</strong></article>
@@ -252,6 +268,24 @@
             </div>
           </section>
 
+          <section id="view-drift" class="view">
+            <section class="section-heading">
+              <h3>Drift</h3>
+              <p>Collect live state and compare it against trusted desired state. Drift checks are read-only.</p>
+            </section>
+            <section class="plan-summary">
+              <article><span>Compliance</span><strong id="drift-compliance">Unknown</strong></article>
+              <article><span>Current intent</span><strong id="drift-intent">None</strong></article>
+              <article><span>Live state</span><strong id="drift-live">Not collected</strong></article>
+              <article><span>Action</span><strong id="drift-action">Review</strong></article>
+            </section>
+            <pre id="drift-output" class="code-box tall">Create a plan, then check drift for that intent.</pre>
+            <div class="button-row">
+              <button id="check-drift" type="button">Check drift</button>
+              <button class="secondary" type="button" data-go="evidence">Review evidence</button>
+            </div>
+          </section>
+
           <section id="view-evidence" class="view">
             <section class="section-heading">
               <h3>Evidence</h3>
@@ -264,6 +298,7 @@
               <button class="evidence-tab" type="button" data-artifact="validation">Validation</button>
               <button class="evidence-tab" type="button" data-artifact="lab">Lab</button>
               <button class="evidence-tab" type="button" data-artifact="git">Git</button>
+              <button class="evidence-tab" type="button" data-artifact="audit">Audit</button>
               <button class="evidence-tab" type="button" data-artifact="jobs">Jobs</button>
             </div>
             <pre id="evidence-output" class="code-box evidence-output">No artifacts yet. Start with Setup or Desired State.</pre>
@@ -306,6 +341,6 @@
         </aside>
       </section>
     </main>
-    <script src="/static/app.js?v=20260703-mvp2"></script>
+    <script src="/static/app.js?v=20260703-mvp4"></script>
   </body>
 </html>

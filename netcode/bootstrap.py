@@ -18,12 +18,74 @@ interface Vlan{{ vlan.id }}
 """
 
 
+INTERFACE_CONFIG_TEMPLATE = """interface {{ interface.name }}
+{% if interface.description %}
+   description {{ interface.description }}
+{% endif %}
+{% if interface.mode == "access" %}
+   switchport mode access
+   switchport access vlan {{ interface.access_vlan }}
+{% elif interface.mode == "trunk" %}
+   switchport mode trunk
+{% if interface.trunk_allowed_vlans %}
+   switchport trunk allowed vlan {{ interface.trunk_allowed_vlans | join(',') }}
+{% endif %}
+{% elif interface.mode == "routed" %}
+   no switchport
+   ip address {{ interface.ip_address }}
+{% endif %}
+{% if interface.enabled %}
+   no shutdown
+{% else %}
+   shutdown
+{% endif %}
+"""
+
+
+BGP_NEIGHBOR_TEMPLATE = """router bgp {{ bgp.asn }}
+{% if bgp.router_id %}
+   router-id {{ bgp.router_id }}
+{% endif %}
+{% for neighbor in bgp.neighbors %}
+   neighbor {{ neighbor.address }} remote-as {{ neighbor.remote_as }}
+{% if neighbor.description %}
+   neighbor {{ neighbor.address }} description {{ neighbor.description }}
+{% endif %}
+{% if neighbor.update_source %}
+   neighbor {{ neighbor.address }} update-source {{ neighbor.update_source }}
+{% endif %}
+{% if neighbor.shutdown %}
+   neighbor {{ neighbor.address }} shutdown
+{% else %}
+   no neighbor {{ neighbor.address }} shutdown
+{% endif %}
+{% endfor %}
+"""
+
+
+ACL_RULE_TEMPLATE = """ip access-list {{ acl.name }}
+{% if acl.remark %}
+   remark {{ acl.remark }}
+{% endif %}
+   {{ acl.sequence }} {{ acl.action }} {{ acl.protocol }} {{ acl.source }} {{ acl.destination }}{% if acl.destination_port %} eq {{ acl.destination_port }}{% endif %}
+"""
+
+
+SITE_DEVICE_INTENT_TEMPLATE = """! Source-of-truth only intent.
+! Device {{ device.device_id }} should be represented in inventory before config push.
+"""
+
+
 def init_workspace(paths: WorkspacePaths, force: bool = False) -> list[Path]:
     paths.ensure()
     written: list[Path] = []
 
     files: list[tuple[Path, str]] = [
         (paths.templates / "arista" / "add_vlan.j2", ADD_VLAN_TEMPLATE),
+        (paths.templates / "arista" / "interface_config.j2", INTERFACE_CONFIG_TEMPLATE),
+        (paths.templates / "arista" / "bgp_neighbor.j2", BGP_NEIGHBOR_TEMPLATE),
+        (paths.templates / "arista" / "acl_rule.j2", ACL_RULE_TEMPLATE),
+        (paths.templates / "arista" / "site_device_intent.j2", SITE_DEVICE_INTENT_TEMPLATE),
     ]
     for path, content in files:
         if force or not path.exists():
@@ -91,12 +153,34 @@ def init_workspace(paths: WorkspacePaths, force: bool = False) -> list[Path]:
                 "   description ",
                 "   ip address ",
             ],
+            "interface_config_allowed_prefixes": [
+                "interface ",
+                "   description ",
+                "   switchport ",
+                "   no switchport",
+                "   ip address ",
+                "   shutdown",
+                "   no shutdown",
+            ],
+            "bgp_neighbor_allowed_prefixes": [
+                "router bgp ",
+                "   router-id ",
+                "   neighbor ",
+                "   no neighbor ",
+            ],
+            "acl_rule_allowed_prefixes": [
+                "ip access-list ",
+                "   remark ",
+                "   permit ",
+                "   deny ",
+            ],
+            "site_device_intent_allowed_prefixes": [
+                "! ",
+            ],
             "blocked_fragments": [
                 "username ",
                 "management api",
                 "interface Management",
-                "ip access-list",
-                "router bgp",
                 "router ospf",
                 "enable secret",
             ],

@@ -8,24 +8,26 @@ from typing import Any
 
 from jinja2 import Environment, FileSystemLoader, StrictUndefined
 
+from netcode.intent_utils import config_filename, template_for_intent
 from netcode.models import Intent, RenderResult
 from netcode.paths import WorkspacePaths
 
 
 def _variables(intent: Intent) -> dict[str, Any]:
     data = intent.model_dump()
-    network = ip_network(intent.vlan.subnet, strict=False)
-    data["vlan"]["network"] = str(network.network_address)
-    data["vlan"]["prefixlen"] = network.prefixlen
-    data["vlan"]["netmask"] = str(network.netmask)
-    if data["vlan"].get("svi", {}).get("enabled") and not data["vlan"]["svi"].get("gateway_ip"):
-        hosts = network.hosts()
-        data["vlan"]["svi"]["gateway_ip"] = str(next(hosts))
+    if intent.change_type == "add_vlan":
+        network = ip_network(intent.vlan.subnet, strict=False)
+        data["vlan"]["network"] = str(network.network_address)
+        data["vlan"]["prefixlen"] = network.prefixlen
+        data["vlan"]["netmask"] = str(network.netmask)
+        if data["vlan"].get("svi", {}).get("enabled") and not data["vlan"]["svi"].get("gateway_ip"):
+            hosts = network.hosts()
+            data["vlan"]["svi"]["gateway_ip"] = str(next(hosts))
     return data
 
 
 def render_intent(intent: Intent, paths: WorkspacePaths) -> RenderResult:
-    template_name = "add_vlan.j2"
+    template_name = template_for_intent(intent)
     template_path = paths.templates / "arista" / template_name
     env = Environment(
         loader=FileSystemLoader(str(template_path.parent)),
@@ -45,8 +47,7 @@ def render_intent(intent: Intent, paths: WorkspacePaths) -> RenderResult:
 
 
 def write_rendered_config(paths: WorkspacePaths, intent: Intent, result: RenderResult) -> Path:
-    filename = f"{intent.site}-{intent.change_type}-vlan-{intent.vlan.id}.eos"
-    path = paths.rendered / filename
+    path = paths.rendered / config_filename(intent)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(result.config, encoding="utf-8")
     return path

@@ -1,0 +1,5 @@
+ip access-list {{ acl.name }}
+{% if acl.remark %}
+   remark {{ acl.remark }}
+{% endif %}
+   {{ acl.sequence }} {{ acl.action }} {{ acl.protocol }} {{ acl.source }} {{ acl.destination }}{% if acl.destination_port %} eq {{ acl.destination_port }}{% endif %}

@@ -17,9 +17,11 @@ from netcode.drift import compliance_summary, vlan_drift_report
 from netcode.gitflow import git_workspace_status
 from netcode.gitops import gitops_plan
 from netcode.inventory import Inventory
+from netcode.intent_utils import lab_write_supported, plan_metadata, production_write_supported
 from netcode.jobs import JobRunner
-from netcode.lab import lab_status, run_arista_end_to_end, run_lab_action
-from netcode.orchestrator import create_add_vlan_intent, run_static_pipeline
+from netcode.lab import AristaEOSLabAdapter, lab_status, run_arista_end_to_end, run_lab_action
+from netcode.models import load_intent
+from netcode.orchestrator import create_add_vlan_intent, create_desired_state_intent, run_static_pipeline
 from netcode.paths import paths
 from netcode.platform import platform_capabilities
 from netcode.scale import rollout_plan
@@ -38,6 +40,14 @@ class AddVlanRequest(BaseModel):
     purpose: str = "guest"
     pci_reachable: bool = False
     requested_by: str = "lab-engineer"
+
+
+class DesiredStatePlanRequest(BaseModel):
+    change_type: str = "add_vlan"
+    site: str = "store-1842"
+    device_id: str = "v2-store1"
+    requested_by: str = "lab-engineer"
+    values: dict[str, object] = {}
 
 
 class IntentPathRequest(BaseModel):
@@ -87,6 +97,55 @@ class ScalePlanRequest(BaseModel):
     device_ids: list[str] | None = None
     canary_size: int = 1
     batch_size: int = 100
+
+
+DESIRED_STATE_CATALOG: list[dict[str, object]] = [
+    {
+        "id": "add_vlan",
+        "label": "Add VLAN",
+        "outcome": "Create a Layer 2 segment and optional SVI.",
+        "risk": "Low for lab",
+        "lab_write_supported": True,
+        "production_write_supported": False,
+        "fields": ["vlan_id", "name", "subnet", "purpose", "svi_enabled", "gateway_ip", "pci_reachable"],
+    },
+    {
+        "id": "interface_config",
+        "label": "Interface Config",
+        "outcome": "Configure access, trunk, or routed interface intent.",
+        "risk": "Medium: can affect connected hosts",
+        "lab_write_supported": True,
+        "production_write_supported": False,
+        "fields": ["interface", "description", "mode", "access_vlan", "trunk_allowed_vlans", "ip_address", "enabled"],
+    },
+    {
+        "id": "bgp_neighbor",
+        "label": "BGP Neighbor",
+        "outcome": "Define routing adjacency intent and generated router BGP commands.",
+        "risk": "High: can affect reachability",
+        "lab_write_supported": True,
+        "production_write_supported": False,
+        "fields": ["asn", "router_id", "neighbor", "remote_as", "description", "update_source", "shutdown"],
+    },
+    {
+        "id": "acl_rule",
+        "label": "ACL Rule",
+        "outcome": "Add a sequenced permit or deny rule to a named ACL.",
+        "risk": "High: can permit or block traffic",
+        "lab_write_supported": True,
+        "production_write_supported": False,
+        "fields": ["acl_name", "sequence", "action", "protocol", "source", "destination", "destination_port", "remark"],
+    },
+    {
+        "id": "site_device_intent",
+        "label": "Site / Device Intent",
+        "outcome": "Capture source-of-truth intent for a site/device before config exists.",
+        "risk": "Inventory only",
+        "lab_write_supported": False,
+        "production_write_supported": False,
+        "fields": ["new_device_id", "role", "platform", "management_ip", "groups", "notes"],
+    },
+]
 
 
 app = FastAPI(title="Netcode Platform", version="0.1.0")
@@ -160,6 +219,64 @@ def wizard_add_vlan(request: AddVlanRequest) -> dict[str, object]:
             "change": record_to_dict(store.get_change(change.id)),
             "intent_path": str(intent_path),
             "pipeline": result.model_dump(),
+            "plan": plan_metadata(load_intent(intent_path)),
+            "workflow": workflow.as_dict(),
+        }
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/api/desired-state/catalog")
+def desired_state_catalog() -> dict[str, object]:
+    return {"change_types": DESIRED_STATE_CATALOG}
+
+
+@app.post("/api/desired-state/plan")
+def desired_state_plan(request: DesiredStatePlanRequest) -> dict[str, object]:
+    p = paths()
+    try:
+        intent_path = create_desired_state_intent(
+            p,
+            change_type=request.change_type,
+            site=request.site,
+            device_id=request.device_id,
+            requested_by=request.requested_by,
+            values=request.values,
+        )
+        intent = load_intent(intent_path)
+        result = run_static_pipeline(p, intent_path)
+        store = PlatformStore(p)
+        change = store.get_or_create_change(intent_path, request.device_id, requested_by=request.requested_by)
+        workflow = state_after_static_validation(result.status == "pass")
+        metadata = plan_metadata(intent)
+        result_payload = result.model_dump()
+        result_payload["plan"] = metadata
+        store.update_change(
+            change.id,
+            "validated" if result.status == "pass" else "blocked",
+            result_payload,
+            workflow_state=workflow.state,
+        )
+        store.record_workflow_event(
+            change.id,
+            "plan",
+            change.workflow_state,
+            workflow.state,
+            workflow.message,
+            {
+                "intent_path": str(intent_path),
+                "change_type": intent.change_type,
+                "checks": len(result.validation.checks),
+                "lab_write_supported": lab_write_supported(intent),
+                "production_write_supported": production_write_supported(intent),
+            },
+        )
+        return {
+            "ok": result.status == "pass",
+            "change": record_to_dict(store.get_change(change.id)),
+            "intent_path": str(intent_path),
+            "pipeline": result.model_dump(),
+            "plan": metadata,
             "workflow": workflow.as_dict(),
         }
     except Exception as exc:
@@ -423,6 +540,32 @@ def api_verify(request: GenericVerifyRequest) -> dict[str, object]:
     }
 
 
+@app.post("/api/verify/intent")
+def api_verify_intent(request: IntentPathRequest) -> dict[str, object]:
+    p = paths()
+    intent = load_intent(Path(request.intent_path))
+    inventory = Inventory(p.inventories / "lab.yaml")
+    device_id = request.device_id or (intent.targets.device_ids[0] if intent.targets.device_ids else "")
+    device = inventory.by_id.get(device_id)
+    if not device:
+        raise HTTPException(status_code=404, detail=f"Unknown device {device_id}")
+    adapter = AristaEOSLabAdapter(device)
+    try:
+        adapter.connect()
+        verification = adapter.verify_intent(intent, present=True)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    finally:
+        adapter.disconnect()
+    return {
+        "ok": verification.status == "pass",
+        "device_id": device.id,
+        "platform": device.platform,
+        "change_type": intent.change_type,
+        "verification": verification.__dict__,
+    }
+
+
 @app.post("/api/drift/vlan")
 def api_vlan_drift(request: IntentPathRequest) -> dict[str, object]:
     p = paths()
@@ -460,6 +603,37 @@ def api_changes() -> dict[str, object]:
 def api_jobs() -> dict[str, object]:
     store = PlatformStore(paths())
     return {"jobs": [record_to_dict(record) for record in store.list_jobs()]}
+
+
+@app.get("/api/audit/sessions")
+def api_audit_sessions() -> dict[str, object]:
+    store = PlatformStore(paths())
+    changes = [record_to_dict(record) for record in store.list_changes(limit=100)]
+    jobs = [record_to_dict(record) for record in store.list_jobs(limit=100)]
+    events = []
+    for change in changes:
+        events.extend(record_to_dict(event) for event in store.list_workflow_events(str(change["id"])))
+    sessions = []
+    for job in jobs:
+        result = job.get("result") or {}
+        lab_result = result.get("result") if isinstance(result, dict) else {}
+        evidence = lab_result.get("evidence", {}) if isinstance(lab_result, dict) else {}
+        transcript = evidence.get("transcript") or evidence.get("session", {}).get("transcript", [])
+        if transcript:
+            sessions.append(
+                {
+                    "job_id": job["id"],
+                    "change_id": job["change_id"],
+                    "action": job["action"],
+                    "status": job["status"],
+                    "message": job["message"],
+                    "created_at": job["created_at"],
+                    "updated_at": job["updated_at"],
+                    "session_name": lab_result.get("session_name", ""),
+                    "commands": transcript,
+                }
+            )
+    return {"changes": changes, "jobs": jobs, "events": events, "sessions": sessions}
 
 
 app.mount("/static", StaticFiles(directory=str(paths().static)), name="static")

@@ -38,7 +38,8 @@ body {
 
 button,
 input,
-select {
+select,
+textarea {
   font: inherit;
 }
 
@@ -83,7 +84,8 @@ button.danger {
 
 button:focus-visible,
 input:focus-visible,
-select:focus-visible {
+select:focus-visible,
+textarea:focus-visible {
   box-shadow: var(--focus);
   outline: 0;
 }
@@ -399,7 +401,8 @@ label {
 }
 
 input,
-select {
+select,
+textarea {
   background: white;
   border: 1px solid var(--line);
   border-radius: 7px;
@@ -407,6 +410,11 @@ select {
   min-height: 38px;
   padding: 8px 10px;
   width: 100%;
+}
+
+textarea {
+  min-height: 88px;
+  resize: vertical;
 }
 
 .check-row {
@@ -418,6 +426,99 @@ select {
 .check-row input {
   min-height: 16px;
   width: 16px;
+}
+
+.desired-layout {
+  display: grid;
+  gap: 16px;
+  grid-template-columns: minmax(420px, 520px) minmax(0, 1fr);
+}
+
+fieldset {
+  border: 0;
+  margin: 0;
+  padding: 0;
+}
+
+legend,
+.form-section h4 {
+  color: var(--text);
+  font-size: 14px;
+  font-weight: 750;
+  margin: 0 0 10px;
+}
+
+.change-type-grid {
+  display: grid;
+  gap: 8px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.change-type-card {
+  align-items: start;
+  background: var(--surface-soft);
+  border-color: var(--line);
+  color: var(--text);
+  display: grid;
+  gap: 6px;
+  justify-items: start;
+  min-height: 118px;
+  padding: 12px;
+  text-align: left;
+}
+
+.change-type-card.active {
+  background: var(--blue-soft);
+  border-color: #b8c7f4;
+}
+
+.change-type-card span,
+.change-type-card em,
+.capability-strip span {
+  color: var(--muted);
+  font-size: 11px;
+  font-style: normal;
+  font-weight: 750;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+}
+
+.change-type-card p {
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.35;
+  margin: 0;
+}
+
+.form-section {
+  border-top: 1px solid var(--line);
+  padding-top: 12px;
+}
+
+.form-grid {
+  display: grid;
+  gap: 11px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.form-grid .wide,
+.form-grid .check-row {
+  grid-column: 1 / -1;
+}
+
+.capability-strip {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 10px 0 12px;
+}
+
+.capability-strip span {
+  background: var(--surface-soft);
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  color: var(--text);
+  padding: 5px 8px;
 }
 
 .button-row {
@@ -670,6 +771,9 @@ select {
   .choice-grid,
   .setup-grid,
   .two-column,
+  .desired-layout,
+  .change-type-grid,
+  .form-grid,
   .artifact-grid,
   .summary-strip,
   .plan-summary,

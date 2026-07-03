@@ -84,7 +84,125 @@ class AddVlanIntent(BaseModel):
         return value
 
 
-Intent = AddVlanIntent
+class InterfaceSpec(BaseModel):
+    name: str
+    description: str = ""
+    enabled: bool = True
+    mode: Literal["access", "trunk", "routed"] = "access"
+    access_vlan: int | None = None
+    trunk_allowed_vlans: list[int] = Field(default_factory=list)
+    ip_address: str | None = None
+
+    @field_validator("name")
+    @classmethod
+    def interface_name(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("interface name is required")
+        return value
+
+    @model_validator(mode="after")
+    def validate_mode(self) -> "InterfaceSpec":
+        if self.mode == "access" and self.access_vlan is None:
+            raise ValueError("access_vlan is required for access interfaces")
+        if self.mode == "routed" and not self.ip_address:
+            raise ValueError("ip_address is required for routed interfaces")
+        return self
+
+
+class InterfaceConfigIntent(BaseModel):
+    change_type: Literal["interface_config"] = "interface_config"
+    site: str
+    targets: TargetSpec
+    interface: InterfaceSpec
+    policy: PolicySpec = Field(default_factory=PolicySpec)
+    metadata: IntentMetadata = Field(default_factory=IntentMetadata)
+
+
+class BgpNeighborSpec(BaseModel):
+    address: str
+    remote_as: int
+    description: str = ""
+    update_source: str | None = None
+    shutdown: bool = False
+
+    @field_validator("address")
+    @classmethod
+    def neighbor_address(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("neighbor address is required")
+        return value
+
+
+class BgpSpec(BaseModel):
+    asn: int
+    router_id: str | None = None
+    neighbors: list[BgpNeighborSpec]
+
+    @model_validator(mode="after")
+    def has_neighbor(self) -> "BgpSpec":
+        if not self.neighbors:
+            raise ValueError("at least one BGP neighbor is required")
+        return self
+
+
+class BgpNeighborIntent(BaseModel):
+    change_type: Literal["bgp_neighbor"] = "bgp_neighbor"
+    site: str
+    targets: TargetSpec
+    bgp: BgpSpec
+    policy: PolicySpec = Field(default_factory=PolicySpec)
+    metadata: IntentMetadata = Field(default_factory=IntentMetadata)
+
+
+class AclRuleSpec(BaseModel):
+    name: str
+    sequence: int = 10
+    action: Literal["permit", "deny"] = "permit"
+    protocol: Literal["ip", "tcp", "udp", "icmp"] = "ip"
+    source: str = "any"
+    destination: str = "any"
+    destination_port: str | None = None
+    remark: str = ""
+
+    @field_validator("name")
+    @classmethod
+    def acl_name(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("ACL name is required")
+        return value
+
+
+class AclRuleIntent(BaseModel):
+    change_type: Literal["acl_rule"] = "acl_rule"
+    site: str
+    targets: TargetSpec
+    acl: AclRuleSpec
+    policy: PolicySpec = Field(default_factory=PolicySpec)
+    metadata: IntentMetadata = Field(default_factory=IntentMetadata)
+
+
+class SiteDeviceSpec(BaseModel):
+    device_id: str
+    role: str
+    platform: str
+    management_ip: str
+    groups: list[str] = Field(default_factory=list)
+    notes: str = ""
+
+
+class SiteDeviceIntent(BaseModel):
+    change_type: Literal["site_device_intent"] = "site_device_intent"
+    site: str
+    targets: TargetSpec
+    device: SiteDeviceSpec
+    policy: PolicySpec = Field(default_factory=PolicySpec)
+    metadata: IntentMetadata = Field(default_factory=IntentMetadata)
+
+
+Intent = AddVlanIntent | InterfaceConfigIntent | BgpNeighborIntent | AclRuleIntent | SiteDeviceIntent
 
 
 class CheckResult(BaseModel):
@@ -157,4 +275,12 @@ def load_intent(path: Path) -> Intent:
     change_type = data.get("change_type")
     if change_type == "add_vlan":
         return AddVlanIntent.model_validate(data)
+    if change_type == "interface_config":
+        return InterfaceConfigIntent.model_validate(data)
+    if change_type == "bgp_neighbor":
+        return BgpNeighborIntent.model_validate(data)
+    if change_type == "acl_rule":
+        return AclRuleIntent.model_validate(data)
+    if change_type == "site_device_intent":
+        return SiteDeviceIntent.model_validate(data)
     raise ValueError(f"Unsupported change_type: {change_type!r}")

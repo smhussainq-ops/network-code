@@ -1,9 +1,85 @@
 const $ = (id) => document.getElementById(id);
 const $$ = (selector) => Array.from(document.querySelectorAll(selector));
 
+const LOCAL_CHANGE_TYPES = {
+  add_vlan: {
+    label: "Add VLAN",
+    outcome: "Create a Layer 2 segment and optional SVI.",
+    risk: "Low for lab",
+    fields: [
+      { name: "vlan_id", label: "VLAN ID", type: "number", value: 90, min: 2, max: 4094 },
+      { name: "name", label: "Name", type: "text", value: "GUEST_WIFI" },
+      { name: "subnet", label: "Subnet", type: "text", value: "10.42.90.0/24" },
+      { name: "purpose", label: "Purpose", type: "text", value: "guest" },
+      { name: "svi_enabled", label: "Create SVI", type: "checkbox", value: false },
+      { name: "gateway_ip", label: "Gateway IP", type: "text", value: "", placeholder: "auto from subnet" },
+      { name: "pci_reachable", label: "PCI reachable", type: "checkbox", value: false },
+    ],
+  },
+  interface_config: {
+    label: "Interface Config",
+    outcome: "Configure access, trunk, or routed interface intent.",
+    risk: "Medium: can affect connected hosts",
+    fields: [
+      { name: "interface", label: "Interface", type: "text", value: "Ethernet1" },
+      { name: "description", label: "Description", type: "text", value: "NETCODE_LAB_ENDPOINT" },
+      { name: "mode", label: "Mode", type: "select", value: "access", options: [["access", "Access"], ["trunk", "Trunk"], ["routed", "Routed"]] },
+      { name: "access_vlan", label: "Access VLAN", type: "number", value: 90, min: 2, max: 4094 },
+      { name: "trunk_allowed_vlans", label: "Trunk VLANs", type: "text", value: "90,91", placeholder: "comma separated" },
+      { name: "ip_address", label: "Routed IP", type: "text", value: "", placeholder: "10.0.0.1/31" },
+      { name: "enabled", label: "No shutdown", type: "checkbox", value: true },
+    ],
+  },
+  bgp_neighbor: {
+    label: "BGP Neighbor",
+    outcome: "Define routing adjacency intent and generated router BGP commands.",
+    risk: "High: can affect reachability",
+    fields: [
+      { name: "asn", label: "Local ASN", type: "number", value: 65001, min: 1 },
+      { name: "router_id", label: "Router ID", type: "text", value: "10.255.0.1" },
+      { name: "neighbor", label: "Neighbor IP", type: "text", value: "10.255.0.2" },
+      { name: "remote_as", label: "Remote ASN", type: "number", value: 65002, min: 1 },
+      { name: "description", label: "Description", type: "text", value: "NETCODE_LAB_PEER" },
+      { name: "update_source", label: "Update source", type: "text", value: "", placeholder: "Loopback0" },
+      { name: "shutdown", label: "Keep neighbor shutdown", type: "checkbox", value: false },
+    ],
+  },
+  acl_rule: {
+    label: "ACL Rule",
+    outcome: "Add a sequenced permit or deny rule to a named ACL.",
+    risk: "High: can permit or block traffic",
+    fields: [
+      { name: "acl_name", label: "ACL name", type: "text", value: "NETCODE_LAB" },
+      { name: "sequence", label: "Sequence", type: "number", value: 10, min: 1 },
+      { name: "action", label: "Action", type: "select", value: "permit", options: [["permit", "Permit"], ["deny", "Deny"]] },
+      { name: "protocol", label: "Protocol", type: "select", value: "ip", options: [["ip", "IP"], ["tcp", "TCP"], ["udp", "UDP"], ["icmp", "ICMP"]] },
+      { name: "source", label: "Source", type: "text", value: "any" },
+      { name: "destination", label: "Destination", type: "text", value: "any" },
+      { name: "destination_port", label: "Destination port", type: "text", value: "", placeholder: "443" },
+      { name: "remark", label: "Remark", type: "text", value: "managed by netcode" },
+    ],
+  },
+  site_device_intent: {
+    label: "Site / Device Intent",
+    outcome: "Capture source-of-truth intent before config exists.",
+    risk: "Inventory only",
+    fields: [
+      { name: "new_device_id", label: "New device ID", type: "text", value: "v2-store4" },
+      { name: "role", label: "Role", type: "text", value: "access-switch" },
+      { name: "platform", label: "Platform", type: "select", value: "arista_eos", options: [["arista_eos", "Arista EOS"], ["cisco_ios", "Cisco IOS/XE"], ["cisco_nxos", "Cisco NX-OS"], ["juniper_junos", "Juniper Junos"]] },
+      { name: "management_ip", label: "Management IP", type: "text", value: "172.100.1.44" },
+      { name: "groups", label: "Groups", type: "text", value: "stores,access-switches" },
+      { name: "notes", label: "Notes", type: "textarea", value: "source-of-truth proposal only" },
+    ],
+  },
+};
+
 const appState = {
   view: "home",
   artifact: "overview",
+  selectedChangeType: "add_vlan",
+  formValues: {},
+  catalog: null,
   health: null,
   git: null,
   source: null,
@@ -20,7 +96,17 @@ const appState = {
   changeLive: false,
   jobs: null,
   workflow: null,
+  audit: null,
+  drift: null,
 };
+
+function escapeHtml(value) {
+  return String(value)
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;");
+}
 
 function formatJson(value) {
   return JSON.stringify(value, null, 2);
@@ -100,32 +186,127 @@ function setView(view) {
   $$(".view").forEach((panel) => panel.classList.toggle("active", panel.id === `view-${view}`));
   $$(".nav-item").forEach((button) => button.classList.toggle("active", button.dataset.view === view));
   const titles = {
-    home: ["Define, plan, validate, apply, verify.", "A simple network-as-code flow using your Git repo, local YAML source of truth, Rez discovery, and the Arista ORB lab."],
+    home: ["Define, plan, validate, apply, verify.", "A Terraform-style network-as-code flow using Git, source of truth, Rez discovery, typed intents, validation, and audited Arista lab proof."],
     setup: ["Set up the workspace.", "Check Git, source of truth, adapters, and lab reachability before making a change."],
-    inventory: ["Discover and trust devices.", "Use Rez read adapters to discover the Arista lab switch, then import the reviewed device record."],
-    desired: ["Create desired state.", "Describe the network outcome in a simple form and let the platform create YAML and config."],
-    plan: ["Preview exact impact.", "Review the Terraform-style plan, generated commands, and blast radius before any device write."],
+    inventory: ["Discover and trust devices.", "Use Rez read adapters to discover devices, then import reviewed records into source of truth."],
+    desired: ["Create desired state.", "Choose the network outcome, fill the intent fields, and let the platform create YAML and candidate config."],
+    plan: ["Preview exact impact.", "Review the Terraform-style plan, generated commands, affected devices, risk, and apply gate."],
     validate: ["Validate before apply.", "Policy checks and lab dry-run proof must pass before apply is unlocked."],
-    apply: ["Apply and verify.", "Commit only after validation and dry-run proof, then prove live state."],
-    evidence: ["Review the evidence.", "Inspect every artifact created or inspected from the UI."],
+    apply: ["Apply and verify.", "Commit only after validation and dry-run proof, then prove live state and keep rollback available."],
+    drift: ["Detect drift.", "Compare desired state and live state without changing the network."],
+    evidence: ["Review the evidence.", "Inspect every artifact, audit event, and command session created from the UI."],
   };
   $("view-title").textContent = titles[view][0];
   $("view-subtitle").textContent = titles[view][1];
   if (view === "evidence") renderEvidence();
+  if (view === "drift") renderDrift();
+}
+
+function catalogItem(id = appState.selectedChangeType) {
+  const remote = appState.catalog?.change_types?.find((item) => item.id === id);
+  return { ...(LOCAL_CHANGE_TYPES[id] || LOCAL_CHANGE_TYPES.add_vlan), ...(remote || {}) };
+}
+
+function localSchema(id = appState.selectedChangeType) {
+  return LOCAL_CHANGE_TYPES[id] || LOCAL_CHANGE_TYPES.add_vlan;
+}
+
+function renderChangeTypeGrid() {
+  const catalog = appState.catalog?.change_types?.length ? appState.catalog.change_types : Object.entries(LOCAL_CHANGE_TYPES).map(([id, item]) => ({ id, ...item }));
+  $("change-type-grid").innerHTML = catalog
+    .map((item) => {
+      const active = item.id === appState.selectedChangeType ? "active" : "";
+      const lab = item.lab_write_supported ? "Lab apply" : "Plan only";
+      return `
+        <button class="change-type-card ${active}" type="button" data-change-type="${escapeHtml(item.id)}">
+          <strong>${escapeHtml(item.label)}</strong>
+          <span>${escapeHtml(item.risk || "")}</span>
+          <p>${escapeHtml(item.outcome || "")}</p>
+          <em>${escapeHtml(lab)}</em>
+        </button>
+      `;
+    })
+    .join("");
+  $$("#change-type-grid [data-change-type]").forEach((button) =>
+    button.addEventListener("click", () => {
+      selectChangeType(button.dataset.changeType);
+    })
+  );
+}
+
+function renderDynamicFields() {
+  const schema = localSchema();
+  $("dynamic-title").textContent = `${schema.label} details`;
+  $("dynamic-fields").innerHTML = schema.fields.map(renderField).join("");
+  $$("#dynamic-fields input, #dynamic-fields select, #dynamic-fields textarea").forEach((input) =>
+    input.addEventListener("input", () => {
+      storeDynamicValues();
+      resetChangeProof();
+    })
+  );
+}
+
+function renderField(field) {
+  const name = escapeHtml(field.name);
+  const label = escapeHtml(field.label);
+  const value = storedFieldValue(field);
+  if (field.type === "checkbox") {
+    return `<label class="check-row"><input name="${name}" type="checkbox" ${value ? "checked" : ""} /> ${label}</label>`;
+  }
+  if (field.type === "select") {
+    const options = field.options.map(([optionValue, text]) => `<option value="${escapeHtml(optionValue)}" ${optionValue === value ? "selected" : ""}>${escapeHtml(text)}</option>`).join("");
+    return `<label>${label}<select name="${name}">${options}</select></label>`;
+  }
+  if (field.type === "textarea") {
+    return `<label class="wide">${label}<textarea name="${name}" placeholder="${escapeHtml(field.placeholder || "")}">${escapeHtml(value || "")}</textarea></label>`;
+  }
+  return `<label>${label}<input name="${name}" type="${escapeHtml(field.type || "text")}" value="${escapeHtml(value ?? "")}" min="${escapeHtml(field.min ?? "")}" max="${escapeHtml(field.max ?? "")}" placeholder="${escapeHtml(field.placeholder || "")}" /></label>`;
+}
+
+function storedFieldValue(field) {
+  const values = appState.formValues[appState.selectedChangeType] || {};
+  return Object.prototype.hasOwnProperty.call(values, field.name) ? values[field.name] : field.value;
+}
+
+function storeDynamicValues() {
+  const schema = localSchema();
+  const form = new FormData($("change-form"));
+  const values = {};
+  for (const field of schema.fields) {
+    if (field.type === "checkbox") {
+      values[field.name] = form.get(field.name) === "on";
+    } else if (field.type === "number") {
+      const raw = form.get(field.name);
+      values[field.name] = raw === null || raw === "" ? null : Number(raw);
+    } else {
+      values[field.name] = String(form.get(field.name) || "");
+    }
+  }
+  appState.formValues[appState.selectedChangeType] = values;
+  return values;
+}
+
+function readDynamicValues() {
+  const values = storeDynamicValues();
+  const form = new FormData($("change-form"));
+  values.ticket_id = String(form.get("ticket_id") || "");
+  return values;
 }
 
 function changePayload() {
   const form = new FormData($("change-form"));
   return {
+    change_type: appState.selectedChangeType,
     site: String(form.get("site") || ""),
     device_id: String(form.get("device_id") || ""),
-    vlan_id: Number(form.get("vlan_id")),
-    name: String(form.get("name") || ""),
-    subnet: String(form.get("subnet") || ""),
-    purpose: String(form.get("purpose") || ""),
     requested_by: String(form.get("requested_by") || ""),
-    pci_reachable: form.get("pci_reachable") === "on",
+    values: readDynamicValues(),
   };
+}
+
+function selectedDeviceId() {
+  const payload = changePayload();
+  return payload.change_type === "site_device_intent" && payload.values.new_device_id ? String(payload.values.new_device_id) : payload.device_id;
 }
 
 function discoveryPayload() {
@@ -214,10 +395,10 @@ function renderInventory() {
       (device) => `
         <article class="device-row">
           <div>
-            <strong>${device.id}</strong>
-            <p>${device.platform} at ${device.host}:${device.port}</p>
+            <strong>${escapeHtml(device.id)}</strong>
+            <p>${escapeHtml(device.platform)} at ${escapeHtml(device.host)}:${escapeHtml(device.port)}</p>
           </div>
-          <span>${device.site || "unassigned"}</span>
+          <span>${escapeHtml(device.site || "unassigned")}</span>
         </article>
       `
     )
@@ -226,8 +407,17 @@ function renderInventory() {
 
 function renderDesiredSummary() {
   const payload = changePayload();
-  $("desired-title").textContent = `Add VLAN ${payload.vlan_id} to ${payload.device_id}`;
-  $("desired-summary").textContent = `Desired state: VLAN ${payload.vlan_id} named ${payload.name} at ${payload.site}.`;
+  const catalog = catalogItem();
+  $("desired-title").textContent = catalog.label;
+  $("desired-summary").textContent = `${catalog.outcome} Target: ${selectedDeviceId()} at ${payload.site}.`;
+  $("desired-capability").innerHTML = [
+    `<span>${escapeHtml(catalog.risk || "Review required")}</span>`,
+    `<span>${catalog.lab_write_supported ? "Lab write supported" : "Plan only"}</span>`,
+    `<span>${catalog.production_write_supported ? "Production ready" : "Production locked"}</span>`,
+  ].join("");
+  if (appState.plan?.pipeline?.intent_yaml) {
+    $("desired-yaml").textContent = appState.plan.pipeline.intent_yaml;
+  }
 }
 
 function renderPlan() {
@@ -237,29 +427,32 @@ function renderPlan() {
     $("plan-device").textContent = "-";
     $("plan-risk").textContent = "Unknown";
     $("plan-writes").textContent = "None";
-    $("plan-summary-text").textContent = "Create a desired state first.";
+    $("plan-summary-text").textContent = "Create desired state first.";
     $("plan-commands").textContent = "No commands generated yet.";
     return;
   }
-  const payload = changePayload();
+  const meta = plan.plan || {};
   const pipeline = plan.pipeline;
   const commands = commandListFromText(pipeline.render.config);
-  $("plan-action").textContent = `Add VLAN ${payload.vlan_id}`;
-  $("plan-device").textContent = payload.device_id;
-  $("plan-risk").textContent = pipeline.validation.status === "pass" ? "Low for lab" : "Blocked";
-  $("plan-writes").textContent = "None during plan";
+  $("plan-action").textContent = meta.title || meta.label || plan.pipeline.intent.change_type;
+  $("plan-device").textContent = meta.target_device_id || selectedDeviceId();
+  $("plan-risk").textContent = meta.risk || (pipeline.validation.status === "pass" ? "Review" : "Blocked");
+  $("plan-writes").textContent = meta.lab_write_supported ? "Lab only" : "Locked";
   $("plan-summary-text").textContent = [
     "Netcode plan",
     "",
-    `+ VLAN ${payload.vlan_id} (${payload.name})`,
-    `  target: ${payload.device_id}`,
-    `  site: ${payload.site}`,
-    `  subnet: ${payload.subnet}`,
+    `+ ${meta.title || meta.label || "desired state"}`,
+    `  type: ${pipeline.intent.change_type}`,
+    `  target: ${meta.target_device_id || selectedDeviceId()}`,
+    `  site: ${pipeline.intent.site}`,
+    `  risk: ${meta.risk || "review required"}`,
     "",
-    "Device writes: none",
-    "Next: review validation, then dry-run in Arista EOS config session.",
+    "Device writes during plan: none",
+    meta.lab_write_supported
+      ? "Next: review validation, then dry-run in an Arista EOS config session."
+      : "Next: review validation and evidence. Apply is locked for this intent type.",
   ].join("\n");
-  $("plan-commands").textContent = commandListBlock(commands);
+  $("plan-commands").textContent = commandListBlock(commands, "No device commands. This intent is source-of-truth only.");
   $("desired-yaml").textContent = pipeline.intent_yaml;
 }
 
@@ -272,17 +465,22 @@ function renderValidation() {
     list.innerHTML = checks
       .map(
         (check) => `
-          <article class="check-item ${check.status}">
-            <strong>${check.status.toUpperCase()}: ${check.title}</strong>
-            <p>${check.message}</p>
+          <article class="check-item ${escapeHtml(check.status)}">
+            <strong>${escapeHtml(check.status.toUpperCase())}: ${escapeHtml(check.title)}</strong>
+            <p>${escapeHtml(check.message)}</p>
           </article>
         `
       )
       .join("");
   }
   $("git-plan").textContent = appState.gitPlan ? formatJson(appState.gitPlan) : "Create a plan first.";
-  $("dryrun-proof").textContent = appState.dryRun ? formatJson(appState.dryRun) : "Run dry-run after validation is reviewed.";
-  $("run-dry-run").disabled = !(appState.plan?.ok);
+  const labSupported = Boolean(appState.plan?.plan?.lab_write_supported);
+  $("dryrun-proof").textContent = appState.dryRun
+    ? formatJson(appState.dryRun)
+    : labSupported
+      ? "Run dry-run after validation is reviewed."
+      : "Dry-run is locked for this intent type. Review plan, validation, and audit evidence.";
+  $("run-dry-run").disabled = !(appState.plan?.ok && labSupported);
 }
 
 function setGate(id, state, label) {
@@ -292,18 +490,21 @@ function setGate(id, state, label) {
 }
 
 function renderApply() {
+  const labSupported = Boolean(appState.plan?.plan?.lab_write_supported);
   setGate("gate-plan", appState.plan ? "pass" : "warn", appState.plan ? "Planned" : "Waiting");
   setGate("gate-validation", appState.plan?.ok ? "pass" : appState.plan ? "fail" : "warn", appState.plan?.ok ? "Passed" : appState.plan ? "Blocked" : "Waiting");
-  setGate("gate-dryrun", appState.dryRun?.ok ? "pass" : appState.dryRun ? "fail" : "warn", appState.dryRun?.ok ? "Passed" : appState.dryRun ? "Failed" : "Waiting");
+  setGate("gate-dryrun", !labSupported && appState.plan ? "warn" : appState.dryRun?.ok ? "pass" : appState.dryRun ? "fail" : "warn", !labSupported && appState.plan ? "Locked" : appState.dryRun?.ok ? "Passed" : appState.dryRun ? "Failed" : "Waiting");
   if (appState.rollback?.ok && !appState.changeLive) {
     setGate("gate-verify", "pass", "Rolled back");
   } else {
     setGate("gate-verify", appState.verify?.ok || appState.apply?.ok ? "pass" : appState.verify ? "fail" : "warn", appState.verify?.ok || appState.apply?.ok ? "Verified" : appState.verify ? "Failed" : "Waiting");
   }
-  $("apply-change").disabled = !(appState.plan?.ok && appState.dryRun?.ok);
+  $("apply-change").disabled = !(appState.plan?.ok && labSupported && appState.dryRun?.ok);
   $("verify-change").disabled = !(appState.apply?.ok && appState.changeLive);
   $("rollback-change").disabled = !(appState.apply?.ok && appState.changeLive);
-  if (appState.rollback) {
+  if (!labSupported && appState.plan) {
+    $("apply-transcript").textContent = "Apply is locked for this intent type in the current MVP. Plan, validation, Git evidence, and audit records are still available.";
+  } else if (appState.rollback) {
     $("apply-transcript").textContent = transcriptText(appState.rollback, formatJson(appState.rollback));
   } else if (appState.apply) {
     $("apply-transcript").textContent = transcriptText(appState.apply, formatJson(appState.apply));
@@ -314,7 +515,17 @@ function renderApply() {
   }
 }
 
+function renderDrift() {
+  $("drift-compliance").textContent = appState.drift?.compliance?.ok === false ? "Review" : appState.drift ? "Loaded" : "Unknown";
+  $("drift-intent").textContent = appState.plan?.plan?.title || "None";
+  $("drift-live").textContent = appState.drift?.live_state?.ok ? "Collected" : appState.drift ? "Unavailable" : "Not collected";
+  $("drift-action").textContent = appState.drift?.drift?.ok === false ? "Reconcile" : "Review";
+  $("drift-output").textContent = appState.drift ? formatJson(appState.drift) : "Create a plan, then check drift for that intent.";
+}
+
 function renderAll() {
+  renderChangeTypeGrid();
+  renderDynamicFields();
   renderHome();
   renderSetup();
   renderInventory();
@@ -322,26 +533,31 @@ function renderAll() {
   renderPlan();
   renderValidation();
   renderApply();
+  renderDrift();
   renderEvidence();
 }
 
 async function checkWorkspace({ silent = false } = {}) {
-  if (!silent) startOutcome("Check workspace", "Load Git, source of truth, Rez adapter, lab, and job status.");
+  if (!silent) startOutcome("Check workspace", "Load Git, source of truth, Rez adapter, desired-state catalog, lab, jobs, and audit status.");
   try {
-    const [health, git, source, rezHealth, rezPlatforms, jobs] = await Promise.all([
+    const [health, git, source, rezHealth, rezPlatforms, catalog, jobs, audit] = await Promise.all([
       getJson("/api/health"),
       getJson("/api/git/status"),
       getJson("/api/source-of-truth"),
       getJson("/api/adapters/rez/health"),
       getJson("/api/adapters/rez/platforms"),
+      getJson("/api/desired-state/catalog"),
       getJson("/api/jobs"),
+      getJson("/api/audit/sessions"),
     ]);
     appState.health = health;
     appState.git = git;
     appState.source = source;
     appState.rezHealth = rezHealth;
     appState.rezPlatforms = rezPlatforms;
+    appState.catalog = catalog;
     appState.jobs = jobs;
+    appState.audit = audit;
     setRunState("Workspace checked", health.lab?.ok ? "pass" : "warn");
     renderAll();
     if (!silent) {
@@ -349,12 +565,12 @@ async function checkWorkspace({ silent = false } = {}) {
         state: health.lab?.ok ? "Passed" : "Review",
         status: health.lab?.ok ? "pass" : "warn",
         title: "Workspace check complete.",
-        summary: "Git, source of truth, Rez adapters, and lab status were loaded.",
+        summary: "Git, source of truth, Rez adapters, desired-state catalog, lab status, and audit records were loaded.",
         expected: "Confirm the platform is ready before making a network change.",
-        actual: `${git.available ? "Git ready" : "Git needs setup"}. ${source.summary?.device_count || 0} source-of-truth devices. Rez platforms: ${rezHealth.platform_count || 0}.`,
-        artifact: "Workspace status loaded from API.",
+        actual: `${git.available ? "Git ready" : "Git needs setup"}. ${source.summary?.device_count || 0} devices. ${catalog.change_types?.length || 0} desired-state types. ${audit.sessions?.length || 0} command sessions logged.`,
+        artifact: "Workspace and audit status loaded from API.",
         device: "No device config was changed.",
-        next: "Discover the lab device or create desired state.",
+        next: "Discover devices or create desired state.",
       });
     }
   } catch (error) {
@@ -418,22 +634,25 @@ async function saveDiscoveredDevice() {
 }
 
 async function createPlan() {
-  startOutcome("Create plan", "Create YAML intent, render Arista EOS config, and run static policy checks. No device contact.");
+  startOutcome("Create plan", "Create YAML intent, render candidate config, run static policy checks, and set apply gates. No device contact.");
   try {
-    const data = await postJson("/api/wizard/add-vlan", changePayload());
+    const payload = changePayload();
+    const data = await postJson("/api/desired-state/plan", payload);
     appState.plan = data;
     appState.dryRun = null;
     appState.apply = null;
     appState.verify = null;
     appState.rollback = null;
     appState.changeLive = false;
+    appState.drift = null;
     if (data.intent_path) {
       appState.gitPlan = await postJson("/api/gitops/plan", {
         intent_path: data.intent_path,
-        device_id: changePayload().device_id,
+        device_id: selectedDeviceId(),
         change_id: data.change?.id || null,
       });
     }
+    appState.audit = await getJson("/api/audit/sessions");
     renderAll();
     setRunState(data.ok ? "Planned" : "Blocked", data.ok ? "pass" : "fail");
     setView("plan");
@@ -441,12 +660,12 @@ async function createPlan() {
       state: data.ok ? "Passed" : "Failed",
       status: data.ok ? "pass" : "fail",
       title: data.ok ? "Plan created." : "Plan blocked by validation.",
-      summary: "The platform created the desired-state YAML and rendered candidate config.",
+      summary: "The platform created typed desired-state YAML and rendered candidate config.",
       expected: "Generate a reviewable plan without touching the device.",
-      actual: `${data.pipeline.validation.checks.length} checks returned ${data.pipeline.validation.status}.`,
+      actual: `${data.pipeline.validation.checks.length} checks returned ${data.pipeline.validation.status}. Apply gate: ${data.plan.lab_write_supported ? "lab supported" : "locked"}.`,
       artifact: data.intent_path,
       device: "No device config was changed.",
-      next: data.ok ? "Review validation, then run lab dry-run." : "Fix the request or policy issue before dry-run.",
+      next: data.ok ? "Review validation." : "Fix the request or policy issue before dry-run.",
     });
   } catch (error) {
     failOutcome("Plan creation failed.", error);
@@ -460,16 +679,17 @@ function reviewValidation() {
   }
   renderValidation();
   setView("validate");
+  const labSupported = Boolean(appState.plan.plan?.lab_write_supported);
   setOutcome({
     state: appState.plan.ok ? "Passed" : "Failed",
     status: appState.plan.ok ? "pass" : "fail",
     title: "Validation reviewed.",
     summary: "Static checks are visible and the Git review plan is attached.",
     expected: "Inspect policy and generated config guardrails before any device contact.",
-    actual: `${appState.plan.pipeline.validation.checks.length} validation checks reviewed.`,
+    actual: `${appState.plan.pipeline.validation.checks.length} validation checks reviewed. ${labSupported ? "Dry-run is available." : "Apply is locked for this intent type."}`,
     artifact: appState.plan.pipeline.artifacts?.report_markdown_path || "Validation report.",
     device: "No device config was changed.",
-    next: appState.plan.ok ? "Run lab dry-run." : "Fix validation failures first.",
+    next: appState.plan.ok && labSupported ? "Run lab dry-run." : "Review evidence or choose a lab-supported intent.",
   });
 }
 
@@ -478,14 +698,19 @@ async function runDryRun() {
     failOutcome("Dry-run blocked.", new Error("Create a plan first."));
     return;
   }
+  if (!appState.plan.plan?.lab_write_supported) {
+    failOutcome("Dry-run locked.", new Error("This intent type is not enabled for lab device writes in the current MVP."), "Review plan and evidence.");
+    return;
+  }
   startOutcome("Run lab dry-run", "Open EOS config session, load candidate, collect diff, then abort. No commit.");
   try {
     const data = await postJson("/api/lab/dry-run", {
       intent_path: appState.plan.intent_path,
-      device_id: changePayload().device_id,
+      device_id: selectedDeviceId(),
       change_id: appState.plan.change?.id || null,
     });
     appState.dryRun = data;
+    appState.audit = await getJson("/api/audit/sessions");
     renderAll();
     setRunState(data.ok ? "Dry-run passed" : "Dry-run failed", data.ok ? "pass" : "fail");
     setView("apply");
@@ -510,16 +735,17 @@ async function applyChange() {
     failOutcome("Apply blocked.", new Error("Run a passing dry-run first."));
     return;
   }
-  startOutcome("Apply in Arista lab", "Commit the validated candidate, then verify VLAN state.");
+  startOutcome("Apply in Arista lab", "Commit the validated candidate, verify intent state, and log the command session.");
   try {
     const data = await postJson("/api/lab/apply", {
       intent_path: appState.plan.intent_path,
-      device_id: changePayload().device_id,
+      device_id: selectedDeviceId(),
       change_id: appState.plan.change?.id || null,
     });
     appState.apply = data;
     appState.changeLive = Boolean(data.ok);
     appState.rollback = null;
+    appState.audit = await getJson("/api/audit/sessions");
     renderAll();
     setRunState(data.ok ? "Applied" : "Apply failed", data.ok ? "pass" : "fail");
     setOutcome({
@@ -530,7 +756,7 @@ async function applyChange() {
       expected: "Commit only after plan, validation, and dry-run passed.",
       actual: data.result?.message || "Apply returned.",
       artifact: data.job ? `Job ${data.job.id}` : "Apply result.",
-      device: data.ok ? "Candidate config was committed in the Arista lab." : "Commit did not complete safely.",
+      device: data.ok ? "Candidate config was committed in the Arista lab and logged." : "Commit did not complete safely.",
       next: data.ok ? "Run live-state verification or rollback." : "Review apply transcript.",
     });
   } catch (error) {
@@ -543,14 +769,12 @@ async function verifyChange() {
     failOutcome("Verify blocked.", new Error("Apply the lab change first."));
     return;
   }
-  startOutcome("Verify live state", "Collect device state through Rez and prove the VLAN exists.");
+  startOutcome("Verify live state", "Collect read-only device evidence and prove the intent is present.");
   try {
-    const payload = changePayload();
-    const data = await postJson("/api/verify/vlan", {
-      device_id: payload.device_id,
-      vlan_id: payload.vlan_id,
-      name: payload.name,
-      present: true,
+    const data = await postJson("/api/verify/intent", {
+      intent_path: appState.plan.intent_path,
+      device_id: selectedDeviceId(),
+      change_id: appState.plan.change?.id || null,
     });
     appState.verify = data;
     renderAll();
@@ -561,7 +785,7 @@ async function verifyChange() {
       summary: data.verification?.message || "Verification completed.",
       expected: "Live device state matches desired state.",
       actual: data.verification?.message || "Verification returned.",
-      artifact: `Rez state via ${data.state?.adapter || "unknown adapter"}.`,
+      artifact: `Read-only verification for ${data.change_type}.`,
       device: "No config was changed during verification.",
       next: "Review evidence or rollback the lab change.",
     });
@@ -575,15 +799,16 @@ async function rollbackChange() {
     failOutcome("Rollback blocked.", new Error("Apply the lab change first."));
     return;
   }
-  startOutcome("Rollback lab change", "Commit no-vlan rollback and verify the VLAN is absent.");
+  startOutcome("Rollback lab change", "Commit rollback config, verify the intent was removed, and log the session.");
   try {
     const data = await postJson("/api/lab/rollback", {
       intent_path: appState.plan.intent_path,
-      device_id: changePayload().device_id,
+      device_id: selectedDeviceId(),
       change_id: appState.plan.change?.id || null,
     });
     appState.rollback = data;
     if (data.ok) appState.changeLive = false;
+    appState.audit = await getJson("/api/audit/sessions");
     renderAll();
     setRunState(data.ok ? "Rolled back" : "Rollback failed", data.ok ? "pass" : "fail");
     setOutcome({
@@ -591,10 +816,10 @@ async function rollbackChange() {
       status: data.ok ? "pass" : "fail",
       title: data.ok ? "Rollback verified." : "Rollback failed.",
       summary: data.result?.message || "Rollback completed.",
-      expected: "Remove the lab VLAN and prove it is absent.",
+      expected: "Remove the lab intent and prove it is absent.",
       actual: data.result?.message || "Rollback returned.",
       artifact: data.job ? `Job ${data.job.id}` : "Rollback result.",
-      device: data.ok ? "Rollback config was committed in the Arista lab." : "Rollback did not complete safely.",
+      device: data.ok ? "Rollback config was committed in the Arista lab and logged." : "Rollback did not complete safely.",
       next: "Review evidence.",
     });
   } catch (error) {
@@ -602,15 +827,54 @@ async function rollbackChange() {
   }
 }
 
+async function checkDrift() {
+  startOutcome("Check drift", "Collect read-only state and compare the current desired state against the live device where supported.");
+  try {
+    const compliance = await getJson("/api/compliance/summary");
+    const payload = { compliance };
+    if (appState.plan?.intent_path) {
+      if (appState.plan.pipeline.intent.change_type === "add_vlan") {
+        payload.drift = await postJson("/api/drift/vlan", {
+          intent_path: appState.plan.intent_path,
+          device_id: selectedDeviceId(),
+          change_id: appState.plan.change?.id || null,
+        });
+      } else {
+        payload.live_state = await postJson("/api/adapters/rez/collect-state", { device_id: selectedDeviceId() });
+        payload.note = "Deep drift comparison is currently wired for VLAN intents. Non-VLAN intents collect live state and stay audit-visible.";
+      }
+    } else {
+      payload.note = "Create a plan first to compare a specific desired state.";
+    }
+    appState.drift = payload;
+    renderDrift();
+    setView("drift");
+    setOutcome({
+      state: "Passed",
+      status: "pass",
+      title: "Drift check complete.",
+      summary: "Drift collection is read-only.",
+      expected: "Compare trusted desired state against live network evidence.",
+      actual: payload.drift?.message || payload.note || "Compliance summary loaded.",
+      artifact: "Drift/compliance evidence loaded.",
+      device: "No device config was changed.",
+      next: "Review drift evidence or reconcile through a new desired-state plan.",
+    });
+  } catch (error) {
+    failOutcome("Drift check failed.", error);
+  }
+}
+
 async function refreshEvidence() {
-  startOutcome("Refresh evidence", "Load latest jobs, workflow events, and Git plan.");
+  startOutcome("Refresh evidence", "Load latest jobs, workflow events, audit sessions, reports, and Git plan.");
   try {
     appState.jobs = await getJson("/api/jobs");
+    appState.audit = await getJson("/api/audit/sessions");
     if (appState.plan?.change?.id) {
       appState.workflow = await getJson(`/api/workflow/change/${appState.plan.change.id}`);
       appState.gitPlan = await postJson("/api/gitops/plan", {
         intent_path: appState.plan.intent_path,
-        device_id: changePayload().device_id,
+        device_id: selectedDeviceId(),
         change_id: appState.plan.change.id,
       });
     }
@@ -619,9 +883,9 @@ async function refreshEvidence() {
       state: "Passed",
       status: "pass",
       title: "Evidence refreshed.",
-      summary: "Latest jobs, workflow events, reports, and Git review data are visible.",
-      expected: "Collect audit evidence for the current MVP flow.",
-      actual: `${appState.jobs?.jobs?.length || 0} job records loaded.`,
+      summary: "Latest jobs, workflow events, reports, command sessions, and Git review data are visible.",
+      expected: "Collect audit evidence for the current flow.",
+      actual: `${appState.jobs?.jobs?.length || 0} jobs and ${appState.audit?.sessions?.length || 0} command sessions loaded.`,
       artifact: "Evidence view updated.",
       device: "No device config was changed.",
       next: "Use the evidence tabs to inspect artifacts.",
@@ -636,7 +900,9 @@ function evidencePayload() {
     workspace: appState.health?.workspace,
     run_state: $("run-state-label").textContent,
     source_of_truth: appState.source?.summary,
+    selected_change_type: appState.selectedChangeType,
     current_change: appState.plan?.change || null,
+    current_plan: appState.plan?.plan || null,
     intent_path: appState.plan?.intent_path || null,
     reports: appState.plan?.pipeline?.artifacts || null,
     discovery: appState.discovery
@@ -670,6 +936,7 @@ function evidencePayload() {
           message: appState.rollback.result?.message,
         }
       : null,
+    audit_sessions: appState.audit?.sessions?.length || 0,
   };
 }
 
@@ -690,12 +957,13 @@ function renderEvidence() {
       rollback: appState.rollback,
     }),
     git: appState.gitPlan ? formatJson(appState.gitPlan) : appState.git ? formatJson(appState.git) : "No Git evidence yet.",
+    audit: appState.audit ? formatJson(appState.audit) : "No audit data loaded yet.",
     jobs: appState.jobs ? formatJson(appState.jobs) : "No jobs loaded yet.",
   };
   $("evidence-output").textContent = outputs[artifact] || outputs.overview;
 }
 
-function resetChangeProof() {
+function clearChangeProofState() {
   appState.plan = null;
   appState.gitPlan = null;
   appState.dryRun = null;
@@ -703,8 +971,32 @@ function resetChangeProof() {
   appState.verify = null;
   appState.rollback = null;
   appState.changeLive = false;
+  appState.drift = null;
   setRunState("Draft");
-  renderAll();
+}
+
+function resetChangeProof() {
+  clearChangeProofState();
+  renderDesiredSummary();
+  renderPlan();
+  renderValidation();
+  renderApply();
+  renderDrift();
+  renderEvidence();
+}
+
+function selectChangeType(changeType) {
+  storeDynamicValues();
+  appState.selectedChangeType = changeType;
+  clearChangeProofState();
+  renderChangeTypeGrid();
+  renderDynamicFields();
+  renderDesiredSummary();
+  renderPlan();
+  renderValidation();
+  renderApply();
+  renderDrift();
+  renderEvidence();
 }
 
 function bindEvents() {
@@ -725,8 +1017,9 @@ function bindEvents() {
   $("apply-change").addEventListener("click", applyChange);
   $("verify-change").addEventListener("click", verifyChange);
   $("rollback-change").addEventListener("click", rollbackChange);
+  $("check-drift").addEventListener("click", checkDrift);
   $("refresh-evidence").addEventListener("click", refreshEvidence);
-  $$("#change-form input").forEach((input) => input.addEventListener("input", resetChangeProof));
+  $$("#change-form input, #change-form select, #change-form textarea").forEach((input) => input.addEventListener("input", resetChangeProof));
 }
 
 bindEvents();

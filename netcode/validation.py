@@ -3,12 +3,22 @@
 from __future__ import annotations
 
 import re
+from ipaddress import ip_address
 from ipaddress import ip_network
 from pathlib import Path
-from typing import Callable
 
 from netcode.inventory import Inventory
-from netcode.models import CheckResult, Intent, RenderResult, ValidationReport
+from netcode.models import (
+    AclRuleIntent,
+    AddVlanIntent,
+    BgpNeighborIntent,
+    CheckResult,
+    Intent,
+    InterfaceConfigIntent,
+    RenderResult,
+    SiteDeviceIntent,
+    ValidationReport,
+)
 from netcode.paths import WorkspacePaths
 from netcode.rendering import render_intent
 from netcode.yamlio import read_yaml
@@ -22,15 +32,13 @@ class StaticValidator:
 
     def validate(self, intent: Intent, render: RenderResult) -> ValidationReport:
         checks: list[CheckResult] = []
-        for check in (
-            self._schema_present,
-            self._targets_exist,
-            self._vlan_policy,
-            self._subnet_overlap,
-            self._segmentation,
-            self._render_scope,
-            self._deterministic_render,
-        ):
+        validators = [self._schema_present, self._targets_exist]
+        if isinstance(intent, AddVlanIntent):
+            validators.extend([self._vlan_policy, self._subnet_overlap, self._segmentation])
+        else:
+            validators.append(self._intent_policy)
+        validators.extend([self._render_scope, self._deterministic_render])
+        for check in validators:
             try:
                 checks.append(check(intent, render))
             except Exception as exc:
@@ -57,12 +65,19 @@ class StaticValidator:
         return self._pass(
             "schema",
             "Intent Schema",
-            "Intent loaded into the add_vlan model.",
+            f"Intent loaded into the {intent.change_type} model.",
             change_type=intent.change_type,
             site=intent.site,
         )
 
     def _targets_exist(self, intent: Intent, render: RenderResult) -> CheckResult:
+        if isinstance(intent, SiteDeviceIntent):
+            return self._pass(
+                "targets",
+                "Target Resolution",
+                "Site/device intent may describe a new source-of-truth record. Device writes stay locked.",
+                device_id=intent.device.device_id,
+            )
         devices = self.inventory.resolve_targets(intent.targets, site=intent.site)
         return self._pass(
             "targets",
@@ -71,7 +86,34 @@ class StaticValidator:
             devices=[d.id for d in devices],
         )
 
-    def _vlan_policy(self, intent: Intent, render: RenderResult) -> CheckResult:
+    def _intent_policy(self, intent: Intent, render: RenderResult) -> CheckResult:
+        if isinstance(intent, AddVlanIntent):
+            checks = [self._vlan_policy(intent, render), self._subnet_overlap(intent, render), self._segmentation(intent, render)]
+            failed = [check for check in checks if check.status == "fail"]
+            if failed:
+                return self._fail(
+                    "intent_policy",
+                    "Intent Policy",
+                    "One or more VLAN intent policies failed.",
+                    checks=[check.model_dump() for check in checks],
+                )
+            return self._pass("intent_policy", "Intent Policy", "VLAN intent policies passed.", checks=[check.model_dump() for check in checks])
+        if isinstance(intent, InterfaceConfigIntent):
+            return self._interface_policy(intent, render)
+        if isinstance(intent, BgpNeighborIntent):
+            return self._bgp_policy(intent, render)
+        if isinstance(intent, AclRuleIntent):
+            return self._acl_policy(intent, render)
+        if isinstance(intent, SiteDeviceIntent):
+            return self._pass(
+                "intent_policy",
+                "Intent Policy",
+                "Site/device intent is source-of-truth only. Device writes stay locked.",
+                device_id=intent.device.device_id,
+            )
+        return self._fail("intent_policy", "Intent Policy", f"Unsupported intent type {intent.change_type}.")
+
+    def _vlan_policy(self, intent: AddVlanIntent, render: RenderResult) -> CheckResult:
         vlan_policy = self.policy.get("vlan", {})
         allowed_min, allowed_max = vlan_policy.get("allowed_range", [2, 4094])
         reserved = set(int(v) for v in vlan_policy.get("reserved", []))
@@ -107,7 +149,7 @@ class StaticValidator:
             name=intent.vlan.name,
         )
 
-    def _subnet_overlap(self, intent: Intent, render: RenderResult) -> CheckResult:
+    def _subnet_overlap(self, intent: AddVlanIntent, render: RenderResult) -> CheckResult:
         candidate = ip_network(intent.vlan.subnet, strict=False)
         overlaps = []
         for existing in self.inventory.known_subnets(intent.site):
@@ -129,7 +171,7 @@ class StaticValidator:
             subnet=str(candidate),
         )
 
-    def _segmentation(self, intent: Intent, render: RenderResult) -> CheckResult:
+    def _segmentation(self, intent: AddVlanIntent, render: RenderResult) -> CheckResult:
         segmentation = self.policy.get("segmentation", {})
         guest_purposes = {str(v).lower() for v in segmentation.get("guest_purposes", [])}
         purpose = intent.vlan.purpose.lower()
@@ -149,10 +191,74 @@ class StaticValidator:
             pci_reachable=intent.policy.pci_reachable,
         )
 
+    def _interface_policy(self, intent: InterfaceConfigIntent, render: RenderResult) -> CheckResult:
+        name = intent.interface.name.lower()
+        if name.startswith("management"):
+            return self._fail("interface_policy", "Interface Policy", "Management interfaces are blocked from this UI workflow.", interface=intent.interface.name)
+        if intent.interface.mode == "access" and intent.interface.access_vlan is not None:
+            vlan_policy = self.policy.get("vlan", {})
+            allowed_min, allowed_max = vlan_policy.get("allowed_range", [2, 4094])
+            if intent.interface.access_vlan < allowed_min or intent.interface.access_vlan > allowed_max:
+                return self._fail(
+                    "interface_policy",
+                    "Interface Policy",
+                    f"Access VLAN must be in approved range {allowed_min}-{allowed_max}.",
+                    vlan_id=intent.interface.access_vlan,
+                )
+        return self._pass(
+            "interface_policy",
+            "Interface Policy",
+            "Interface intent stays within editable access/trunk/routed interface scope.",
+            interface=intent.interface.name,
+            mode=intent.interface.mode,
+        )
+
+    def _bgp_policy(self, intent: BgpNeighborIntent, render: RenderResult) -> CheckResult:
+        if intent.bgp.asn < 1 or intent.bgp.asn > 4294967295:
+            return self._fail("bgp_policy", "BGP Policy", "BGP ASN is outside valid range.", asn=intent.bgp.asn)
+        for neighbor in intent.bgp.neighbors:
+            try:
+                ip_address(neighbor.address)
+            except ValueError:
+                return self._fail("bgp_policy", "BGP Policy", "BGP neighbor must be a valid IP address.", neighbor=neighbor.address)
+            if neighbor.remote_as < 1 or neighbor.remote_as > 4294967295:
+                return self._fail("bgp_policy", "BGP Policy", "Neighbor remote-as is outside valid range.", neighbor=neighbor.address, remote_as=neighbor.remote_as)
+        return self._pass(
+            "bgp_policy",
+            "BGP Policy",
+            "BGP neighbor intent has valid ASN and neighbor addressing. Treat as high risk until lab/canary proof exists.",
+            asn=intent.bgp.asn,
+            neighbors=[neighbor.address for neighbor in intent.bgp.neighbors],
+        )
+
+    def _acl_policy(self, intent: AclRuleIntent, render: RenderResult) -> CheckResult:
+        if intent.acl.sequence < 1 or intent.acl.sequence > 9999:
+            return self._fail("acl_policy", "ACL Policy", "ACL sequence must be between 1 and 9999.", sequence=intent.acl.sequence)
+        if intent.acl.destination_port and intent.acl.protocol not in {"tcp", "udp"}:
+            return self._fail("acl_policy", "ACL Policy", "Destination port is only valid for TCP or UDP rules.", protocol=intent.acl.protocol)
+        return self._pass(
+            "acl_policy",
+            "ACL Policy",
+            "ACL rule intent is syntactically scoped to one named ACL and sequence.",
+            acl=intent.acl.name,
+            sequence=intent.acl.sequence,
+        )
+
     def _render_scope(self, intent: Intent, render: RenderResult) -> CheckResult:
         scope = self.policy.get("render_scope", {})
-        allowed = tuple(scope.get("add_vlan_allowed_prefixes", []))
+        default_allowed = {
+            "add_vlan": ["vlan ", "   name ", "interface Vlan", "   description ", "   ip address "],
+            "interface_config": ["interface ", "   description ", "   switchport ", "   no switchport", "   ip address ", "   shutdown", "   no shutdown"],
+            "bgp_neighbor": ["router bgp ", "   router-id ", "   neighbor ", "   no neighbor "],
+            "acl_rule": ["ip access-list ", "   remark ", "   permit ", "   deny "],
+            "site_device_intent": ["! "],
+        }
+        allowed = tuple(scope.get(f"{intent.change_type}_allowed_prefixes", default_allowed.get(intent.change_type, [])))
         blocked = [str(v).lower() for v in scope.get("blocked_fragments", [])]
+        if intent.change_type == "bgp_neighbor":
+            blocked = [fragment for fragment in blocked if fragment != "router bgp"]
+        if intent.change_type == "acl_rule":
+            blocked = [fragment for fragment in blocked if fragment != "ip access-list"]
         unexpected_lines: list[str] = []
         blocked_lines: list[str] = []
         for line in render.config.splitlines():
@@ -175,14 +281,14 @@ class StaticValidator:
             return self._fail(
                 "render_scope",
                 "Rendered Config Scope",
-                "Rendered config contains lines outside the allowed add_vlan scope.",
+                f"Rendered config contains lines outside the allowed {intent.change_type} scope.",
                 unexpected_lines=unexpected_lines,
                 allowed_prefixes=list(allowed),
             )
         return self._pass(
             "render_scope",
             "Rendered Config Scope",
-            "Rendered config only touches the intended VLAN feature scope.",
+            f"Rendered config only touches the intended {intent.change_type} feature scope.",
             line_count=len(render.config.splitlines()),
         )
 

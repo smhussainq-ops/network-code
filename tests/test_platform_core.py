@@ -353,6 +353,109 @@ def test_template_artifact_endpoint_returns_jinja_body(tmp_path: Path, monkeypat
     assert "vlan {{ vlan.id }}" in data["body"]
 
 
+def test_desired_state_catalog_and_dynamic_plans(tmp_path: Path, monkeypatch):
+    init_workspace(WorkspacePaths(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    client = TestClient(api.app)
+
+    catalog = client.get("/api/desired-state/catalog")
+    ids = {item["id"] for item in catalog.json()["change_types"]}
+
+    assert catalog.status_code == 200
+    assert {"add_vlan", "interface_config", "bgp_neighbor", "acl_rule", "site_device_intent"}.issubset(ids)
+
+    interface_plan = client.post(
+        "/api/desired-state/plan",
+        json={
+            "change_type": "interface_config",
+            "site": "store-1842",
+            "device_id": "v2-store1",
+            "requested_by": "unit",
+            "values": {
+                "interface": "Ethernet1",
+                "description": "UNIT_TEST",
+                "mode": "access",
+                "access_vlan": 90,
+                "enabled": True,
+            },
+        },
+    )
+    bgp_plan = client.post(
+        "/api/desired-state/plan",
+        json={
+            "change_type": "bgp_neighbor",
+            "site": "store-1842",
+            "device_id": "v2-store1",
+            "requested_by": "unit",
+            "values": {"asn": 65001, "neighbor": "10.255.0.2", "remote_as": 65002, "description": "UNIT_PEER"},
+        },
+    )
+    acl_plan = client.post(
+        "/api/desired-state/plan",
+        json={
+            "change_type": "acl_rule",
+            "site": "store-1842",
+            "device_id": "v2-store1",
+            "requested_by": "unit",
+            "values": {"acl_name": "UNIT_ACL", "sequence": 10, "action": "permit", "protocol": "ip", "source": "any", "destination": "any"},
+        },
+    )
+    site_plan = client.post(
+        "/api/desired-state/plan",
+        json={
+            "change_type": "site_device_intent",
+            "site": "store-1842",
+            "device_id": "v2-store4",
+            "requested_by": "unit",
+            "values": {"new_device_id": "v2-store4", "role": "access-switch", "platform": "arista_eos", "management_ip": "172.100.1.44"},
+        },
+    )
+
+    assert interface_plan.status_code == 200
+    assert interface_plan.json()["ok"] is True
+    assert interface_plan.json()["plan"]["lab_write_supported"] is True
+    assert "interface Ethernet1" in interface_plan.json()["pipeline"]["render"]["config"]
+    assert bgp_plan.status_code == 200
+    assert "router bgp 65001" in bgp_plan.json()["pipeline"]["render"]["config"]
+    assert acl_plan.status_code == 200
+    assert "ip access-list UNIT_ACL" in acl_plan.json()["pipeline"]["render"]["config"]
+    assert site_plan.status_code == 200
+    assert site_plan.json()["plan"]["lab_write_supported"] is False
+    assert "Source-of-truth only intent" in site_plan.json()["pipeline"]["render"]["config"]
+
+
+def test_audit_sessions_endpoint_exposes_command_transcripts(tmp_path: Path, monkeypatch):
+    paths = WorkspacePaths(tmp_path)
+    init_workspace(paths)
+    monkeypatch.chdir(tmp_path)
+    store = PlatformStore(paths)
+    change = store.create_change(paths.intents / "examples" / "add_guest_vlan.yaml", "v2-store1")
+    job = store.create_job(change.id, "lab_apply")
+    store.update_job(
+        job.id,
+        "completed",
+        "applied",
+        {
+            "result": {
+                "session_name": "netcode_unit",
+                "evidence": {
+                    "transcript": [
+                        {"command": "configure session netcode_unit", "output": "ok"},
+                        {"command": "commit", "output": "ok"},
+                    ]
+                },
+            }
+        },
+    )
+
+    response = TestClient(api.app).get("/api/audit/sessions")
+    data = response.json()
+
+    assert response.status_code == 200
+    assert data["sessions"][0]["session_name"] == "netcode_unit"
+    assert data["sessions"][0]["commands"][1]["command"] == "commit"
+
+
 def test_rez_collect_state_endpoint_accepts_device_only_request(monkeypatch, tmp_path: Path):
     paths = WorkspacePaths(tmp_path)
     init_workspace(paths)
@@ -378,7 +481,7 @@ def test_app_route_serves_ui():
 
     assert response.status_code == 200
     assert "Netcode" in response.text
-    assert "Terraform-style network changes for the Arista lab" in response.text
+    assert "Terraform-style network changes with audited lab proof" in response.text
     assert "Home" in response.text
     assert "Setup" in response.text
     assert "Inventory" in response.text
@@ -386,7 +489,11 @@ def test_app_route_serves_ui():
     assert "Plan" in response.text
     assert "Validate" in response.text
     assert "Apply" in response.text
+    assert "Drift" in response.text
     assert "Evidence" in response.text
+    assert "Choose VLAN, interface, BGP, ACL, or site/device intent" in response.text
+    assert "change-type-grid" in response.text
+    assert "dynamic-fields" in response.text
     assert "Live outcome" in response.text
     assert "Next safe action" in response.text
     assert "Check workspace" in response.text
@@ -396,6 +503,7 @@ def test_app_route_serves_ui():
     assert "Create plan" in response.text
     assert "Run lab dry-run" in response.text
     assert "Apply in Arista lab" in response.text
+    assert "Audit" in response.text
 
 
 def test_platform_capabilities_exposes_all_core_deliverables(tmp_path: Path):

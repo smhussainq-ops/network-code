@@ -13,7 +13,8 @@ from typing import Literal
 from netcode.adapters.execution import ExecutionAdapter, ExecutionAdapterMetadata
 from netcode.adapters.registry import AdapterRegistry
 from netcode.inventory import Device, Inventory
-from netcode.models import EndToEndArtifacts, EndToEndResult, Intent, PhaseResult, load_intent
+from netcode.intent_utils import lab_write_supported, report_stem, rollback_config
+from netcode.models import AclRuleIntent, AddVlanIntent, BgpNeighborIntent, EndToEndArtifacts, EndToEndResult, Intent, InterfaceConfigIntent, PhaseResult, load_intent
 from netcode.paths import WorkspacePaths
 from netcode.rendering import render_intent
 from netcode.reporting import write_end_to_end_reports
@@ -119,7 +120,7 @@ class AristaEOSLabAdapter(ExecutionAdapter):
             session = self.config_session(render.config, "apply")
             if session.status != "pass":
                 return session
-            verify = self.verify_vlan(intent.vlan.id, intent.vlan.name)
+            verify = self.verify_intent(intent, present=True)
             return LabResult(
                 status="pass" if verify.status == "pass" else "fail",
                 action="apply",
@@ -134,10 +135,18 @@ class AristaEOSLabAdapter(ExecutionAdapter):
     def rollback(self, intent: Intent, render) -> LabResult:
         self.connect()
         try:
-            session = self.config_session(f"no vlan {intent.vlan.id}\n", "rollback")
+            rollback = rollback_config(intent)
+            if not rollback.strip():
+                return LabResult(
+                    status="fail",
+                    action="rollback",
+                    device_id=self.device.id,
+                    message=f"No rollback command is defined for {intent.change_type}.",
+                )
+            session = self.config_session(rollback, "rollback")
             if session.status != "pass":
                 return session
-            verify = self.verify_vlan_absent(intent.vlan.id)
+            verify = self.verify_intent(intent, present=False)
             return LabResult(
                 status="pass" if verify.status == "pass" else "fail",
                 action="rollback",
@@ -255,6 +264,69 @@ class AristaEOSLabAdapter(ExecutionAdapter):
             evidence={"commands": outputs},
         )
 
+    def verify_intent(self, intent: Intent, present: bool = True) -> LabResult:
+        if isinstance(intent, AddVlanIntent):
+            return self.verify_vlan(intent.vlan.id, intent.vlan.name) if present else self.verify_vlan_absent(intent.vlan.id)
+        if isinstance(intent, InterfaceConfigIntent):
+            command = f"show running-config interfaces {intent.interface.name}"
+            output = self.show(command)
+            expected = f"interface {intent.interface.name}"
+            seen = expected in output
+            if present:
+                if intent.interface.description:
+                    seen = seen and intent.interface.description in output
+                if intent.interface.mode == "access" and intent.interface.access_vlan is not None:
+                    seen = seen and f"switchport access vlan {intent.interface.access_vlan}" in output
+                if intent.interface.mode == "routed" and intent.interface.ip_address:
+                    seen = seen and "no switchport" in output and f"ip address {intent.interface.ip_address}" in output
+                return LabResult(
+                    status="pass" if seen else "fail",
+                    action="verify",
+                    device_id=self.device.id,
+                    message=f"Interface {intent.interface.name} config {'matches' if seen else 'does not match'} desired state.",
+                    evidence={"commands": {command: output}},
+                )
+            absent = intent.interface.description not in output if intent.interface.description else True
+            return LabResult(
+                status="pass" if absent else "fail",
+                action="verify_rollback",
+                device_id=self.device.id,
+                message=f"Interface {intent.interface.name} rollback {'was verified' if absent else 'still shows desired fragments'}.",
+                evidence={"commands": {command: output}},
+            )
+        if isinstance(intent, BgpNeighborIntent):
+            command = f"show running-config | section router bgp {intent.bgp.asn}"
+            output = self.show(command)
+            neighbors = [neighbor.address for neighbor in intent.bgp.neighbors]
+            seen = f"router bgp {intent.bgp.asn}" in output and all(f"neighbor {neighbor} remote-as" in output for neighbor in neighbors)
+            if not present:
+                seen = not any(f"neighbor {neighbor}" in output for neighbor in neighbors)
+            return LabResult(
+                status="pass" if seen else "fail",
+                action="verify" if present else "verify_rollback",
+                device_id=self.device.id,
+                message=f"BGP neighbor config {'is present' if present and seen else 'is absent' if not present and seen else 'did not match expected state'}.",
+                evidence={"commands": {command: output}, "neighbors": neighbors},
+            )
+        if isinstance(intent, AclRuleIntent):
+            command = f"show running-config | section ip access-list {intent.acl.name}"
+            output = self.show(command)
+            line_seen = re.search(rf"(?m)^\s*{intent.acl.sequence}\s+{intent.acl.action}\s+{intent.acl.protocol}\s+", output) is not None
+            seen = line_seen if present else not line_seen
+            return LabResult(
+                status="pass" if seen else "fail",
+                action="verify" if present else "verify_rollback",
+                device_id=self.device.id,
+                message=f"ACL {intent.acl.name} sequence {intent.acl.sequence} {'matches' if seen else 'does not match'} expected state.",
+                evidence={"commands": {command: output}},
+            )
+        return LabResult(
+            status="fail",
+            action="verify",
+            device_id=self.device.id,
+            message=f"No live verification is defined for {intent.change_type}.",
+        )
+
 
 def lab_status() -> dict[str, object]:
     if not shutil.which("clab"):
@@ -294,6 +366,14 @@ def run_lab_action(paths: WorkspacePaths, intent_path: Path, action: Literal["dr
             message="Static validation failed. Lab action blocked.",
             evidence={"validation": validation.model_dump()},
         ).__dict__
+    if not lab_write_supported(intent):
+        return LabResult(
+            status="fail",
+            action=action,
+            device_id=device_id or "unresolved",
+            message=f"{intent.change_type} is source-of-truth only in this MVP. Device write is locked.",
+            evidence={"apply_locked": True, "change_type": intent.change_type},
+        ).__dict__
 
     device = _device_for_intent(paths, intent, device_id)
     adapter = AristaEOSLabAdapter(device)
@@ -319,12 +399,13 @@ def run_lab_action(paths: WorkspacePaths, intent_path: Path, action: Literal["dr
             "errors": state_result.get("errors", []),
             "error": state_result.get("error"),
         }
-        payload["evidence"]["rez_verification"] = verify_vlan_state(
-            state_result,
-            intent.vlan.id,
-            intent.vlan.name,
-            present=action == "apply",
-        )
+        if isinstance(intent, AddVlanIntent):
+            payload["evidence"]["rez_verification"] = verify_vlan_state(
+                state_result,
+                intent.vlan.id,
+                intent.vlan.name,
+                present=action == "apply",
+            )
     return payload
 
 
@@ -432,7 +513,7 @@ def run_arista_end_to_end(paths: WorkspacePaths, intent_path: Path, device_id: s
                 )
             )
 
-    stem = f"{intent.site}-{intent.change_type}-vlan-{intent.vlan.id}"
+    stem = report_stem(intent)
     partial = EndToEndResult(
         status=status,
         intent_path=str(intent_path.resolve()),

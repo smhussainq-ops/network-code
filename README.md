@@ -6,8 +6,13 @@ validation, Arista lab testing, and evidence reports.
 The current MVP UI is organized around a Terraform-style network flow:
 
 ```text
-Home -> Setup -> Inventory -> Desired State -> Plan -> Validate -> Apply -> Evidence
+Home -> Setup -> Inventory -> Desired State -> Plan -> Validate -> Apply -> Drift -> Evidence
 ```
+
+Desired State is now dynamic. The UI can create typed intent, generated config,
+validation, Git review evidence, and audit records for VLAN, interface, BGP,
+ACL, and site/device source-of-truth workflows. Arista lab write/apply gates are
+shown per intent type; production writes remain locked in this MVP.
 
 For the detailed MVP scope and UI behavior, see
 [`docs/ARISTA_MVP_UI.md`](docs/ARISTA_MVP_UI.md). For the dated rebuild notes,
