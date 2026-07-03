@@ -695,6 +695,24 @@ def test_change_record_packages_request_plan_safety_git_and_manifest(tmp_path: P
     assert missing.status_code == 404
 
 
+def test_readiness_devices_reports_per_device_readability_honestly(tmp_path: Path, monkeypatch):
+    init_workspace(WorkspacePaths(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    client = TestClient(api.app)
+
+    readiness = client.post("/api/readiness/devices")
+
+    assert readiness.status_code == 200
+    body = readiness.json()
+    # No Rez drivers in unit tests: every seeded device must be reported unreadable, never fake-green.
+    assert body["ok"] is False
+    assert body["tested"] == 3
+    assert body["readable"] == 0
+    assert {device["id"] for device in body["devices"]} == {"v2-store1", "v2-store2", "v2-store3"}
+    assert all(device["error"] for device in body["devices"])
+    assert "0/3" in body["message"]
+
+
 def test_health_endpoint_returns_lab_summary_not_raw_dump(tmp_path: Path, monkeypatch):
     init_workspace(WorkspacePaths(tmp_path))
     monkeypatch.chdir(tmp_path)

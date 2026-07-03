@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Netcode MVP</title>
     <link rel="icon" href="/static/favicon.svg" type="image/svg+xml" />
-    <link rel="stylesheet" href="/static/styles.css?v=20260703-mvp9" />
+    <link rel="stylesheet" href="/static/styles.css?v=20260703-mvp10" />
   </head>
   <body>
     <main class="app-shell">
@@ -94,7 +94,7 @@
           <section id="view-setup" class="view">
             <section class="section-heading">
               <h3>Setup — readiness gates</h3>
-              <p>Four things every safe change depends on. Each gate is pass/fail with one fix. When all four are green, start a change.</p>
+              <p>Gates 1–2 (Git, source of truth) unlock changes. Gates 3–4 tell you how changes will be proven — with a lab, with on-device dry-runs, or plan-only. A missing lab never blocks planning.</p>
             </section>
             <div class="setup-grid">
               <article class="setup-item gate" id="gate-git-card">
@@ -122,15 +122,19 @@
               </article>
               <article class="setup-item gate" id="gate-read-card">
                 <span>Gate 3</span>
-                <h4>Read access</h4>
-                <p class="gate-question">Can the platform read live devices?</p>
+                <h4>Device reachability</h4>
+                <p class="gate-question">Can the platform read your devices?</p>
                 <p id="setup-rez-copy" class="gate-status">Checking.</p>
-                <p id="setup-rez-detail" class="setup-hint"></p>
+                <div id="reachability-results" class="stat-chips"></div>
+                <p id="setup-rez-detail" class="setup-hint">Verification and drift read live device state. If the platform cannot read, you are blind after an apply.</p>
+                <div class="button-row compact">
+                  <button id="test-reachability" class="secondary" type="button">Test reachability</button>
+                </div>
               </article>
               <article class="setup-item gate" id="gate-lab-card">
                 <span>Gate 4</span>
-                <h4>Safe test target</h4>
-                <p class="gate-question">Is there a lab to prove changes before they matter?</p>
+                <h4>Proof mode</h4>
+                <p class="gate-question">Where do changes get proven before they matter?</p>
                 <p id="setup-lab-copy" class="gate-status">Checking.</p>
                 <p id="setup-lab-detail" class="setup-hint"></p>
               </article>
@@ -471,6 +475,6 @@
         </aside>
       </section>
     </main>
-    <script src="/static/app.js?v=20260703-mvp9"></script>
+    <script src="/static/app.js?v=20260703-mvp10"></script>
   </body>
 </html>

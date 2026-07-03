@@ -39,6 +39,7 @@ const appState = {
   uiConfigPath: "",
   configHistory: [],
   configApplied: false,
+  reachability: null,
   gitBranches: null,
   activeChangeId: "",
   lastCommit: null,
@@ -689,12 +690,59 @@ function setStory(id, status, label) {
   card.querySelector("strong").textContent = label;
 }
 
+function proofMode() {
+  if (appState.health?.lab?.ok) {
+    return {
+      id: "lab-first",
+      label: "Lab-first",
+      pass: true,
+      copy: "Lab reachable. Dry-run and apply are proven in the lab before anything that matters.",
+      detail: "Runner: this runtime. Your browser never touches devices directly.",
+    };
+  }
+  const reach = appState.reachability;
+  if (reach && reach.readable > 0) {
+    return {
+      id: "dry-run",
+      label: "Dry-run proof",
+      pass: true,
+      copy: "No lab detected. Every change is still proven with a dry-run on the target device: isolated config session, diff shown, nothing committed. Apply requires that proof.",
+      detail: "Runner: this runtime. Your browser never touches devices directly.",
+    };
+  }
+  if (reach && reach.readable === 0) {
+    return {
+      id: "plan-only",
+      label: "Plan-only",
+      pass: false,
+      copy: "No lab and no readable devices. You can plan, validate, and review evidence — device actions stay locked until a device is reachable.",
+      detail: "Fix reachability in Gate 3 to unlock dry-run proof.",
+    };
+  }
+  return {
+    id: "unknown",
+    label: "Dry-run proof (unconfirmed)",
+    pass: false,
+    copy: "No lab detected. Run the reachability test in Gate 3 — if your devices are readable, changes are proven with on-device dry-runs.",
+    detail: "Planning and validation work either way; they never touch a device.",
+  };
+}
+
 function setupGates() {
   const gitPass = Boolean(appState.git?.available);
   const sotPass = Boolean(appState.source?.ok && (appState.source.summary?.device_count || 0) > 0);
-  const readPass = Boolean(appState.rezHealth?.ok);
-  const labPass = Boolean(appState.health?.lab?.ok);
-  return { gitPass, sotPass, readPass, labPass, passed: [gitPass, sotPass, readPass, labPass].filter(Boolean).length };
+  const reach = appState.reachability;
+  const readPass = reach ? reach.readable > 0 : Boolean(appState.rezHealth?.ok);
+  const mode = proofMode();
+  return {
+    gitPass,
+    sotPass,
+    readPass,
+    labPass: mode.pass,
+    mode,
+    core: [gitPass, sotPass].filter(Boolean).length,
+    passed: [gitPass, sotPass, readPass, mode.pass].filter(Boolean).length,
+  };
 }
 
 const STORY3_STEPS = [
@@ -745,7 +793,11 @@ function renderStoryRail() {
 
 function renderUserStories() {
   const gates = setupGates();
-  setStory("story-ready", gates.passed === 4 ? "pass" : "warn", gates.passed === 4 ? "Ready" : `${gates.passed}/4 gates ready`);
+  setStory(
+    "story-ready",
+    gates.core === 2 ? "pass" : "warn",
+    gates.core === 2 ? `Ready · ${gates.mode.label}` : `${gates.core}/2 core gates ready`
+  );
   setStory(
     "story-discovery",
     appState.discovery?.ok ? "pass" : gates.readPass ? "warn" : "fail",
@@ -840,31 +892,57 @@ function renderSetup() {
   );
   $("setup-sot-detail").textContent = `Active provider: ${source.provider || "local_yaml"}. Lab credentials come from inventory defaults (lab only) and are never copied into imported records.`;
 
-  const rezPlatformCount = (appState.rezPlatforms?.platforms || []).length;
-  setGateCard(
-    "gate-read-card",
-    gates.readPass,
-    "setup-rez-copy",
-    gates.readPass
-      ? `Read drivers are loaded (${rezPlatformCount} vendors). Pick the vendor when you discover a device.`
-      : `Read drivers are unavailable: ${appState.rezHealth?.error || "unknown error"}.`
+  const reach = appState.reachability;
+  let reachCopy;
+  if (reach) {
+    reachCopy = reach.tested
+      ? `${reach.readable}/${reach.tested} trusted devices are readable.`
+      : reach.message || "No devices to test yet.";
+  } else if (appState.rezHealth?.ok) {
+    reachCopy = "Not tested yet. Run the test — it reads each trusted device without changing anything.";
+  } else {
+    reachCopy = `Reads are unavailable: ${appState.rezHealth?.error || "device read drivers not loaded"}.`;
+  }
+  setGateCard("gate-read-card", gates.readPass, "setup-rez-copy", reachCopy);
+  chipRow(
+    $("reachability-results"),
+    (reach?.devices || []).map((device) => ({
+      text: device.ok ? `${device.id} ✓` : `${device.id}: ${device.error || "unreadable"}`,
+      tone: device.ok ? "good" : "warn",
+    })),
+    "Run the test to see per-device results"
   );
-  $("setup-rez-detail").textContent = "Used by discovery, verification, and drift. Read-only — never pushes config.";
+  $("test-reachability").disabled = !(appState.source?.ok && (appState.source.summary?.device_count || 0) > 0);
 
-  const lab = appState.health?.lab || {};
-  setGateCard(
-    "gate-lab-card",
-    gates.labPass,
-    "setup-lab-copy",
-    gates.labPass
-      ? "Arista lab is reachable. Every change is proven here before it counts."
-      : "Lab is not reachable from this runtime. Open the ORB URL for dry-run and apply."
-  );
-  $("setup-lab-detail").textContent = "Runner: this runtime. Your browser never touches devices directly.";
+  const mode = gates.mode;
+  setGateCard("gate-lab-card", mode.pass, "setup-lab-copy", `${mode.label}: ${mode.copy}`);
+  $("setup-lab-detail").textContent = mode.detail;
 
   const startChange = $("start-change");
-  if (startChange) startChange.disabled = gates.passed !== 4;
+  if (startChange) startChange.disabled = gates.core !== 2;
   renderConfigPanel();
+}
+
+async function testReachability() {
+  startOutcome("Test device reachability", "Read each trusted device to confirm the platform can see live state. No device config is touched.");
+  try {
+    const data = await postJson("/api/readiness/devices", {});
+    appState.reachability = data;
+    renderAll();
+    setOutcome({
+      state: data.ok ? "Passed" : "Review",
+      status: data.ok ? "pass" : "warn",
+      title: data.ok ? "Devices are readable." : "No devices could be read.",
+      summary: data.message,
+      expected: "Confirm live reads work so verification and drift are trustworthy.",
+      actual: (data.devices || []).map((device) => `${device.ok ? "OK" : "FAIL"}: ${device.id} (${device.host})${device.error ? ` - ${device.error}` : ""}`).join("\n") || data.message,
+      artifact: "Reachability result per trusted device.",
+      device: "No device config was changed.",
+      next: data.ok ? "Start a change, or check drift." : "Fix credentials/network for the failing devices, or re-run discovery.",
+    });
+  } catch (error) {
+    failOutcome("Reachability test failed.", error);
+  }
 }
 
 function renderInventory() {
@@ -1681,6 +1759,7 @@ function bindEvents() {
   $("switch-branch").addEventListener("click", switchGitBranch);
   $("commit-artifacts").addEventListener("click", commitArtifacts);
   $("push-branch").addEventListener("click", pushBranch);
+  $("test-reachability").addEventListener("click", testReachability);
   $("record-select").addEventListener("change", (event) => loadChangeRecord(event.target.value));
   document.addEventListener("click", (event) => {
     const step = event.target.closest("[data-step-view]");

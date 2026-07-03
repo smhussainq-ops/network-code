@@ -501,6 +501,42 @@ def api_git_push(request: GitPushRequest) -> dict[str, object]:
     return result
 
 
+@app.post("/api/readiness/devices")
+def api_readiness_devices() -> dict[str, object]:
+    """Live read test: can the platform actually read the trusted devices right now?"""
+    p = paths()
+    inventory = Inventory(configured_inventory_path(p))
+    devices = list(inventory.by_id.values())
+    if not devices:
+        return {
+            "ok": False,
+            "tested": 0,
+            "readable": 0,
+            "devices": [],
+            "message": "No devices in source of truth yet. Discover a device first.",
+        }
+    collected = AdapterRegistry().rez.collect_many(devices)
+    results = {str(item.get("device_id")): item for item in collected.get("results", []) if isinstance(item, dict)}
+    rows: list[dict[str, object]] = []
+    readable = 0
+    for device in devices:
+        result = results.get(device.id) or {}
+        ok = bool(result.get("ok"))
+        readable += 1 if ok else 0
+        error = ""
+        if not ok:
+            errors = result.get("errors") or []
+            error = str(result.get("error") or (errors[0] if errors else "unreadable"))
+        rows.append({"id": device.id, "host": device.host, "platform": device.platform, "ok": ok, "error": error})
+    return {
+        "ok": readable > 0,
+        "tested": len(devices),
+        "readable": readable,
+        "devices": rows,
+        "message": f"{readable}/{len(devices)} trusted devices are readable.",
+    }
+
+
 @app.post("/api/discovery/scan")
 def api_discovery_scan(request: DiscoveryScanRequest) -> dict[str, object]:
     return DiscoveryService(paths()).scan(
