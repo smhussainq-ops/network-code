@@ -550,6 +550,74 @@ def test_git_branch_endpoint_creates_and_switches_change_branch(tmp_path: Path, 
     assert "main" in branches.json()["branches"]
 
 
+def test_custom_config_ingests_any_config_with_rollback_discipline(tmp_path: Path, monkeypatch):
+    init_workspace(WorkspacePaths(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    client = TestClient(api.app)
+
+    def plan_custom(values):
+        return client.post(
+            "/api/desired-state/plan",
+            json={
+                "change_type": "custom_config",
+                "site": "store-1842",
+                "device_id": "v2-store1",
+                "requested_by": "unit",
+                "values": values,
+            },
+        )
+
+    # Fail-closed: free-form config without rollback and without acknowledgment is blocked.
+    no_rollback = plan_custom({"description": "ntp", "config_lines": "ntp server 10.42.0.10"})
+    assert no_rollback.status_code == 200
+    assert no_rollback.json()["ok"] is False
+    checks = {check["id"]: check["status"] for check in no_rollback.json()["pipeline"]["validation"]["checks"]}
+    assert checks["custom_policy"] == "fail"
+
+    # Blocked fragments still apply to free-form config: credentials can never be pushed.
+    blocked = plan_custom(
+        {
+            "description": "bad idea",
+            "config_lines": "username intruder secret please",
+            "rollback_lines": "no username intruder",
+        }
+    )
+    assert blocked.json()["ok"] is False
+    blocked_checks = {check["id"]: check["status"] for check in blocked.json()["pipeline"]["validation"]["checks"]}
+    assert blocked_checks["render_scope"] == "fail"
+
+    # Happy path: any feature (NTP here) with engineer-supplied rollback passes the same gates.
+    good = plan_custom(
+        {
+            "description": "NTP servers for store-1842",
+            "config_lines": "ntp server 10.42.0.10\nntp server 10.42.0.11",
+            "rollback_lines": "no ntp server 10.42.0.10\nno ntp server 10.42.0.11",
+            "verify_contains": "ntp server 10.42.0.10",
+        }
+    )
+    assert good.json()["ok"] is True
+    rendered = good.json()["pipeline"]["render"]["config"]
+    assert rendered == "ntp server 10.42.0.10\nntp server 10.42.0.11\n"  # verbatim: what you paste is what is pushed
+    meta = good.json()["plan"]
+    assert meta["rollback"]["commands"] == "no ntp server 10.42.0.10\nno ntp server 10.42.0.11\n"
+    assert meta["rollback"]["confidence"]["level"] == "medium"
+    assert meta["lab_write_supported"] is True
+    assert meta["production_write_supported"] is False
+    assert "2 free-form config lines" in meta["blast_radius"]["objects"]
+    assert meta["suggested_branch"].startswith("change/store-1842-custom-")
+
+    # Explicit no-rollback acknowledgment is allowed but honestly labeled.
+    acknowledged = plan_custom(
+        {
+            "description": "banner",
+            "config_lines": "ntp server 10.42.0.12",
+            "acknowledge_no_rollback": True,
+        }
+    )
+    assert acknowledged.json()["ok"] is True
+    assert acknowledged.json()["plan"]["rollback"]["confidence"]["level"] == "none"
+
+
 def test_git_commit_and_push_endpoints_report_honestly(tmp_path: Path, monkeypatch):
     init_workspace(WorkspacePaths(tmp_path))
     monkeypatch.chdir(tmp_path)

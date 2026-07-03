@@ -76,6 +76,10 @@ SITE_DEVICE_INTENT_TEMPLATE = """! Source-of-truth only intent.
 """
 
 
+CUSTOM_CONFIG_TEMPLATE = """{{ custom.config_lines }}
+"""
+
+
 WORKSPACE_GITIGNORE = """.netcode/
 __pycache__/
 *.py[cod]
@@ -94,6 +98,7 @@ def init_workspace(paths: WorkspacePaths, force: bool = False) -> list[Path]:
         (paths.templates / "arista" / "bgp_neighbor.j2", BGP_NEIGHBOR_TEMPLATE),
         (paths.templates / "arista" / "acl_rule.j2", ACL_RULE_TEMPLATE),
         (paths.templates / "arista" / "site_device_intent.j2", SITE_DEVICE_INTENT_TEMPLATE),
+        (paths.templates / "arista" / "custom_config.j2", CUSTOM_CONFIG_TEMPLATE),
     ]
     for path, content in files:
         if force or not path.exists():

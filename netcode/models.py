@@ -202,7 +202,33 @@ class SiteDeviceIntent(BaseModel):
     metadata: IntentMetadata = Field(default_factory=IntentMetadata)
 
 
-Intent = AddVlanIntent | InterfaceConfigIntent | BgpNeighborIntent | AclRuleIntent | SiteDeviceIntent
+class CustomConfigSpec(BaseModel):
+    """Free-form config an engineer wants to push, with an engineer-supplied rollback."""
+
+    config_lines: str
+    rollback_lines: str = ""
+    verify_contains: str = ""
+    description: str = ""
+    acknowledge_no_rollback: bool = False
+
+    @field_validator("config_lines")
+    @classmethod
+    def config_required(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("config_lines is required for a custom config change")
+        return value
+
+
+class CustomConfigIntent(BaseModel):
+    change_type: Literal["custom_config"] = "custom_config"
+    site: str
+    targets: TargetSpec
+    custom: CustomConfigSpec
+    policy: PolicySpec = Field(default_factory=PolicySpec)
+    metadata: IntentMetadata = Field(default_factory=IntentMetadata)
+
+
+Intent = AddVlanIntent | InterfaceConfigIntent | BgpNeighborIntent | AclRuleIntent | SiteDeviceIntent | CustomConfigIntent
 
 
 class CheckResult(BaseModel):
@@ -283,4 +309,6 @@ def load_intent(path: Path) -> Intent:
         return AclRuleIntent.model_validate(data)
     if change_type == "site_device_intent":
         return SiteDeviceIntent.model_validate(data)
+    if change_type == "custom_config":
+        return CustomConfigIntent.model_validate(data)
     raise ValueError(f"Unsupported change_type: {change_type!r}")

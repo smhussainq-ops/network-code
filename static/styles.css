@@ -535,11 +535,19 @@ textarea:focus-visible {
   border: 1px solid var(--line);
   border-radius: 999px;
   color: var(--muted);
+  cursor: pointer;
   display: inline-flex;
+  font-family: inherit;
   font-size: 12px;
   font-weight: 650;
   gap: 6px;
+  min-height: 0;
   padding: 4px 10px;
+  width: auto;
+}
+
+.story-step:hover {
+  border-color: #9fb6e8;
 }
 
 .story-step em {

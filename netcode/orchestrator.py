@@ -138,6 +138,14 @@ def create_desired_state_intent(
             "groups": [g.strip() for g in str(values.get("groups", "stores,access-switches")).split(",") if g.strip()],
             "notes": str(values.get("notes", "")),
         }
+    elif change_type == "custom_config":
+        common["custom"] = {
+            "config_lines": str(values.get("config_lines", "")),
+            "rollback_lines": str(values.get("rollback_lines", "")),
+            "verify_contains": str(values.get("verify_contains", "")),
+            "description": str(values.get("description", "")),
+            "acknowledge_no_rollback": bool(values.get("acknowledge_no_rollback", False)),
+        }
     else:
         raise ValueError(f"Unsupported change_type: {change_type}")
 
@@ -171,6 +179,10 @@ def load_intent_from_data(data: dict[str, Any]):
         from netcode.models import SiteDeviceIntent
 
         return SiteDeviceIntent.model_validate(data)
+    if change_type == "custom_config":
+        from netcode.models import CustomConfigIntent
+
+        return CustomConfigIntent.model_validate(data)
     raise ValueError(f"Unsupported change_type: {change_type!r} in {temp_path}")
 
 

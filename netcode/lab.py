@@ -14,7 +14,7 @@ from netcode.adapters.execution import ExecutionAdapter, ExecutionAdapterMetadat
 from netcode.adapters.registry import AdapterRegistry
 from netcode.inventory import Device, Inventory
 from netcode.intent_utils import lab_write_supported, report_stem, rollback_config
-from netcode.models import AclRuleIntent, AddVlanIntent, BgpNeighborIntent, EndToEndArtifacts, EndToEndResult, Intent, InterfaceConfigIntent, PhaseResult, load_intent
+from netcode.models import AclRuleIntent, AddVlanIntent, BgpNeighborIntent, CustomConfigIntent, EndToEndArtifacts, EndToEndResult, Intent, InterfaceConfigIntent, PhaseResult, load_intent
 from netcode.paths import WorkspacePaths
 from netcode.rendering import render_intent
 from netcode.reporting import write_end_to_end_reports
@@ -320,6 +320,26 @@ class AristaEOSLabAdapter(ExecutionAdapter):
                 device_id=self.device.id,
                 message=f"ACL {intent.acl.name} sequence {intent.acl.sequence} {'matches' if seen else 'does not match'} expected state.",
                 evidence={"commands": {command: output}},
+            )
+        if isinstance(intent, CustomConfigIntent):
+            needle = intent.custom.verify_contains.strip()
+            if not needle:
+                lines = [line.strip() for line in intent.custom.config_lines.splitlines() if line.strip()]
+                needle = lines[0] if lines else ""
+            command = "show running-config"
+            output = self.show(command)
+            found = needle in output if needle else False
+            seen = found if present else not found
+            return LabResult(
+                status="pass" if seen else "fail",
+                action="verify" if present else "verify_rollback",
+                device_id=self.device.id,
+                message=(
+                    f"Custom config fragment {'is present' if found else 'is absent'} in running-config: {needle!r}."
+                    if needle
+                    else "No verify fragment available for this custom config."
+                ),
+                evidence={"command": command, "needle": needle, "found": found},
             )
         return LabResult(
             status="fail",

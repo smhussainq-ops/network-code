@@ -13,6 +13,7 @@ from netcode.models import (
     AddVlanIntent,
     BgpNeighborIntent,
     CheckResult,
+    CustomConfigIntent,
     Intent,
     InterfaceConfigIntent,
     RenderResult,
@@ -112,6 +113,8 @@ class StaticValidator:
                 "Site/device intent is source-of-truth only. Device writes stay locked.",
                 device_id=intent.device.device_id,
             )
+        if isinstance(intent, CustomConfigIntent):
+            return self._custom_config_policy(intent, render)
         return self._fail("intent_policy", "Intent Policy", f"Unsupported intent type {intent.change_type}.")
 
     def _vlan_policy(self, intent: AddVlanIntent, render: RenderResult) -> CheckResult:
@@ -245,6 +248,28 @@ class StaticValidator:
             sequence=intent.acl.sequence,
         )
 
+    def _custom_config_policy(self, intent: CustomConfigIntent, render: RenderResult) -> CheckResult:
+        lines = [line for line in intent.custom.config_lines.splitlines() if line.strip()]
+        if not lines:
+            return self._fail("custom_policy", "Custom Config Policy", "Custom config has no config lines.")
+        has_rollback = bool(intent.custom.rollback_lines.strip())
+        if not has_rollback and not intent.custom.acknowledge_no_rollback:
+            return self._fail(
+                "custom_policy",
+                "Custom Config Policy",
+                "Custom config requires rollback commands, or an explicit acknowledgment that no rollback exists.",
+                config_lines=len(lines),
+            )
+        return self._pass(
+            "custom_policy",
+            "Custom Config Policy",
+            f"Custom config carries {len(lines)} line{'s' if len(lines) != 1 else ''} with "
+            + ("engineer-supplied rollback." if has_rollback else "an explicit no-rollback acknowledgment."),
+            config_lines=len(lines),
+            rollback_supplied=has_rollback,
+            acknowledged_no_rollback=intent.custom.acknowledge_no_rollback,
+        )
+
     def _render_scope(self, intent: Intent, render: RenderResult) -> CheckResult:
         scope = self.policy.get("render_scope", {})
         default_allowed = {
@@ -253,6 +278,9 @@ class StaticValidator:
             "bgp_neighbor": ["router bgp ", "   router-id ", "   neighbor ", "   no neighbor "],
             "acl_rule": ["ip access-list ", "   remark ", "   permit ", "   deny "],
             "site_device_intent": ["! "],
+            # custom_config is DELIBERATELY free-form: no allow-list applies, but the
+            # blocked_fragments list below still rejects credentials/management config.
+            "custom_config": [],
         }
         allowed = tuple(scope.get(f"{intent.change_type}_allowed_prefixes", default_allowed.get(intent.change_type, [])))
         blocked = [str(v).lower() for v in scope.get("blocked_fragments", [])]

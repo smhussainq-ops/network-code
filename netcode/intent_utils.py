@@ -9,6 +9,7 @@ from netcode.models import (
     AclRuleIntent,
     AddVlanIntent,
     BgpNeighborIntent,
+    CustomConfigIntent,
     InterfaceConfigIntent,
     Intent,
     SiteDeviceIntent,
@@ -21,7 +22,13 @@ CHANGE_TYPE_LABELS = {
     "bgp_neighbor": "BGP Neighbor",
     "acl_rule": "ACL Rule",
     "site_device_intent": "Site / Device Intent",
+    "custom_config": "Custom Config",
 }
+
+
+def _custom_first_line(intent: "CustomConfigIntent") -> str:
+    lines = [line.strip() for line in intent.custom.config_lines.splitlines() if line.strip()]
+    return lines[0] if lines else "custom config"
 
 
 def safe_name(value: str) -> str:
@@ -41,6 +48,8 @@ def intent_title(intent: Intent) -> str:
         return f"Update ACL {intent.acl.name} sequence {intent.acl.sequence}"
     if isinstance(intent, SiteDeviceIntent):
         return f"Register {intent.device.device_id} as {intent.device.role}"
+    if isinstance(intent, CustomConfigIntent):
+        return f"Custom config: {intent.custom.description or _custom_first_line(intent)}"
     return CHANGE_TYPE_LABELS.get(intent.change_type, intent.change_type)
 
 
@@ -56,6 +65,8 @@ def intent_slug(intent: Intent) -> str:
         return f"{intent.site}-acl-{safe_name(intent.acl.name)}-{intent.acl.sequence}"
     if isinstance(intent, SiteDeviceIntent):
         return f"{intent.site}-device-{safe_name(intent.device.device_id)}"
+    if isinstance(intent, CustomConfigIntent):
+        return f"{intent.site}-custom-{safe_name(intent.custom.description or _custom_first_line(intent))[:32]}"
     return f"{intent.site}-{safe_name(intent.change_type)}"
 
 
@@ -66,6 +77,7 @@ def template_for_intent(intent: Intent) -> str:
         "bgp_neighbor": "bgp_neighbor.j2",
         "acl_rule": "acl_rule.j2",
         "site_device_intent": "site_device_intent.j2",
+        "custom_config": "custom_config.j2",
     }
     return templates[intent.change_type]
 
@@ -93,11 +105,13 @@ def intent_risk(intent: Intent) -> str:
         return "High: policy changes can permit or block traffic"
     if isinstance(intent, SiteDeviceIntent):
         return "Inventory only"
+    if isinstance(intent, CustomConfigIntent):
+        return "High: free-form config — review every line before dry-run"
     return "Review required"
 
 
 def lab_write_supported(intent: Intent) -> bool:
-    return isinstance(intent, (AddVlanIntent, InterfaceConfigIntent, BgpNeighborIntent, AclRuleIntent))
+    return isinstance(intent, (AddVlanIntent, InterfaceConfigIntent, BgpNeighborIntent, AclRuleIntent, CustomConfigIntent))
 
 
 def production_write_supported(intent: Intent) -> bool:
@@ -117,6 +131,9 @@ def rollback_config(intent: Intent) -> str:
         return "\n".join(lines) + "\n"
     if isinstance(intent, AclRuleIntent):
         return f"ip access-list {intent.acl.name}\n   no {intent.acl.sequence}\n"
+    if isinstance(intent, CustomConfigIntent):
+        rollback = intent.custom.rollback_lines.strip()
+        return f"{rollback}\n" if rollback else ""
     return ""
 
 
@@ -129,6 +146,8 @@ def verification_hint(intent: Intent) -> dict[str, Any]:
         return {"check": "running_config_contains", "params": {"section": f"router bgp {intent.bgp.asn}"}}
     if isinstance(intent, AclRuleIntent):
         return {"check": "running_config_contains", "params": {"section": f"ip access-list {intent.acl.name}"}}
+    if isinstance(intent, CustomConfigIntent):
+        return {"check": "running_config_contains", "params": {"section": intent.custom.verify_contains.strip() or _custom_first_line(intent)}}
     return {"check": "source_of_truth_only", "params": {}}
 
 
@@ -143,6 +162,10 @@ def rollback_confidence(intent: Intent) -> dict[str, str]:
         return {"level": "medium", "reason": "Removes this sequence; does not restore a rule it may have replaced."}
     if isinstance(intent, SiteDeviceIntent):
         return {"level": "none", "reason": "Inventory record only. No device config to roll back."}
+    if isinstance(intent, CustomConfigIntent):
+        if intent.custom.rollback_lines.strip():
+            return {"level": "medium", "reason": "Engineer-supplied rollback commands. The platform runs them but cannot prove they are the exact inverse."}
+        return {"level": "none", "reason": "No rollback commands were supplied for this custom change."}
     return {"level": "unknown", "reason": "Rollback behavior is not defined for this change type."}
 
 
@@ -166,6 +189,14 @@ def blast_radius(intent: Intent) -> dict[str, Any]:
         objects.append(f"ACL {intent.acl.name} sequence {intent.acl.sequence}")
     elif isinstance(intent, SiteDeviceIntent):
         objects.append(f"Inventory record {intent.device.device_id}")
+    elif isinstance(intent, CustomConfigIntent):
+        lines = [line for line in intent.custom.config_lines.splitlines() if line.strip()]
+        objects.append(f"{len(lines)} free-form config line{'s' if len(lines) != 1 else ''}")
+        # Top-level config sections give reviewers a fast read of what is touched.
+        sections = [line.strip() for line in lines if line and not line.startswith((" ", "\t", "!"))]
+        objects.extend(sections[:8])
+        if len(sections) > 8:
+            objects.append(f"+{len(sections) - 8} more sections")
     return {
         "devices": devices,
         "device_count": len(devices),
@@ -248,6 +279,24 @@ def pre_post_checks(intent: Intent) -> dict[str, list[dict[str, Any]]]:
                 {
                     "id": "running_config_contains",
                     "description": f"Running config contains the ACL {intent.acl.name} rule.",
+                    "executable": True,
+                }
+            ],
+        }
+    if isinstance(intent, CustomConfigIntent):
+        needle = intent.custom.verify_contains.strip() or _custom_first_line(intent)
+        return {
+            "pre": [
+                {
+                    "id": "rollback_supplied",
+                    "description": "Rollback commands are supplied (or no-rollback is explicitly acknowledged).",
+                    "executable": True,
+                }
+            ],
+            "post": [
+                {
+                    "id": "running_config_contains",
+                    "description": f"Running config contains: {needle}",
                     "executable": True,
                 }
             ],

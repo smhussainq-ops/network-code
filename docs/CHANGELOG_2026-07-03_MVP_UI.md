@@ -279,3 +279,44 @@ raw artifact tabs moved behind Advanced.
   (blast radius, rollback commands + confidence, pre-checks,
   suggested branch, manifest existence, git_commit event, 404).
 - UI route test updated to the new story board and screens.
+
+## 2026-07-03 Custom Config Ingestion + Guided Empty States (Claude)
+
+### Custom Config — push whatever the engineer needs
+
+New `custom_config` change type: paste ANY exact CLI lines and they run
+through the same safety spine as typed changes.
+
+- **Verbatim rendering**: what you paste is exactly what is pushed
+  (`templates/arista/custom_config.j2` is a passthrough).
+- **Rollback discipline (fail-closed)**: rollback commands are required;
+  the only alternative is an explicit "I accept this change has no
+  rollback" acknowledgment, and the plan then labels rollback
+  confidence `none`. Engineer-supplied rollback flows into the real
+  lab rollback path.
+- **Credentials still blocked**: the policy `blocked_fragments`
+  (username / enable secret / management / api) reject free-form lines
+  too — free-form does not mean unguarded.
+- **Blast radius from the paste**: line count plus the top-level config
+  sections touched.
+- **Verify after apply**: engineer supplies a "running-config must
+  contain" fragment (defaults to the first pasted line); live
+  verification and rollback-absence checks use it.
+- Threaded through every ladder: models, orchestrator, validation,
+  rendering template, lab verify, UI catalog (textarea fields).
+
+### UX repairs from live review
+
+- Story-rail steps are now buttons that navigate to the right view.
+- Plan's empty state guides instead of dead-ending ("Start at step 1
+  on the rail: open Desired State...").
+- Live-verified end to end on the ORB lab before this commit: plan →
+  branch → dry-run → commit → apply (VLAN 90 present) → verify → push
+  (honest credential failure) → change record (all proofs + manifest)
+  → rollback (VLAN 90 absent).
+
+### Tests (36 passing)
+
+- `test_custom_config_ingests_any_config_with_rollback_discipline`:
+  no-rollback blocked, credentials blocked, verbatim render, rollback
+  commands + confidence, blast radius, acknowledged-no-rollback path.

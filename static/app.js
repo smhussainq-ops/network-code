@@ -698,15 +698,15 @@ function setupGates() {
 }
 
 const STORY3_STEPS = [
-  { id: "declare", label: "Declare" },
-  { id: "branch", label: "Branch" },
-  { id: "plan", label: "Plan" },
-  { id: "validate", label: "Validate" },
-  { id: "dryrun", label: "Dry-run" },
-  { id: "commit", label: "Commit" },
-  { id: "apply", label: "Apply" },
-  { id: "verify", label: "Verify" },
-  { id: "push", label: "Push" },
+  { id: "declare", label: "Declare", view: "desired" },
+  { id: "branch", label: "Branch", view: "desired" },
+  { id: "plan", label: "Plan", view: "plan" },
+  { id: "validate", label: "Validate", view: "validate" },
+  { id: "dryrun", label: "Dry-run", view: "validate" },
+  { id: "commit", label: "Commit", view: "apply" },
+  { id: "apply", label: "Apply", view: "apply" },
+  { id: "verify", label: "Verify", view: "apply" },
+  { id: "push", label: "Push", view: "apply" },
 ];
 
 function story3Status() {
@@ -736,7 +736,7 @@ function renderStoryRail() {
   const { done, nextIndex } = story3Status();
   const html = STORY3_STEPS.map((step, index) => {
     const state = done[step.id] ? "done" : index === nextIndex ? "next" : "todo";
-    return `<span class="story-step ${state}"><em>${index + 1}</em>${escapeHtml(step.label)}</span>`;
+    return `<button type="button" class="story-step ${state}" data-step-view="${step.view}" title="Go to ${escapeHtml(step.label)}"><em>${index + 1}</em>${escapeHtml(step.label)}</button>`;
   }).join("");
   rails.forEach((rail) => {
     rail.innerHTML = html;
@@ -931,12 +931,12 @@ function renderPlan() {
     $("plan-device").textContent = "-";
     $("plan-risk").textContent = "Unknown";
     $("plan-writes").textContent = "None";
-    $("plan-summary-text").textContent = "Create desired state first.";
-    $("plan-commands").textContent = "No commands generated yet.";
-    $("plan-blast").innerHTML = "";
-    $("plan-rollback").textContent = "No rollback plan yet.";
+    $("plan-summary-text").textContent = "No plan yet.\n\nStart at step 1 on the rail above: open Desired State, pick a change type (or paste custom config), and click Create plan.";
+    $("plan-commands").textContent = "No commands generated yet. The exact CLI appears here before any device sees it.";
+    $("plan-blast").innerHTML = '<span class="chip muted">Blast radius appears here once a plan exists</span>';
+    $("plan-rollback").textContent = "The rollback plan is computed with the plan — before apply, not after.";
     $("rollback-confidence").textContent = "";
-    $("plan-checks").innerHTML = "Create a plan to see the checks.";
+    $("plan-checks").innerHTML = '<article class="check-item"><strong>Pre/post checks appear with the plan.</strong><p>Each change type declares what must be true before and after apply.</p></article>';
     return;
   }
   const meta = plan.plan || {};
@@ -1682,6 +1682,10 @@ function bindEvents() {
   $("commit-artifacts").addEventListener("click", commitArtifacts);
   $("push-branch").addEventListener("click", pushBranch);
   $("record-select").addEventListener("change", (event) => loadChangeRecord(event.target.value));
+  document.addEventListener("click", (event) => {
+    const step = event.target.closest("[data-step-view]");
+    if (step) setView(step.dataset.stepView);
+  });
   $$("#platform-config-form input, #platform-config-form select, #platform-config-form textarea").forEach((input) => input.addEventListener("input", syncQuickConfigToJson));
   $("discover-device").addEventListener("click", discoverDevice);
   $("save-discovered-device").addEventListener("click", saveDiscoveredDevice);
