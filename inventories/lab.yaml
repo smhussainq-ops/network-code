@@ -1,0 +1,39 @@
+lab_type: arista_containerlab_v2
+description: Rez Arista containerlab v2 reachable from ORB VM clab
+defaults:
+  platform: arista_eos
+  username: admin
+  password: ""  # stripped on control plane; creds live only on the runner
+  port: 22
+devices:
+- id: v2-store1
+  hostname: v2-store1
+  host: 172.100.1.41
+  groups:
+  - stores
+  - access-switches
+  site: store-1842
+- id: v2-store2
+  hostname: v2-store2
+  host: 172.100.1.42
+  groups:
+  - stores
+  - access-switches
+  site: store-1843
+- id: v2-store3
+  hostname: v2-store3
+  host: 172.100.1.43
+  groups:
+  - stores
+  - access-switches
+  site: store-1844
+known_subnets:
+  store-1842:
+  - 10.42.30.0/24
+  - 10.42.40.0/24
+  store-1843:
+  - 10.43.30.0/24
+  - 10.43.40.0/24
+  store-1844:
+  - 10.44.30.0/24
+  - 10.44.40.0/24

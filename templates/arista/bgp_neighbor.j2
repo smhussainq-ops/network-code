@@ -1,0 +1,18 @@
+router bgp {{ bgp.asn }}
+{% if bgp.router_id %}
+   router-id {{ bgp.router_id }}
+{% endif %}
+{% for neighbor in bgp.neighbors %}
+   neighbor {{ neighbor.address }} remote-as {{ neighbor.remote_as }}
+{% if neighbor.description %}
+   neighbor {{ neighbor.address }} description {{ neighbor.description }}
+{% endif %}
+{% if neighbor.update_source %}
+   neighbor {{ neighbor.address }} update-source {{ neighbor.update_source }}
+{% endif %}
+{% if neighbor.shutdown %}
+   neighbor {{ neighbor.address }} shutdown
+{% else %}
+   no neighbor {{ neighbor.address }} shutdown
+{% endif %}
+{% endfor %}

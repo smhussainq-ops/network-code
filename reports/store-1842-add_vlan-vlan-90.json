@@ -1,0 +1,162 @@
+{
+  "status": "pass",
+  "intent": {
+    "change_type": "add_vlan",
+    "site": "store-1842",
+    "targets": {
+      "device_ids": [
+        "v2-store1"
+      ],
+      "device_group": "access-switches"
+    },
+    "vlan": {
+      "id": 90,
+      "name": "GUEST_WIFI",
+      "subnet": "10.42.90.0/24",
+      "purpose": "guest",
+      "svi": {
+        "enabled": false
+      }
+    },
+    "policy": {
+      "pci_reachable": false,
+      "internet_reachable": true
+    },
+    "metadata": {
+      "requested_by": "lab-engineer",
+      "learning_mode": true
+    }
+  },
+  "intent_yaml": "change_type: add_vlan\nsite: store-1842\ntargets:\n  device_ids:\n  - v2-store1\n  device_group: access-switches\nvlan:\n  id: 90\n  name: GUEST_WIFI\n  subnet: 10.42.90.0/24\n  purpose: guest\n  svi:\n    enabled: false\npolicy:\n  pci_reachable: false\n  internet_reachable: true\nmetadata:\n  requested_by: lab-engineer\n  learning_mode: true\n",
+  "render": {
+    "template_path": "/Users/syedhussain/Documents/Network Automation/templates/arista/add_vlan.j2",
+    "config": "vlan 90\n   name GUEST_WIFI\n",
+    "variables": {
+      "change_type": "add_vlan",
+      "site": "store-1842",
+      "targets": {
+        "device_ids": [
+          "v2-store1"
+        ],
+        "device_group": "access-switches"
+      },
+      "vlan": {
+        "id": 90,
+        "name": "GUEST_WIFI",
+        "subnet": "10.42.90.0/24",
+        "purpose": "guest",
+        "svi": {
+          "enabled": false,
+          "gateway_ip": null
+        },
+        "network": "10.42.90.0",
+        "prefixlen": 24,
+        "netmask": "255.255.255.0"
+      },
+      "policy": {
+        "pci_reachable": false,
+        "internet_reachable": true
+      },
+      "metadata": {
+        "requested_by": "lab-engineer",
+        "ticket_id": null,
+        "learning_mode": true
+      }
+    }
+  },
+  "validation": {
+    "status": "pass",
+    "checks": [
+      {
+        "id": "schema",
+        "title": "Intent Schema",
+        "status": "pass",
+        "severity": "info",
+        "message": "Intent loaded into the add_vlan model.",
+        "evidence": {
+          "change_type": "add_vlan",
+          "site": "store-1842"
+        }
+      },
+      {
+        "id": "targets",
+        "title": "Target Resolution",
+        "status": "pass",
+        "severity": "info",
+        "message": "All requested target devices resolve in inventory.",
+        "evidence": {
+          "devices": [
+            "v2-store1"
+          ]
+        }
+      },
+      {
+        "id": "vlan_policy",
+        "title": "VLAN Policy",
+        "status": "pass",
+        "severity": "info",
+        "message": "VLAN ID and name match policy.",
+        "evidence": {
+          "vlan_id": 90,
+          "name": "GUEST_WIFI"
+        }
+      },
+      {
+        "id": "subnet_overlap",
+        "title": "Subnet Overlap",
+        "status": "pass",
+        "severity": "info",
+        "message": "Requested subnet does not overlap known site subnets.",
+        "evidence": {
+          "subnet": "10.42.90.0/24"
+        }
+      },
+      {
+        "id": "segmentation",
+        "title": "PCI Segmentation",
+        "status": "pass",
+        "severity": "info",
+        "message": "Segmentation policy is preserved for this intent.",
+        "evidence": {
+          "purpose": "guest",
+          "pci_reachable": false
+        }
+      },
+      {
+        "id": "render_scope",
+        "title": "Rendered Config Scope",
+        "status": "pass",
+        "severity": "info",
+        "message": "Rendered config only touches the intended VLAN feature scope.",
+        "evidence": {
+          "line_count": 2
+        }
+      },
+      {
+        "id": "deterministic_render",
+        "title": "Deterministic Render",
+        "status": "pass",
+        "severity": "info",
+        "message": "Same intent renders to the same EOS config every time.",
+        "evidence": {}
+      }
+    ]
+  },
+  "git": {
+    "available": true,
+    "branch": "main",
+    "status_short": "?? .gitignore\n?? README.md\n?? intents/\n?? inventories/\n?? netcode/\n?? network-as-code-platform-plan.md\n?? network-as-code-platform-roadmap-v2.md\n?? network-as-code-platform-roadmap.md\n?? policies/\n?? pyproject.toml\n?? rendered/\n?? reports/\n?? static/\n?? templates/\n?? tests/",
+    "intent_diff": "",
+    "suggested_commands": [
+      "git checkout -b change/store-1842-add-vlan-90",
+      "git add intents/store-1842/store-1842-add-vlan-90.yaml",
+      "git commit -m \"Add network intent store-1842-add-vlan-90\""
+    ]
+  },
+  "artifacts": {
+    "intent_path": "/Users/syedhussain/Documents/Network Automation/intents/store-1842/store-1842-add-vlan-90.yaml",
+    "rendered_path": "/Users/syedhussain/Documents/Network Automation/rendered/store-1842-add_vlan-vlan-90.eos",
+    "report_markdown_path": "/Users/syedhussain/Documents/Network Automation/reports/store-1842-add_vlan-vlan-90.md",
+    "report_json_path": "/Users/syedhussain/Documents/Network Automation/reports/store-1842-add_vlan-vlan-90.json"
+  }
+}

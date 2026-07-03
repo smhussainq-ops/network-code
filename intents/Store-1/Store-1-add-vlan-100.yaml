@@ -1,0 +1,19 @@
+change_type: add_vlan
+site: Store-1
+targets:
+  device_ids:
+  - v2-store1
+  device_group: access-switches
+vlan:
+  id: 100
+  name: GUEST_WIFI
+  subnet: 10.1.1.0/24
+  purpose: guest
+  svi:
+    enabled: false
+policy:
+  pci_reachable: false
+  internet_reachable: true
+metadata:
+  requested_by: lab-engineer
+  learning_mode: true

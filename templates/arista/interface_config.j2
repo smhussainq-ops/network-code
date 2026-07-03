@@ -1,0 +1,21 @@
+interface {{ interface.name }}
+{% if interface.description %}
+   description {{ interface.description }}
+{% endif %}
+{% if interface.mode == "access" %}
+   switchport mode access
+   switchport access vlan {{ interface.access_vlan }}
+{% elif interface.mode == "trunk" %}
+   switchport mode trunk
+{% if interface.trunk_allowed_vlans %}
+   switchport trunk allowed vlan {{ interface.trunk_allowed_vlans | join(',') }}
+{% endif %}
+{% elif interface.mode == "routed" %}
+   no switchport
+   ip address {{ interface.ip_address }}
+{% endif %}
+{% if interface.enabled %}
+   no shutdown
+{% else %}
+   shutdown
+{% endif %}

@@ -1,0 +1,165 @@
+{
+  "status": "pass",
+  "intent": {
+    "change_type": "add_vlan",
+    "site": "store-1842",
+    "targets": {
+      "device_ids": [
+        "v2-store1"
+      ],
+      "device_group": "access-switches"
+    },
+    "policy": {
+      "pci_reachable": false,
+      "internet_reachable": true
+    },
+    "metadata": {
+      "requested_by": "phase0-e2e",
+      "ticket_id": null,
+      "learning_mode": true
+    },
+    "vlan": {
+      "id": 94,
+      "name": "PHASE0_RUNNER",
+      "subnet": "10.42.94.0/24",
+      "purpose": "guest",
+      "svi": {
+        "enabled": false,
+        "gateway_ip": null
+      }
+    }
+  },
+  "intent_yaml": "change_type: add_vlan\nsite: store-1842\ntargets:\n  device_ids:\n  - v2-store1\n  device_group: access-switches\npolicy:\n  pci_reachable: false\n  internet_reachable: true\nmetadata:\n  requested_by: phase0-e2e\n  ticket_id: null\n  learning_mode: true\nvlan:\n  id: 94\n  name: PHASE0_RUNNER\n  subnet: 10.42.94.0/24\n  purpose: guest\n  svi:\n    enabled: false\n    gateway_ip: null\n",
+  "render": {
+    "template_path": "/private/tmp/claude-501/-Users-syedhussain-Documents-Network-Automation/5abb41ab-ae5a-4273-85bc-83d5430e3f60/scratchpad/cp-workspace/templates/arista/add_vlan.j2",
+    "config": "vlan 94\n   name PHASE0_RUNNER\n",
+    "variables": {
+      "change_type": "add_vlan",
+      "site": "store-1842",
+      "targets": {
+        "device_ids": [
+          "v2-store1"
+        ],
+        "device_group": "access-switches"
+      },
+      "vlan": {
+        "id": 94,
+        "name": "PHASE0_RUNNER",
+        "subnet": "10.42.94.0/24",
+        "purpose": "guest",
+        "svi": {
+          "enabled": false,
+          "gateway_ip": null
+        },
+        "network": "10.42.94.0",
+        "prefixlen": 24,
+        "netmask": "255.255.255.0"
+      },
+      "policy": {
+        "pci_reachable": false,
+        "internet_reachable": true
+      },
+      "metadata": {
+        "requested_by": "phase0-e2e",
+        "ticket_id": null,
+        "learning_mode": true
+      }
+    }
+  },
+  "validation": {
+    "status": "pass",
+    "checks": [
+      {
+        "id": "schema",
+        "title": "Intent Schema",
+        "status": "pass",
+        "severity": "info",
+        "message": "Intent loaded into the add_vlan model.",
+        "evidence": {
+          "change_type": "add_vlan",
+          "site": "store-1842"
+        }
+      },
+      {
+        "id": "targets",
+        "title": "Target Resolution",
+        "status": "pass",
+        "severity": "info",
+        "message": "All requested target devices resolve in inventory.",
+        "evidence": {
+          "devices": [
+            "v2-store1"
+          ]
+        }
+      },
+      {
+        "id": "vlan_policy",
+        "title": "VLAN Policy",
+        "status": "pass",
+        "severity": "info",
+        "message": "VLAN ID and name match policy.",
+        "evidence": {
+          "vlan_id": 94,
+          "name": "PHASE0_RUNNER"
+        }
+      },
+      {
+        "id": "subnet_overlap",
+        "title": "Subnet Overlap",
+        "status": "pass",
+        "severity": "info",
+        "message": "Requested subnet does not overlap known site subnets.",
+        "evidence": {
+          "subnet": "10.42.94.0/24"
+        }
+      },
+      {
+        "id": "segmentation",
+        "title": "PCI Segmentation",
+        "status": "pass",
+        "severity": "info",
+        "message": "Segmentation policy is preserved for this intent.",
+        "evidence": {
+          "purpose": "guest",
+          "pci_reachable": false
+        }
+      },
+      {
+        "id": "render_scope",
+        "title": "Rendered Config Scope",
+        "status": "pass",
+        "severity": "info",
+        "message": "Rendered config only touches the intended add_vlan feature scope.",
+        "evidence": {
+          "line_count": 2
+        }
+      },
+      {
+        "id": "deterministic_render",
+        "title": "Deterministic Render",
+        "status": "pass",
+        "severity": "info",
+        "message": "Same intent renders to the same EOS config every time.",
+        "evidence": {}
+      }
+    ]
+  },
+  "git": {
+    "available": false,
+    "message": "Git evidence is unavailable because this workspace is not inside a Git repository.",
+    "branch": null,
+    "status_short": "",
+    "intent_diff": "",
+    "suggested_commands": [
+      "git checkout -b change/store-1842-add-vlan-94",
+      "git add intents/store-1842/store-1842-add-vlan-94.yaml",
+      "git commit -m \"Add network intent store-1842-add-vlan-94\""
+    ]
+  },
+  "artifacts": {
+    "intent_path": "/private/tmp/claude-501/-Users-syedhussain-Documents-Network-Automation/5abb41ab-ae5a-4273-85bc-83d5430e3f60/scratchpad/cp-workspace/intents/store-1842/store-1842-add-vlan-94.yaml",
+    "rendered_path": "/private/tmp/claude-501/-Users-syedhussain-Documents-Network-Automation/5abb41ab-ae5a-4273-85bc-83d5430e3f60/scratchpad/cp-workspace/rendered/store-1842-add-vlan-94.eos",
+    "report_markdown_path": "/private/tmp/claude-501/-Users-syedhussain-Documents-Network-Automation/5abb41ab-ae5a-4273-85bc-83d5430e3f60/scratchpad/cp-workspace/reports/store-1842-add-vlan-94.md",
+    "report_json_path": "/private/tmp/claude-501/-Users-syedhussain-Documents-Network-Automation/5abb41ab-ae5a-4273-85bc-83d5430e3f60/scratchpad/cp-workspace/reports/store-1842-add-vlan-94.json"
+  }
+}

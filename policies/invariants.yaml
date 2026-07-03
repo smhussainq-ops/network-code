@@ -1,0 +1,34 @@
+vlan:
+  allowed_range:
+  - 2
+  - 4094
+  reserved:
+  - 1002
+  - 1003
+  - 1004
+  - 1005
+  name_pattern: ^[A-Z0-9_\-]{2,32}$
+segmentation:
+  pci_subnets:
+  - 10.42.30.0/24
+  - 10.43.30.0/24
+  - 10.44.30.0/24
+  guest_purposes:
+  - guest
+  - guest_wifi
+  - public_wifi
+render_scope:
+  add_vlan_allowed_prefixes:
+  - 'vlan '
+  - '   name '
+  - interface Vlan
+  - '   description '
+  - '   ip address '
+  blocked_fragments:
+  - 'username '
+  - management api
+  - interface Management
+  - ip access-list
+  - router bgp
+  - router ospf
+  - enable secret

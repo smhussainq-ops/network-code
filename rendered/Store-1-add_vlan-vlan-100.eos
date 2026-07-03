@@ -1,0 +1,2 @@
+vlan 100
+   name GUEST_WIFI

@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "netcode-platform"
+version = "0.1.0"
+description = "Glass-box network-as-code training and validation platform"
+requires-python = ">=3.10"
+dependencies = [
+  "fastapi>=0.115",
+  "uvicorn[standard]>=0.30",
+  "typer>=0.12",
+  "rich>=13.7",
+  "pydantic>=2.7",
+  "PyYAML>=6.0",
+  "Jinja2>=3.1",
+  "netmiko>=4.4",
+  "tenacity>=9.1",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0",
+  "httpx>=0.27",
+]
+
+[project.scripts]
+netcode = "netcode.cli:app"
+netcode-runner = "netcode.runner_agent:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["netcode*"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
