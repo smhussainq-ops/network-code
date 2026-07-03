@@ -213,6 +213,7 @@ label {
 }
 
 input,
+select,
 textarea {
   background: white;
   border: 1px solid var(--line);
@@ -221,6 +222,10 @@ textarea {
   min-height: 36px;
   padding: 7px 9px;
   width: 100%;
+}
+
+select {
+  appearance: none;
 }
 
 textarea {
@@ -1241,6 +1246,7 @@ button:active:not(:disabled) {
 
 button:focus-visible,
 input:focus-visible,
+select:focus-visible,
 textarea:focus-visible,
 summary:focus-visible {
   box-shadow: var(--nc-focus);

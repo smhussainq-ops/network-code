@@ -16,6 +16,7 @@ dependencies = [
   "PyYAML>=6.0",
   "Jinja2>=3.1",
   "netmiko>=4.4",
+  "tenacity>=9.1",
 ]
 
 [project.optional-dependencies]

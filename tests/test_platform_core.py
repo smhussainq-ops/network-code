@@ -6,6 +6,7 @@ from netcode.adapters.registry import AdapterRegistry
 from netcode.adapters.rez import RezAdapterBridge
 from netcode import api
 from netcode.bootstrap import init_workspace
+from netcode.discovery import DiscoveryService
 from netcode.inventory import Device, Inventory
 from netcode.jobs import JobRunner
 from netcode.paths import WorkspacePaths
@@ -89,6 +90,76 @@ DRIVER_MAP = {"fake_os": FakeDriver}
     assert result["adapter"] == "rez.fake_os"
     assert result["state"] == {"layer2": {"vlans": [{"vlan_id": 90, "name": "GUEST_WIFI"}]}}
     assert bridge.platforms()["platforms"][0]["platform"] == "fake_os"
+
+
+def test_discovery_service_builds_source_of_truth_candidate(tmp_path: Path):
+    paths = WorkspacePaths(tmp_path)
+    init_workspace(paths)
+
+    class FakeRez:
+        def normalize_platform(self, value):
+            return value or ""
+
+        def driver_map(self):
+            return {"arista_eos": object}
+
+        def summary(self):
+            return {"error": None}
+
+        def collect_device_state(self, device):
+            return {
+                "ok": True,
+                "adapter": f"rez.{device.platform}",
+                "driver": "drivers.arista_eos.AsyncAristaEOSDriver",
+                "state": {
+                    "device": {"hostname": "leaf1", "model": "vEOS"},
+                    "layer2": {"vlans": [{"vlan_id": 10}, {"vlan_id": 20}]},
+                    "interfaces": {"Ethernet1": {}, "Ethernet2": {}},
+                },
+                "warnings": [],
+                "errors": [],
+                "collection_time": 0.01,
+            }
+
+    result = DiscoveryService(paths, rez=FakeRez()).scan(
+        host="172.100.1.41",
+        platform="arista_eos",
+        username="admin",
+        password="admin",
+        device_id="leaf1",
+        site="lab",
+    )
+
+    assert result["ok"] is True
+    assert result["platform"] == "arista_eos"
+    assert result["source_of_truth_candidate"]["host"] == "172.100.1.41"
+    assert result["source_of_truth_candidate"]["platform"] == "arista_eos"
+    assert "leaf1" in result["source_of_truth_yaml"]
+    assert result["safety"]["device_writes"] == "none"
+
+
+def test_discovery_import_updates_local_source_of_truth_without_password(tmp_path: Path):
+    paths = WorkspacePaths(tmp_path)
+    init_workspace(paths)
+
+    candidate = {
+        "id": "core1",
+        "hostname": "core1",
+        "host": "192.0.2.10",
+        "platform": "cisco_ios",
+        "site": "dc1",
+        "groups": ["core"],
+        "port": 22,
+        "password": "do-not-store",
+    }
+
+    result = DiscoveryService(paths).import_candidate(candidate)
+    inventory = Inventory(paths.inventories / "lab.yaml")
+
+    assert result["ok"] is True
+    assert inventory.by_id["core1"].host == "192.0.2.10"
+    assert inventory.by_id["core1"].platform == "cisco_ios"
+    assert "password" not in result["device"]
 
 
 def test_adapter_registry_reports_execution_and_rez_state_contract(tmp_path: Path):
@@ -239,6 +310,19 @@ def test_pending_feature_endpoints(tmp_path: Path, monkeypatch):
     scale = client.post("/api/scale/plan", json={"canary_size": 1, "batch_size": 100})
     assistant = client.post("/api/assistant", json={"prompt": "Explain risk for vlan 90", "context": {"workflow": safety["workflow"]}})
     compliance = client.get("/api/compliance/summary")
+    discovery_import = client.post(
+        "/api/source-of-truth/devices/import",
+        json={
+            "candidate": {
+                "id": "edge1",
+                "hostname": "edge1",
+                "host": "192.0.2.11",
+                "platform": "cisco_ios",
+                "site": "dc1",
+                "groups": ["edge"],
+            }
+        },
+    )
 
     assert gitops.status_code == 200
     assert gitops.json()["pull_request"]["required_review_evidence"]
@@ -253,6 +337,8 @@ def test_pending_feature_endpoints(tmp_path: Path, monkeypatch):
     assert assistant.json()["guardrails"]
     assert compliance.status_code == 200
     assert compliance.json()["remediation_states"] == ["detect", "classify", "approve_fix", "apply", "verify"]
+    assert discovery_import.status_code == 200
+    assert discovery_import.json()["device"]["platform"] == "cisco_ios"
 
 
 def test_template_artifact_endpoint_returns_jinja_body(tmp_path: Path, monkeypatch):
@@ -301,6 +387,8 @@ def test_app_route_serves_ui():
     assert "Device Commands" in response.text
     assert "Source of truth" in response.text
     assert "Adapter matrix" in response.text
+    assert "Discovery" in response.text
+    assert "Discover device" in response.text
     assert "Guided Journey" in response.text
     assert "Build the change path one artifact at a time" in response.text
     assert "0/11 complete" in response.text

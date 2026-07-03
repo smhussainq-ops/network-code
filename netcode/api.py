@@ -12,6 +12,7 @@ from pydantic import BaseModel
 from netcode.ai_assistant import assistant_response
 from netcode.adapters.registry import AdapterRegistry
 from netcode.bootstrap import init_workspace
+from netcode.discovery import DiscoveryService
 from netcode.drift import compliance_summary, vlan_drift_report
 from netcode.gitops import gitops_plan
 from netcode.inventory import Inventory
@@ -46,6 +47,21 @@ class IntentPathRequest(BaseModel):
 
 class DeviceRequest(BaseModel):
     device_id: str
+
+
+class DiscoveryScanRequest(BaseModel):
+    host: str
+    username: str = ""
+    password: str = ""
+    platform: str = ""
+    port: int = 22
+    device_id: str = ""
+    site: str = ""
+    groups: list[str] = []
+
+
+class SourceOfTruthDeviceImportRequest(BaseModel):
+    candidate: dict[str, object]
 
 
 class VlanVerifyRequest(BaseModel):
@@ -236,6 +252,25 @@ def api_source_of_truth() -> dict[str, object]:
 @app.get("/api/source-of-truth/providers")
 def api_source_of_truth_providers() -> dict[str, object]:
     return {"providers": provider_catalog()}
+
+
+@app.post("/api/discovery/scan")
+def api_discovery_scan(request: DiscoveryScanRequest) -> dict[str, object]:
+    return DiscoveryService(paths()).scan(
+        host=request.host,
+        username=request.username,
+        password=request.password,
+        platform=request.platform,
+        port=request.port,
+        device_id=request.device_id,
+        site=request.site,
+        groups=request.groups,
+    )
+
+
+@app.post("/api/source-of-truth/devices/import")
+def api_source_of_truth_import_device(request: SourceOfTruthDeviceImportRequest) -> dict[str, object]:
+    return DiscoveryService(paths()).import_candidate(request.candidate)
 
 
 @app.get("/api/templates/{platform}/{name}")

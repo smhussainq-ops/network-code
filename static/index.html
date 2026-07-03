@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Netcode Platform</title>
     <link rel="icon" href="/static/favicon.svg" type="image/svg+xml" />
-    <link rel="stylesheet" href="/static/styles.css?v=20260702-17" />
+    <link rel="stylesheet" href="/static/styles.css?v=20260702-18" />
   </head>
   <body>
     <main class="app-shell">
@@ -46,6 +46,26 @@
           <button id="show-jobs" type="button" class="secondary">Show job history</button>
           <button id="show-device-state" type="button" class="secondary">Show device state</button>
           <button id="verify-vlan-state" type="button" class="secondary">Verify VLAN state</button>
+        </section>
+
+        <section class="panel compact discovery-panel">
+          <h2>Discovery</h2>
+          <label>Device IP / Host<input id="discovery-host" value="172.100.1.41" /></label>
+          <label>Vendor
+            <select id="discovery-platform">
+              <option value="">Auto detect with Rez</option>
+              <option value="arista_eos">Arista EOS</option>
+              <option value="cisco_ios">Cisco IOS/XE</option>
+              <option value="cisco_nxos">Cisco NX-OS</option>
+              <option value="juniper_junos">Juniper Junos</option>
+              <option value="fortinet">Fortinet</option>
+              <option value="palo_alto">Palo Alto</option>
+            </select>
+          </label>
+          <label>Username<input id="discovery-username" placeholder="Use inventory default" /></label>
+          <label>Password<input id="discovery-password" type="password" placeholder="Use inventory default" /></label>
+          <button id="run-discovery" type="button" class="secondary">Discover device</button>
+          <button id="import-discovered-device" type="button" class="secondary" disabled>Save to source of truth</button>
         </section>
 
         <section class="panel compact assistant-panel">
@@ -225,6 +245,7 @@
               <button class="detail-tab" data-detail="checks">Safety Checks</button>
               <button class="detail-tab" data-detail="lab">Device Proof</button>
               <button class="detail-tab" data-detail="source">Source of Truth</button>
+              <button class="detail-tab" data-detail="discovery">Discovery</button>
               <button class="detail-tab" data-detail="adapters">Adapters</button>
               <button class="detail-tab" data-detail="workflow">Workflow</button>
               <button class="detail-tab" data-detail="gitops">GitOps</button>
@@ -239,6 +260,7 @@
             <div class="detail-output checks" id="detail-checks"></div>
             <pre class="detail-output" id="detail-lab"></pre>
             <pre class="detail-output" id="detail-source"></pre>
+            <pre class="detail-output" id="detail-discovery"></pre>
             <pre class="detail-output" id="detail-adapters"></pre>
             <pre class="detail-output" id="detail-workflow"></pre>
             <pre class="detail-output" id="detail-gitops"></pre>
@@ -371,6 +393,6 @@
         </section>
       </section>
     </main>
-    <script src="/static/app.js?v=20260702-17"></script>
+    <script src="/static/app.js?v=20260702-18"></script>
   </body>
 </html>

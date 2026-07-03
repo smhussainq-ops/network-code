@@ -7,6 +7,7 @@ let applying = false;
 let journeyCurrentStep = "define";
 let journeyPipelineData = null;
 let journeyDefinedRequest = null;
+let lastDiscoveryCandidate = null;
 const journeyArtifacts = {};
 const journeyCompletedSteps = new Set();
 const journeyFailedSteps = new Set();
@@ -52,6 +53,16 @@ const ACTIONS = {
     title: "Clicked: Adapter matrix",
     expected: "Show which vendors have Rez read support, which have execution adapters, and which writes remain locked.",
     running: "Loading Rez health, Rez platforms, and Netcode execution adapter capabilities.",
+  },
+  "run-discovery": {
+    title: "Clicked: Discover device",
+    expected: "Use Rez multi-vendor read drivers to identify a device, collect state, and create an import-ready source-of-truth record.",
+    running: "Trying the selected Rez vendor driver, or auto-detecting through Rez if no vendor was selected. No config writes are allowed.",
+  },
+  "import-discovered-device": {
+    title: "Clicked: Save discovered device",
+    expected: "Write the reviewed discovery candidate into local YAML source of truth without storing the discovery password.",
+    running: "Updating the local inventory file with the discovered device record.",
   },
   "show-workflow-rules": {
     title: "Clicked: Workflow rules",
@@ -310,6 +321,12 @@ function requestChanged() {
   renderJourneyStep();
 }
 
+function renderDiscoveryImport() {
+  const button = $("import-discovered-device");
+  if (!button) return;
+  button.disabled = !lastDiscoveryCandidate;
+}
+
 function timestamp() {
   return new Intl.DateTimeFormat(undefined, {
     hour: "2-digit",
@@ -528,6 +545,7 @@ function renderLocks() {
   $("run-dry-run").disabled = !safetyPassed;
   $("run-apply").disabled = !(safetyPassed && dryRunPassed) || applying;
   $("run-rollback").disabled = !applyPassed || applying;
+  renderDiscoveryImport();
   updateLockState();
 }
 
@@ -858,6 +876,7 @@ async function refreshPlatform({ log = true } = {}) {
       );
     }
     renderCapabilities(capabilities);
+    populateDiscoveryPlatforms(adapters.state_adapters?.rez?.platforms || []);
     $("detail-source").textContent = formatJson(source);
     $("detail-adapters").textContent = formatJson(adapters);
     $("detail-jobs").textContent = formatJson({
@@ -928,6 +947,122 @@ async function showAdapterMatrix() {
     });
   } catch (error) {
     failAction("show-adapter-matrix", error.message);
+  }
+}
+
+function populateDiscoveryPlatforms(platforms = []) {
+  const select = $("discovery-platform");
+  if (!select) return;
+  const current = select.value;
+  const labels = {
+    arista_eos: "Arista EOS",
+    cisco_ios: "Cisco IOS/XE",
+    cisco_nxos: "Cisco NX-OS",
+    cisco_asa: "Cisco ASA",
+    juniper_junos: "Juniper Junos",
+    aruba_aoscx: "Aruba AOS-CX",
+    nokia_srl: "Nokia SR Linux",
+    fortinet: "Fortinet",
+    palo_alto: "Palo Alto",
+    meraki: "Meraki",
+    cisco_sdwan: "Cisco SD-WAN",
+  };
+  platforms.forEach((platform) => {
+    if (!platform || select.querySelector(`option[value="${platform}"]`)) return;
+    const option = document.createElement("option");
+    option.value = platform;
+    option.textContent = labels[platform] || platform.replaceAll("_", " ");
+    select.appendChild(option);
+  });
+  select.value = current;
+}
+
+function discoveryPayload() {
+  const form = formPayload();
+  return {
+    host: $("discovery-host").value.trim(),
+    platform: $("discovery-platform").value,
+    username: $("discovery-username").value.trim(),
+    password: $("discovery-password").value,
+    device_id: form.device_id || "",
+    site: form.site || "",
+    groups: [],
+    port: 22,
+  };
+}
+
+function discoveryCommandSummary(data) {
+  const adapter = data.adapter || (data.platform ? `rez.${data.platform}` : "Rez driver");
+  return [
+    `# Discovery uses read/state collection only`,
+    `$ ${adapter}: connect`,
+    `$ ${adapter}: collect device state`,
+    `$ ${adapter}: disconnect`,
+    `# Device writes: none`,
+  ].join("\n");
+}
+
+async function runDiscovery() {
+  startAction("run-discovery");
+  setBusy(true);
+  try {
+    const data = await postJson("/api/discovery/scan", discoveryPayload());
+    $("detail-discovery").textContent = formatJson(data);
+    setDetailsVisible(true);
+    selectDetail("discovery", false);
+    if (data.ok && data.source_of_truth_candidate) {
+      lastDiscoveryCandidate = data.source_of_truth_candidate;
+      const summary = data.state_summary || {};
+      completeAction("run-discovery", {
+        status: "pass",
+        actual: `Discovered ${data.platform} device ${summary.hostname || data.host} at ${data.host}.`,
+        evidence: `Rez adapter ${data.adapter || data.platform} returned state. Source-of-truth candidate is ready to review.`,
+        commands: discoveryCommandSummary(data),
+      });
+    } else {
+      lastDiscoveryCandidate = null;
+      completeAction("run-discovery", {
+        status: "fail",
+        actual: data.error || "Rez could not discover this device with the tried platform drivers.",
+        evidence: `${(data.tried_platforms || []).length} platform attempt(s). No source-of-truth record was written.`,
+        commands: discoveryCommandSummary(data),
+      });
+    }
+    renderDiscoveryImport();
+  } catch (error) {
+    lastDiscoveryCandidate = null;
+    renderDiscoveryImport();
+    failAction("run-discovery", error.message);
+  } finally {
+    setBusy(false);
+  }
+}
+
+async function importDiscoveredDevice() {
+  startAction("import-discovered-device");
+  if (!lastDiscoveryCandidate) {
+    failAction("import-discovered-device", "Run discovery first so there is a reviewed source-of-truth candidate to save.");
+    return;
+  }
+  setBusy(true);
+  try {
+    const data = await postJson("/api/source-of-truth/devices/import", { candidate: lastDiscoveryCandidate });
+    const source = await getJson("/api/source-of-truth");
+    $("detail-discovery").textContent = formatJson({ import: data, candidate: lastDiscoveryCandidate });
+    $("detail-source").textContent = formatJson(source);
+    setDetailsVisible(true);
+    selectDetail("source", false);
+    completeAction("import-discovered-device", {
+      status: data.ok ? "pass" : "fail",
+      actual: data.message || "Source-of-truth import completed.",
+      evidence: `Inventory file: ${data.inventory || "not written"}. Device count: ${source.summary?.device_count || "unknown"}.`,
+      commands: `# Local file update only\n$ update ${data.inventory || "inventories/lab.yaml"}\n# Discovery password was not written to source of truth.`,
+    });
+    await refreshPlatform({ log: false });
+  } catch (error) {
+    failAction("import-discovered-device", error.message);
+  } finally {
+    setBusy(false);
   }
 }
 
@@ -1992,6 +2127,8 @@ $("journey-reset").addEventListener("click", resetJourneyView);
 $("refresh-platform").addEventListener("click", refreshPlatform);
 $("show-source-of-truth").addEventListener("click", showSourceOfTruth);
 $("show-adapter-matrix").addEventListener("click", showAdapterMatrix);
+$("run-discovery").addEventListener("click", runDiscovery);
+$("import-discovered-device").addEventListener("click", importDiscoveredDevice);
 $("show-workflow-rules").addEventListener("click", showWorkflowRules);
 $("show-gitops-plan").addEventListener("click", showGitOpsPlan);
 $("show-conformance").addEventListener("click", showConformance);

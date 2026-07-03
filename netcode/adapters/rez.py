@@ -17,6 +17,28 @@ from typing import Any
 
 from netcode.inventory import Device
 
+PLATFORM_ALIASES = {
+    "arista": "arista_eos",
+    "eos": "arista_eos",
+    "cisco": "cisco_ios",
+    "ios": "cisco_ios",
+    "iosxe": "cisco_ios",
+    "ios-xe": "cisco_ios",
+    "nxos": "cisco_nxos",
+    "nx-os": "cisco_nxos",
+    "asa": "cisco_asa",
+    "junos": "juniper_junos",
+    "juniper": "juniper_junos",
+    "fortigate": "fortinet",
+    "fortios": "fortinet",
+    "paloalto": "palo_alto",
+    "palo-alto": "palo_alto",
+    "aruba": "aruba_aoscx",
+    "aoscx": "aruba_aoscx",
+    "srl": "nokia_srl",
+    "nokia": "nokia_srl",
+}
+
 
 class RezAdapterBridge:
     def __init__(self, root: str | Path | None = None):
@@ -57,6 +79,19 @@ class RezAdapterBridge:
             self._driver_map = {}
             self._error = f"{type(exc).__name__}: {exc}"
         return self._driver_map
+
+    def driver_map(self) -> dict[str, Any]:
+        """Return the loaded Rez platform driver registry."""
+        return self._load_driver_map()
+
+    def supported_platforms(self) -> list[str]:
+        return sorted(self._load_driver_map().keys())
+
+    def normalize_platform(self, value: str | None) -> str:
+        platform = (value or "").strip().lower().replace(" ", "_")
+        if not platform or platform in {"auto", "autodetect", "detect"}:
+            return ""
+        return PLATFORM_ALIASES.get(platform, platform)
 
     def _clear_stale_driver_modules(self) -> None:
         """Avoid reusing a previously imported Rez drivers package from another root."""
