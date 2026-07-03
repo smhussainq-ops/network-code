@@ -128,6 +128,35 @@ blocks); grep all cloud-side artifacts for credential strings → zero.
 **Exit:** the full golden path + 4 negative proofs pass with control plane and
 runner on different machines.
 
+### ✅ M1–M2 + M4 DONE (2026-07-03) — proven end-to-end on real hardware
+
+M1 (runner protocol + queue) and M2 (runner agent) shipped and unit-tested
+(39 tests). M4 e2e ran live: **Mac control plane in runner mode (device
+password stripped from its inventory) + on-prem runner on the ORB clab VM
+(credentials local) drove a full change against the real Arista device
+`v2-store1`:**
+
+- Mac `/api/health` showed lab UNREACHABLE from the Mac; ORB VM reached the
+  Mac control plane on `:8095` (HTTP 200) — the SaaS/on-prem asymmetry, real.
+- Runner enrolled via single-use join token (two-phase), registered `online`.
+- Plan (Mac, no device) → dry-run **queued** → runner claimed, ran the EOS
+  config-session diff on the real device, aborted it, HMAC-signed the result;
+  control plane verified the signature → `dry_run_passed`.
+- Commit (git) → apply **queued** → runner committed VLAN 94 on the device →
+  `rollback_available`. **Independent SSH (bypassing netcode) confirmed
+  `VLAN 94 PHASE0_RUNNER active`.**
+- Rollback **queued** → runner removed it → `rolled_back`; independent SSH
+  confirmed `VLAN 94 not found`. Lab left clean.
+- Credential-custody proof: queued job payloads carried NO password (asserted
+  in test + live); the Mac inventory had no device password at all, yet the
+  change succeeded because the runner supplied creds locally.
+- Negative proof: with the runner stopped, a queued dry-run stayed `queued`,
+  the change stayed `validated`, and VLAN 95 never appeared on the device —
+  the control plane structurally cannot self-execute.
+
+Remaining in Phase 0: **M3** (UI async job polling + Runners panel — the API
+is done; the browser still renders sync/local-mode lab actions) and **M5**.
+
 ### M5 — SaaS-able hardening (starts after M4 demo, still Phase 0)
 Postgres migration (SQLAlchemy or thin driver swap), minimal login (single
 org, admin/operator roles), change-type registry refactor (pay before Cisco),
