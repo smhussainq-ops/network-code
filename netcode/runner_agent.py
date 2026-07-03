@@ -20,6 +20,7 @@ import argparse
 import hashlib
 import hmac
 import json
+import os
 import signal
 import sys
 import time
@@ -107,11 +108,15 @@ def _execute_job(job: dict[str, Any]) -> dict[str, Any]:
     device_spec = payload.get("device") or {}
     device_id = device_spec.get("id")
 
+    # Render workspace: the runner uses ITS OWN templates (never the control
+    # plane's rendered output) so it fully controls what gets pushed. Defaults to
+    # the runner's working directory, which ships the templates/ tree.
+    ws_root = Path(os.environ.get("NETCODE_RUNNER_WORKSPACE", "") or Path.cwd()).resolve()
     workdir = Path(tempfile.mkdtemp(prefix="netcode-runner-"))
     intent_path = workdir / "intent.yaml"
     intent_path.write_text(payload.get("intent_yaml", ""), encoding="utf-8")
     intent = load_intent(intent_path)
-    render = render_intent(intent, _RunnerPaths(workdir))
+    render = render_intent(intent, _RunnerPaths(ws_root))
 
     # Second safety gate: local fail-closed policy re-check. A compromised control
     # plane cannot make the runner push forbidden config.
