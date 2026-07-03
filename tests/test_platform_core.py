@@ -332,6 +332,14 @@ def test_runner_enroll_queue_claim_signed_result_roundtrip(tmp_path: Path, monke
     # Unauthenticated runner calls are refused.
     assert client.post("/api/runner/poll", json={"wait_seconds": 0}).status_code == 401
 
+    # M3: the UI polls a single-job endpoint to a terminal state; health exposes the mode.
+    single = client.get(f"/api/jobs/{dry['job']['id']}")
+    assert single.status_code == 200
+    assert single.json()["status"] == "completed"
+    assert single.json()["result"]["status"] == "pass"
+    assert client.get("/api/jobs/not-a-job").status_code == 404
+    assert client.get("/api/health").json()["execution"]["mode"] == "runner"
+
 
 def test_runner_local_policy_gate_blocks_forbidden_config(tmp_path: Path):
     """The runner's own fail-closed gate must reject credential/out-of-scope config
@@ -935,6 +943,8 @@ def test_app_route_serves_ui():
     assert "Catch drift" in response.text
     assert "readiness gates" in response.text
     assert "Send for review" in response.text
+    assert "runners-panel" in response.text
+    assert "On-prem runners" in response.text
     assert "Rollback plan (known before apply)" in response.text
     assert "change-record" in response.text
     assert "Setup" in response.text

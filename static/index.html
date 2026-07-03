@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Netcode MVP</title>
     <link rel="icon" href="/static/favicon.svg" type="image/svg+xml" />
-    <link rel="stylesheet" href="/static/styles.css?v=20260703-mvp10" />
+    <link rel="stylesheet" href="/static/styles.css?v=20260703-mvp11" />
   </head>
   <body>
     <main class="app-shell">
@@ -143,6 +143,23 @@
               <button id="check-workspace" type="button">Check readiness</button>
               <button id="start-change" type="button" data-go="desired" disabled>Start a change</button>
             </div>
+            <section id="runners-panel" class="runners-panel" hidden>
+              <div class="config-head">
+                <div>
+                  <span>On-prem runners</span>
+                  <h4>Runner mode — device actions run on your runner</h4>
+                  <p id="runners-copy">The control plane queues changes; an on-prem runner next to your devices executes them and returns signed evidence. The browser and control plane never touch devices.</p>
+                </div>
+                <div class="button-row compact">
+                  <button id="mint-join-token" type="button">Generate join token</button>
+                </div>
+              </div>
+              <div id="runners-list" class="record-sections"></div>
+              <div id="join-token-box" hidden>
+                <p class="setup-hint">Run this on the machine next to your devices (single-use token, shown once):</p>
+                <pre id="join-token-cmd" class="mini-code"></pre>
+              </div>
+            </section>
             <details class="advanced-panel">
               <summary>Advanced: platform configuration</summary>
             <section class="config-panel">
@@ -475,6 +492,6 @@
         </aside>
       </section>
     </main>
-    <script src="/static/app.js?v=20260703-mvp10"></script>
+    <script src="/static/app.js?v=20260703-mvp11"></script>
   </body>
 </html>

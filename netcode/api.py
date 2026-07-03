@@ -28,7 +28,7 @@ from netcode.gitflow import (
 from netcode.gitops import gitops_plan
 from netcode.inventory import Inventory
 from netcode.intent_utils import lab_write_supported, plan_metadata, production_write_supported
-from netcode.jobs import JobRunner
+from netcode.jobs import JobRunner, execution_mode, runner_pool
 from netcode.lab import AristaEOSLabAdapter, lab_status, run_arista_end_to_end, run_lab_action
 from netcode.models import load_intent
 from netcode.runner_hub import (
@@ -223,6 +223,7 @@ def health() -> dict[str, object]:
         "ok": True,
         "workspace": str(p.root),
         "lab": _lab_summary(lab_status()),
+        "execution": {"mode": execution_mode(), "pool": runner_pool()},
     }
 
 
@@ -852,6 +853,16 @@ def api_changes() -> dict[str, object]:
 def api_jobs() -> dict[str, object]:
     store = PlatformStore(paths())
     return {"jobs": [record_to_dict(record) for record in store.list_jobs()]}
+
+
+@app.get("/api/jobs/{job_id}")
+def api_job(job_id: str) -> dict[str, object]:
+    """Single job status for UI polling of runner-executed (queued) lab actions."""
+    store = PlatformStore(paths())
+    try:
+        return record_to_dict(store.get_job(job_id))
+    except Exception as exc:
+        raise HTTPException(status_code=404, detail=f"Unknown job {job_id}") from exc
 
 
 @app.get("/api/audit/sessions")

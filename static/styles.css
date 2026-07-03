@@ -660,6 +660,26 @@ textarea:focus-visible {
   gap: 8px;
 }
 
+.runners-panel {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  margin-top: 16px;
+  padding: 16px;
+}
+
+.runners-panel .record-block h5 {
+  align-items: center;
+  display: flex;
+  gap: 8px;
+  text-transform: none;
+  font-size: 14px;
+}
+
+#join-token-box {
+  margin-top: 12px;
+}
+
 .config-panel {
   background: var(--surface);
   border: 1px solid var(--line);
