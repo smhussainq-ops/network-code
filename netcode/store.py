@@ -602,6 +602,19 @@ class PlatformStore:
             )
         return self.get_job(job.id)
 
+    def create_read_job(self, org_id: str, pool: str, action: str, payload: dict[str, Any]) -> JobRecord:
+        """Queue a device-READ job for a runner. Not tied to a change (uses the '__read__'
+        sentinel), so submitting its result never advances a change workflow."""
+        job_id = str(uuid.uuid4())
+        now = utc_now()
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT INTO jobs (id, change_id, action, status, message, created_at, updated_at, result_json, org_id, pool, payload_json)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (job_id, "__read__", f"read_{action}", "queued", f"Queued read '{action}' for pool {pool}", now, now, None, org_id, pool, json.dumps(payload)),
+            )
+        return self.get_job(job_id)
+
     def claim_next_job(self, org_id: str, pool: str, runner_id: str) -> JobRecord | None:
         """Atomically claim the oldest queued job for a (org, pool). Concurrent- and tenant-safe:
         a runner may only claim jobs in its OWN org, so colliding pool names across tenants stay isolated."""

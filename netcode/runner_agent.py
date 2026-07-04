@@ -104,6 +104,9 @@ def _execute_job(job: dict[str, Any]) -> dict[str, Any]:
     from netcode.runner_checks import local_policy_gate
 
     payload = job.get("payload") or {}
+    job_action = str(job.get("action") or "")
+    if job_action.startswith("read_"):
+        return _execute_read(job_action[len("read_"):], payload)
     action = payload.get("action")
     device_spec = payload.get("device") or {}
     device_id = device_spec.get("id")
@@ -154,6 +157,85 @@ def _execute_job(job: dict[str, Any]) -> dict[str, Any]:
     result.setdefault("device_id", device_id)
     result["runner_version"] = VERSION
     return result
+
+
+def _runner_ws():
+    return _RunnerPaths(Path(os.environ.get("NETCODE_RUNNER_WORKSPACE", "") or Path.cwd()).resolve())
+
+
+def _execute_read(action: str, payload: dict[str, Any]) -> dict[str, Any]:
+    """Device READ actions executed on the runner (next to the devices), using the
+    runner's LOCAL credentialed inventory. Mirrors the control-plane read logic so
+    the browser renders results identically whether local or runner mode."""
+    import tempfile
+    from netcode.inventory import Inventory
+    from netcode.models import load_intent
+
+    if not INVENTORY_FILE.exists():
+        return {"ok": False, "error": f"No local runner inventory at {INVENTORY_FILE}."}
+
+    if action == "readiness":
+        from netcode.adapters.registry import AdapterRegistry
+        devices = list(Inventory(INVENTORY_FILE).by_id.values())
+        if not devices:
+            return {"ok": False, "tested": 0, "readable": 0, "devices": [], "message": "No devices in runner inventory."}
+        results = {str(i.get("device_id")): i for i in AdapterRegistry().rez.collect_many(devices).get("results", []) if isinstance(i, dict)}
+        rows, readable = [], 0
+        for d in devices:
+            r = results.get(d.id) or {}
+            ok = bool(r.get("ok"))
+            readable += 1 if ok else 0
+            err = "" if ok else str(r.get("error") or (r.get("errors") or ["unreadable"])[0])
+            rows.append({"id": d.id, "host": d.host, "platform": d.platform, "ok": ok, "error": err})
+        return {"ok": readable > 0, "tested": len(devices), "readable": readable, "devices": rows,
+                "message": f"{readable}/{len(devices)} trusted devices are readable."}
+
+    if action == "verify":
+        from netcode.lab import AristaEOSLabAdapter
+        wd = Path(tempfile.mkdtemp(prefix="netcode-read-"))
+        ip = wd / "intent.yaml"
+        ip.write_text(payload.get("intent_yaml", ""), encoding="utf-8")
+        intent = load_intent(ip)
+        inv = Inventory(INVENTORY_FILE)
+        device_id = payload.get("device_id") or (intent.targets.device_ids[0] if intent.targets.device_ids else "")
+        device = inv.by_id.get(device_id)
+        if not device:
+            return {"ok": False, "error": f"Device {device_id} not in runner inventory."}
+        adapter = AristaEOSLabAdapter(device)
+        try:
+            adapter.connect()
+            verification = adapter.verify_intent(intent, present=bool(payload.get("present", True)))
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": str(exc), "device_id": device_id}
+        finally:
+            adapter.disconnect()
+        return {"ok": verification.status == "pass", "device_id": device.id, "platform": device.platform,
+                "change_type": intent.change_type, "verification": verification.__dict__}
+
+    if action == "drift":
+        from netcode.adapters.registry import AdapterRegistry
+        from netcode.drift import vlan_drift_report
+        wd = Path(tempfile.mkdtemp(prefix="netcode-read-"))
+        ip = wd / "intent.yaml"
+        ip.write_text(payload.get("intent_yaml", ""), encoding="utf-8")
+        inv = Inventory(INVENTORY_FILE)
+        device = inv.by_id.get(payload.get("device_id"))
+        if not device:
+            return {"ok": False, "error": f"Device {payload.get('device_id')} not in runner inventory."}
+        state = AdapterRegistry().rez.collect_device_state(device)
+        report = vlan_drift_report(_runner_ws(), ip, state)
+        report.setdefault("ok", True)
+        return report
+
+    if action == "discovery":
+        from netcode.discovery import DiscoveryService
+        return DiscoveryService(_runner_ws()).scan(
+            host=str(payload.get("host", "")), username=str(payload.get("username", "")),
+            password=str(payload.get("password", "")), platform=str(payload.get("platform", "")),
+            port=int(payload.get("port") or 22), device_id=str(payload.get("device_id", "")),
+            site=str(payload.get("site", "")), groups=payload.get("groups"))
+
+    return {"ok": False, "error": f"Unknown read action '{action}'."}
 
 
 class _RunnerPaths:

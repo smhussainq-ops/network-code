@@ -1341,11 +1341,11 @@ function renderApply() {
     setGate("gate-verify", appState.verify?.ok || appState.apply?.ok ? "pass" : appState.verify ? "fail" : "warn", appState.verify?.ok || appState.apply?.ok ? "Verified" : appState.verify ? "Failed" : "Waiting");
   }
   $("apply-change").disabled = !(appState.plan?.ok && labSupported && appState.dryRun?.ok);
-  // Standalone verify is a control-plane device read; in runner mode the control
-  // plane has no device access, and apply already includes verification.
+  // Standalone verify routes through the runner in runner mode (read-routing), so it
+  // works in both modes; apply also includes verification.
   const verifyBtn = $("verify-change");
-  verifyBtn.disabled = isRunnerMode() || !(appState.apply?.ok && appState.changeLive);
-  verifyBtn.title = isRunnerMode() ? "Verification runs on the runner as part of apply. Standalone verify (runner read-routing) is a later milestone." : "";
+  verifyBtn.disabled = !(appState.apply?.ok && appState.changeLive);
+  verifyBtn.title = "";
   $("rollback-change").disabled = !(appState.apply?.ok && appState.changeLive);
   // Commit/push only once we're on a change branch, so artifacts never land on the base branch.
   const onChangeBranch = Boolean((appState.gitBranches?.current || "").startsWith("change/"));
@@ -1393,22 +1393,11 @@ function renderAll() {
   renderModeGuards();
 }
 
-// Control-plane device reads can't work in runner mode (the control plane has no
-// device access). Rather than let these buttons silently fail, disable them with an
-// honest tooltip in runner mode. (Routing reads through the runner is a later milestone.)
-const RUNNER_READ_BUTTONS = ["test-reachability", "discover-device", "netbox-test", "netbox-sync", "check-drift"];
+// Device reads (reachability, discovery, verify, drift) now route THROUGH the runner
+// in runner mode, so they work in both modes. NetBox sync still runs control-plane-side
+// (NetBox is often reachable from the cloud); left unguarded intentionally.
 function renderModeGuards() {
-  const runner = isRunnerMode();
-  for (const id of RUNNER_READ_BUTTONS) {
-    const el = $(id);
-    if (!el) continue;
-    if (runner) {
-      el.disabled = true;
-      el.title = "Live device reads run on the on-prem runner. Not available from the browser in runner mode yet — use local mode.";
-    } else {
-      el.title = "";
-    }
-  }
+  // No runner-mode read gaps remain for device reads. Kept as a hook for future guards.
 }
 
 async function checkWorkspace({ silent = false } = {}) {

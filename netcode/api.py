@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import re
+import time
 from pathlib import Path
 
 from fastapi import FastAPI, Header, HTTPException, Request, Response
@@ -707,10 +708,26 @@ def api_runner_heartbeat(request: RunnerHeartbeatRequest, authorization: str | N
     return {"ok": True, "runner_id": runner.id, "pool": runner.pool}
 
 
+def _runner_read(p, action: str, payload: dict, org_id: str, timeout: float = 60.0) -> dict[str, object]:
+    """Runner mode: queue a device-read job and wait for the on-prem runner to report.
+    Keeps the browser API synchronous while the actual device I/O happens on the runner."""
+    store = PlatformStore(p)
+    job = store.create_read_job(org_id, runner_pool(), action, payload)
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        current = store.get_job(job.id)
+        if current.status in ("completed", "failed"):
+            return current.result or {"ok": current.status == "completed", "message": current.message}
+        time.sleep(0.4)
+    return {"ok": False, "error": f"No runner completed the {action} read within {int(timeout)}s. Is a runner online for this pool? (Setup → Runners)"}
+
+
 @app.post("/api/readiness/devices")
-def api_readiness_devices() -> dict[str, object]:
+def api_readiness_devices(request: Request) -> dict[str, object]:
     """Live read test: can the platform actually read the trusted devices right now?"""
     p = paths()
+    if execution_mode() == "runner":
+        return _runner_read(p, "readiness", {}, _request_principal(request).org_id)
     inventory = Inventory(configured_inventory_path(p))
     devices = list(inventory.by_id.values())
     if not devices:
@@ -744,8 +761,14 @@ def api_readiness_devices() -> dict[str, object]:
 
 
 @app.post("/api/discovery/scan")
-def api_discovery_scan(request: DiscoveryScanRequest) -> dict[str, object]:
-    return DiscoveryService(paths()).scan(
+def api_discovery_scan(request: DiscoveryScanRequest, http_request: Request) -> dict[str, object]:
+    p = paths()
+    if execution_mode() == "runner":
+        payload = {"host": request.host, "username": request.username, "password": request.password,
+                   "platform": request.platform, "port": request.port, "device_id": request.device_id,
+                   "site": request.site, "groups": request.groups}
+        return _runner_read(p, "discovery", payload, _request_principal(http_request).org_id)
+    return DiscoveryService(p).scan(
         host=request.host,
         username=request.username,
         password=request.password,
@@ -907,8 +930,12 @@ def api_verify(request: GenericVerifyRequest) -> dict[str, object]:
 
 
 @app.post("/api/verify/intent")
-def api_verify_intent(request: IntentPathRequest) -> dict[str, object]:
+def api_verify_intent(request: IntentPathRequest, http_request: Request) -> dict[str, object]:
     p = paths()
+    if execution_mode() == "runner":
+        intent_yaml = Path(request.intent_path).read_text(encoding="utf-8")
+        payload = {"intent_yaml": intent_yaml, "device_id": request.device_id, "present": True}
+        return _runner_read(p, "verify", payload, _request_principal(http_request).org_id)
     intent = load_intent(Path(request.intent_path))
     inventory = Inventory(configured_inventory_path(p))
     device_id = request.device_id or (intent.targets.device_ids[0] if intent.targets.device_ids else "")
@@ -933,8 +960,12 @@ def api_verify_intent(request: IntentPathRequest) -> dict[str, object]:
 
 
 @app.post("/api/drift/vlan")
-def api_vlan_drift(request: IntentPathRequest) -> dict[str, object]:
+def api_vlan_drift(request: IntentPathRequest, http_request: Request) -> dict[str, object]:
     p = paths()
+    if execution_mode() == "runner":
+        intent_yaml = Path(request.intent_path).read_text(encoding="utf-8")
+        device_id = request.device_id or str(read_ui_config(p).get("desired_state", {}).get("common", {}).get("device_id") or "")
+        return _runner_read(p, "drift", {"intent_yaml": intent_yaml, "device_id": device_id}, _request_principal(http_request).org_id)
     inventory = Inventory(configured_inventory_path(p))
     device_id = request.device_id or str(read_ui_config(p).get("desired_state", {}).get("common", {}).get("device_id") or "")
     device = inventory.by_id.get(device_id)

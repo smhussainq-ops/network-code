@@ -112,6 +112,15 @@ def submit_job_result(
         # rather than bricking it.
         return {"ok": False, "message": "Result signature verification failed; result rejected."}
 
+    # Device-READ jobs (reachability/verify/drift/discovery) aren't change-scoped:
+    # store the result and return; no workflow to advance.
+    if job.action.startswith("read_"):
+        read_ok = result.get("ok", result.get("status") == "pass")
+        final_job = store.update_job(job.id, "completed" if read_ok else "failed", str(result.get("message", "read complete")), result)
+        store.record_job_signature(job.id, signature)
+        store.touch_runner(runner.id, status="online")
+        return {"ok": True, "job": record_to_dict(final_job), "message": "Read result accepted."}
+
     action = job.action.removeprefix("lab_")
     passed = result.get("status") == "pass"
     status = "completed" if passed else "failed"

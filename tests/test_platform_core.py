@@ -341,6 +341,55 @@ def test_runner_enroll_queue_claim_signed_result_roundtrip(tmp_path: Path, monke
     assert client.get("/api/health").json()["execution"]["mode"] == "runner"
 
 
+def test_runner_read_job_routing_roundtrip(tmp_path: Path, monkeypatch):
+    """Read-routing: in runner mode a device read is queued as a read job, the runner
+    claims it, returns a signed result, and the control plane returns that result."""
+    import hashlib
+    import hmac as hmac_mod
+    import threading
+
+    from netcode.runner_hub import canonical_json
+
+    init_workspace(WorkspacePaths(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("NETCODE_EXECUTION", "runner")
+    monkeypatch.setenv("NETCODE_RUNNER_POOL", "store-lab")
+    client = TestClient(api.app)
+
+    enroll = client.post("/api/runner/enroll", json={"join_token": client.post("/api/runners/join-token", json={"pool": "store-lab"}).json()["join_token"], "name": "r1"}).json()
+    token, secret = enroll["runner_token"], enroll["hmac_secret"]
+    auth = {"Authorization": f"Bearer {token}"}
+
+    # A stand-in runner: claim the queued read job, return a canned readiness result.
+    canned = {"ok": True, "tested": 3, "readable": 3, "devices": [{"id": "v2-store1", "ok": True, "error": ""}], "message": "3/3 trusted devices are readable."}
+
+    def fake_runner():
+        for _ in range(60):
+            claim = client.post("/api/runner/poll", json={"wait_seconds": 0}, headers=auth)
+            if claim.status_code == 200:
+                job = claim.json()["job"]
+                sig = hmac_mod.new(secret.encode(), canonical_json(canned).encode(), hashlib.sha256).hexdigest()
+                client.post(f"/api/runner/jobs/{job['id']}/result", json={"result": canned, "signature": sig}, headers=auth)
+                return
+            time.sleep(0.1)
+
+    t = threading.Thread(target=fake_runner, daemon=True)
+    t.start()
+    # Control-plane read endpoint queues the read and waits for the runner's result.
+    resp = client.post("/api/readiness/devices")
+    t.join(timeout=10)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["ok"] is True and body["readable"] == 3
+    assert body["message"] == "3/3 trusted devices are readable."
+
+    # The read job is recorded but is NOT a change (change-less '__read__').
+    jobs = client.get("/api/jobs").json()["jobs"]
+    read_jobs = [j for j in jobs if str(j.get("action", "")).startswith("read_")]
+    assert read_jobs and read_jobs[0]["change_id"] == "__read__"
+    assert read_jobs[0]["status"] == "completed"
+
+
 def test_runner_local_policy_gate_blocks_forbidden_config(tmp_path: Path):
     """The runner's own fail-closed gate must reject credential/out-of-scope config
     even if the control plane said it was fine."""
