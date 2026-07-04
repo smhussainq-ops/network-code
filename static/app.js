@@ -982,7 +982,12 @@ function labSummary() {
 
 function renderHome() {
   $("sidebar-workspace").textContent = appState.gitBranches?.current || appState.git?.branch || "main";
-  $("sidebar-lab").textContent = appState.health?.lab?.ok ? "Arista lab reachable" : "Lab not reachable from this runtime";
+  // In runner mode the control-plane lab check (clab-on-PATH) is irrelevant — proof
+  // happens on the runner. Show the actual proof source instead of a false negative.
+  const mode = proofMode();
+  $("sidebar-lab").textContent = isRunnerMode()
+    ? (mode.pass ? `Proof: ${mode.label}` : "Proof: no runner online")
+    : (appState.health?.lab?.ok ? "Arista lab reachable" : "Lab not reachable from this runtime");
   renderUserStories();
 }
 
@@ -1852,6 +1857,7 @@ async function loadChangeRecord(changeId) {
   if (!changeId) {
     appState.changeRecord = null;
     renderChangeRecord();
+    if ($("copy-ticket")) $("copy-ticket").disabled = true;
     return;
   }
   try {
@@ -1860,6 +1866,54 @@ async function loadChangeRecord(changeId) {
     appState.changeRecord = { ok: false, error: String(error) };
   }
   renderChangeRecord();
+  if ($("copy-ticket")) $("copy-ticket").disabled = !appState.changeRecord?.ok;
+}
+
+function ticketText(record) {
+  const req = record.request || {};
+  const plan = record.plan || {};
+  const safety = record.safety || {};
+  const proof = (p, label) => (p?.present ? `${label}: ${p.status} — ${p.message || ""}` : `${label}: not run`);
+  const lines = [
+    `NETWORK CHANGE — ${req.title || record.change_id}`,
+    `Change ID:   ${record.change_id}`,
+    `Type:        ${req.change_type || "-"}`,
+    `Site/Device: ${req.site || "-"} / ${req.device_id || "-"}`,
+    `Requested by: ${req.requested_by || "-"}   State: ${record.workflow_state || "-"}`,
+    "",
+    `RISK:        ${plan.risk || "-"}`,
+    `BLAST RADIUS: ${(plan.blast_radius?.devices || []).join(", ") || "-"} · ${(plan.blast_radius?.objects || []).join(", ") || "-"}`,
+    "",
+    "COMMANDS APPLIED:",
+    (plan.commands || "(none)").trim(),
+    "",
+    "ROLLBACK:",
+    (plan.rollback?.commands || "(none)").trim() + `   [${plan.rollback?.confidence?.level || "?"} confidence]`,
+    "",
+    `SAFETY: ${safety.status || "unknown"} (${(safety.checks || []).length} policy checks)`,
+    proof(record.lab_proof, "  Dry-run proof"),
+    proof(record.apply_proof, "  Apply proof"),
+    `  Verification: ${record.verify_proof?.present ? "confirmed" : "not verified"}`,
+    proof(record.rollback_record, "  Rollback"),
+    "",
+    `GIT: branch ${record.git?.branch || "-"}${record.git?.upstream ? ` → ${record.git.upstream}` : ""}`,
+    "ARTIFACTS: " + (record.manifest || []).map((m) => `${m.artifact}${m.exists ? "✓" : "✗"}`).join(", "),
+  ];
+  return lines.join("\n");
+}
+
+async function copyTicket() {
+  if (!appState.changeRecord?.ok) return;
+  const text = ticketText(appState.changeRecord);
+  try {
+    await navigator.clipboard.writeText(text);
+    setOutcome({ state: "Passed", status: "pass", title: "Change record copied.", summary: "A ticket-ready summary is on your clipboard — paste it into the change ticket.", expected: "One audit-grade record attached to the change ticket.", actual: `${text.split("\n").length} lines copied.`, artifact: "Ticket summary (plain text).", device: "No device config was changed.", next: "Paste into your change/ITSM ticket." });
+  } catch (error) {
+    // Clipboard blocked (e.g. non-secure context): show the text so it can be copied manually.
+    $("evidence-output").textContent = text;
+    $$(".evidence-tab").forEach((b) => b.classList.remove("active"));
+    setOutcome({ state: "Review", status: "warn", title: "Clipboard unavailable — record shown below.", summary: "Copy the text from the Advanced → artifacts box.", expected: "Ticket summary ready to copy.", actual: "Clipboard API blocked in this context.", artifact: "Ticket summary shown in Advanced.", device: "No device config was changed.", next: "Select-all and copy from the box." });
+  }
 }
 
 function recordBlock(title, lines) {
@@ -2013,6 +2067,7 @@ function bindEvents() {
   $("netbox-test").addEventListener("click", () => netboxAction("test"));
   $("netbox-sync").addEventListener("click", () => netboxAction("sync"));
   $("record-select").addEventListener("change", (event) => loadChangeRecord(event.target.value));
+  $("copy-ticket").addEventListener("click", copyTicket);
   document.addEventListener("click", (event) => {
     const step = event.target.closest("[data-step-view]");
     if (step) setView(step.dataset.stepView);

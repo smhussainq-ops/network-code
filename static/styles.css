@@ -496,6 +496,58 @@ textarea:focus-visible {
   color: var(--muted);
 }
 
+.gate-group-label {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 750;
+  letter-spacing: 0.03em;
+  margin: 14px 0 8px;
+  text-transform: uppercase;
+}
+
+.gate-group-label em {
+  font-weight: 600;
+  text-transform: none;
+  letter-spacing: 0;
+}
+
+.setup-grid.two {
+  display: grid;
+  gap: 12px;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+}
+
+.gate-tag {
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 750;
+  letter-spacing: 0.02em;
+  padding: 2px 9px;
+  text-transform: uppercase;
+}
+
+.gate-tag.required {
+  background: #eef3fd;
+  color: #1d4fb8;
+}
+
+.gate-tag.info {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  color: var(--muted);
+}
+
+.record-toolbar {
+  align-items: end;
+  display: flex;
+  gap: 12px;
+  justify-content: space-between;
+}
+
+.record-toolbar label {
+  flex: 1;
+}
+
 .setup-item.gate {
   border-left: 3px solid var(--line);
 }

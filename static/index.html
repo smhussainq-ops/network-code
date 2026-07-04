@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Netcode MVP</title>
     <link rel="icon" href="/static/favicon.svg" type="image/svg+xml" />
-    <link rel="stylesheet" href="/static/styles.css?v=20260703-mvp16" />
+    <link rel="stylesheet" href="/static/styles.css?v=20260703-mvp17" />
   </head>
   <body>
     <div id="login-overlay" class="login-overlay" hidden>
@@ -107,9 +107,10 @@
               <h3>Setup — readiness gates</h3>
               <p>Gates 1–2 (Git, source of truth) unlock changes. Gates 3–4 tell you how changes will be proven — with a lab, with on-device dry-runs, or plan-only. A missing lab never blocks planning.</p>
             </section>
-            <div class="setup-grid">
+            <p class="gate-group-label">Required before you can start a change</p>
+            <div class="setup-grid two">
               <article class="setup-item gate" id="gate-git-card">
-                <span>Gate 1</span>
+                <span class="gate-tag required">Required · 1</span>
                 <h4>Git connected</h4>
                 <p class="gate-question">Can changes be reviewed and audited?</p>
                 <p id="setup-git-copy" class="gate-status">Checking.</p>
@@ -122,7 +123,7 @@
                 </div>
               </article>
               <article class="setup-item gate" id="gate-sot-card">
-                <span>Gate 2</span>
+                <span class="gate-tag required">Required · 2</span>
                 <h4>Source of truth</h4>
                 <p class="gate-question">Does the platform know your network?</p>
                 <p id="setup-sot-copy" class="gate-status">Checking.</p>
@@ -131,8 +132,11 @@
                   <button class="secondary" type="button" data-go="inventory">Discover devices</button>
                 </div>
               </article>
+            </div>
+            <p class="gate-group-label">How your changes will be proven <em>(informational — these never block planning)</em></p>
+            <div class="setup-grid two">
               <article class="setup-item gate" id="gate-read-card">
-                <span>Gate 3</span>
+                <span class="gate-tag info">Info</span>
                 <h4>Device reachability</h4>
                 <p class="gate-question">Can the platform read your devices?</p>
                 <p id="setup-rez-copy" class="gate-status">Checking.</p>
@@ -143,7 +147,7 @@
                 </div>
               </article>
               <article class="setup-item gate" id="gate-lab-card">
-                <span>Gate 4</span>
+                <span class="gate-tag info">Info</span>
                 <h4>Proof mode</h4>
                 <p class="gate-question">Where do changes get proven before they matter?</p>
                 <p id="setup-lab-copy" class="gate-status">Checking.</p>
@@ -316,17 +320,8 @@
                   <h4 id="dynamic-title">Intent details</h4>
                   <div id="dynamic-fields" class="form-grid"></div>
                 </section>
-                <div class="button-row">
-                  <button id="create-plan" type="button">Create plan</button>
-                  <button class="secondary" type="button" data-go="plan">Open plan</button>
-                </div>
-              </form>
-              <article class="result-panel">
-                <span>Selected workflow</span>
-                <h4 id="desired-title">Add VLAN</h4>
-                <p id="desired-summary">Choose a change type and fill in the outcome. YAML remains visible as an artifact, not as the primary workflow.</p>
-                <div id="desired-capability" class="capability-strip"></div>
-                <div class="branch-panel">
+                <section class="form-section branch-panel">
+                  <h4>Step 2 · Give this change its own branch</h4>
                   <p class="branch-current">Change branch <strong id="git-current-branch">not created</strong></p>
                   <div class="field-grid">
                     <label>Branch name<input id="git-new-branch" placeholder="change/site-change-type" autocomplete="off" /></label>
@@ -337,7 +332,17 @@
                     <button id="switch-branch" class="secondary" type="button">Switch</button>
                   </div>
                   <p id="git-branch-outcome" class="setup-hint">The change branch carries intent, config, validation, and proof for review.</p>
+                </section>
+                <div class="button-row">
+                  <button id="create-plan" type="button">Step 3 · Create plan</button>
+                  <button class="secondary" type="button" data-go="plan">Open plan</button>
                 </div>
+              </form>
+              <article class="result-panel">
+                <span>Selected workflow</span>
+                <h4 id="desired-title">Add VLAN</h4>
+                <p id="desired-summary">Choose a change type and fill in the outcome. YAML remains visible as an artifact, not as the primary workflow.</p>
+                <div id="desired-capability" class="capability-strip"></div>
                 <pre id="desired-yaml" class="code-box">Create a plan to see the YAML intent.</pre>
               </article>
             </div>
@@ -461,8 +466,9 @@
               <h3>Evidence — the change record</h3>
               <p>One readable package per change: request, plan, safety, lab proof, apply proof, verification, Git record, rollback. Attach it to a ticket.</p>
             </section>
-            <div class="field-grid">
+            <div class="record-toolbar">
               <label>Change<select id="record-select"><option value="">Select a change</option></select></label>
+              <button id="copy-ticket" class="secondary" type="button" disabled>Copy for ticket</button>
             </div>
             <div id="change-record" class="record-sections">
               <p class="setup-hint">Pick a change to see its full record.</p>
@@ -521,6 +527,6 @@
         </aside>
       </section>
     </main>
-    <script src="/static/app.js?v=20260703-mvp16"></script>
+    <script src="/static/app.js?v=20260703-mvp17"></script>
   </body>
 </html>
