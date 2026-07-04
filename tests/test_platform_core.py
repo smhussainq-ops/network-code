@@ -798,6 +798,83 @@ def test_change_record_packages_request_plan_safety_git_and_manifest(tmp_path: P
     assert missing.status_code == 404
 
 
+def test_auth_rbac_and_tenant_isolation(tmp_path: Path, monkeypatch):
+    """M5: with NETCODE_AUTH on, roles are enforced and tenants are isolated."""
+    from netcode.auth import hash_password
+    from netcode.store import DEFAULT_ORG_ID
+
+    init_workspace(WorkspacePaths(tmp_path))
+    monkeypatch.chdir(tmp_path)
+
+    # Bootstrap seeding is idempotent and env-driven (tested directly since Starlette
+    # startup events don't fire for a non-context-manager TestClient).
+    monkeypatch.setenv("NETCODE_BOOTSTRAP_ADMIN_EMAIL", "admin@a.co")
+    monkeypatch.setenv("NETCODE_BOOTSTRAP_ADMIN_PASSWORD", "s3cret-pw")
+    api._bootstrap_admin()
+    api._bootstrap_admin()  # idempotent — second call must not raise or duplicate
+
+    monkeypatch.setenv("NETCODE_AUTH", "1")
+    client = TestClient(api.app)
+
+    # Unauthenticated is rejected once auth is on.
+    assert client.get("/api/changes").status_code == 401
+
+    # Seed extra principals + a second tenant directly in the store.
+    # Resolve the path so this store hits the SAME db file the app uses (the app
+    # resolves cwd, and on macOS tmp_path is an unresolved /var -> /private/var symlink).
+    store = PlatformStore(WorkspacePaths(tmp_path.resolve()))
+    store.create_user(DEFAULT_ORG_ID, "op@a.co", hash_password("op-pw"), role="operator")
+    store.create_user(DEFAULT_ORG_ID, "view@a.co", hash_password("view-pw"), role="viewer")
+    store.ensure_org("org_b", "B", "b")
+    store.create_change(tmp_path / "intents" / "examples" / "add_guest_vlan.yaml", "v2-store1", org_id="org_b")
+
+    def login(email, pw):
+        r = client.post("/api/auth/login", json={"email": email, "password": pw})
+        return r
+
+    assert login("admin@a.co", "wrong").status_code == 401
+    admin_tok = login("admin@a.co", "s3cret-pw").json()["token"]
+    op_tok = login("op@a.co", "op-pw").json()["token"]
+    view_tok = login("view@a.co", "view-pw").json()["token"]
+    H = lambda t: {"Authorization": f"Bearer {t}"}
+
+    assert client.get("/api/auth/me", headers=H(admin_tok)).json()["role"] == "admin"
+
+    # Viewer may read but not perform write actions.
+    assert client.get("/api/changes", headers=H(view_tok)).status_code == 200
+    blocked = client.post(
+        "/api/desired-state/plan",
+        headers=H(view_tok),
+        json={"change_type": "add_vlan", "site": "store-1842", "device_id": "v2-store1", "requested_by": "v",
+              "values": {"vlan_id": 90, "name": "GUEST_WIFI", "subnet": "10.42.90.0/24", "purpose": "guest"}},
+    )
+    assert blocked.status_code == 403
+
+    # Operator may create a change; it is stamped to their org (org_default).
+    made = client.post(
+        "/api/desired-state/plan",
+        headers=H(op_tok),
+        json={"change_type": "add_vlan", "site": "store-1842", "device_id": "v2-store1", "requested_by": "op",
+              "values": {"vlan_id": 90, "name": "GUEST_WIFI", "subnet": "10.42.90.0/24", "purpose": "guest"}},
+    )
+    assert made.status_code == 200
+
+    # Tenant isolation: org_default users never see org_b's change, by list or by id.
+    listed = client.get("/api/changes", headers=H(admin_tok)).json()["changes"]
+    assert all(c["org_id"] == DEFAULT_ORG_ID for c in listed)
+    org_b_change = next(c for c in store.list_changes(org_id="org_b"))
+    assert client.get(f"/api/change/{org_b_change.id}/record", headers=H(admin_tok)).status_code == 404
+
+    # Admin-only: minting a runner join token needs admin, not operator/viewer.
+    assert client.post("/api/runners/join-token", headers=H(view_tok), json={"pool": "p"}).status_code == 403
+    assert client.post("/api/runners/join-token", headers=H(op_tok), json={"pool": "p"}).status_code == 403
+    assert client.post("/api/runners/join-token", headers=H(admin_tok), json={"pool": "p"}).json()["ok"] is True
+
+    # Logout revokes the session.
+    assert client.post("/api/auth/logout", headers=H(view_tok)).json()["ok"] is True
+    assert client.get("/api/changes", headers=H(view_tok)).status_code == 401
+
+
 def test_readiness_devices_reports_per_device_readability_honestly(tmp_path: Path, monkeypatch):
     init_workspace(WorkspacePaths(tmp_path))
     monkeypatch.chdir(tmp_path)

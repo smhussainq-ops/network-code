@@ -174,7 +174,48 @@ registry refactor, security whitepaper + failure-domain doc). Also deferred:
 routing read paths (verify/readiness/drift/discovery) through the runner — today
 they run control-plane-side and so are local-mode only.
 
-### M5 — SaaS-able hardening (starts after M4 demo, still Phase 0)
+### ✅ M5 (mostly) DONE (2026-07-03) — SaaS backbone: auth, RBAC, multi-tenancy, Postgres-readiness
+
+Implemented against an adversarial design spec. **40 tests pass** (was 39).
+
+- **Multi-tenancy:** `orgs`/`users`/`sessions` tables + `org_id` on
+  changes/jobs/runners/join_tokens (via `_ensure_column`, backfilled to
+  `org_default`). Every change/job/runner is tenant-scoped; a runner may only
+  claim jobs in its own org (colliding pool names across tenants stay isolated);
+  cross-tenant single-record reads return **404** (no existence leak).
+- **Auth:** `netcode/auth.py` — pbkdf2-sha256 password hashing (600k iters,
+  per-user salt, `compare_digest`), opaque `nut_` session tokens (sha256-stored,
+  12h TTL). Three token namespaces coexist (`njt_` join / `nrt_` runner / `nut_`
+  user), each with its own lookup — a user token can't act as a runner and
+  vice-versa.
+- **RBAC:** roles admin/operator/viewer enforced by middleware — reads need
+  viewer, writes need operator, join-token minting needs admin. `POST
+  /api/auth/login|logout`, `GET /api/auth/me`. Env-driven idempotent bootstrap
+  admin so flipping the flag never locks anyone out; legacy `NETCODE_ADMIN_TOKEN`
+  stays as break-glass.
+- **Gating:** all of the above is behind `NETCODE_AUTH` (default **off**). Off =
+  every request is a system admin on `org_default`, so the current UI and every
+  test keep working byte-for-byte. Live-verified both ways: off → no login,
+  `/api/changes` open; on → 401 without token, login works, authed → 200.
+- **Postgres-readiness:** `store.py` is `DATABASE_URL`-driven (sqlite default,
+  `postgresql://` via psycopg); a connection wrapper rewrites `?`→`%s`, pragmas
+  are sqlite-gated, `_ensure_column` has an information_schema branch. **Validated
+  on SQLite** (incl. a live run against `DATABASE_URL=sqlite:////tmp/...`); the
+  psycopg path is structured but needs a live Postgres + `FOR UPDATE SKIP LOCKED`
+  claim to validate — deferred.
+- **UI:** login overlay shown only when auth is on and unauthenticated; Bearer
+  token attached to all fetches; viewer role hides write actions (server enforces
+  regardless). Asset `mvp12`.
+- **Docs:** `docs/SECURITY_WHITEPAPER.md` and `docs/FAILURE_DOMAINS.md` shipped.
+
+**Remaining M5 hardening (follow-ups, tracked honestly):** per-endpoint
+change-ownership checks on every mutating-by-`change_id` endpoint (dry-run/apply/
+rollback/verify/drift) — today list + record + the primary create/read paths are
+scoped, but exhaustive per-endpoint ownership on all mutating routes is the next
+pass; live Postgres validation; org/user management endpoints (users seeded via
+store today); asymmetric runner result signing (HMAC today).
+
+### M5 — SaaS-able hardening (original notes)
 Postgres migration (SQLAlchemy or thin driver swap), minimal login (single
 org, admin/operator roles), change-type registry refactor (pay before Cisco),
 security whitepaper + failure-domain doc drafts.

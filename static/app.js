@@ -39,6 +39,9 @@ const appState = {
   uiConfigPath: "",
   configHistory: [],
   configApplied: false,
+  authEnabled: false,
+  role: null,
+  email: null,
   reachability: null,
   runners: null,
   gitBranches: null,
@@ -65,8 +68,15 @@ function apiError(data, fallback) {
   return typeof data.detail === "string" ? data.detail : formatJson(data.detail);
 }
 
+let authToken = localStorage.getItem("netcode_token") || "";
+
+function authHeaders(extra = {}) {
+  return authToken ? { ...extra, Authorization: `Bearer ${authToken}` } : extra;
+}
+
 async function getJson(url) {
-  const response = await fetch(url);
+  const response = await fetch(url, { headers: authHeaders() });
+  if (response.status === 401 && appState.authEnabled) return requireLogin();
   const data = await response.json();
   if (!response.ok) throw new Error(apiError(data, response.statusText));
   return data;
@@ -75,12 +85,70 @@ async function getJson(url) {
 async function postJson(url, body) {
   const response = await fetch(url, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: authHeaders({ "Content-Type": "application/json" }),
     body: JSON.stringify(body),
   });
+  if (response.status === 401 && appState.authEnabled) return requireLogin();
   const data = await response.json();
   if (!response.ok) throw new Error(apiError(data, response.statusText));
   return data;
+}
+
+function requireLogin() {
+  $("login-overlay").hidden = false;
+  throw new Error("Authentication required.");
+}
+
+async function initAuth() {
+  let me;
+  try {
+    const res = await fetch("/api/auth/me", { headers: authHeaders() });
+    me = res.ok ? await res.json() : { auth_enabled: true, kind: "anon", role: null };
+  } catch (error) {
+    me = { auth_enabled: false };
+  }
+  appState.authEnabled = Boolean(me.auth_enabled);
+  appState.role = me.role || null;
+  appState.email = me.email || null;
+  if (appState.authEnabled && me.kind !== "user" && me.kind !== "system") {
+    $("login-overlay").hidden = false;
+    return false;
+  }
+  $("login-overlay").hidden = true;
+  document.body.classList.toggle("role-viewer", appState.role === "viewer");
+  if (appState.authEnabled) renderIdentity();
+  return true;
+}
+
+function renderIdentity() {
+  const el = $("sidebar-workspace");
+  if (el && appState.email) el.title = `${appState.email} · ${appState.role}`;
+}
+
+async function handleLogin(event) {
+  event.preventDefault();
+  const err = $("login-error");
+  err.hidden = true;
+  try {
+    const res = await fetch("/api/auth/login", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        email: $("login-email").value.trim(),
+        password: $("login-password").value,
+        org_id: $("login-org").value.trim(),
+      }),
+    });
+    const data = await res.json();
+    if (!res.ok || !data.token) throw new Error(data.detail || "Invalid email or password.");
+    authToken = data.token;
+    localStorage.setItem("netcode_token", authToken);
+    $("login-overlay").hidden = true;
+    await boot();
+  } catch (error) {
+    err.textContent = error.message;
+    err.hidden = false;
+  }
 }
 
 function setRunState(label, status = "info") {
@@ -1904,5 +1972,12 @@ function bindEvents() {
   $$("#change-form input, #change-form select, #change-form textarea").forEach((input) => input.addEventListener("input", resetChangeProof));
 }
 
+async function boot() {
+  const ready = await initAuth();
+  if (!ready) return; // login overlay shown; boot resumes after successful login
+  await checkWorkspace({ silent: true });
+}
+
+$("login-form").addEventListener("submit", handleLogin);
 bindEvents();
-checkWorkspace({ silent: true });
+boot();

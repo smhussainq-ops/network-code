@@ -5,9 +5,20 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Netcode MVP</title>
     <link rel="icon" href="/static/favicon.svg" type="image/svg+xml" />
-    <link rel="stylesheet" href="/static/styles.css?v=20260703-mvp11" />
+    <link rel="stylesheet" href="/static/styles.css?v=20260703-mvp12" />
   </head>
   <body>
+    <div id="login-overlay" class="login-overlay" hidden>
+      <form id="login-form" class="login-card">
+        <div class="brand-mark">NC</div>
+        <h2>Sign in to Netcode</h2>
+        <p id="login-error" class="login-error" hidden></p>
+        <label>Email<input id="login-email" type="email" autocomplete="username" required /></label>
+        <label>Password<input id="login-password" type="password" autocomplete="current-password" required /></label>
+        <label>Organization<input id="login-org" placeholder="org_default" autocomplete="organization" /></label>
+        <button id="login-submit" type="submit">Sign in</button>
+      </form>
+    </div>
     <main class="app-shell">
       <aside class="sidebar" aria-label="MVP navigation">
         <div class="brand">
@@ -492,6 +503,6 @@
         </aside>
       </section>
     </main>
-    <script src="/static/app.js?v=20260703-mvp11"></script>
+    <script src="/static/app.js?v=20260703-mvp12"></script>
   </body>
 </html>
