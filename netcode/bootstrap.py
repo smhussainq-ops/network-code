@@ -80,11 +80,17 @@ CUSTOM_CONFIG_TEMPLATE = """{{ custom.config_lines }}
 """
 
 
-WORKSPACE_GITIGNORE = """.netcode/
-__pycache__/
-*.py[cod]
-.DS_Store
-._*
+WORKSPACE_GITIGNORE = """# Netcode change workspace: Git tracks ONLY change artifacts, never platform code,
+# UI, runtime state, or dev files. This keeps branch switching from colliding with
+# source files when the workspace and the code happen to share a directory.
+/*
+!/.gitignore
+!/intents/
+!/rendered/
+!/reports/
+!/inventories/
+!/policies/
+!/templates/
 """
 
 

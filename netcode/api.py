@@ -17,7 +17,7 @@ from netcode.ai_assistant import assistant_response
 from netcode.adapters.registry import AdapterRegistry
 from netcode.bootstrap import init_workspace
 from netcode.discovery import DiscoveryService
-from netcode.drift import compliance_summary, vlan_drift_report
+from netcode.drift import baseline_for_state, compliance_summary, vlan_drift_report
 from netcode.gitflow import (
     commit_change_artifacts,
     create_change_branch,
@@ -963,17 +963,27 @@ def api_verify_intent(request: IntentPathRequest, http_request: Request) -> dict
 @app.post("/api/drift/vlan")
 def api_vlan_drift(request: IntentPathRequest, http_request: Request) -> dict[str, object]:
     p = paths()
+    device_id = request.device_id or str(read_ui_config(p).get("desired_state", {}).get("common", {}).get("device_id") or "")
+    # Baseline = what the device SHOULD look like given this change's lifecycle state,
+    # so a rolled-back change reads as in-sync (absent), not a false high-severity drift.
+    workflow_state = None
+    if request.change_id:
+        try:
+            workflow_state = PlatformStore(p).get_change(request.change_id).workflow_state
+        except Exception:
+            workflow_state = None
+    base = baseline_for_state(workflow_state)
     if execution_mode() == "runner":
         intent_yaml = Path(request.intent_path).read_text(encoding="utf-8")
-        device_id = request.device_id or str(read_ui_config(p).get("desired_state", {}).get("common", {}).get("device_id") or "")
-        return _runner_read(p, "drift", {"intent_yaml": intent_yaml, "device_id": device_id}, _request_principal(http_request).org_id)
+        payload = {"intent_yaml": intent_yaml, "device_id": device_id,
+                   "expected_present": base["expected_present"], "baseline": base["label"], "context": base["context"]}
+        return _runner_read(p, "drift", payload, _request_principal(http_request).org_id)
     inventory = Inventory(configured_inventory_path(p))
-    device_id = request.device_id or str(read_ui_config(p).get("desired_state", {}).get("common", {}).get("device_id") or "")
     device = inventory.by_id.get(device_id)
     if not device:
         raise HTTPException(status_code=404, detail=f"Unknown device {device_id}")
     state = AdapterRegistry().rez.collect_device_state(device)
-    return vlan_drift_report(p, Path(request.intent_path), state)
+    return vlan_drift_report(p, Path(request.intent_path), state, expected_present=base["expected_present"], baseline=base["label"], context=base["context"])
 
 
 @app.get("/api/compliance/summary")

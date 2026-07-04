@@ -223,7 +223,12 @@ def _execute_read(action: str, payload: dict[str, Any]) -> dict[str, Any]:
         if not device:
             return {"ok": False, "error": f"Device {payload.get('device_id')} not in runner inventory."}
         state = AdapterRegistry().rez.collect_device_state(device)
-        report = vlan_drift_report(_runner_ws(), ip, state)
+        report = vlan_drift_report(
+            _runner_ws(), ip, state,
+            expected_present=bool(payload.get("expected_present", True)),
+            baseline=str(payload.get("baseline", "intended state")),
+            context=str(payload.get("context", "applied")),
+        )
         report.setdefault("ok", True)
         return report
 

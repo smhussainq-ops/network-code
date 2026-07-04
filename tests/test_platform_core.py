@@ -777,6 +777,56 @@ def test_netbox_sync_endpoint(tmp_path: Path, monkeypatch):
     assert sot.json()["ok"] is True
 
 
+def test_drift_baseline_is_lifecycle_aware():
+    """A rolled-back change should read as in-sync when absent (not a false high-severity
+    drift); an applied change reads as drift when absent."""
+    from netcode.drift import baseline_for_state, vlan_drift_report
+    from netcode.paths import WorkspacePaths as WP
+
+    # baseline_for_state maps workflow state -> expected presence.
+    assert baseline_for_state("rolled_back")["expected_present"] is False
+    assert baseline_for_state("rollback_available")["expected_present"] is True
+    assert baseline_for_state("validated")["context"] == "preview"
+
+    import tempfile
+    d = Path(tempfile.mkdtemp())
+    init_workspace(WP(d))
+    intent_path = d / "intents" / "examples" / "add_guest_vlan.yaml"
+
+    # Live state where VLAN 90 is ABSENT.
+    state_absent = {"ok": True, "state": {"vlans": []}}
+
+    # Rolled-back change: VLAN absent is CORRECT -> in_sync, not drift.
+    base_rb = baseline_for_state("rolled_back")
+    rb = vlan_drift_report(WP(d), intent_path, state_absent, expected_present=base_rb["expected_present"], baseline=base_rb["label"], context=base_rb["context"])
+    assert rb["status"] == "in_sync" and rb["severity"] == "none"
+
+    # Applied change: VLAN absent is real drift (an applied change went missing).
+    base_ap = baseline_for_state("rollback_available")
+    ap = vlan_drift_report(WP(d), intent_path, state_absent, expected_present=base_ap["expected_present"], baseline=base_ap["label"], context=base_ap["context"])
+    assert ap["status"] == "drifted" and ap["severity"] == "high"
+
+    # Never-applied change: a mismatch is an expected preview, not an alarm.
+    base_pv = baseline_for_state("validated")
+    pv = vlan_drift_report(WP(d), intent_path, state_absent, expected_present=base_pv["expected_present"], baseline=base_pv["label"], context=base_pv["context"])
+    assert pv["status"] == "preview_mismatch" and pv["severity"] == "info"
+
+
+def test_workspace_gitignore_tracks_only_artifacts(tmp_path: Path):
+    """The seeded workspace .gitignore must exclude platform code so branch switching
+    never collides with source files (Marcus's branch-collision bug)."""
+    init_workspace(WorkspacePaths(tmp_path))
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+    # Simulate a workspace that shares a dir with code.
+    (tmp_path / "netcode").mkdir(exist_ok=True)
+    (tmp_path / "netcode" / "api.py").write_text("# code\n")
+    (tmp_path / "static").mkdir(exist_ok=True)
+    (tmp_path / "static" / "app.js").write_text("// code\n")
+    tracked = subprocess.run(["git", "add", "-An"], cwd=tmp_path, check=True, capture_output=True, text=True).stdout
+    assert "intents/" in tracked  # artifacts ARE tracked
+    assert "netcode/" not in tracked and "static/" not in tracked  # code is NOT
+
+
 def test_change_type_registry_contract_is_complete():
     """Each registered change type must resolve its validator + adapter methods,
     so 'register once' can't silently ship a type with a missing policy/verify handler."""
