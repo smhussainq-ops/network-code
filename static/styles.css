@@ -660,6 +660,96 @@ textarea:focus-visible {
   gap: 8px;
 }
 
+.runners-panel {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  margin-top: 16px;
+  padding: 16px;
+}
+
+.runners-panel .record-block h5 {
+  align-items: center;
+  display: flex;
+  gap: 8px;
+  text-transform: none;
+  font-size: 14px;
+}
+
+#join-token-box {
+  margin-top: 12px;
+}
+
+.login-overlay {
+  align-items: center;
+  background: rgba(16, 24, 40, 0.55);
+  display: flex;
+  inset: 0;
+  justify-content: center;
+  position: fixed;
+  z-index: 100;
+}
+
+.login-card {
+  background: white;
+  border-radius: var(--radius);
+  box-shadow: 0 24px 60px rgba(16, 24, 40, 0.25);
+  display: grid;
+  gap: 12px;
+  padding: 28px;
+  width: min(380px, 92vw);
+}
+
+.login-card h2 {
+  margin: 4px 0 8px;
+}
+
+.login-card label {
+  color: #344054;
+  display: grid;
+  font-size: 13px;
+  font-weight: 700;
+  gap: 6px;
+}
+
+.login-error {
+  background: #fdecea;
+  border: 1px solid #f5b5ad;
+  border-radius: 8px;
+  color: #912018;
+  font-size: 13px;
+  margin: 0;
+  padding: 8px 10px;
+}
+
+/* Viewer role: hide write actions (server enforces regardless; this is UX). */
+body.role-viewer .danger,
+body.role-viewer #create-plan,
+body.role-viewer #run-dry-run,
+body.role-viewer #apply-change,
+body.role-viewer #rollback-change,
+body.role-viewer #commit-artifacts,
+body.role-viewer #push-branch,
+body.role-viewer #connect-git,
+body.role-viewer #create-branch,
+body.role-viewer #discover-device,
+body.role-viewer #mint-join-token,
+body.role-viewer #netbox-sync {
+  display: none;
+}
+
+.netbox-panel {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  margin-bottom: 16px;
+  padding: 16px;
+}
+
+.netbox-panel .config-head {
+  margin-bottom: 12px;
+}
+
 .config-panel {
   background: var(--surface);
   border: 1px solid var(--line);

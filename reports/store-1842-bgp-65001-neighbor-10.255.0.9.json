@@ -1,0 +1,148 @@
+{
+  "status": "pass",
+  "intent": {
+    "change_type": "bgp_neighbor",
+    "site": "store-1842",
+    "targets": {
+      "device_ids": [
+        "v2-store1"
+      ],
+      "device_group": "access-switches"
+    },
+    "policy": {
+      "pci_reachable": false,
+      "internet_reachable": true
+    },
+    "metadata": {
+      "requested_by": "registry-smoke",
+      "ticket_id": null,
+      "learning_mode": true
+    },
+    "bgp": {
+      "asn": 65001,
+      "router_id": null,
+      "neighbors": [
+        {
+          "address": "10.255.0.9",
+          "remote_as": 65009,
+          "description": "REG_TEST",
+          "update_source": null,
+          "shutdown": false
+        }
+      ]
+    }
+  },
+  "intent_yaml": "change_type: bgp_neighbor\nsite: store-1842\ntargets:\n  device_ids:\n  - v2-store1\n  device_group: access-switches\npolicy:\n  pci_reachable: false\n  internet_reachable: true\nmetadata:\n  requested_by: registry-smoke\n  ticket_id: null\n  learning_mode: true\nbgp:\n  asn: 65001\n  router_id: null\n  neighbors:\n  - address: 10.255.0.9\n    remote_as: 65009\n    description: REG_TEST\n    update_source: null\n    shutdown: false\n",
+  "render": {
+    "template_path": "/private/tmp/claude-501/-Users-syedhussain-Documents-Network-Automation/5abb41ab-ae5a-4273-85bc-83d5430e3f60/scratchpad/cp-workspace/templates/arista/bgp_neighbor.j2",
+    "config": "router bgp 65001\n   neighbor 10.255.0.9 remote-as 65009\n   neighbor 10.255.0.9 description REG_TEST\n   no neighbor 10.255.0.9 shutdown\n",
+    "variables": {
+      "change_type": "bgp_neighbor",
+      "site": "store-1842",
+      "targets": {
+        "device_ids": [
+          "v2-store1"
+        ],
+        "device_group": "access-switches"
+      },
+      "bgp": {
+        "asn": 65001,
+        "router_id": null,
+        "neighbors": [
+          {
+            "address": "10.255.0.9",
+            "remote_as": 65009,
+            "description": "REG_TEST",
+            "update_source": null,
+            "shutdown": false
+          }
+        ]
+      },
+      "policy": {
+        "pci_reachable": false,
+        "internet_reachable": true
+      },
+      "metadata": {
+        "requested_by": "registry-smoke",
+        "ticket_id": null,
+        "learning_mode": true
+      }
+    }
+  },
+  "validation": {
+    "status": "pass",
+    "checks": [
+      {
+        "id": "schema",
+        "title": "Intent Schema",
+        "status": "pass",
+        "severity": "info",
+        "message": "Intent loaded into the bgp_neighbor model.",
+        "evidence": {
+          "change_type": "bgp_neighbor",
+          "site": "store-1842"
+        }
+      },
+      {
+        "id": "targets",
+        "title": "Target Resolution",
+        "status": "pass",
+        "severity": "info",
+        "message": "All requested target devices resolve in inventory.",
+        "evidence": {
+          "devices": [
+            "v2-store1"
+          ]
+        }
+      },
+      {
+        "id": "bgp_policy",
+        "title": "BGP Policy",
+        "status": "pass",
+        "severity": "info",
+        "message": "BGP neighbor intent has valid ASN and neighbor addressing. Treat as high risk until lab/canary proof exists.",
+        "evidence": {
+          "asn": 65001,
+          "neighbors": [
+            "10.255.0.9"
+          ]
+        }
+      },
+      {
+        "id": "render_scope",
+        "title": "Rendered Config Scope",
+        "status": "pass",
+        "severity": "info",
+        "message": "Rendered config only touches the intended bgp_neighbor feature scope.",
+        "evidence": {
+          "line_count": 4
+        }
+      },
+      {
+        "id": "deterministic_render",
+        "title": "Deterministic Render",
+        "status": "pass",
+        "severity": "info",
+        "message": "Same intent renders to the same EOS config every time.",
+        "evidence": {}
+      }
+    ]
+  },
+  "git": {
+    "available": true,
+    "branch": "main",
+    "status_short": "M netcode/api.py\n M netcode/intent_utils.py\n M netcode/lab.py\n M netcode/models.py\n M netcode/orchestrator.py\n M netcode/runner_agent.py\n M netcode/runner_hub.py\n M netcode/store.py\n M netcode/validation.py\n M static/app.js\n M static/index.html\n M static/styles.css\n?? intents/store-1842/store-1842-add-vlan-95.yaml\n?? intents/store-1842/store-1842-add-vlan-96.yaml\n?? intents/store-1842/store-1842-bgp-65001-neighbor-10.255.0.9.yaml\n?? netcode/auth.py\n?? netcode/change_types.py\n?? rendered/store-1842-add-vlan-95.eos\n?? rendered/store-1842-add-vlan-96.eos\n?? rendered/store-1842-bgp-65001-neighbor-10.255.0.9.eos\n?? reports/store-1842-add-vlan-95.json\n?? reports/store-1842-add-vlan-95.md\n?? reports/store-1842-add-vlan-96.json\n?? reports/store-1842-add-vlan-96.md",
+    "intent_diff": "",
+    "suggested_commands": [
+      "git checkout -b change/store-1842-bgp-65001-neighbor-10.255.0.9",
+      "git add intents/store-1842/store-1842-bgp-65001-neighbor-10.255.0.9.yaml",
+      "git commit -m \"Add network intent store-1842-bgp-65001-neighbor-10.255.0.9\""
+    ]
+  },
+  "artifacts": {
+    "intent_path": "/private/tmp/claude-501/-Users-syedhussain-Documents-Network-Automation/5abb41ab-ae5a-4273-85bc-83d5430e3f60/scratchpad/cp-workspace/intents/store-1842/store-1842-bgp-65001-neighbor-10.255.0.9.yaml",
+    "rendered_path": "/private/tmp/claude-501/-Users-syedhussain-Documents-Network-Automation/5abb41ab-ae5a-4273-85bc-83d5430e3f60/scratchpad/cp-workspace/rendered/store-1842-bgp-65001-neighbor-10.255.0.9.eos",
+    "report_markdown_path": "/private/tmp/claude-501/-Users-syedhussain-Documents-Network-Automation/5abb41ab-ae5a-4273-85bc-83d5430e3f60/scratchpad/cp-workspace/reports/store-1842-bgp-65001-neighbor-10.255.0.9.md",
+    "report_json_path": "/private/tmp/claude-501/-Users-syedhussain-Documents-Network-Automation/5abb41ab-ae5a-4273-85bc-83d5430e3f60/scratchpad/cp-workspace/reports/store-1842-bgp-65001-neighbor-10.255.0.9.json"
+  }
+}

@@ -39,7 +39,11 @@ const appState = {
   uiConfigPath: "",
   configHistory: [],
   configApplied: false,
+  authEnabled: false,
+  role: null,
+  email: null,
   reachability: null,
+  runners: null,
   gitBranches: null,
   activeChangeId: "",
   lastCommit: null,
@@ -64,8 +68,15 @@ function apiError(data, fallback) {
   return typeof data.detail === "string" ? data.detail : formatJson(data.detail);
 }
 
+let authToken = localStorage.getItem("netcode_token") || "";
+
+function authHeaders(extra = {}) {
+  return authToken ? { ...extra, Authorization: `Bearer ${authToken}` } : extra;
+}
+
 async function getJson(url) {
-  const response = await fetch(url);
+  const response = await fetch(url, { headers: authHeaders() });
+  if (response.status === 401 && appState.authEnabled) return requireLogin();
   const data = await response.json();
   if (!response.ok) throw new Error(apiError(data, response.statusText));
   return data;
@@ -74,18 +85,124 @@ async function getJson(url) {
 async function postJson(url, body) {
   const response = await fetch(url, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: authHeaders({ "Content-Type": "application/json" }),
     body: JSON.stringify(body),
   });
+  if (response.status === 401 && appState.authEnabled) return requireLogin();
   const data = await response.json();
   if (!response.ok) throw new Error(apiError(data, response.statusText));
   return data;
+}
+
+function requireLogin() {
+  $("login-overlay").hidden = false;
+  throw new Error("Authentication required.");
+}
+
+async function initAuth() {
+  let me;
+  try {
+    const res = await fetch("/api/auth/me", { headers: authHeaders() });
+    me = res.ok ? await res.json() : { auth_enabled: true, kind: "anon", role: null };
+  } catch (error) {
+    me = { auth_enabled: false };
+  }
+  appState.authEnabled = Boolean(me.auth_enabled);
+  appState.role = me.role || null;
+  appState.email = me.email || null;
+  if (appState.authEnabled && me.kind !== "user" && me.kind !== "system") {
+    $("login-overlay").hidden = false;
+    return false;
+  }
+  $("login-overlay").hidden = true;
+  document.body.classList.toggle("role-viewer", appState.role === "viewer");
+  if (appState.authEnabled) renderIdentity();
+  return true;
+}
+
+function renderIdentity() {
+  const el = $("sidebar-workspace");
+  if (el && appState.email) el.title = `${appState.email} · ${appState.role}`;
+}
+
+async function handleLogin(event) {
+  event.preventDefault();
+  const err = $("login-error");
+  err.hidden = true;
+  try {
+    const res = await fetch("/api/auth/login", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        email: $("login-email").value.trim(),
+        password: $("login-password").value,
+        org_id: $("login-org").value.trim(),
+      }),
+    });
+    const data = await res.json();
+    if (!res.ok || !data.token) throw new Error(data.detail || "Invalid email or password.");
+    authToken = data.token;
+    localStorage.setItem("netcode_token", authToken);
+    $("login-overlay").hidden = true;
+    await boot();
+  } catch (error) {
+    err.textContent = error.message;
+    err.hidden = false;
+  }
 }
 
 function setRunState(label, status = "info") {
   const el = $("run-state-label");
   el.textContent = label;
   el.className = status === "pass" ? "state-pass" : status === "fail" ? "state-fail" : status === "warn" ? "state-warn" : "";
+}
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+// In runner mode, lab write actions return {queued:true, job}. The on-prem runner
+// executes them and reports back, so poll the job to a terminal state and normalize
+// the response into the SAME shape local (synchronous) mode returns — one render path.
+async function awaitLabResult(data, label) {
+  if (!data || !data.queued) return data;
+  const jobId = data.job?.id;
+  setRunState(`${label}: on runner…`, "info");
+  setOutcome({
+    state: "Running",
+    status: "info",
+    title: `${label} dispatched to the on-prem runner.`,
+    summary: data.result?.message || "Queued for the on-prem runner.",
+    expected: "The runner executes this against the device and returns signed evidence.",
+    actual: "Waiting for a runner to claim and complete the job…",
+    artifact: jobId ? `Job ${jobId}` : "Queued job.",
+    device: "The control plane never touches the device; the runner does.",
+    next: "Waiting for the runner…",
+  });
+  const startedAt = Date.now();
+  const timeoutMs = 180000;
+  while (Date.now() - startedAt < timeoutMs) {
+    await sleep(2000);
+    let job;
+    try {
+      job = await getJson(`/api/jobs/${jobId}`);
+    } catch (error) {
+      continue;
+    }
+    if (job.status === "completed" || job.status === "failed") {
+      const result = job.result || { status: job.status, message: job.message };
+      return { ok: result.status === "pass", queued: true, job, change: data.change, result };
+    }
+  }
+  return {
+    ok: false,
+    queued: true,
+    job: { id: jobId, status: "timeout" },
+    change: data.change,
+    result: { status: "fail", message: "No runner reported within 3 minutes. Is a runner online for this pool? (Setup → Runners)" },
+  };
+}
+
+function isRunnerMode() {
+  return appState.health?.execution?.mode === "runner";
 }
 
 function setOutcome({ state = "Info", status = "info", title, summary, expected, actual, artifact, device, next }) {
@@ -691,6 +808,25 @@ function setStory(id, status, label) {
 }
 
 function proofMode() {
+  if (isRunnerMode()) {
+    const online = (appState.runners?.runners || []).filter((r) => r.status === "online");
+    if (online.length) {
+      return {
+        id: "runner",
+        label: "Runner-backed",
+        pass: true,
+        copy: `${online.length} on-prem runner${online.length === 1 ? "" : "s"} online. Every change is proven and applied on your runner, next to the devices — the control plane never touches them.`,
+        detail: "Runner mode: device credentials stay on the runner, not in the cloud.",
+      };
+    }
+    return {
+      id: "runner-offline",
+      label: "No runner online",
+      pass: false,
+      copy: "Runner mode is on but no runner has connected. Enroll a runner below before running lab actions.",
+      detail: "Plan and validation still work; device actions wait for a runner.",
+    };
+  }
   if (appState.health?.lab?.ok) {
     return {
       id: "lab-first",
@@ -920,7 +1056,98 @@ function renderSetup() {
 
   const startChange = $("start-change");
   if (startChange) startChange.disabled = gates.core !== 2;
+  renderRunnersPanel();
   renderConfigPanel();
+}
+
+function renderRunnersPanel() {
+  const panel = $("runners-panel");
+  if (!panel) return;
+  panel.hidden = !isRunnerMode();
+  if (!isRunnerMode()) return;
+  const pool = appState.health?.execution?.pool || "store-lab";
+  $("runners-copy").textContent = `Runner mode (pool "${pool}"): the control plane queues changes; an on-prem runner next to your devices executes them and returns signed evidence. The browser and control plane never touch devices.`;
+  const runners = appState.runners?.runners || [];
+  if (!runners.length) {
+    $("runners-list").innerHTML = '<article class="record-block"><h5>No runners enrolled</h5><p>Generate a join token and run it on the machine next to your devices.</p></article>';
+    return;
+  }
+  $("runners-list").innerHTML = runners
+    .map(
+      (runner) => `<article class="record-block"><h5>${escapeHtml(runner.name)} <span class="chip ${runner.status === "online" ? "good" : "warn"}">${escapeHtml(runner.status)}</span></h5>` +
+        `<p>Pool ${escapeHtml(runner.pool)} · version ${escapeHtml(runner.version || "—")} · last seen ${escapeHtml(runner.last_seen || "never")}</p></article>`
+    )
+    .join("");
+}
+
+async function mintJoinToken() {
+  const pool = appState.health?.execution?.pool || "store-lab";
+  startOutcome("Generate join token", "Mint a single-use token to enroll an on-prem runner.");
+  try {
+    const data = await postJson("/api/runners/join-token", { pool });
+    if (!data.ok) throw new Error(data.message || "Could not mint token.");
+    $("join-token-box").hidden = false;
+    $("join-token-cmd").textContent = [
+      `# on the machine next to your devices (pool: ${pool}):`,
+      `netcode-runner enroll --server <control-plane-url> \\`,
+      `  --join-token ${data.join_token} --name my-runner`,
+      `netcode-runner run`,
+    ].join("\n");
+    setOutcome({
+      state: "Passed",
+      status: "pass",
+      title: "Join token minted.",
+      summary: `Single-use token for pool '${pool}'. It is shown once — copy it now.`,
+      expected: "Enroll a runner so device actions can execute on-prem.",
+      actual: "Token generated. Use the command shown to enroll and start the runner.",
+      artifact: "Single-use join token (not stored in plaintext).",
+      device: "No device config was changed.",
+      next: "Run the command on your runner host, then re-check readiness.",
+    });
+  } catch (error) {
+    failOutcome("Could not mint join token.", error);
+  }
+}
+
+async function netboxAction(kind) {
+  const url = $("netbox-url").value.trim();
+  const token = $("netbox-token").value;
+  if (!url) {
+    $("netbox-result").textContent = "Enter the NetBox URL first.";
+    return;
+  }
+  const isSync = kind === "sync";
+  startOutcome(isSync ? "Sync NetBox devices" : "Test NetBox connection", isSync ? "Read devices from NetBox and merge them into local inventory. Read-only on NetBox." : "Check the NetBox URL and token.");
+  try {
+    const data = await postJson(`/api/source-of-truth/netbox/${kind}`, { url, token });
+    if (!data.ok) throw new Error(data.error || "NetBox request failed.");
+    if (isSync) {
+      $("netbox-result").textContent = data.message;
+      appState.source = await getJson("/api/source-of-truth");
+      renderAll();
+      setOutcome({
+        state: "Passed", status: "pass", title: "NetBox devices synced.",
+        summary: data.message,
+        expected: "NetBox devices appear in inventory for targeting and validation.",
+        actual: `${data.imported} new, ${data.updated} updated: ${(data.devices || []).slice(0, 8).join(", ")}${(data.devices || []).length > 8 ? "…" : ""}`,
+        artifact: data.inventory, device: "No device config was changed. Credentials are not imported.",
+        next: "Review the device list, then create a change.",
+      });
+    } else {
+      $("netbox-result").textContent = `Connected to NetBox ${data.netbox_version} — ${data.device_count} device(s) available to sync.`;
+      setOutcome({
+        state: "Passed", status: "pass", title: "NetBox connection OK.",
+        summary: `NetBox ${data.netbox_version} reachable with ${data.device_count} device(s).`,
+        expected: "The platform can read NetBox as a source of truth.",
+        actual: `Version ${data.netbox_version}, ${data.device_count} devices.`,
+        artifact: "NetBox connection test.", device: "No device config was changed.",
+        next: "Sync devices into inventory.",
+      });
+    }
+  } catch (error) {
+    $("netbox-result").textContent = error.message;
+    failOutcome(isSync ? "NetBox sync failed." : "NetBox connection failed.", error);
+  }
 }
 
 async function testReachability() {
@@ -1112,7 +1339,11 @@ function renderApply() {
     setGate("gate-verify", appState.verify?.ok || appState.apply?.ok ? "pass" : appState.verify ? "fail" : "warn", appState.verify?.ok || appState.apply?.ok ? "Verified" : appState.verify ? "Failed" : "Waiting");
   }
   $("apply-change").disabled = !(appState.plan?.ok && labSupported && appState.dryRun?.ok);
-  $("verify-change").disabled = !(appState.apply?.ok && appState.changeLive);
+  // Standalone verify is a control-plane device read; in runner mode the control
+  // plane has no device access, and apply already includes verification.
+  const verifyBtn = $("verify-change");
+  verifyBtn.disabled = isRunnerMode() || !(appState.apply?.ok && appState.changeLive);
+  verifyBtn.title = isRunnerMode() ? "Verification runs on the runner as part of apply. Standalone verify (runner read-routing) is a later milestone." : "";
   $("rollback-change").disabled = !(appState.apply?.ok && appState.changeLive);
   $("commit-artifacts").disabled = !(appState.plan && appState.git?.available);
   $("push-branch").disabled = !(appState.lastCommit?.ok || (appState.git?.ahead || 0) > 0);
@@ -1160,7 +1391,7 @@ function renderAll() {
 async function checkWorkspace({ silent = false } = {}) {
   if (!silent) startOutcome("Check workspace", "Load Git, source of truth, Rez adapter, desired-state catalog, lab, jobs, and audit status.");
   try {
-    const [uiConfig, health, git, gitBranches, source, rezHealth, rezPlatforms, catalog, jobs, audit] = await Promise.all([
+    const [uiConfig, health, git, gitBranches, source, rezHealth, rezPlatforms, catalog, jobs, audit, runners] = await Promise.all([
       getJson("/api/config/ui"),
       getJson("/api/health"),
       getJson("/api/git/status"),
@@ -1171,6 +1402,7 @@ async function checkWorkspace({ silent = false } = {}) {
       getJson("/api/desired-state/catalog"),
       getJson("/api/jobs"),
       getJson("/api/audit/sessions"),
+      getJson("/api/runners").catch(() => ({ runners: [], count: 0 })),
     ]);
     appState.uiConfig = uiConfig.config;
     appState.uiConfigPath = uiConfig.path;
@@ -1178,6 +1410,7 @@ async function checkWorkspace({ silent = false } = {}) {
     appState.health = health;
     appState.git = git;
     appState.gitBranches = gitBranches;
+    appState.runners = runners;
     appState.source = source;
     appState.rezHealth = rezHealth;
     appState.rezPlatforms = rezPlatforms;
@@ -1336,11 +1569,11 @@ async function runDryRun() {
   }
   startOutcome("Run lab dry-run", "Open EOS config session, load candidate, collect diff, then abort. No commit.");
   try {
-    const data = await postJson("/api/lab/dry-run", {
+    const data = await awaitLabResult(await postJson("/api/lab/dry-run", {
       intent_path: appState.plan.intent_path,
       device_id: selectedDeviceId(),
       change_id: appState.plan.change?.id || null,
-    });
+    }), "Dry-run");
     appState.dryRun = data;
     appState.audit = await getJson("/api/audit/sessions");
     renderAll();
@@ -1369,11 +1602,11 @@ async function applyChange() {
   }
   startOutcome("Apply in Arista lab", "Commit the validated candidate, verify intent state, and log the command session.");
   try {
-    const data = await postJson("/api/lab/apply", {
+    const data = await awaitLabResult(await postJson("/api/lab/apply", {
       intent_path: appState.plan.intent_path,
       device_id: selectedDeviceId(),
       change_id: appState.plan.change?.id || null,
-    });
+    }), "Apply");
     appState.apply = data;
     appState.changeLive = Boolean(data.ok);
     appState.rollback = null;
@@ -1433,11 +1666,11 @@ async function rollbackChange() {
   }
   startOutcome("Rollback lab change", "Commit rollback config, verify the intent was removed, and log the session.");
   try {
-    const data = await postJson("/api/lab/rollback", {
+    const data = await awaitLabResult(await postJson("/api/lab/rollback", {
       intent_path: appState.plan.intent_path,
       device_id: selectedDeviceId(),
       change_id: appState.plan.change?.id || null,
-    });
+    }), "Rollback");
     appState.rollback = data;
     if (data.ok) appState.changeLive = false;
     appState.audit = await getJson("/api/audit/sessions");
@@ -1760,6 +1993,9 @@ function bindEvents() {
   $("commit-artifacts").addEventListener("click", commitArtifacts);
   $("push-branch").addEventListener("click", pushBranch);
   $("test-reachability").addEventListener("click", testReachability);
+  $("mint-join-token").addEventListener("click", mintJoinToken);
+  $("netbox-test").addEventListener("click", () => netboxAction("test"));
+  $("netbox-sync").addEventListener("click", () => netboxAction("sync"));
   $("record-select").addEventListener("change", (event) => loadChangeRecord(event.target.value));
   document.addEventListener("click", (event) => {
     const step = event.target.closest("[data-step-view]");
@@ -1779,5 +2015,12 @@ function bindEvents() {
   $$("#change-form input, #change-form select, #change-form textarea").forEach((input) => input.addEventListener("input", resetChangeProof));
 }
 
+async function boot() {
+  const ready = await initAuth();
+  if (!ready) return; // login overlay shown; boot resumes after successful login
+  await checkWorkspace({ silent: true });
+}
+
+$("login-form").addEventListener("submit", handleLogin);
 bindEvents();
-checkWorkspace({ silent: true });
+boot();

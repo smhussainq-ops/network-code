@@ -6,8 +6,8 @@ import os
 import re
 from pathlib import Path
 
-from fastapi import FastAPI, Header, HTTPException, Response
-from fastapi.responses import FileResponse
+from fastapi import FastAPI, Header, HTTPException, Request, Response
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -28,8 +28,18 @@ from netcode.gitflow import (
 from netcode.gitops import gitops_plan
 from netcode.inventory import Inventory
 from netcode.intent_utils import lab_write_supported, plan_metadata, production_write_supported
-from netcode.jobs import JobRunner
+from netcode.jobs import JobRunner, execution_mode, runner_pool
 from netcode.lab import AristaEOSLabAdapter, lab_status, run_arista_end_to_end, run_lab_action
+from netcode.auth import (
+    Principal,
+    SYSTEM_PRINCIPAL,
+    auth_enabled,
+    hash_password,
+    mint_session,
+    resolve_principal,
+    token_hash,
+    verify_password,
+)
 from netcode.models import load_intent
 from netcode.runner_hub import (
     authenticate_runner,
@@ -43,8 +53,8 @@ from netcode.orchestrator import create_add_vlan_intent, create_desired_state_in
 from netcode.paths import paths
 from netcode.platform import platform_capabilities
 from netcode.scale import rollout_plan
-from netcode.source_of_truth import provider_catalog, source_of_truth
-from netcode.store import PlatformStore, record_to_dict
+from netcode.source_of_truth import netbox_sync, netbox_test, provider_catalog, source_of_truth
+from netcode.store import DEFAULT_ORG_ID, PlatformStore, record_to_dict
 from netcode.ui_config import (
     configured_inventory_path,
     configured_template_dir,
@@ -172,12 +182,69 @@ class RunnerHeartbeatRequest(BaseModel):
     version: str = ""
 
 
+class LoginRequest(BaseModel):
+    email: str
+    password: str
+    org_id: str = ""
+
+
+class NetBoxRequest(BaseModel):
+    url: str = ""
+    token: str = ""
+
+
 app = FastAPI(title="Netcode Platform", version="0.1.0")
 
 
 @app.on_event("startup")
 def _startup() -> None:
     init_workspace(paths())
+    _bootstrap_admin()
+
+
+def _bootstrap_admin() -> None:
+    """Seed the default org + a bootstrap admin so flipping NETCODE_AUTH never locks everyone out.
+    Idempotent. Admin credentials come from env; skipped if the admin already exists."""
+    store = PlatformStore(paths())
+    store.ensure_org(DEFAULT_ORG_ID, "Default", "default")
+    email = os.environ.get("NETCODE_BOOTSTRAP_ADMIN_EMAIL", "").strip().lower()
+    password = os.environ.get("NETCODE_BOOTSTRAP_ADMIN_PASSWORD", "").strip()
+    if email and password and not store.user_exists(DEFAULT_ORG_ID, email):
+        store.create_user(DEFAULT_ORG_ID, email, hash_password(password), role="admin")
+
+
+# ── RBAC middleware (M5) ──────────────────────────────────────────────────
+# Auth OFF (default): every request resolves to a system admin — no behavior change,
+# UI and all existing tests keep working. Auth ON (NETCODE_AUTH=1): user endpoints
+# require a valid session + role; runner endpoints keep their own token auth.
+
+_PUBLIC_EXACT = {"/", "/app", "/app/", "/api/health", "/api/auth/login", "/api/auth/logout"}
+_ADMIN_PATHS = {"/api/runners/join-token"}
+
+
+def _request_principal(request: Request) -> Principal:
+    return getattr(request.state, "principal", SYSTEM_PRINCIPAL)
+
+
+@app.middleware("http")
+async def _rbac(request: Request, call_next):
+    path = request.url.path
+    if auth_enabled():
+        request.state.principal = resolve_principal(PlatformStore(paths()), request.headers.get("authorization"))
+    else:
+        request.state.principal = SYSTEM_PRINCIPAL
+    principal = request.state.principal
+
+    # Public UI shell, health, login, static assets, and the runner data plane
+    # (which authenticates with its own runner token) bypass user RBAC.
+    bypass = path in _PUBLIC_EXACT or path.startswith("/static") or path.startswith("/api/runner/")
+    if auth_enabled() and not bypass:
+        if not principal.authenticated:
+            return JSONResponse({"detail": "Authentication required."}, status_code=401)
+        required = "admin" if path in _ADMIN_PATHS else ("operator" if request.method in ("POST", "PUT", "PATCH", "DELETE") else "viewer")
+        if not principal.has_role(required):
+            return JSONResponse({"detail": f"This action requires the '{required}' role."}, status_code=403)
+    return await call_next(request)
 
 
 @app.get("/")
@@ -223,6 +290,7 @@ def health() -> dict[str, object]:
         "ok": True,
         "workspace": str(p.root),
         "lab": _lab_summary(lab_status()),
+        "execution": {"mode": execution_mode(), "pool": runner_pool()},
     }
 
 
@@ -276,7 +344,7 @@ def api_ui_config_history() -> dict[str, object]:
 
 
 @app.post("/api/wizard/add-vlan")
-def wizard_add_vlan(request: AddVlanRequest) -> dict[str, object]:
+def wizard_add_vlan(request: AddVlanRequest, http_request: Request) -> dict[str, object]:
     p = paths()
     try:
         intent_path = create_add_vlan_intent(
@@ -292,7 +360,8 @@ def wizard_add_vlan(request: AddVlanRequest) -> dict[str, object]:
         )
         result = run_static_pipeline(p, intent_path)
         store = PlatformStore(p)
-        change = store.get_or_create_change(intent_path, request.device_id, requested_by=request.requested_by)
+        principal = _request_principal(http_request)
+        change = store.get_or_create_change(intent_path, request.device_id, requested_by=request.requested_by, org_id=principal.org_id, created_by_user_id=principal.user_id)
         workflow = state_after_static_validation(result.status == "pass")
         store.update_change(change.id, "validated" if result.status == "pass" else "blocked", result.model_dump(), workflow_state=workflow.state)
         store.record_workflow_event(
@@ -324,7 +393,7 @@ def desired_state_catalog() -> dict[str, object]:
 
 
 @app.post("/api/desired-state/plan")
-def desired_state_plan(request: DesiredStatePlanRequest) -> dict[str, object]:
+def desired_state_plan(request: DesiredStatePlanRequest, http_request: Request) -> dict[str, object]:
     p = paths()
     try:
         intent_path = create_desired_state_intent(
@@ -338,7 +407,8 @@ def desired_state_plan(request: DesiredStatePlanRequest) -> dict[str, object]:
         intent = load_intent(intent_path)
         result = run_static_pipeline(p, intent_path)
         store = PlatformStore(p)
-        change = store.get_or_create_change(intent_path, request.device_id, requested_by=request.requested_by)
+        principal = _request_principal(http_request)
+        change = store.get_or_create_change(intent_path, request.device_id, requested_by=request.requested_by, org_id=principal.org_id, created_by_user_id=principal.user_id)
         workflow = state_after_static_validation(result.status == "pass")
         metadata = plan_metadata(intent)
         result_payload = result.model_dump()
@@ -464,6 +534,16 @@ def api_source_of_truth_providers() -> dict[str, object]:
     return {"providers": provider_catalog()}
 
 
+@app.post("/api/source-of-truth/netbox/test")
+def api_netbox_test(request: NetBoxRequest) -> dict[str, object]:
+    return netbox_test(paths(), request.url, request.token)
+
+
+@app.post("/api/source-of-truth/netbox/sync")
+def api_netbox_sync(request: NetBoxRequest) -> dict[str, object]:
+    return netbox_sync(paths(), request.url, request.token)
+
+
 @app.get("/api/git/status")
 def api_git_status() -> dict[str, object]:
     return git_workspace_status(paths().root)
@@ -549,15 +629,52 @@ def _require_runner(store: PlatformStore, authorization: str | None):
     return runner
 
 
+@app.post("/api/auth/login")
+def api_login(request: LoginRequest) -> dict[str, object]:
+    store = PlatformStore(paths())
+    org_id = request.org_id or DEFAULT_ORG_ID
+    user = store.get_user_by_email(org_id, request.email)
+    if not user or not verify_password(request.password, str(user["password_hash"])):
+        raise HTTPException(status_code=401, detail="Invalid email or password.")
+    token = mint_session(store, str(user["id"]), org_id)
+    return {"ok": True, "token": token, "user": {"email": user["email"], "role": user["role"], "org_id": org_id}}
+
+
+@app.post("/api/auth/logout")
+def api_logout(authorization: str | None = Header(default=None)) -> dict[str, object]:
+    token = (authorization or "").removeprefix("Bearer ").strip()
+    if token:
+        PlatformStore(paths()).revoke_session(token_hash(token))
+    return {"ok": True}
+
+
+@app.get("/api/auth/me")
+def api_me(request: Request) -> dict[str, object]:
+    principal = _request_principal(request)
+    if auth_enabled() and not principal.authenticated:
+        raise HTTPException(status_code=401, detail="Not authenticated.")
+    return {
+        "ok": True,
+        "auth_enabled": auth_enabled(),
+        "kind": principal.kind,
+        "role": principal.role,
+        "org_id": principal.org_id,
+        "email": principal.email,
+    }
+
+
 @app.post("/api/runners/join-token")
-def api_mint_join_token(request: JoinTokenRequest, authorization: str | None = Header(default=None)) -> dict[str, object]:
-    _admin_guard(authorization)
-    return mint_join_token(PlatformStore(paths()), request.pool)
+def api_mint_join_token(request: JoinTokenRequest, http_request: Request, authorization: str | None = Header(default=None)) -> dict[str, object]:
+    # Admin role (via middleware when auth on) OR the legacy break-glass admin token.
+    if not auth_enabled():
+        _admin_guard(authorization)
+    principal = _request_principal(http_request)
+    return mint_join_token(PlatformStore(paths()), request.pool, org_id=principal.org_id)
 
 
 @app.get("/api/runners")
-def api_list_runners() -> dict[str, object]:
-    return runner_summary(PlatformStore(paths()))
+def api_list_runners(request: Request) -> dict[str, object]:
+    return runner_summary(PlatformStore(paths()), org_id=_request_principal(request).org_id)
 
 
 @app.post("/api/runner/enroll")
@@ -843,15 +960,31 @@ def api_assistant(request: AssistantRequest) -> dict[str, object]:
 
 
 @app.get("/api/changes")
-def api_changes() -> dict[str, object]:
+def api_changes(request: Request) -> dict[str, object]:
     store = PlatformStore(paths())
-    return {"changes": [record_to_dict(record) for record in store.list_changes()]}
+    org = _request_principal(request).org_id
+    return {"changes": [record_to_dict(record) for record in store.list_changes(org_id=org)]}
 
 
 @app.get("/api/jobs")
-def api_jobs() -> dict[str, object]:
+def api_jobs(request: Request) -> dict[str, object]:
     store = PlatformStore(paths())
-    return {"jobs": [record_to_dict(record) for record in store.list_jobs()]}
+    org = _request_principal(request).org_id
+    return {"jobs": [record_to_dict(record) for record in store.list_jobs(org_id=org)]}
+
+
+@app.get("/api/jobs/{job_id}")
+def api_job(job_id: str, request: Request) -> dict[str, object]:
+    """Single job status for UI polling of runner-executed (queued) lab actions."""
+    store = PlatformStore(paths())
+    org = _request_principal(request).org_id
+    try:
+        job = store.get_job(job_id)
+    except Exception as exc:
+        raise HTTPException(status_code=404, detail=f"Unknown job {job_id}") from exc
+    if job.org_id != org:  # 404 (not 403) so job existence never leaks across tenants
+        raise HTTPException(status_code=404, detail=f"Unknown job {job_id}")
+    return record_to_dict(job)
 
 
 @app.get("/api/audit/sessions")
@@ -902,7 +1035,7 @@ def _job_transcript(job: dict[str, object]) -> list[dict[str, object]]:
 
 
 @app.get("/api/change/{change_id}/record")
-def api_change_record(change_id: str) -> dict[str, object]:
+def api_change_record(change_id: str, request: Request) -> dict[str, object]:
     """One readable change package: request, plan, safety, lab/apply/verify proof, git, rollback, manifest."""
     p = paths()
     store = PlatformStore(p)
@@ -910,6 +1043,8 @@ def api_change_record(change_id: str) -> dict[str, object]:
         change = store.get_change(change_id)
     except Exception as exc:
         raise HTTPException(status_code=404, detail=f"Unknown change {change_id}") from exc
+    if change.org_id != _request_principal(request).org_id:  # 404 to avoid cross-tenant existence leak
+        raise HTTPException(status_code=404, detail=f"Unknown change {change_id}")
     change_dict = record_to_dict(change)
     result = change_dict.get("result") or {}
     plan = result.get("plan") or {}

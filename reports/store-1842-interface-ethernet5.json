@@ -1,0 +1,138 @@
+{
+  "status": "pass",
+  "intent": {
+    "change_type": "interface_config",
+    "site": "store-1842",
+    "targets": {
+      "device_ids": [
+        "v2-store1"
+      ],
+      "device_group": "access-switches"
+    },
+    "policy": {
+      "pci_reachable": false,
+      "internet_reachable": true
+    },
+    "metadata": {
+      "requested_by": "e2e",
+      "ticket_id": null,
+      "learning_mode": true
+    },
+    "interface": {
+      "name": "Ethernet5",
+      "description": "E2E uplink",
+      "enabled": true,
+      "mode": "access",
+      "access_vlan": 40,
+      "trunk_allowed_vlans": [],
+      "ip_address": null
+    }
+  },
+  "intent_yaml": "change_type: interface_config\nsite: store-1842\ntargets:\n  device_ids:\n  - v2-store1\n  device_group: access-switches\npolicy:\n  pci_reachable: false\n  internet_reachable: true\nmetadata:\n  requested_by: e2e\n  ticket_id: null\n  learning_mode: true\ninterface:\n  name: Ethernet5\n  description: E2E uplink\n  enabled: true\n  mode: access\n  access_vlan: 40\n  trunk_allowed_vlans: []\n  ip_address: null\n",
+  "render": {
+    "template_path": "/private/tmp/claude-501/-Users-syedhussain-Documents-Network-Automation/5abb41ab-ae5a-4273-85bc-83d5430e3f60/scratchpad/cp-workspace/templates/arista/interface_config.j2",
+    "config": "interface Ethernet5\n   description E2E uplink\n   switchport mode access\n   switchport access vlan 40\n   no shutdown\n",
+    "variables": {
+      "change_type": "interface_config",
+      "site": "store-1842",
+      "targets": {
+        "device_ids": [
+          "v2-store1"
+        ],
+        "device_group": "access-switches"
+      },
+      "interface": {
+        "name": "Ethernet5",
+        "description": "E2E uplink",
+        "enabled": true,
+        "mode": "access",
+        "access_vlan": 40,
+        "trunk_allowed_vlans": [],
+        "ip_address": null
+      },
+      "policy": {
+        "pci_reachable": false,
+        "internet_reachable": true
+      },
+      "metadata": {
+        "requested_by": "e2e",
+        "ticket_id": null,
+        "learning_mode": true
+      }
+    }
+  },
+  "validation": {
+    "status": "pass",
+    "checks": [
+      {
+        "id": "schema",
+        "title": "Intent Schema",
+        "status": "pass",
+        "severity": "info",
+        "message": "Intent loaded into the interface_config model.",
+        "evidence": {
+          "change_type": "interface_config",
+          "site": "store-1842"
+        }
+      },
+      {
+        "id": "targets",
+        "title": "Target Resolution",
+        "status": "pass",
+        "severity": "info",
+        "message": "All requested target devices resolve in inventory.",
+        "evidence": {
+          "devices": [
+            "v2-store1"
+          ]
+        }
+      },
+      {
+        "id": "interface_policy",
+        "title": "Interface Policy",
+        "status": "pass",
+        "severity": "info",
+        "message": "Interface intent stays within editable access/trunk/routed interface scope.",
+        "evidence": {
+          "interface": "Ethernet5",
+          "mode": "access"
+        }
+      },
+      {
+        "id": "render_scope",
+        "title": "Rendered Config Scope",
+        "status": "pass",
+        "severity": "info",
+        "message": "Rendered config only touches the intended interface_config feature scope.",
+        "evidence": {
+          "line_count": 5
+        }
+      },
+      {
+        "id": "deterministic_render",
+        "title": "Deterministic Render",
+        "status": "pass",
+        "severity": "info",
+        "message": "Same intent renders to the same EOS config every time.",
+        "evidence": {}
+      }
+    ]
+  },
+  "git": {
+    "available": true,
+    "branch": "change/store-1842-add-vlan-98",
+    "status_short": "M netcode/api.py\n M netcode/intent_utils.py\n M netcode/lab.py\n M netcode/models.py\n M netcode/orchestrator.py\n M netcode/runner_agent.py\n M netcode/runner_hub.py\n M netcode/source_of_truth.py\n M netcode/store.py\n M netcode/ui_config.py\n M netcode/validation.py\n M static/app.js\n M static/index.html\n M static/styles.css\n?? intents/store-1842/store-1842-add-vlan-95.yaml\n?? intents/store-1842/store-1842-add-vlan-96.yaml\n?? intents/store-1842/store-1842-add-vlan-98.yaml\n?? intents/store-1842/store-1842-bgp-65001-neighbor-10.255.0.9.yaml\n?? intents/store-1842/store-1842-interface-ethernet5.yaml\n?? netcode/auth.py\n?? netcode/change_types.py\n?? netcode/netbox.py\n?? rendered/store-1842-add-vlan-95.eos\n?? rendered/store-1842-add-vlan-96.eos\n?? rendered/store-1842-add-vlan-98.eos\n?? rendered/store-1842-bgp-65001-neighbor-10.255.0.9.eos\n?? rendered/store-1842-interface-ethernet5.eos\n?? reports/store-1842-add-vlan-95.json\n?? reports/store-1842-add-vlan-95.md\n?? reports/store-1842-add-vlan-96.json\n?? reports/store-1842-add-vlan-96.md\n?? reports/store-1842-add-vlan-98.json\n?? reports/store-1842-add-vlan-98.md\n?? reports/store-1842-bgp-65001-neighbor-10.255.0.9.json\n?? reports/store-1842-bgp-65001-neighbor-10.255.0.9.md",
+    "intent_diff": "",
+    "suggested_commands": [
+      "git checkout -b change/store-1842-interface-ethernet5",
+      "git add intents/store-1842/store-1842-interface-ethernet5.yaml",
+      "git commit -m \"Add network intent store-1842-interface-ethernet5\""
+    ]
+  },
+  "artifacts": {
+    "intent_path": "/private/tmp/claude-501/-Users-syedhussain-Documents-Network-Automation/5abb41ab-ae5a-4273-85bc-83d5430e3f60/scratchpad/cp-workspace/intents/store-1842/store-1842-interface-ethernet5.yaml",
+    "rendered_path": "/private/tmp/claude-501/-Users-syedhussain-Documents-Network-Automation/5abb41ab-ae5a-4273-85bc-83d5430e3f60/scratchpad/cp-workspace/rendered/store-1842-interface-ethernet5.eos",
+    "report_markdown_path": "/private/tmp/claude-501/-Users-syedhussain-Documents-Network-Automation/5abb41ab-ae5a-4273-85bc-83d5430e3f60/scratchpad/cp-workspace/reports/store-1842-interface-ethernet5.md",
+    "report_json_path": "/private/tmp/claude-501/-Users-syedhussain-Documents-Network-Automation/5abb41ab-ae5a-4273-85bc-83d5430e3f60/scratchpad/cp-workspace/reports/store-1842-interface-ethernet5.json"
+  }
+}

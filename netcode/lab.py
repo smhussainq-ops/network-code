@@ -12,6 +12,7 @@ from typing import Literal
 
 from netcode.adapters.execution import ExecutionAdapter, ExecutionAdapterMetadata
 from netcode.adapters.registry import AdapterRegistry
+from netcode.change_types import spec_for
 from netcode.inventory import Device, Inventory
 from netcode.intent_utils import lab_write_supported, report_stem, rollback_config
 from netcode.models import AclRuleIntent, AddVlanIntent, BgpNeighborIntent, CustomConfigIntent, EndToEndArtifacts, EndToEndResult, Intent, InterfaceConfigIntent, PhaseResult, load_intent
@@ -266,86 +267,96 @@ class AristaEOSLabAdapter(ExecutionAdapter):
         )
 
     def verify_intent(self, intent: Intent, present: bool = True) -> LabResult:
-        if isinstance(intent, AddVlanIntent):
-            return self.verify_vlan(intent.vlan.id, intent.vlan.name) if present else self.verify_vlan_absent(intent.vlan.id)
-        if isinstance(intent, InterfaceConfigIntent):
-            command = f"show running-config interfaces {intent.interface.name}"
-            output = self.show(command)
-            expected = f"interface {intent.interface.name}"
-            seen = expected in output
-            if present:
-                if intent.interface.description:
-                    seen = seen and intent.interface.description in output
-                if intent.interface.mode == "access" and intent.interface.access_vlan is not None:
-                    seen = seen and f"switchport access vlan {intent.interface.access_vlan}" in output
-                if intent.interface.mode == "routed" and intent.interface.ip_address:
-                    seen = seen and "no switchport" in output and f"ip address {intent.interface.ip_address}" in output
-                return LabResult(
-                    status="pass" if seen else "fail",
-                    action="verify",
-                    device_id=self.device.id,
-                    message=f"Interface {intent.interface.name} config {'matches' if seen else 'does not match'} desired state.",
-                    evidence={"commands": {command: output}},
-                )
-            absent = intent.interface.description not in output if intent.interface.description else True
-            return LabResult(
-                status="pass" if absent else "fail",
-                action="verify_rollback",
-                device_id=self.device.id,
-                message=f"Interface {intent.interface.name} rollback {'was verified' if absent else 'still shows desired fragments'}.",
-                evidence={"commands": {command: output}},
-            )
-        if isinstance(intent, BgpNeighborIntent):
-            command = f"show running-config | section router bgp {intent.bgp.asn}"
-            output = self.show(command)
-            neighbors = [neighbor.address for neighbor in intent.bgp.neighbors]
-            seen = f"router bgp {intent.bgp.asn}" in output and all(f"neighbor {neighbor} remote-as" in output for neighbor in neighbors)
-            if not present:
-                seen = not any(f"neighbor {neighbor}" in output for neighbor in neighbors)
-            return LabResult(
-                status="pass" if seen else "fail",
-                action="verify" if present else "verify_rollback",
-                device_id=self.device.id,
-                message=f"BGP neighbor config {'is present' if present and seen else 'is absent' if not present and seen else 'did not match expected state'}.",
-                evidence={"commands": {command: output}, "neighbors": neighbors},
-            )
-        if isinstance(intent, AclRuleIntent):
-            command = f"show running-config | section ip access-list {intent.acl.name}"
-            output = self.show(command)
-            line_seen = re.search(rf"(?m)^\s*{intent.acl.sequence}\s+{intent.acl.action}\s+{intent.acl.protocol}\s+", output) is not None
-            seen = line_seen if present else not line_seen
-            return LabResult(
-                status="pass" if seen else "fail",
-                action="verify" if present else "verify_rollback",
-                device_id=self.device.id,
-                message=f"ACL {intent.acl.name} sequence {intent.acl.sequence} {'matches' if seen else 'does not match'} expected state.",
-                evidence={"commands": {command: output}},
-            )
-        if isinstance(intent, CustomConfigIntent):
-            needle = intent.custom.verify_contains.strip()
-            if not needle:
-                lines = [line.strip() for line in intent.custom.config_lines.splitlines() if line.strip()]
-                needle = lines[0] if lines else ""
-            command = "show running-config"
-            output = self.show(command)
-            found = needle in output if needle else False
-            seen = found if present else not found
-            return LabResult(
-                status="pass" if seen else "fail",
-                action="verify" if present else "verify_rollback",
-                device_id=self.device.id,
-                message=(
-                    f"Custom config fragment {'is present' if found else 'is absent'} in running-config: {needle!r}."
-                    if needle
-                    else "No verify fragment available for this custom config."
-                ),
-                evidence={"command": command, "needle": needle, "found": found},
-            )
+        # The registry names the verify method per change type; a new type adds a
+        # _verify_* method here and points its spec at it — no ladder to edit.
+        return getattr(self, spec_for(intent).verify_method)(intent, present)
+
+    def _verify_add_vlan(self, intent: AddVlanIntent, present: bool) -> LabResult:
+        return self.verify_vlan(intent.vlan.id, intent.vlan.name) if present else self.verify_vlan_absent(intent.vlan.id)
+
+    def _verify_unsupported(self, intent: Intent, present: bool) -> LabResult:
         return LabResult(
             status="fail",
             action="verify",
             device_id=self.device.id,
             message=f"No live verification is defined for {intent.change_type}.",
+        )
+
+    def _verify_interface(self, intent: InterfaceConfigIntent, present: bool) -> LabResult:
+        command = f"show running-config interfaces {intent.interface.name}"
+        output = self.show(command)
+        expected = f"interface {intent.interface.name}"
+        seen = expected in output
+        if present:
+            if intent.interface.description:
+                seen = seen and intent.interface.description in output
+            if intent.interface.mode == "access" and intent.interface.access_vlan is not None:
+                seen = seen and f"switchport access vlan {intent.interface.access_vlan}" in output
+            if intent.interface.mode == "routed" and intent.interface.ip_address:
+                seen = seen and "no switchport" in output and f"ip address {intent.interface.ip_address}" in output
+            return LabResult(
+                status="pass" if seen else "fail",
+                action="verify",
+                device_id=self.device.id,
+                message=f"Interface {intent.interface.name} config {'matches' if seen else 'does not match'} desired state.",
+                evidence={"commands": {command: output}},
+            )
+        absent = intent.interface.description not in output if intent.interface.description else True
+        return LabResult(
+            status="pass" if absent else "fail",
+            action="verify_rollback",
+            device_id=self.device.id,
+            message=f"Interface {intent.interface.name} rollback {'was verified' if absent else 'still shows desired fragments'}.",
+            evidence={"commands": {command: output}},
+        )
+
+    def _verify_bgp(self, intent: BgpNeighborIntent, present: bool) -> LabResult:
+        command = f"show running-config | section router bgp {intent.bgp.asn}"
+        output = self.show(command)
+        neighbors = [neighbor.address for neighbor in intent.bgp.neighbors]
+        seen = f"router bgp {intent.bgp.asn}" in output and all(f"neighbor {neighbor} remote-as" in output for neighbor in neighbors)
+        if not present:
+            seen = not any(f"neighbor {neighbor}" in output for neighbor in neighbors)
+        return LabResult(
+            status="pass" if seen else "fail",
+            action="verify" if present else "verify_rollback",
+            device_id=self.device.id,
+            message=f"BGP neighbor config {'is present' if present and seen else 'is absent' if not present and seen else 'did not match expected state'}.",
+            evidence={"commands": {command: output}, "neighbors": neighbors},
+        )
+
+    def _verify_acl(self, intent: AclRuleIntent, present: bool) -> LabResult:
+        command = f"show running-config | section ip access-list {intent.acl.name}"
+        output = self.show(command)
+        line_seen = re.search(rf"(?m)^\s*{intent.acl.sequence}\s+{intent.acl.action}\s+{intent.acl.protocol}\s+", output) is not None
+        seen = line_seen if present else not line_seen
+        return LabResult(
+            status="pass" if seen else "fail",
+            action="verify" if present else "verify_rollback",
+            device_id=self.device.id,
+            message=f"ACL {intent.acl.name} sequence {intent.acl.sequence} {'matches' if seen else 'does not match'} expected state.",
+            evidence={"commands": {command: output}},
+        )
+
+    def _verify_custom(self, intent: CustomConfigIntent, present: bool) -> LabResult:
+        needle = intent.custom.verify_contains.strip()
+        if not needle:
+            lines = [line.strip() for line in intent.custom.config_lines.splitlines() if line.strip()]
+            needle = lines[0] if lines else ""
+        command = "show running-config"
+        output = self.show(command)
+        found = needle in output if needle else False
+        seen = found if present else not found
+        return LabResult(
+            status="pass" if seen else "fail",
+            action="verify" if present else "verify_rollback",
+            device_id=self.device.id,
+            message=(
+                f"Custom config fragment {'is present' if found else 'is absent'} in running-config: {needle!r}."
+                if needle
+                else "No verify fragment available for this custom config."
+            ),
+            evidence={"command": command, "needle": needle, "found": found},
         )
 
 

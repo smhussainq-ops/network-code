@@ -1,0 +1,4 @@
+router bgp 65001
+   neighbor 10.255.0.9 remote-as 65009
+   neighbor 10.255.0.9 description REG_TEST
+   no neighbor 10.255.0.9 shutdown

@@ -1,0 +1,21 @@
+change_type: interface_config
+site: store-1842
+targets:
+  device_ids:
+  - v2-store1
+  device_group: access-switches
+policy:
+  pci_reachable: false
+  internet_reachable: true
+metadata:
+  requested_by: e2e
+  ticket_id: null
+  learning_mode: true
+interface:
+  name: Ethernet5
+  description: E2E uplink
+  enabled: true
+  mode: access
+  access_vlan: 40
+  trunk_allowed_vlans: []
+  ip_address: null

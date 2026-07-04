@@ -5,9 +5,20 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Netcode MVP</title>
     <link rel="icon" href="/static/favicon.svg" type="image/svg+xml" />
-    <link rel="stylesheet" href="/static/styles.css?v=20260703-mvp10" />
+    <link rel="stylesheet" href="/static/styles.css?v=20260703-mvp13" />
   </head>
   <body>
+    <div id="login-overlay" class="login-overlay" hidden>
+      <form id="login-form" class="login-card">
+        <div class="brand-mark">NC</div>
+        <h2>Sign in to Netcode</h2>
+        <p id="login-error" class="login-error" hidden></p>
+        <label>Email<input id="login-email" type="email" autocomplete="username" required /></label>
+        <label>Password<input id="login-password" type="password" autocomplete="current-password" required /></label>
+        <label>Organization<input id="login-org" placeholder="org_default" autocomplete="organization" /></label>
+        <button id="login-submit" type="submit">Sign in</button>
+      </form>
+    </div>
     <main class="app-shell">
       <aside class="sidebar" aria-label="MVP navigation">
         <div class="brand">
@@ -143,6 +154,23 @@
               <button id="check-workspace" type="button">Check readiness</button>
               <button id="start-change" type="button" data-go="desired" disabled>Start a change</button>
             </div>
+            <section id="runners-panel" class="runners-panel" hidden>
+              <div class="config-head">
+                <div>
+                  <span>On-prem runners</span>
+                  <h4>Runner mode — device actions run on your runner</h4>
+                  <p id="runners-copy">The control plane queues changes; an on-prem runner next to your devices executes them and returns signed evidence. The browser and control plane never touch devices.</p>
+                </div>
+                <div class="button-row compact">
+                  <button id="mint-join-token" type="button">Generate join token</button>
+                </div>
+              </div>
+              <div id="runners-list" class="record-sections"></div>
+              <div id="join-token-box" hidden>
+                <p class="setup-hint">Run this on the machine next to your devices (single-use token, shown once):</p>
+                <pre id="join-token-cmd" class="mini-code"></pre>
+              </div>
+            </section>
             <details class="advanced-panel">
               <summary>Advanced: platform configuration</summary>
             <section class="config-panel">
@@ -217,7 +245,25 @@
           <section id="view-inventory" class="view">
             <section class="section-heading">
               <h3>Inventory</h3>
-              <p>Discover the lab switch with Rez, then save the reviewed device record into source of truth.</p>
+              <p>Bring devices under management: discover them live with Rez, or import them from NetBox — the de-facto network source of truth.</p>
+            </section>
+            <section class="netbox-panel">
+              <div class="config-head">
+                <div>
+                  <span>NetBox source of truth</span>
+                  <h4>Import devices from NetBox</h4>
+                  <p id="netbox-status">Read-only. Set the URL and API token, test, then sync devices into inventory. Local YAML stays the default.</p>
+                </div>
+              </div>
+              <div class="field-grid">
+                <label>NetBox URL<input id="netbox-url" placeholder="https://netbox.example.com" autocomplete="off" /></label>
+                <label>API token<input id="netbox-token" type="password" placeholder="read-only token" autocomplete="off" /></label>
+              </div>
+              <div class="button-row compact">
+                <button id="netbox-test" class="secondary" type="button">Test connection</button>
+                <button id="netbox-sync" type="button">Sync devices</button>
+              </div>
+              <p id="netbox-result" class="setup-hint"></p>
             </section>
             <div class="two-column">
               <form id="discover-form" class="form-panel">
@@ -475,6 +521,6 @@
         </aside>
       </section>
     </main>
-    <script src="/static/app.js?v=20260703-mvp10"></script>
+    <script src="/static/app.js?v=20260703-mvp13"></script>
   </body>
 </html>

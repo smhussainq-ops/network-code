@@ -1,0 +1,19 @@
+change_type: custom_config
+site: store-1842
+targets:
+  device_ids:
+  - v2-store1
+  device_group: access-switches
+policy:
+  pci_reachable: false
+  internet_reachable: true
+metadata:
+  requested_by: e2e
+  ticket_id: null
+  learning_mode: true
+custom:
+  config_lines: ntp server 10.42.0.10
+  rollback_lines: no ntp server 10.42.0.10
+  verify_contains: ntp server 10.42.0.10
+  description: NTP
+  acknowledge_no_rollback: false

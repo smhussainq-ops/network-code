@@ -1,0 +1,135 @@
+{
+  "status": "pass",
+  "intent": {
+    "change_type": "custom_config",
+    "site": "store-1842",
+    "targets": {
+      "device_ids": [
+        "v2-store1"
+      ],
+      "device_group": "access-switches"
+    },
+    "policy": {
+      "pci_reachable": false,
+      "internet_reachable": true
+    },
+    "metadata": {
+      "requested_by": "e2e",
+      "ticket_id": null,
+      "learning_mode": true
+    },
+    "custom": {
+      "config_lines": "ntp server 10.42.0.10",
+      "rollback_lines": "no ntp server 10.42.0.10",
+      "verify_contains": "ntp server 10.42.0.10",
+      "description": "NTP",
+      "acknowledge_no_rollback": false
+    }
+  },
+  "intent_yaml": "change_type: custom_config\nsite: store-1842\ntargets:\n  device_ids:\n  - v2-store1\n  device_group: access-switches\npolicy:\n  pci_reachable: false\n  internet_reachable: true\nmetadata:\n  requested_by: e2e\n  ticket_id: null\n  learning_mode: true\ncustom:\n  config_lines: ntp server 10.42.0.10\n  rollback_lines: no ntp server 10.42.0.10\n  verify_contains: ntp server 10.42.0.10\n  description: NTP\n  acknowledge_no_rollback: false\n",
+  "render": {
+    "template_path": "/private/tmp/claude-501/-Users-syedhussain-Documents-Network-Automation/5abb41ab-ae5a-4273-85bc-83d5430e3f60/scratchpad/cp-workspace/templates/arista/custom_config.j2",
+    "config": "ntp server 10.42.0.10\n",
+    "variables": {
+      "change_type": "custom_config",
+      "site": "store-1842",
+      "targets": {
+        "device_ids": [
+          "v2-store1"
+        ],
+        "device_group": "access-switches"
+      },
+      "custom": {
+        "config_lines": "ntp server 10.42.0.10",
+        "rollback_lines": "no ntp server 10.42.0.10",
+        "verify_contains": "ntp server 10.42.0.10",
+        "description": "NTP",
+        "acknowledge_no_rollback": false
+      },
+      "policy": {
+        "pci_reachable": false,
+        "internet_reachable": true
+      },
+      "metadata": {
+        "requested_by": "e2e",
+        "ticket_id": null,
+        "learning_mode": true
+      }
+    }
+  },
+  "validation": {
+    "status": "pass",
+    "checks": [
+      {
+        "id": "schema",
+        "title": "Intent Schema",
+        "status": "pass",
+        "severity": "info",
+        "message": "Intent loaded into the custom_config model.",
+        "evidence": {
+          "change_type": "custom_config",
+          "site": "store-1842"
+        }
+      },
+      {
+        "id": "targets",
+        "title": "Target Resolution",
+        "status": "pass",
+        "severity": "info",
+        "message": "All requested target devices resolve in inventory.",
+        "evidence": {
+          "devices": [
+            "v2-store1"
+          ]
+        }
+      },
+      {
+        "id": "custom_policy",
+        "title": "Custom Config Policy",
+        "status": "pass",
+        "severity": "info",
+        "message": "Custom config carries 1 line with engineer-supplied rollback.",
+        "evidence": {
+          "config_lines": 1,
+          "rollback_supplied": true,
+          "acknowledged_no_rollback": false
+        }
+      },
+      {
+        "id": "render_scope",
+        "title": "Rendered Config Scope",
+        "status": "pass",
+        "severity": "info",
+        "message": "Rendered config only touches the intended custom_config feature scope.",
+        "evidence": {
+          "line_count": 1
+        }
+      },
+      {
+        "id": "deterministic_render",
+        "title": "Deterministic Render",
+        "status": "pass",
+        "severity": "info",
+        "message": "Same intent renders to the same EOS config every time.",
+        "evidence": {}
+      }
+    ]
+  },
+  "git": {
+    "available": true,
+    "branch": "change/store-1842-add-vlan-98",
+    "status_short": "M netcode/api.py\n M netcode/intent_utils.py\n M netcode/lab.py\n M netcode/models.py\n M netcode/orchestrator.py\n M netcode/runner_agent.py\n M netcode/runner_hub.py\n M netcode/source_of_truth.py\n M netcode/store.py\n M netcode/ui_config.py\n M netcode/validation.py\n M static/app.js\n M static/index.html\n M static/styles.css\n?? intents/store-1842/store-1842-add-vlan-95.yaml\n?? intents/store-1842/store-1842-add-vlan-96.yaml\n?? intents/store-1842/store-1842-add-vlan-98.yaml\n?? intents/store-1842/store-1842-bgp-65001-neighbor-10.255.0.9.yaml\n?? intents/store-1842/store-1842-custom-ntp.yaml\n?? intents/store-1842/store-1842-interface-ethernet5.yaml\n?? netcode/auth.py\n?? netcode/change_types.py\n?? netcode/netbox.py\n?? rendered/store-1842-add-vlan-95.eos\n?? rendered/store-1842-add-vlan-96.eos\n?? rendered/store-1842-add-vlan-98.eos\n?? rendered/store-1842-bgp-65001-neighbor-10.255.0.9.eos\n?? rendered/store-1842-custom-ntp.eos\n?? rendered/store-1842-interface-ethernet5.eos\n?? reports/store-1842-add-vlan-95.json\n?? reports/store-1842-add-vlan-95.md\n?? reports/store-1842-add-vlan-96.json\n?? reports/store-1842-add-vlan-96.md\n?? reports/store-1842-add-vlan-98.json\n?? reports/store-1842-add-vlan-98.md\n?? reports/store-1842-bgp-65001-neighbor-10.255.0.9.json\n?? reports/store-1842-bgp-65001-neighbor-10.255.0.9.md\n?? reports/store-1842-interface-ethernet5.json\n?? reports/store-1842-interface-ethernet5.md",
+    "intent_diff": "",
+    "suggested_commands": [
+      "git checkout -b change/store-1842-custom-ntp",
+      "git add intents/store-1842/store-1842-custom-ntp.yaml",
+      "git commit -m \"Add network intent store-1842-custom-ntp\""
+    ]
+  },
+  "artifacts": {
+    "intent_path": "/private/tmp/claude-501/-Users-syedhussain-Documents-Network-Automation/5abb41ab-ae5a-4273-85bc-83d5430e3f60/scratchpad/cp-workspace/intents/store-1842/store-1842-custom-ntp.yaml",
+    "rendered_path": "/private/tmp/claude-501/-Users-syedhussain-Documents-Network-Automation/5abb41ab-ae5a-4273-85bc-83d5430e3f60/scratchpad/cp-workspace/rendered/store-1842-custom-ntp.eos",
+    "report_markdown_path": "/private/tmp/claude-501/-Users-syedhussain-Documents-Network-Automation/5abb41ab-ae5a-4273-85bc-83d5430e3f60/scratchpad/cp-workspace/reports/store-1842-custom-ntp.md",
+    "report_json_path": "/private/tmp/claude-501/-Users-syedhussain-Documents-Network-Automation/5abb41ab-ae5a-4273-85bc-83d5430e3f60/scratchpad/cp-workspace/reports/store-1842-custom-ntp.json"
+  }
+}

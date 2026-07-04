@@ -1,0 +1,21 @@
+change_type: add_vlan
+site: store-1842
+targets:
+  device_ids:
+  - v2-store1
+  device_group: access-switches
+policy:
+  pci_reachable: false
+  internet_reachable: true
+metadata:
+  requested_by: phase0-neg
+  ticket_id: null
+  learning_mode: true
+vlan:
+  id: 95
+  name: NO_RUNNER
+  subnet: 10.42.95.0/24
+  purpose: guest
+  svi:
+    enabled: false
+    gateway_ip: null

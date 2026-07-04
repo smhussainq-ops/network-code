@@ -1,0 +1,5 @@
+interface Ethernet5
+   description E2E uplink
+   switchport mode access
+   switchport access vlan 40
+   no shutdown

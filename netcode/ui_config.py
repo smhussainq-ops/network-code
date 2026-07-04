@@ -28,6 +28,7 @@ DEFAULT_UI_CONFIG: dict[str, Any] = {
         "policy_path": "policies/invariants.yaml",
         "template_dir": "templates",
         "write_imports": True,
+        "netbox": {"url": "", "token": ""},
     },
     "credentials": {
         "profile": "lab-default",

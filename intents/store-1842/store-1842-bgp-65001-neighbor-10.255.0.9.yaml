@@ -1,0 +1,22 @@
+change_type: bgp_neighbor
+site: store-1842
+targets:
+  device_ids:
+  - v2-store1
+  device_group: access-switches
+policy:
+  pci_reachable: false
+  internet_reachable: true
+metadata:
+  requested_by: registry-smoke
+  ticket_id: null
+  learning_mode: true
+bgp:
+  asn: 65001
+  router_id: null
+  neighbors:
+  - address: 10.255.0.9
+    remote_as: 65009
+    description: REG_TEST
+    update_source: null
+    shutdown: false

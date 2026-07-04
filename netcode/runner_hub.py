@@ -34,10 +34,10 @@ def sign_result(secret: str, result: dict[str, Any]) -> str:
     return hmac.new(secret.encode("utf-8"), canonical_json(result).encode("utf-8"), hashlib.sha256).hexdigest()
 
 
-def mint_join_token(store: PlatformStore, pool: str) -> dict[str, Any]:
+def mint_join_token(store: PlatformStore, pool: str, org_id: str = "org_default") -> dict[str, Any]:
     pool = pool.strip() or "default"
     token = f"njt_{secrets.token_urlsafe(32)}"
-    store.create_join_token(_hash(token), pool)
+    store.create_join_token(_hash(token), pool, org_id=org_id)
     return {
         "ok": True,
         "join_token": token,
@@ -48,12 +48,14 @@ def mint_join_token(store: PlatformStore, pool: str) -> dict[str, Any]:
 
 def enroll_runner(store: PlatformStore, join_token: str, name: str) -> dict[str, Any]:
     name = name.strip() or "runner"
-    pool = store.consume_join_token(_hash(join_token.strip()))
-    if pool is None:
+    claim = store.consume_join_token(_hash(join_token.strip()))
+    if claim is None:
         return {"ok": False, "message": "Join token is invalid or already used. Mint a new one."}
+    pool, org_id = claim["pool"], claim["org_id"]
     runner_token = f"nrt_{secrets.token_urlsafe(32)}"
     hmac_secret = secrets.token_urlsafe(32)
-    runner = store.create_runner(name=name, pool=pool, token_hash=_hash(runner_token), hmac_secret=hmac_secret)
+    # The runner's tenant is decided exactly once, here, from the join token's org.
+    runner = store.create_runner(name=name, pool=pool, token_hash=_hash(runner_token), hmac_secret=hmac_secret, org_id=org_id)
     return {
         "ok": True,
         "runner_id": runner.id,
@@ -77,7 +79,7 @@ def poll_for_job(store: PlatformStore, runner: RunnerRecord, wait_seconds: float
     deadline = time.monotonic() + wait_seconds
     store.touch_runner(runner.id, status="online")
     while True:
-        job = store.claim_next_job(runner.pool, runner.id)
+        job = store.claim_next_job(runner.org_id, runner.pool, runner.id)
         if job is not None:
             return job
         if time.monotonic() >= deadline:
@@ -136,6 +138,6 @@ def submit_job_result(
     }
 
 
-def runner_summary(store: PlatformStore) -> dict[str, Any]:
-    runners = [record_to_dict(runner) for runner in store.list_runners()]
+def runner_summary(store: PlatformStore, org_id: str | None = None) -> dict[str, Any]:
+    runners = [record_to_dict(runner) for runner in store.list_runners(org_id=org_id)]
     return {"ok": True, "runners": runners, "count": len(runners)}

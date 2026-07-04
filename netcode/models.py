@@ -297,18 +297,11 @@ class EndToEndResult(BaseModel):
 
 
 def load_intent(path: Path) -> Intent:
-    data = read_yaml(path)
-    change_type = data.get("change_type")
-    if change_type == "add_vlan":
-        return AddVlanIntent.model_validate(data)
-    if change_type == "interface_config":
-        return InterfaceConfigIntent.model_validate(data)
-    if change_type == "bgp_neighbor":
-        return BgpNeighborIntent.model_validate(data)
-    if change_type == "acl_rule":
-        return AclRuleIntent.model_validate(data)
-    if change_type == "site_device_intent":
-        return SiteDeviceIntent.model_validate(data)
-    if change_type == "custom_config":
-        return CustomConfigIntent.model_validate(data)
-    raise ValueError(f"Unsupported change_type: {change_type!r}")
+    return load_intent_data(read_yaml(path))
+
+
+def load_intent_data(data: dict) -> Intent:
+    """Validate a raw intent dict into its typed model via the change-type registry."""
+    from netcode.change_types import spec_for  # local import avoids a cycle at module load
+
+    return spec_for(data.get("change_type")).model.model_validate(data)

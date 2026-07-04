@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import os
 from typing import Any
 
 from netcode.inventory import Inventory
+from netcode.netbox import NetBoxClient, NetBoxError
 from netcode.paths import WorkspacePaths
 from netcode.ui_config import configured_inventory_path, configured_policy_path, configured_template_dir, read_ui_config
-from netcode.yamlio import read_yaml
+from netcode.yamlio import read_yaml, write_yaml
 
 
 class LocalSourceOfTruth:
@@ -65,7 +67,7 @@ class LocalSourceOfTruth:
         }
 
 
-def provider_catalog() -> list[dict[str, Any]]:
+def provider_catalog(netbox_configured: bool = False) -> list[dict[str, Any]]:
     return [
         {
             "id": "local_yaml",
@@ -78,10 +80,14 @@ def provider_catalog() -> list[dict[str, Any]]:
         {
             "id": "netbox",
             "name": "NetBox",
-            "status": "stub",
+            "status": "configured" if netbox_configured else "available",
             "capabilities": ["devices", "sites", "prefixes", "vlans", "tenants"],
             "writes": False,
-            "message": "Provider contract reserved; configure API URL/token before enabling.",
+            "message": (
+                "Configured. Test the connection, then sync devices into inventory."
+                if netbox_configured
+                else "Read-only device sync. Set source_of_truth.netbox.url + token to enable."
+            ),
         },
         {
             "id": "nautobot",
@@ -110,7 +116,68 @@ def provider_catalog() -> list[dict[str, Any]]:
     ]
 
 
+def _netbox_settings(paths: WorkspacePaths, url: str = "", token: str = "") -> tuple[str, str]:
+    # URL may live in ui_config (non-secret). The token is a SENSITIVE key that
+    # ui_config deliberately never persists, so it comes from the request or the
+    # NETBOX_TOKEN env var — never stored in the config file or returned in reads.
+    config = read_ui_config(paths).get("source_of_truth", {}).get("netbox", {}) or {}
+    resolved_url = (url or str(config.get("url") or "") or os.environ.get("NETBOX_URL", "")).rstrip("/")
+    resolved_token = token or str(config.get("token") or "") or os.environ.get("NETBOX_TOKEN", "")
+    return resolved_url, resolved_token
+
+
+def netbox_test(paths: WorkspacePaths, url: str = "", token: str = "", get_json=None) -> dict[str, Any]:
+    url, token = _netbox_settings(paths, url, token)
+    if not url:
+        return {"ok": False, "error": "NetBox URL is not configured (source_of_truth.netbox.url)."}
+    return NetBoxClient(url, token, get_json=get_json).test_connection()
+
+
+def netbox_sync(paths: WorkspacePaths, url: str = "", token: str = "", get_json=None) -> dict[str, Any]:
+    """Read devices from NetBox and merge them into the local inventory (read-only on NetBox;
+    never writes device credentials — synced devices use inventory defaults)."""
+    url, token = _netbox_settings(paths, url, token)
+    if not url:
+        return {"ok": False, "error": "NetBox URL is not configured (source_of_truth.netbox.url)."}
+    try:
+        candidates = NetBoxClient(url, token, get_json=get_json).list_devices()
+    except NetBoxError as exc:
+        return {"ok": False, "error": str(exc)}
+
+    inventory_path = configured_inventory_path(paths)
+    inventory = read_yaml(inventory_path)
+    devices = list(inventory.get("devices") or [])
+    by_id = {str(d.get("id")): i for i, d in enumerate(devices)}
+    by_host = {str(d.get("host")): i for i, d in enumerate(devices)}
+    imported = updated = 0
+    synced_ids: list[str] = []
+    for candidate in candidates:
+        record = {key: candidate[key] for key in ("id", "hostname", "host", "platform", "site", "groups", "port")}
+        index = by_id.get(record["id"], by_host.get(record["host"]))
+        if index is not None:
+            devices[index] = {**devices[index], **record}
+            updated += 1
+        else:
+            devices.append(record)
+            imported += 1
+        synced_ids.append(record["id"])
+
+    inventory["devices"] = devices
+    write_yaml(inventory_path, inventory)
+    return {
+        "ok": True,
+        "imported": imported,
+        "updated": updated,
+        "total": len(candidates),
+        "devices": synced_ids,
+        "inventory": str(inventory_path),
+        "message": f"Synced {len(candidates)} device(s) from NetBox into local inventory ({imported} new, {updated} updated).",
+    }
+
+
 def source_of_truth(paths: WorkspacePaths) -> dict[str, Any]:
     snapshot = LocalSourceOfTruth(paths).snapshot()
-    snapshot["providers"] = provider_catalog()
+    netbox_url, _ = _netbox_settings(paths)
+    snapshot["providers"] = provider_catalog(netbox_configured=bool(netbox_url))
+    snapshot["netbox_configured"] = bool(netbox_url)
     return snapshot
