@@ -7,6 +7,7 @@ from ipaddress import ip_address
 from ipaddress import ip_network
 from pathlib import Path
 
+from netcode.change_types import spec_for
 from netcode.inventory import Inventory
 from netcode.models import (
     AclRuleIntent,
@@ -34,12 +35,10 @@ class StaticValidator:
 
     def validate(self, intent: Intent, render: RenderResult) -> ValidationReport:
         checks: list[CheckResult] = []
-        validators = [self._schema_present, self._targets_exist]
-        if isinstance(intent, AddVlanIntent):
-            validators.extend([self._vlan_policy, self._subnet_overlap, self._segmentation])
-        else:
-            validators.append(self._intent_policy)
-        validators.extend([self._render_scope, self._deterministic_render])
+        # Each change type declares its policy checks by method name in the registry,
+        # so a new type never edits this dispatch.
+        policy_checks = [getattr(self, name) for name in spec_for(intent).policy_checks]
+        validators = [self._schema_present, self._targets_exist, *policy_checks, self._render_scope, self._deterministic_render]
         for check in validators:
             try:
                 checks.append(check(intent, render))
@@ -88,34 +87,13 @@ class StaticValidator:
             devices=[d.id for d in devices],
         )
 
-    def _intent_policy(self, intent: Intent, render: RenderResult) -> CheckResult:
-        if isinstance(intent, AddVlanIntent):
-            checks = [self._vlan_policy(intent, render), self._subnet_overlap(intent, render), self._segmentation(intent, render)]
-            failed = [check for check in checks if check.status == "fail"]
-            if failed:
-                return self._fail(
-                    "intent_policy",
-                    "Intent Policy",
-                    "One or more VLAN intent policies failed.",
-                    checks=[check.model_dump() for check in checks],
-                )
-            return self._pass("intent_policy", "Intent Policy", "VLAN intent policies passed.", checks=[check.model_dump() for check in checks])
-        if isinstance(intent, InterfaceConfigIntent):
-            return self._interface_policy(intent, render)
-        if isinstance(intent, BgpNeighborIntent):
-            return self._bgp_policy(intent, render)
-        if isinstance(intent, AclRuleIntent):
-            return self._acl_policy(intent, render)
-        if isinstance(intent, SiteDeviceIntent):
-            return self._pass(
-                "intent_policy",
-                "Intent Policy",
-                "Site/device intent is source-of-truth only. Device writes stay locked.",
-                device_id=intent.device.device_id,
-            )
-        if isinstance(intent, CustomConfigIntent):
-            return self._custom_config_policy(intent, render)
-        return self._fail("intent_policy", "Intent Policy", f"Unsupported intent type {intent.change_type}.")
+    def _site_policy(self, intent: SiteDeviceIntent, render: RenderResult) -> CheckResult:
+        return self._pass(
+            "site_policy",
+            "Site/Device Policy",
+            "Site/device intent is source-of-truth only. Device writes stay locked.",
+            device_id=intent.device.device_id,
+        )
 
     def _vlan_policy(self, intent: AddVlanIntent, render: RenderResult) -> CheckResult:
         vlan_policy = self.policy.get("vlan", {})
@@ -272,22 +250,12 @@ class StaticValidator:
 
     def _render_scope(self, intent: Intent, render: RenderResult) -> CheckResult:
         scope = self.policy.get("render_scope", {})
-        default_allowed = {
-            "add_vlan": ["vlan ", "   name ", "interface Vlan", "   description ", "   ip address "],
-            "interface_config": ["interface ", "   description ", "   switchport ", "   no switchport", "   ip address ", "   shutdown", "   no shutdown"],
-            "bgp_neighbor": ["router bgp ", "   router-id ", "   neighbor ", "   no neighbor "],
-            "acl_rule": ["ip access-list ", "   remark ", "   permit ", "   deny "],
-            "site_device_intent": ["! "],
-            # custom_config is DELIBERATELY free-form: no allow-list applies, but the
-            # blocked_fragments list below still rejects credentials/management config.
-            "custom_config": [],
-        }
-        allowed = tuple(scope.get(f"{intent.change_type}_allowed_prefixes", default_allowed.get(intent.change_type, [])))
-        blocked = [str(v).lower() for v in scope.get("blocked_fragments", [])]
-        if intent.change_type == "bgp_neighbor":
-            blocked = [fragment for fragment in blocked if fragment != "router bgp"]
-        if intent.change_type == "acl_rule":
-            blocked = [fragment for fragment in blocked if fragment != "ip access-list"]
+        spec = spec_for(intent)
+        # Allow-list and per-type block-list carve-outs come from the registry; a policy
+        # YAML override (`<type>_allowed_prefixes`) still wins if present.
+        allowed = tuple(scope.get(f"{intent.change_type}_allowed_prefixes", spec.allow_prefixes))
+        carveouts = {c.lower() for c in spec.block_carveouts}
+        blocked = [str(v).lower() for v in scope.get("blocked_fragments", []) if str(v).lower() not in carveouts]
         unexpected_lines: list[str] = []
         blocked_lines: list[str] = []
         for line in render.config.splitlines():

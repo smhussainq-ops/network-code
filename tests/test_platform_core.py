@@ -653,6 +653,24 @@ def test_git_branch_endpoint_creates_and_switches_change_branch(tmp_path: Path, 
     assert "main" in branches.json()["branches"]
 
 
+def test_change_type_registry_contract_is_complete():
+    """Each registered change type must resolve its validator + adapter methods,
+    so 'register once' can't silently ship a type with a missing policy/verify handler."""
+    from netcode.change_types import REGISTRY
+    from netcode.lab import AristaEOSLabAdapter
+    from netcode.validation import StaticValidator
+
+    assert set(REGISTRY) == {"add_vlan", "interface_config", "bgp_neighbor", "acl_rule", "site_device_intent", "custom_config"}
+    for key, spec in REGISTRY.items():
+        assert spec.template.endswith(".j2"), key
+        assert spec.policy_checks, f"{key} has no policy checks"
+        for method in spec.policy_checks:
+            assert hasattr(StaticValidator, method), f"{key}: validator is missing {method}"
+        assert hasattr(AristaEOSLabAdapter, spec.verify_method), f"{key}: adapter is missing {spec.verify_method}"
+        # the pure callables must run against a minimally-built intent without raising
+        assert callable(spec.build) and callable(spec.title) and callable(spec.slug)
+
+
 def test_custom_config_ingests_any_config_with_rollback_discipline(tmp_path: Path, monkeypatch):
     init_workspace(WorkspacePaths(tmp_path))
     monkeypatch.chdir(tmp_path)
