@@ -1109,6 +1109,47 @@ async function mintJoinToken() {
   }
 }
 
+async function netboxAction(kind) {
+  const url = $("netbox-url").value.trim();
+  const token = $("netbox-token").value;
+  if (!url) {
+    $("netbox-result").textContent = "Enter the NetBox URL first.";
+    return;
+  }
+  const isSync = kind === "sync";
+  startOutcome(isSync ? "Sync NetBox devices" : "Test NetBox connection", isSync ? "Read devices from NetBox and merge them into local inventory. Read-only on NetBox." : "Check the NetBox URL and token.");
+  try {
+    const data = await postJson(`/api/source-of-truth/netbox/${kind}`, { url, token });
+    if (!data.ok) throw new Error(data.error || "NetBox request failed.");
+    if (isSync) {
+      $("netbox-result").textContent = data.message;
+      appState.source = await getJson("/api/source-of-truth");
+      renderAll();
+      setOutcome({
+        state: "Passed", status: "pass", title: "NetBox devices synced.",
+        summary: data.message,
+        expected: "NetBox devices appear in inventory for targeting and validation.",
+        actual: `${data.imported} new, ${data.updated} updated: ${(data.devices || []).slice(0, 8).join(", ")}${(data.devices || []).length > 8 ? "…" : ""}`,
+        artifact: data.inventory, device: "No device config was changed. Credentials are not imported.",
+        next: "Review the device list, then create a change.",
+      });
+    } else {
+      $("netbox-result").textContent = `Connected to NetBox ${data.netbox_version} — ${data.device_count} device(s) available to sync.`;
+      setOutcome({
+        state: "Passed", status: "pass", title: "NetBox connection OK.",
+        summary: `NetBox ${data.netbox_version} reachable with ${data.device_count} device(s).`,
+        expected: "The platform can read NetBox as a source of truth.",
+        actual: `Version ${data.netbox_version}, ${data.device_count} devices.`,
+        artifact: "NetBox connection test.", device: "No device config was changed.",
+        next: "Sync devices into inventory.",
+      });
+    }
+  } catch (error) {
+    $("netbox-result").textContent = error.message;
+    failOutcome(isSync ? "NetBox sync failed." : "NetBox connection failed.", error);
+  }
+}
+
 async function testReachability() {
   startOutcome("Test device reachability", "Read each trusted device to confirm the platform can see live state. No device config is touched.");
   try {
@@ -1953,6 +1994,8 @@ function bindEvents() {
   $("push-branch").addEventListener("click", pushBranch);
   $("test-reachability").addEventListener("click", testReachability);
   $("mint-join-token").addEventListener("click", mintJoinToken);
+  $("netbox-test").addEventListener("click", () => netboxAction("test"));
+  $("netbox-sync").addEventListener("click", () => netboxAction("sync"));
   $("record-select").addEventListener("change", (event) => loadChangeRecord(event.target.value));
   document.addEventListener("click", (event) => {
     const step = event.target.closest("[data-step-view]");

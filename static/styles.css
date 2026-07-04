@@ -733,8 +733,21 @@ body.role-viewer #push-branch,
 body.role-viewer #connect-git,
 body.role-viewer #create-branch,
 body.role-viewer #discover-device,
-body.role-viewer #mint-join-token {
+body.role-viewer #mint-join-token,
+body.role-viewer #netbox-sync {
   display: none;
+}
+
+.netbox-panel {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  margin-bottom: 16px;
+  padding: 16px;
+}
+
+.netbox-panel .config-head {
+  margin-bottom: 12px;
 }
 
 .config-panel {

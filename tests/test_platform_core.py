@@ -653,6 +653,81 @@ def test_git_branch_endpoint_creates_and_switches_change_branch(tmp_path: Path, 
     assert "main" in branches.json()["branches"]
 
 
+def _fake_netbox(page, status=None):
+    status = status or {"netbox-version": "4.1.0"}
+
+    def get_json(url, token, timeout=15.0):
+        return status if url.rstrip("/").endswith("/api/status") else page
+
+    return get_json
+
+
+def test_netbox_sync_imports_devices_into_local_inventory(tmp_path: Path, monkeypatch):
+    from netcode import source_of_truth as sot
+    from netcode.inventory import Inventory
+    from netcode.netbox import NetBoxError
+    from netcode.ui_config import configured_inventory_path
+
+    paths = WorkspacePaths(tmp_path.resolve())
+    init_workspace(paths)
+    monkeypatch.chdir(tmp_path)
+
+    page = {"count": 2, "next": None, "results": [
+        {"name": "nb-store9", "site": {"slug": "store-1849"}, "platform": {"slug": "arista-eos"}, "role": {"slug": "access"}, "primary_ip": {"address": "172.100.1.49/24"}, "tags": [{"slug": "pci"}]},
+        {"name": "nb core 10", "site": {"slug": "store-1850"}, "platform": {"slug": "cisco-nxos"}, "device_role": {"slug": "core"}, "primary_ip4": {"address": "172.100.1.50/24"}},
+    ]}
+    get_json = _fake_netbox(page)
+
+    result = sot.netbox_sync(paths, url="https://netbox.example", token="tok", get_json=get_json)
+    assert result["ok"] is True
+    assert result["imported"] == 2 and result["updated"] == 0
+
+    inv = Inventory(configured_inventory_path(paths))
+    assert "nb-store9" in inv.by_id
+    assert inv.by_id["nb-store9"].host == "172.100.1.49"
+    assert inv.by_id["nb-store9"].platform == "arista_eos"
+    assert "netbox" in inv.by_id["nb-store9"].groups and "pci" in inv.by_id["nb-store9"].groups
+    assert inv.by_id["nb-core-10"].platform == "cisco_nxos"  # name sanitized to a valid id
+
+    # Re-sync updates existing rows instead of duplicating.
+    again = sot.netbox_sync(paths, url="https://netbox.example", token="tok", get_json=get_json)
+    assert again["imported"] == 0 and again["updated"] == 2
+
+    # Test connection surfaces version + device count without importing.
+    probe = sot.netbox_test(paths, url="https://netbox.example", token="tok", get_json=get_json)
+    assert probe["ok"] is True and probe["netbox_version"] == "4.1.0" and probe["device_count"] == 2
+
+    # Fail-closed: a NetBox error returns a structured error, never raises.
+    def boom(url, token, timeout=15.0):
+        raise NetBoxError("connection refused")
+    err = sot.netbox_sync(paths, url="https://netbox.example", token="tok", get_json=boom)
+    assert err["ok"] is False and "connection refused" in err["error"]
+
+    # Not configured -> honest error, not a crash.
+    assert sot.netbox_test(paths)["ok"] is False
+
+
+def test_netbox_sync_endpoint(tmp_path: Path, monkeypatch):
+    from netcode import netbox
+
+    init_workspace(WorkspacePaths(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    page = {"count": 1, "next": None, "results": [
+        {"name": "nb-edge", "site": {"slug": "hq"}, "platform": {"slug": "arista-eos"}, "role": {"slug": "edge"}, "primary_ip": {"address": "10.0.0.2/24"}},
+    ]}
+    monkeypatch.setattr(netbox, "_default_get_json", _fake_netbox(page))
+    client = TestClient(api.app)
+
+    synced = client.post("/api/source-of-truth/netbox/sync", json={"url": "https://nb.example", "token": "t"})
+    assert synced.status_code == 200
+    assert synced.json()["ok"] is True and synced.json()["imported"] == 1
+    assert "nb-edge" in synced.json()["devices"]
+
+    # Provider catalog now reflects NetBox as configured (url passed through config path).
+    sot = client.post("/api/source-of-truth/netbox/test", json={"url": "https://nb.example", "token": "t"})
+    assert sot.json()["ok"] is True
+
+
 def test_change_type_registry_contract_is_complete():
     """Each registered change type must resolve its validator + adapter methods,
     so 'register once' can't silently ship a type with a missing policy/verify handler."""

@@ -53,7 +53,7 @@ from netcode.orchestrator import create_add_vlan_intent, create_desired_state_in
 from netcode.paths import paths
 from netcode.platform import platform_capabilities
 from netcode.scale import rollout_plan
-from netcode.source_of_truth import provider_catalog, source_of_truth
+from netcode.source_of_truth import netbox_sync, netbox_test, provider_catalog, source_of_truth
 from netcode.store import DEFAULT_ORG_ID, PlatformStore, record_to_dict
 from netcode.ui_config import (
     configured_inventory_path,
@@ -186,6 +186,11 @@ class LoginRequest(BaseModel):
     email: str
     password: str
     org_id: str = ""
+
+
+class NetBoxRequest(BaseModel):
+    url: str = ""
+    token: str = ""
 
 
 app = FastAPI(title="Netcode Platform", version="0.1.0")
@@ -527,6 +532,16 @@ def api_source_of_truth() -> dict[str, object]:
 @app.get("/api/source-of-truth/providers")
 def api_source_of_truth_providers() -> dict[str, object]:
     return {"providers": provider_catalog()}
+
+
+@app.post("/api/source-of-truth/netbox/test")
+def api_netbox_test(request: NetBoxRequest) -> dict[str, object]:
+    return netbox_test(paths(), request.url, request.token)
+
+
+@app.post("/api/source-of-truth/netbox/sync")
+def api_netbox_sync(request: NetBoxRequest) -> dict[str, object]:
+    return netbox_sync(paths(), request.url, request.token)
 
 
 @app.get("/api/git/status")

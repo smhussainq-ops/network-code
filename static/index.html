@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Netcode MVP</title>
     <link rel="icon" href="/static/favicon.svg" type="image/svg+xml" />
-    <link rel="stylesheet" href="/static/styles.css?v=20260703-mvp12" />
+    <link rel="stylesheet" href="/static/styles.css?v=20260703-mvp13" />
   </head>
   <body>
     <div id="login-overlay" class="login-overlay" hidden>
@@ -245,7 +245,25 @@
           <section id="view-inventory" class="view">
             <section class="section-heading">
               <h3>Inventory</h3>
-              <p>Discover the lab switch with Rez, then save the reviewed device record into source of truth.</p>
+              <p>Bring devices under management: discover them live with Rez, or import them from NetBox — the de-facto network source of truth.</p>
+            </section>
+            <section class="netbox-panel">
+              <div class="config-head">
+                <div>
+                  <span>NetBox source of truth</span>
+                  <h4>Import devices from NetBox</h4>
+                  <p id="netbox-status">Read-only. Set the URL and API token, test, then sync devices into inventory. Local YAML stays the default.</p>
+                </div>
+              </div>
+              <div class="field-grid">
+                <label>NetBox URL<input id="netbox-url" placeholder="https://netbox.example.com" autocomplete="off" /></label>
+                <label>API token<input id="netbox-token" type="password" placeholder="read-only token" autocomplete="off" /></label>
+              </div>
+              <div class="button-row compact">
+                <button id="netbox-test" class="secondary" type="button">Test connection</button>
+                <button id="netbox-sync" type="button">Sync devices</button>
+              </div>
+              <p id="netbox-result" class="setup-hint"></p>
             </section>
             <div class="two-column">
               <form id="discover-form" class="form-panel">
@@ -503,6 +521,6 @@
         </aside>
       </section>
     </main>
-    <script src="/static/app.js?v=20260703-mvp12"></script>
+    <script src="/static/app.js?v=20260703-mvp13"></script>
   </body>
 </html>
