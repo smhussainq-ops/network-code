@@ -812,6 +812,57 @@ def test_drift_baseline_is_lifecycle_aware():
     assert pv["status"] == "preview_mismatch" and pv["severity"] == "info"
 
 
+def test_device_drift_aggregates_committed_intents(tmp_path: Path):
+    """Whole-device drift compares live state against the AGGREGATE of every applied
+    VLAN intent on the device — not a single change. Rolled-back and never-applied
+    changes must not pollute the baseline; the newest applied change wins per VLAN."""
+    from netcode.drift import aggregate_device_vlans, device_drift_from_state
+    from netcode.models import load_intent
+
+    def write_vlan(name: str, vlan_id: int, vlan_name: str) -> Path:
+        path = tmp_path / name
+        write_yaml(path, {
+            "change_type": "add_vlan",
+            "site": "store-1842",
+            "targets": {"device_ids": ["v2-store1"]},
+            "vlan": {"id": vlan_id, "name": vlan_name, "subnet": f"10.42.{vlan_id}.0/24", "purpose": "data"},
+        })
+        return path
+
+    p_applied = write_vlan("a.yaml", 90, "GUEST_WIFI")
+    p_verified = write_vlan("b.yaml", 20, "VOICE")
+    p_rolled = write_vlan("c.yaml", 30, "OLD")
+    p_preview = write_vlan("d.yaml", 40, "PROPOSED")
+
+    # newest-first, as list_changes returns them
+    changes = [
+        {"id": "chg-preview", "device_id": "v2-store1", "workflow_state": "validated", "intent_path": str(p_preview)},
+        {"id": "chg-rolled", "device_id": "v2-store1", "workflow_state": "rolled_back", "intent_path": str(p_rolled)},
+        {"id": "chg-verified", "device_id": "v2-store1", "workflow_state": "verified", "intent_path": str(p_verified)},
+        {"id": "chg-applied", "device_id": "v2-store1", "workflow_state": "rollback_available", "intent_path": str(p_applied)},
+        {"id": "chg-other", "device_id": "other-device", "workflow_state": "verified", "intent_path": str(p_applied)},
+    ]
+    device_changes = [c for c in changes if c["device_id"] == "v2-store1"]
+    expected = aggregate_device_vlans(device_changes, load_intent)
+    ids = sorted(e["vlan_id"] for e in expected)
+    assert ids == [20, 90]  # only applied/verified; rolled-back(30) and preview(40) excluded
+
+    # Live state: VLAN 90 present, VLAN 20 missing -> drift on the aggregate.
+    state = {"ok": True, "state": {"vlans": [{"id": 90, "name": "GUEST_WIFI"}]}}
+    report = device_drift_from_state(expected, state, "v2-store1")
+    assert report["status"] == "drifted" and report["severity"] == "high"
+    assert report["expected_count"] == 2 and report["drifted_count"] == 1
+
+    # All present -> in sync.
+    state_full = {"ok": True, "state": {"vlans": [{"id": 90, "name": "GUEST_WIFI"}, {"id": 20, "name": "VOICE"}]}}
+    ok = device_drift_from_state(expected, state_full, "v2-store1")
+    assert ok["status"] == "in_sync" and ok["severity"] == "none"
+
+    # Unreadable device -> unknown, not a false drift.
+    unknown = device_drift_from_state(expected, {"ok": False, "error": "unreachable"}, "v2-store1")
+    assert unknown["status"] == "unknown"
+
+
 def test_workspace_gitignore_tracks_only_artifacts(tmp_path: Path):
     """The seeded workspace .gitignore must exclude platform code so branch switching
     never collides with source files (Marcus's branch-collision bug)."""

@@ -232,6 +232,16 @@ def _execute_read(action: str, payload: dict[str, Any]) -> dict[str, Any]:
         report.setdefault("ok", True)
         return report
 
+    if action == "device_drift":
+        from netcode.adapters.registry import AdapterRegistry
+        from netcode.drift import device_drift_from_state
+        inv = Inventory(INVENTORY_FILE)
+        device = inv.by_id.get(payload.get("device_id"))
+        if not device:
+            return {"ok": False, "error": f"Device {payload.get('device_id')} not in runner inventory."}
+        state = AdapterRegistry().rez.collect_device_state(device)
+        return device_drift_from_state(payload.get("expected") or [], state, str(payload.get("device_id", "")))
+
     if action == "discovery":
         from netcode.discovery import DiscoveryService
         return DiscoveryService(_runner_ws()).scan(

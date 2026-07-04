@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Netcode MVP</title>
     <link rel="icon" href="/static/favicon.svg" type="image/svg+xml" />
-    <link rel="stylesheet" href="/static/styles.css?v=20260703-mvp17" />
+    <link rel="stylesheet" href="/static/styles.css?v=20260703-mvp18" />
   </head>
   <body>
     <div id="login-overlay" class="login-overlay" hidden>
@@ -445,7 +445,7 @@
           <section id="view-drift" class="view">
             <section class="section-heading">
               <h3>Drift</h3>
-              <p>Collect live state and compare it against trusted desired state. Drift checks are read-only.</p>
+              <p>Collect live state and compare it against trusted desired state. Drift checks are read-only. <strong>This change</strong> compares against the current plan's intent; <strong>whole device</strong> compares against every VLAN this platform has applied to the device — its committed source of truth.</p>
             </section>
             <section class="plan-summary">
               <article><span>Compliance</span><strong id="drift-compliance">Unknown</strong></article>
@@ -455,7 +455,8 @@
             </section>
             <pre id="drift-output" class="code-box tall">Create a plan, then check drift for that intent.</pre>
             <div class="button-row">
-              <button id="check-drift" type="button">Check drift</button>
+              <button id="check-drift" type="button">Check this change</button>
+              <button id="check-device-drift" class="secondary" type="button">Check whole device</button>
               <button class="secondary" type="button" data-go="desired">Reconcile: start a new change</button>
               <button class="secondary" type="button" data-go="evidence">Review evidence</button>
             </div>
@@ -527,6 +528,6 @@
         </aside>
       </section>
     </main>
-    <script src="/static/app.js?v=20260703-mvp17"></script>
+    <script src="/static/app.js?v=20260703-mvp18"></script>
   </body>
 </html>

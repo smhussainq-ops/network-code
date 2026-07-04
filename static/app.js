@@ -1374,6 +1374,15 @@ function renderApply() {
 }
 
 function renderDrift() {
+  const dev = appState.drift?.device_drift;
+  if (dev) {
+    $("drift-compliance").textContent = dev.status === "in_sync" ? "In sync" : (dev.status === "unknown" ? "Unknown" : "Drifted");
+    $("drift-intent").textContent = `${dev.device_id} · committed baseline (${dev.expected_count} VLAN${dev.expected_count === 1 ? "" : "s"})`;
+    $("drift-live").textContent = dev.status === "unknown" ? "Unavailable" : "Collected";
+    $("drift-action").textContent = dev.status === "drifted" ? "Reconcile" : "Review";
+    $("drift-output").textContent = formatJson(dev);
+    return;
+  }
   $("drift-compliance").textContent = appState.drift?.compliance?.ok === false ? "Review" : appState.drift ? "Loaded" : "Unknown";
   $("drift-intent").textContent = appState.plan?.plan?.title || "None";
   $("drift-live").textContent = appState.drift?.live_state?.ok ? "Collected" : appState.drift ? "Unavailable" : "Not collected";
@@ -1747,6 +1756,35 @@ async function checkDrift() {
   }
 }
 
+async function checkDeviceDrift() {
+  const deviceId = selectedDeviceId();
+  if (!deviceId) {
+    failOutcome("Pick a device first.", new Error("No device selected. Set a device in Desired State or Inventory, then retry."));
+    return;
+  }
+  startOutcome("Check whole-device drift", `Compare ${deviceId}'s live state against every VLAN this platform has applied to it — its committed source of truth.`);
+  try {
+    const report = await postJson("/api/drift/device", { device_id: deviceId });
+    appState.drift = { device_drift: report };
+    renderAll();
+    setView("drift");
+    const passed = report.status === "in_sync";
+    setOutcome({
+      state: passed ? "In sync" : (report.status === "unknown" ? "Unknown" : "Drift found"),
+      status: passed ? "pass" : (report.status === "unknown" ? "warn" : "fail"),
+      title: passed ? `${deviceId} matches its committed baseline.` : `${deviceId}: ${report.drifted_count} of ${report.expected_count} committed VLANs missing.`,
+      summary: "Whole-device drift is read-only. It compares against the aggregate of every applied VLAN intent on this device.",
+      expected: `All ${report.expected_count} committed VLAN intents present on ${deviceId}.`,
+      actual: report.message,
+      artifact: "Per-device drift evidence loaded.",
+      device: "No device config was changed.",
+      next: passed ? "Nothing to reconcile." : "Reconcile the missing VLANs through a new desired-state change.",
+    });
+  } catch (error) {
+    failOutcome("Whole-device drift check failed.", error);
+  }
+}
+
 async function refreshEvidence() {
   startOutcome("Refresh evidence", "Load latest jobs, workflow events, audit sessions, reports, and Git plan.");
   try {
@@ -2082,6 +2120,7 @@ function bindEvents() {
   $("verify-change").addEventListener("click", verifyChange);
   $("rollback-change").addEventListener("click", rollbackChange);
   $("check-drift").addEventListener("click", checkDrift);
+  $("check-device-drift").addEventListener("click", checkDeviceDrift);
   $("refresh-evidence").addEventListener("click", refreshEvidence);
   $$("#change-form input, #change-form select, #change-form textarea").forEach((input) => input.addEventListener("input", resetChangeProof));
 }

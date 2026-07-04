@@ -17,7 +17,13 @@ from netcode.ai_assistant import assistant_response
 from netcode.adapters.registry import AdapterRegistry
 from netcode.bootstrap import init_workspace
 from netcode.discovery import DiscoveryService
-from netcode.drift import baseline_for_state, compliance_summary, vlan_drift_report
+from netcode.drift import (
+    aggregate_device_vlans,
+    baseline_for_state,
+    compliance_summary,
+    device_drift_from_state,
+    vlan_drift_report,
+)
 from netcode.gitflow import (
     commit_change_artifacts,
     create_change_branch,
@@ -984,6 +990,25 @@ def api_vlan_drift(request: IntentPathRequest, http_request: Request) -> dict[st
         raise HTTPException(status_code=404, detail=f"Unknown device {device_id}")
     state = AdapterRegistry().rez.collect_device_state(device)
     return vlan_drift_report(p, Path(request.intent_path), state, expected_present=base["expected_present"], baseline=base["label"], context=base["context"])
+
+
+@app.post("/api/drift/device")
+def api_device_drift(request: DeviceRequest, http_request: Request) -> dict[str, object]:
+    """Per-device drift: compare live state against the device's committed baseline —
+    the aggregate of every applied (live, not rolled-back) VLAN intent on that device."""
+    p = paths()
+    org = _request_principal(http_request).org_id
+    store = PlatformStore(p)
+    device_changes = [record_to_dict(c) for c in store.list_changes(limit=500, org_id=org) if c.device_id == request.device_id]
+    expected = aggregate_device_vlans(device_changes, load_intent)
+    if execution_mode() == "runner":
+        return _runner_read(p, "device_drift", {"device_id": request.device_id, "expected": expected}, org)
+    inventory = Inventory(configured_inventory_path(p))
+    device = inventory.by_id.get(request.device_id)
+    if not device:
+        raise HTTPException(status_code=404, detail=f"Unknown device {request.device_id}")
+    state = AdapterRegistry().rez.collect_device_state(device)
+    return device_drift_from_state(expected, state, request.device_id)
 
 
 @app.get("/api/compliance/summary")

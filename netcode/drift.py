@@ -81,6 +81,63 @@ def vlan_drift_report(
     }
 
 
+_APPLIED_STATES = {"rollback_available", "completed", "verified", "applying"}
+
+
+def aggregate_device_vlans(device_changes: list[dict[str, Any]], load_intent_fn) -> list[dict[str, Any]]:
+    """Build a device's expected VLAN baseline from its APPLIED (live, not rolled-back)
+    changes — the committed source of truth for that device. Newest change wins per VLAN."""
+    expected: dict[int, dict[str, Any]] = {}
+    for change in device_changes:  # callers pass newest-first
+        if change.get("workflow_state") not in _APPLIED_STATES:
+            continue
+        try:
+            intent = load_intent_fn(Path(str(change.get("intent_path") or "")))
+        except Exception:
+            continue
+        if intent.change_type != "add_vlan":
+            continue
+        if intent.vlan.id not in expected:
+            expected[intent.vlan.id] = {"vlan_id": intent.vlan.id, "name": intent.vlan.name, "change_id": change.get("id")}
+    return list(expected.values())
+
+
+def device_drift_from_state(expected: list[dict[str, Any]], state_result: dict[str, Any], device_id: str) -> dict[str, Any]:
+    """Compare live device state against the device's expected VLAN baseline."""
+    rows: list[dict[str, Any]] = []
+    drifted = 0
+    unknown = state_result.get("ok") is False
+    for entry in expected:
+        verification = verify_vlan_state(state_result, entry["vlan_id"], entry["name"], present=True)
+        present = verification["status"] == "pass"
+        if not present:
+            drifted += 1
+        rows.append({**entry, "present": present, "status": "in_sync" if present else "drifted"})
+    if unknown:
+        status, severity = "unknown", "warning"
+        message = f"Could not read {device_id}; device drift is unknown."
+    elif not expected:
+        status, severity = "in_sync", "none"
+        message = f"No committed VLAN intents recorded for {device_id} yet — nothing to compare."
+    elif drifted:
+        status, severity = "drifted", "high"
+        message = f"{len(expected) - drifted}/{len(expected)} committed VLAN intents present on {device_id}; {drifted} missing."
+    else:
+        status, severity = "in_sync", "none"
+        message = f"All {len(expected)} committed VLAN intents are present on {device_id}."
+    return {
+        "ok": status in ("in_sync",),
+        "device_id": device_id,
+        "status": status,
+        "severity": severity,
+        "expected_count": len(expected),
+        "drifted_count": drifted,
+        "vlans": rows,
+        "message": message,
+        "baseline": "committed source of truth (all applied VLAN intents on this device)",
+    }
+
+
 def compliance_summary(paths: WorkspacePaths) -> dict[str, Any]:
     return {
         "ok": True,
