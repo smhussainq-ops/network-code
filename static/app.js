@@ -868,7 +868,9 @@ function setupGates() {
   const gitPass = Boolean(appState.git?.available);
   const sotPass = Boolean(appState.source?.ok && (appState.source.summary?.device_count || 0) > 0);
   const reach = appState.reachability;
-  const readPass = reach ? reach.readable > 0 : Boolean(appState.rezHealth?.ok);
+  // In runner mode the control plane can't read devices, so drivers-loaded is not
+  // proof of reachability — require an actual reachability result before green.
+  const readPass = reach ? reach.readable > 0 : (isRunnerMode() ? false : Boolean(appState.rezHealth?.ok));
   const mode = proofMode();
   return {
     gitPass,
@@ -1345,8 +1347,10 @@ function renderApply() {
   verifyBtn.disabled = isRunnerMode() || !(appState.apply?.ok && appState.changeLive);
   verifyBtn.title = isRunnerMode() ? "Verification runs on the runner as part of apply. Standalone verify (runner read-routing) is a later milestone." : "";
   $("rollback-change").disabled = !(appState.apply?.ok && appState.changeLive);
-  $("commit-artifacts").disabled = !(appState.plan && appState.git?.available);
-  $("push-branch").disabled = !(appState.lastCommit?.ok || (appState.git?.ahead || 0) > 0);
+  // Commit/push only once we're on a change branch, so artifacts never land on the base branch.
+  const onChangeBranch = Boolean((appState.gitBranches?.current || "").startsWith("change/"));
+  $("commit-artifacts").disabled = !(appState.plan && appState.git?.available && onChangeBranch);
+  $("push-branch").disabled = !(onChangeBranch && (appState.lastCommit?.ok || (appState.git?.ahead || 0) > 0));
   const commitMessage = $("commit-message");
   if (document.activeElement !== commitMessage && !commitMessage.value && appState.plan?.plan?.slug) {
     commitMessage.value = `Netcode change ${appState.plan.plan.slug}`;
@@ -1386,6 +1390,25 @@ function renderAll() {
   renderDrift();
   renderEvidence();
   renderStoryRail();
+  renderModeGuards();
+}
+
+// Control-plane device reads can't work in runner mode (the control plane has no
+// device access). Rather than let these buttons silently fail, disable them with an
+// honest tooltip in runner mode. (Routing reads through the runner is a later milestone.)
+const RUNNER_READ_BUTTONS = ["test-reachability", "discover-device", "netbox-test", "netbox-sync", "check-drift"];
+function renderModeGuards() {
+  const runner = isRunnerMode();
+  for (const id of RUNNER_READ_BUTTONS) {
+    const el = $(id);
+    if (!el) continue;
+    if (runner) {
+      el.disabled = true;
+      el.title = "Live device reads run on the on-prem runner. Not available from the browser in runner mode yet — use local mode.";
+    } else {
+      el.title = "";
+    }
+  }
 }
 
 async function checkWorkspace({ silent = false } = {}) {
@@ -1712,7 +1735,7 @@ async function checkDrift() {
       payload.note = "Create a plan first to compare a specific desired state.";
     }
     appState.drift = payload;
-    renderDrift();
+    renderAll();  // refresh the Home drift chip + drift view together
     setView("drift");
     setOutcome({
       state: "Passed",
@@ -1748,6 +1771,10 @@ async function refreshEvidence() {
       });
     }
     renderEvidence();
+    // Re-fetch the selected change record so the readable package reflects new proof,
+    // not a stale copy from when the change was last picked.
+    const selected = $("record-select")?.value;
+    if (selected) await loadChangeRecord(selected);
     setOutcome({
       state: "Passed",
       status: "pass",
