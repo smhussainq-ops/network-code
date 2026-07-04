@@ -939,6 +939,16 @@ def test_change_record_packages_request_plan_safety_git_and_manifest(tmp_path: P
     missing = client.get("/api/change/not-a-real-change/record")
     assert missing.status_code == 404
 
+    # Marcus's bug: a lab action overwrites the change result (no validation/plan). The
+    # record must still show safety + change_type, sourced from durable artifacts.
+    store = PlatformStore(WorkspacePaths(tmp_path.resolve()))
+    store.update_change(change_id, "completed", {"status": "pass", "message": "VLAN applied", "action": "apply"}, workflow_state="rollback_available")
+    after = client.get(f"/api/change/{change_id}/record").json()
+    assert after["safety"]["status"] == "pass"          # not None after clobber
+    assert len(after["safety"]["checks"]) == 7
+    assert after["request"]["change_type"] == "add_vlan"  # not None after clobber
+    assert after["plan"]["blast_radius"]["devices"] == ["v2-store1"]
+
 
 def test_auth_rbac_and_tenant_isolation(tmp_path: Path, monkeypatch):
     """M5: with NETCODE_AUTH on, roles are enforced and tenants are isolated."""

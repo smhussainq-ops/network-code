@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import time
@@ -1078,10 +1079,36 @@ def api_change_record(change_id: str, request: Request) -> dict[str, object]:
         raise HTTPException(status_code=404, detail=f"Unknown change {change_id}")
     change_dict = record_to_dict(change)
     result = change_dict.get("result") or {}
-    plan = result.get("plan") or {}
-    validation = result.get("validation") or {}
-    render = result.get("render") or {}
-    intent_info = result.get("intent") or {}
+    # A change's stored result is overwritten by later lab actions (apply/rollback store
+    # their lab result, which has no plan/validation). So source the record from DURABLE
+    # artifacts — recompute plan metadata from the intent, and read the persisted validation
+    # report — falling back to whatever is still in result.
+    intent_path_for_record = Path(str(change_dict.get("intent_path") or ""))
+    durable_plan: dict = {}
+    durable_intent: dict = {}
+    try:
+        if intent_path_for_record.exists():
+            _record_intent = load_intent(intent_path_for_record)
+            durable_plan = plan_metadata(_record_intent)
+            durable_intent = _record_intent.model_dump()
+    except Exception:
+        pass
+    durable_validation: dict = {}
+    durable_render: dict = {}
+    _report_slug = (result.get("plan") or {}).get("slug") or durable_plan.get("slug") or intent_path_for_record.stem
+    _report_json = paths().reports / f"{_report_slug}.json"
+    if _report_json.exists():
+        try:
+            _report = json.loads(_report_json.read_text(encoding="utf-8"))
+            durable_validation = _report.get("validation") or {}
+            durable_render = _report.get("render") or {}
+            durable_intent = durable_intent or (_report.get("intent") or {})
+        except Exception:
+            pass
+    plan = result.get("plan") or durable_plan
+    validation = result.get("validation") or durable_validation
+    render = result.get("render") or durable_render
+    intent_info = result.get("intent") or durable_intent
     jobs = [record_to_dict(j) for j in store.list_jobs(limit=200) if j.change_id == change_id]
     events = [record_to_dict(e) for e in store.list_workflow_events(change_id)]
 

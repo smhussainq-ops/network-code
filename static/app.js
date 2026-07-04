@@ -1356,7 +1356,7 @@ function renderApply() {
     commitMessage.value = `Netcode change ${appState.plan.plan.slug}`;
   }
   if (!labSupported && appState.plan) {
-    $("apply-transcript").textContent = "Apply is locked for this intent type in the current MVP. Plan, validation, Git evidence, and audit records are still available.";
+    $("apply-transcript").textContent = "This change type doesn't push config to a device (e.g. an inventory-only record), so there's nothing to apply. Plan, validation, Git evidence, and audit records are still produced.";
   } else if (appState.rollback) {
     $("apply-transcript").textContent = transcriptText(appState.rollback, formatJson(appState.rollback));
   } else if (appState.apply) {
@@ -1576,7 +1576,7 @@ async function runDryRun() {
     return;
   }
   if (!appState.plan.plan?.lab_write_supported) {
-    failOutcome("Dry-run locked.", new Error("This intent type is not enabled for lab device writes in the current MVP."), "Review plan and evidence.");
+    failOutcome("Dry-run not applicable.", new Error("This change type doesn't push config to a device, so there's nothing to dry-run. Review the plan and evidence instead."), "Review plan and evidence.");
     return;
   }
   startOutcome("Run lab dry-run", "Open EOS config session, load candidate, collect diff, then abort. No commit.");

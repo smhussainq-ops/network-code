@@ -231,7 +231,14 @@ def create_change_branch(root: Path, name: str, base: str = "") -> dict[str, obj
     else:
         failed = next((step for step in steps if not step["ok"] and step["command"].startswith("git checkout")), None)
         detail = (failed or {}).get("stderr") or "Git command failed."
-        message = f"Could not {'create' if action == 'created' else 'switch to'} branch {name}: {detail}"
+        # Translate the most common raw-git failure into plain language for non-programmers.
+        if "would be overwritten by checkout" in detail or "commit your changes or stash" in detail:
+            message = (
+                f"Can't switch to {name}: this workspace has uncommitted changes that conflict with it. "
+                "Commit or discard the current changes first, then try again."
+            )
+        else:
+            message = f"Could not {'create' if action == 'created' else 'switch to'} branch {name}: {detail}"
         action = "failed"
     return {
         "ok": ok,
