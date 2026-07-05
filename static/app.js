@@ -36,6 +36,7 @@ const appState = {
   audit: null,
   drift: null,
   troubleshoot: null,
+  shell: null,
   uiConfig: null,
   uiConfigPath: "",
   configHistory: [],
@@ -258,6 +259,7 @@ function setView(view) {
     plan: ["Preview exact impact.", "Review the Terraform-style plan, generated commands, affected devices, risk, and apply gate."],
     validate: ["Validate before apply.", "Policy checks and lab dry-run proof must pass before apply is unlocked."],
     apply: ["Apply and verify.", "Commit only after validation and dry-run proof, then prove live state and keep rollback available."],
+    shell: ["Netcode Shell — governed SSH.", "Keep CLI control while every session is guarded, staged, verified, and captured as evidence. The guard runs on the on-prem runner; the browser never touches the device."],
     drift: ["Troubleshoot / investigate.", "Run read-only Rez checks, compare expected vs live state, detect drift, and attach findings to the change record."],
     evidence: ["Prove / audit.", "One package per change: request, intent, branch, commands, validation, dry-run, apply, verify, troubleshooting, rollback."],
   };
@@ -265,6 +267,7 @@ function setView(view) {
   $("view-subtitle").textContent = titles[view][1];
   if (view === "evidence") renderEvidence();
   if (view === "drift") renderDrift();
+  if (view === "shell") renderShell();
 }
 
 function getPath(object, path, fallback = "") {
@@ -1458,6 +1461,7 @@ function renderAll() {
   renderValidation();
   renderApply();
   renderDrift();
+  renderShell();
   renderEvidence();
   renderStoryRail();
   renderModeGuards();
@@ -2208,6 +2212,150 @@ function selectChangeType(changeType) {
   renderEvidence();
 }
 
+// ---- Netcode Shell (governed SSH) ------------------------------------------
+function shellDevices() {
+  return (appState.source?.devices || []).map((d) => d.id).filter(Boolean);
+}
+
+function shellWrite(text, cls) {
+  const term = $("shell-terminal");
+  if (term.dataset.fresh !== "no") { term.textContent = ""; term.dataset.fresh = "no"; }
+  const line = document.createElement("div");
+  if (cls) line.className = cls;
+  line.textContent = text;
+  term.appendChild(line);
+  term.scrollTop = term.scrollHeight;
+}
+
+function renderShell() {
+  const select = $("shell-device");
+  const devices = shellDevices();
+  const current = select.value;
+  select.innerHTML = devices.length
+    ? devices.map((id) => `<option value="${id}">${id}</option>`).join("")
+    : '<option value="">No devices in source of truth</option>';
+  if (current && devices.includes(current)) select.value = current;
+  else if (selectedDeviceId() && devices.includes(selectedDeviceId())) select.value = selectedDeviceId();
+  renderChangeGuard();
+}
+
+function renderChangeGuard() {
+  const s = appState.shell;
+  const modeText = !s ? "No session" : s.mode === "change_attached" ? "Change attached" : s.in_config ? "Config staged" : "Read-only";
+  const chip = $("guard-mode-chip");
+  chip.textContent = modeText;
+  chip.className = "guard-mode" + (s?.in_config ? " config" : s?.mode === "change_attached" ? " attached" : "");
+  $("shell-session-id").textContent = s?.sessionId ? s.sessionId.slice(0, 10) : "none";
+  $("shell-change").textContent = s?.changeId ? s.changeId.slice(0, 8) : "none";
+  const touched = Boolean(s?.deviceTouched);
+  const deviceChip = $("guard-device-chip");
+  deviceChip.textContent = touched ? "Touched" : "Not touched";
+  deviceChip.className = "device-chip " + (touched ? "touched" : "not-touched");
+  const hasSession = Boolean(s?.sessionId);
+  $("shell-line").disabled = !hasSession;
+  $("shell-send").disabled = !hasSession;
+  $("shell-attach").disabled = !hasSession || s?.mode === "change_attached";
+  $("shell-evidence").disabled = !hasSession;
+  $("shell-prompt").textContent = s ? `${s.deviceId}${s.in_config ? "(config)#" : "#"}` : "device#";
+}
+
+async function openShell() {
+  const deviceId = $("shell-device").value;
+  if (!deviceId) { failOutcome("Pick a device.", new Error("No device selected for the shell session.")); return; }
+  startOutcome("Open governed session", `Open a read-only, guarded SSH session on ${deviceId}. Config mode stays locked until a change is attached.`);
+  try {
+    const res = await postJson("/api/shell/open", { device_id: deviceId });
+    appState.shell = { sessionId: res.session_id, deviceId, changeId: null, mode: res.state.mode, in_config: false, deviceTouched: false };
+    $("shell-terminal").dataset.fresh = "yes";
+    shellWrite(`Session open on ${deviceId} — read-only. Config mode is guarded.`, "shell-sys");
+    renderChangeGuard();
+    setGuardFacts("Session opened", "Read commands run on the device; config mode is guarded.", "Read-only session established.", "Run a read command, or attach a change to configure.");
+    $("shell-line").focus();
+    setOutcome({ state: "Read-only", status: "pass", title: `Governed session open on ${deviceId}.`,
+      summary: "The session runs through the on-prem runner. The browser never touches the device.",
+      expected: "A read-only session where config mode is guarded.", actual: res.message,
+      artifact: "Session transcript is being recorded as evidence.", device: "No device config was changed.",
+      next: "Run read commands; attach a change to configure." });
+  } catch (error) { failOutcome("Could not open session.", error); }
+}
+
+function setGuardFacts(last, expected, actual, next) {
+  if (last !== undefined) $("guard-last").textContent = last;
+  if (expected !== undefined) $("guard-expected").textContent = expected;
+  if (actual !== undefined) $("guard-actual").textContent = actual;
+  if (next !== undefined) $("guard-next").textContent = next;
+}
+
+function applyShellResult(input, result) {
+  if (result.state) {
+    appState.shell.mode = result.state.mode;
+    appState.shell.in_config = Boolean(result.state.in_config);
+    appState.shell.deviceTouched = Boolean(result.device_touched ?? result.state.device_touched);
+  }
+  const events = result.events || [];
+  const guardEvent = events.find((e) => e.type === "guard");
+  if (result.executed && result.output) {
+    shellWrite(result.output.replace(/\s+$/, ""), "shell-out");
+    setGuardFacts(`Ran: ${input}`, "Read command executes read-only on the device.", "Executed; device output returned.", "Continue reading, or attach a change to configure.");
+  } else if (guardEvent) {
+    const label = (guardEvent.action || "guarded").replace(/_/g, " ");
+    shellWrite(`⛔ ${guardEvent.message || label}`, "shell-block");
+    if (guardEvent.options) shellWrite(`   options: ${guardEvent.options.join("  ·  ")}`, "shell-hint");
+    setGuardFacts(`Guarded: ${input}`, "The guard evaluates every line before the device sees it.", guardEvent.message || label,
+      guardEvent.action === "blocked_config_mode" ? "Attach a change record to configure." :
+      guardEvent.action === "paste_intercepted" ? "Stage the paste as a governed change." :
+      "Adjust the command and try again.");
+  } else if (result.output) {
+    shellWrite(result.output, "shell-sys");
+  }
+  renderChangeGuard();
+}
+
+async function shellSubmit(event) {
+  event.preventDefault();
+  const s = appState.shell;
+  if (!s?.sessionId) return;
+  const input = $("shell-line").value;
+  if (!input.trim()) return;
+  shellWrite(`${s.deviceId}${s.in_config ? "(config)#" : "#"} ${input}`, "shell-cmd");
+  $("shell-line").value = "";
+  $("shell-send").disabled = true;
+  try {
+    const result = await postJson("/api/shell/input", { session_id: s.sessionId, input });
+    applyShellResult(input, result);
+  } catch (error) {
+    shellWrite(`[shell] request failed: ${error.message}`, "shell-block");
+  } finally {
+    $("shell-send").disabled = !appState.shell?.sessionId;
+    $("shell-line").focus();
+  }
+}
+
+async function shellAttach() {
+  const s = appState.shell;
+  if (!s?.sessionId) return;
+  const changeId = s.changeId || appState.plan?.change?.id || prompt("Change ID to attach (unlocks config mode):", appState.plan?.change?.id || "");
+  if (!changeId) return;
+  try {
+    const res = await postJson("/api/shell/attach", { session_id: s.sessionId, change_id: changeId });
+    appState.shell.changeId = changeId;
+    appState.shell.mode = res.state.mode;
+    shellWrite(`✓ ${res.message}`, "shell-sys");
+    setGuardFacts("Change attached", "Config mode is now permitted under this change.", `Change ${changeId.slice(0, 8)} attached.`, "Enter config mode; changes are governed and evidenced.");
+    renderChangeGuard();
+  } catch (error) { failOutcome("Could not attach change.", error); }
+}
+
+async function openShellEvidence() {
+  const s = appState.shell;
+  if (!s?.sessionId) return;
+  try {
+    const t = await getJson(`/api/shell/${s.sessionId}/transcript`);
+    shellWrite(`— evidence: ${t.entries.length} events · device_config: ${t.device_config} · ${t.artifact}`, "shell-hint");
+    setGuardFacts(undefined, undefined, `Evidence: ${t.entries.length} recorded events; device_config = ${t.device_config}.`, undefined);
+  } catch (error) { failOutcome("Could not load transcript.", error); }
+}
+
 function bindEvents() {
   $$(".nav-item").forEach((button) => button.addEventListener("click", () => setView(button.dataset.view)));
   $$("[data-go]").forEach((button) => button.addEventListener("click", () => setView(button.dataset.go)));
@@ -2248,6 +2396,11 @@ function bindEvents() {
   $("check-drift").addEventListener("click", checkDrift);
   $("check-device-drift").addEventListener("click", checkDeviceDrift);
   $("run-troubleshoot").addEventListener("click", runTroubleshoot);
+  $("shell-open").addEventListener("click", openShell);
+  $("shell-attach").addEventListener("click", shellAttach);
+  $("shell-evidence").addEventListener("click", openShellEvidence);
+  $("shell-input-form").addEventListener("submit", shellSubmit);
+  $("shell-terminal").addEventListener("click", () => $("shell-line").focus());
   $("refresh-evidence").addEventListener("click", refreshEvidence);
   $$("#change-form input, #change-form select, #change-form textarea").forEach((input) => input.addEventListener("input", resetChangeProof));
 }

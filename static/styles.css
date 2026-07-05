@@ -1377,3 +1377,64 @@ legend,
     padding: 14px;
   }
 }
+
+/* ---- Netcode Shell (governed SSH) ---- */
+.shell-workspace {
+  display: grid;
+  grid-template-columns: 220px 1fr 300px;
+  gap: 16px;
+  align-items: stretch;
+  min-height: 520px;
+}
+@media (max-width: 1100px) { .shell-workspace { grid-template-columns: 1fr; } }
+.shell-devices, .change-guard {
+  background: var(--panel, #fff);
+  border: 1px solid var(--border, #e2e5ea);
+  border-radius: 16px;
+  padding: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+.shell-field { display: flex; flex-direction: column; gap: 6px; font-size: 13px; font-weight: 600; color: var(--muted, #5b6472); }
+.shell-field select { padding: 8px 10px; border-radius: 9px; border: 1px solid var(--border, #d8dce3); font: inherit; }
+.shell-session-meta p { display: flex; justify-content: space-between; gap: 8px; margin: 4px 0; font-size: 12.5px; }
+.shell-session-meta span { color: var(--muted, #7a828f); }
+.shell-session-meta strong { font-family: ui-monospace, Menlo, monospace; font-size: 12px; }
+.shell-terminal-wrap { display: flex; flex-direction: column; border-radius: 16px; overflow: hidden; border: 1px solid #0c1a2b; background: #0b1622; min-height: 520px; }
+.shell-terminal {
+  flex: 1;
+  margin: 0;
+  padding: 16px 18px;
+  overflow-y: auto;
+  color: #cfe3f5;
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 13px;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.shell-terminal .shell-cmd { color: #eaf2fb; font-weight: 600; }
+.shell-terminal .shell-out { color: #9fd0a6; }
+.shell-terminal .shell-sys { color: #7fa8d0; }
+.shell-terminal .shell-hint { color: #6b7d92; }
+.shell-terminal .shell-block { color: #ff9d8a; font-weight: 600; }
+.shell-input { display: flex; align-items: center; gap: 8px; padding: 10px 12px; background: #0e1c2c; border-top: 1px solid #142638; }
+.shell-prompt { color: #6fd8a4; font-family: ui-monospace, Menlo, monospace; font-size: 12.5px; white-space: nowrap; }
+.shell-input input {
+  flex: 1; background: transparent; border: none; outline: none;
+  color: #eaf2fb; font-family: ui-monospace, Menlo, monospace; font-size: 13px;
+}
+.shell-input input::placeholder { color: #4d647d; }
+.shell-input button { padding: 7px 16px; border-radius: 9px; border: none; background: #2f6feb; color: #fff; font-weight: 600; cursor: pointer; }
+.shell-input button:disabled { opacity: .5; cursor: not-allowed; }
+.change-guard h4 { margin: 0 0 4px; font-size: 15px; }
+.guard-mode { align-self: flex-start; padding: 5px 12px; border-radius: 999px; font-size: 12px; font-weight: 700; background: #eef1f6; color: #45505f; letter-spacing: .02em; }
+.guard-mode.attached { background: #e7f0ff; color: #1d4ed8; }
+.guard-mode.config { background: #fdeede; color: #9a5b12; }
+.guard-facts { margin: 0; display: grid; gap: 3px; }
+.guard-facts dt { font-size: 11px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted, #8b94a2); margin-top: 10px; font-family: ui-monospace, Menlo, monospace; }
+.guard-facts dd { margin: 0; font-size: 13.5px; line-height: 1.4; color: var(--ink, #1f2733); }
+.device-chip { display: inline-block; padding: 3px 10px; border-radius: 999px; font-size: 12px; font-weight: 700; }
+.device-chip.not-touched { background: #e6f5ec; color: #0b7a43; }
+.device-chip.touched { background: #fde7e3; color: #b23b1f; }
