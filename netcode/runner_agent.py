@@ -163,7 +163,31 @@ def _runner_ws():
     return _RunnerPaths(Path(os.environ.get("NETCODE_RUNNER_WORKSPACE", "") or Path.cwd()).resolve())
 
 
+READ_TIMEOUT_SECONDS = 30
+READINESS_TIMEOUT_SECONDS = 55  # multi-device sweep; still under the control plane's 60s poll
+
+
 def _execute_read(action: str, payload: dict[str, Any]) -> dict[str, Any]:
+    """Fail-closed wrapper: a hung device read must never wedge the runner's
+    sequential job loop (a dead container / unreachable device can otherwise
+    block every later job and stop heartbeats). Reads get a hard deadline."""
+    from concurrent.futures import ThreadPoolExecutor
+    from concurrent.futures import TimeoutError as FuturesTimeout
+
+    deadline = READINESS_TIMEOUT_SECONDS if action == "readiness" else READ_TIMEOUT_SECONDS
+    executor = ThreadPoolExecutor(max_workers=1)
+    future = executor.submit(_execute_read_inner, action, payload)
+    try:
+        return future.result(timeout=deadline)
+    except FuturesTimeout:
+        return {"ok": False, "status": "fail",
+                "error": f"Runner read '{action}' timed out after {deadline}s (device unreachable or hung).",
+                "message": f"Runner read '{action}' timed out after {deadline}s (device unreachable or hung)."}
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
+
+
+def _execute_read_inner(action: str, payload: dict[str, Any]) -> dict[str, Any]:
     """Device READ actions executed on the runner (next to the devices), using the
     runner's LOCAL credentialed inventory. Mirrors the control-plane read logic so
     the browser renders results identically whether local or runner mode."""
@@ -241,6 +265,21 @@ def _execute_read(action: str, payload: dict[str, Any]) -> dict[str, Any]:
             return {"ok": False, "error": f"Device {payload.get('device_id')} not in runner inventory."}
         state = AdapterRegistry().rez.collect_device_state(device)
         return device_drift_from_state(payload.get("expected") or [], state, str(payload.get("device_id", "")))
+
+    if action == "troubleshoot":
+        from netcode.adapters.registry import AdapterRegistry
+        from netcode.troubleshooting import troubleshoot_state
+        inv = Inventory(INVENTORY_FILE)
+        device = inv.by_id.get(payload.get("device_id"))
+        if not device:
+            return {"ok": False, "error": f"Device {payload.get('device_id')} not in runner inventory."}
+        state = AdapterRegistry().rez.collect_device_state(device)
+        return troubleshoot_state(
+            state,
+            check=str(payload.get("check", "live_state")),
+            target=str(payload.get("target", "")),
+            expected=str(payload.get("expected", "")),
+        )
 
     if action == "discovery":
         from netcode.discovery import DiscoveryService

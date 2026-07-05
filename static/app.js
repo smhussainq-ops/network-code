@@ -35,6 +35,7 @@ const appState = {
   workflow: null,
   audit: null,
   drift: null,
+  troubleshoot: null,
   uiConfig: null,
   uiConfigPath: "",
   configHistory: [],
@@ -250,15 +251,15 @@ function setView(view) {
   $$(".view").forEach((panel) => panel.classList.toggle("active", panel.id === `view-${view}`));
   $$(".nav-item").forEach((button) => button.classList.toggle("active", button.dataset.view === view));
   const titles = {
-    home: ["Define, plan, validate, apply, verify.", "A Terraform-style network-as-code flow using Git, source of truth, Rez discovery, typed intents, validation, and audited Arista lab proof."],
+    home: ["Five guided stories for Network as Code.", "Lower change risk, faster delivery, audit-ready proof, and a practical path for network engineers to adopt Git, source of truth, templates, validation, and Rez-driven device reads."],
     setup: ["Set up the workspace.", "Check Git, source of truth, adapters, and lab reachability before making a change."],
     inventory: ["Discover and trust devices.", "Use Rez read adapters to discover devices, then import reviewed records into source of truth."],
     desired: ["Create desired state.", "Choose the network outcome, fill the intent fields, and let the platform create YAML and candidate config."],
     plan: ["Preview exact impact.", "Review the Terraform-style plan, generated commands, affected devices, risk, and apply gate."],
     validate: ["Validate before apply.", "Policy checks and lab dry-run proof must pass before apply is unlocked."],
     apply: ["Apply and verify.", "Commit only after validation and dry-run proof, then prove live state and keep rollback available."],
-    drift: ["Detect drift.", "Compare desired state and live state without changing the network."],
-    evidence: ["Review the evidence.", "Inspect every artifact, audit event, and command session created from the UI."],
+    drift: ["Troubleshoot / investigate.", "Run read-only Rez checks, compare expected vs live state, detect drift, and attach findings to the change record."],
+    evidence: ["Prove / audit.", "One package per change: request, intent, branch, commands, validation, dry-run, apply, verify, troubleshooting, rollback."],
   };
   $("view-title").textContent = titles[view][0];
   $("view-subtitle").textContent = titles[view][1];
@@ -950,13 +951,29 @@ function renderUserStories() {
     appState.plan && appState.plan.ok === false ? "fail" : complete ? "pass" : doneCount ? "warn" : "warn",
     appState.plan && appState.plan.ok === false ? "Plan blocked" : doneCount ? (complete ? "Complete" : `Step ${doneCount}/9 · ${nextLabel}`) : "Not started"
   );
+  setStory(
+    "story-troubleshoot",
+    appState.troubleshoot
+      ? appState.troubleshoot.ok
+        ? "pass"
+        : "warn"
+      : appState.drift
+        ? appState.drift?.drift?.ok === false || appState.drift?.device_drift?.status === "drifted"
+          ? "fail"
+          : "pass"
+        : "warn",
+    appState.troubleshoot
+      ? appState.troubleshoot.ok
+        ? "Live evidence matched"
+        : "Review live evidence"
+      : appState.drift
+        ? appState.drift?.drift?.ok === false || appState.drift?.device_drift?.status === "drifted"
+          ? "Drift found"
+          : "In sync"
+        : "Not checked"
+  );
   const changeCount = appState.audit?.changes?.length || 0;
   setStory("story-audit", changeCount ? "pass" : "warn", changeCount ? `${changeCount} change record${changeCount === 1 ? "" : "s"}` : "No changes yet");
-  setStory(
-    "story-drift",
-    appState.drift ? (appState.drift?.drift?.ok === false ? "fail" : "pass") : "warn",
-    appState.drift ? (appState.drift?.drift?.ok === false ? "Drift found — reconcile" : "In sync") : "Not checked"
-  );
 }
 
 function adapterSummary() {
@@ -1374,20 +1391,59 @@ function renderApply() {
 }
 
 function renderDrift() {
+  const form = $("troubleshoot-form");
+  if (form) {
+    const deviceField = form.elements.device_id;
+    const fallbackDevice = selectedDeviceId() || getPath(appState.uiConfig || {}, "desired_state.common.device_id", "");
+    if (deviceField && document.activeElement !== deviceField && !deviceField.value && fallbackDevice) deviceField.value = fallbackDevice;
+  }
+
+  const investigation = appState.troubleshoot;
+  if (investigation) {
+    $("troubleshoot-title").textContent = investigation.ok ? "Expected state matched live evidence." : "Review live evidence.";
+    $("troubleshoot-summary").textContent = investigation.message || "Investigation completed.";
+    chipRow(
+      $("troubleshoot-chips"),
+      [
+        { text: investigation.check_label || investigation.check || "Live check", tone: investigation.ok ? "good" : "warn" },
+        { text: investigation.device_id || "device" },
+        { text: investigation.adapter || "Rez" },
+        { text: investigation.change_event_recorded ? "Attached to record" : "Not attached" },
+      ],
+      "No investigation yet"
+    );
+    $("troubleshoot-evidence").textContent = commandListBlock([], formatJson({
+      summary: investigation.summary,
+      evidence_rows: investigation.evidence_rows,
+      read_path: investigation.read_path,
+    }));
+  } else {
+    $("troubleshoot-title").textContent = "No investigation run yet.";
+    $("troubleshoot-summary").textContent = "Pick a device and check type. The result will show the live evidence and whether it matches what you expected.";
+    chipRow($("troubleshoot-chips"), [], "No read-only check has run");
+    $("troubleshoot-evidence").textContent = "Read-only evidence will appear here.";
+  }
+
   const dev = appState.drift?.device_drift;
-  if (dev) {
+  if (investigation) {
+    $("drift-compliance").textContent = investigation.status === "pass" ? "Matched" : investigation.status === "fail" ? "Failed" : "Review";
+    $("drift-intent").textContent = investigation.target ? `${investigation.check_label}: ${investigation.target}` : investigation.check_label || "Live state";
+    $("drift-live").textContent = investigation.collection?.ok ? "Collected" : "Unavailable";
+    $("drift-action").textContent = investigation.ok ? "Attach / audit" : "Investigate";
+  } else if (dev) {
     $("drift-compliance").textContent = dev.status === "in_sync" ? "In sync" : (dev.status === "unknown" ? "Unknown" : "Drifted");
     $("drift-intent").textContent = `${dev.device_id} · committed baseline (${dev.expected_count} VLAN${dev.expected_count === 1 ? "" : "s"})`;
     $("drift-live").textContent = dev.status === "unknown" ? "Unavailable" : "Collected";
     $("drift-action").textContent = dev.status === "drifted" ? "Reconcile" : "Review";
-    $("drift-output").textContent = formatJson(dev);
-    return;
+  } else {
+    $("drift-compliance").textContent = appState.drift?.compliance?.ok === false ? "Review" : appState.drift ? "Loaded" : "Unknown";
+    $("drift-intent").textContent = appState.plan?.plan?.title || "None";
+    $("drift-live").textContent = appState.drift?.live_state?.ok ? "Collected" : appState.drift ? "Unavailable" : "Not collected";
+    $("drift-action").textContent = appState.drift?.drift?.ok === false ? "Reconcile" : "Review";
   }
-  $("drift-compliance").textContent = appState.drift?.compliance?.ok === false ? "Review" : appState.drift ? "Loaded" : "Unknown";
-  $("drift-intent").textContent = appState.plan?.plan?.title || "None";
-  $("drift-live").textContent = appState.drift?.live_state?.ok ? "Collected" : appState.drift ? "Unavailable" : "Not collected";
-  $("drift-action").textContent = appState.drift?.drift?.ok === false ? "Reconcile" : "Review";
-  $("drift-output").textContent = appState.drift ? formatJson(appState.drift) : "Create a plan, then check drift for that intent.";
+  $("drift-output").textContent = appState.troubleshoot || appState.drift
+    ? formatJson({ investigation: appState.troubleshoot, drift: appState.drift })
+    : "Run a read-only investigation, or create a plan and compare it to live state.";
 }
 
 function renderAll() {
@@ -1536,6 +1592,7 @@ async function createPlan() {
     appState.rollback = null;
     appState.changeLive = false;
     appState.drift = null;
+    appState.troubleshoot = null;
     if (data.intent_path) {
       appState.gitPlan = await postJson("/api/gitops/plan", {
         intent_path: data.intent_path,
@@ -1718,6 +1775,46 @@ async function rollbackChange() {
   }
 }
 
+function troubleshootPayload() {
+  const form = new FormData($("troubleshoot-form"));
+  return {
+    device_id: String(form.get("device_id") || selectedDeviceId() || ""),
+    check: String(form.get("check") || "live_state"),
+    target: String(form.get("target") || ""),
+    expected: String(form.get("expected") || ""),
+    change_id: appState.activeChangeId || null,
+  };
+}
+
+async function runTroubleshoot() {
+  const payload = troubleshootPayload();
+  if (!payload.device_id) {
+    failOutcome("Investigation blocked.", new Error("Pick a device first."));
+    return;
+  }
+  startOutcome("Run read-only investigation", "Use Rez SSH/API read adapters to collect live state, compare expected vs actual, and attach evidence to the active change record when one exists.");
+  try {
+    const data = await postJson("/api/troubleshoot/run", payload);
+    appState.troubleshoot = data;
+    if (data.change_event_recorded) appState.audit = await getJson("/api/audit/sessions");
+    renderAll();
+    setView("drift");
+    setOutcome({
+      state: data.ok ? "Passed" : data.status === "fail" ? "Failed" : "Review",
+      status: data.ok ? "pass" : data.status === "fail" ? "fail" : "warn",
+      title: data.ok ? "Live evidence matched." : "Investigation needs review.",
+      summary: data.message || "Read-only investigation completed.",
+      expected: payload.expected ? `Find '${payload.expected}' in live ${data.check_label || payload.check} evidence.` : "Collect live device evidence without changing config.",
+      actual: data.message || "Rez returned live-state evidence.",
+      artifact: data.change_event_recorded ? `Attached to change ${appState.activeChangeId}.` : "Investigation evidence in current session.",
+      device: "No config was changed. Rez used read-only SSH/API collection.",
+      next: data.ok ? "Open Evidence or continue the change flow." : "Review live evidence, then reconcile with a desired-state change if needed.",
+    });
+  } catch (error) {
+    failOutcome("Investigation failed.", error);
+  }
+}
+
 async function checkDrift() {
   startOutcome("Check drift", "Collect read-only state and compare the current desired state against the live device where supported.");
   try {
@@ -1864,6 +1961,16 @@ function evidencePayload() {
           message: appState.rollback.result?.message,
         }
       : null,
+    troubleshooting: appState.troubleshoot
+      ? {
+          ok: appState.troubleshoot.ok,
+          status: appState.troubleshoot.status,
+          check: appState.troubleshoot.check,
+          device_id: appState.troubleshoot.device_id,
+          message: appState.troubleshoot.message,
+          attached_to_change: appState.troubleshoot.change_event_recorded,
+        }
+      : null,
     audit_sessions: appState.audit?.sessions?.length || 0,
     ui_config: appState.uiConfigPath
       ? {
@@ -1911,6 +2018,7 @@ function ticketText(record) {
   const req = record.request || {};
   const plan = record.plan || {};
   const safety = record.safety || {};
+  const investigations = (record.events || []).filter((event) => String(event.action || "") === "troubleshoot");
   const proof = (p, label) => (p?.present ? `${label}: ${p.status} — ${p.message || ""}` : `${label}: not run`);
   const lines = [
     `NETWORK CHANGE — ${req.title || record.change_id}`,
@@ -1932,6 +2040,7 @@ function ticketText(record) {
     proof(record.lab_proof, "  Dry-run proof"),
     proof(record.apply_proof, "  Apply proof"),
     `  Verification: ${record.verify_proof?.present ? "confirmed" : "not verified"}`,
+    `  Troubleshooting: ${investigations.length ? `${investigations.length} read-only investigation(s) attached` : "not run"}`,
     proof(record.rollback_record, "  Rollback"),
     "",
     `GIT: branch ${record.git?.branch || "-"}${record.git?.upstream ? ` → ${record.git.upstream}` : ""}`,
@@ -1975,6 +2084,7 @@ function renderChangeRecord() {
   const req = record.request || {};
   const plan = record.plan || {};
   const safety = record.safety || {};
+  const investigations = (record.events || []).filter((event) => String(event.action || "") === "troubleshoot");
   const failedChecks = (safety.checks || []).filter((check) => check.status !== "pass");
   const proofLine = (proof, label) =>
     proof?.present
@@ -2000,6 +2110,16 @@ function renderChangeRecord() {
         ? `Verified with the apply job ${esc(record.verify_proof.job_id || "")} (${esc(record.verify_proof.status || "")}).`
         : "Not verified yet.",
     ]),
+    recordBlock(
+      "Troubleshooting / investigation",
+      investigations.length
+        ? investigations.map((event) => {
+            const evidence = event.evidence || {};
+            const summary = evidence.summary || {};
+            return `${esc(event.created_at || "")} · ${esc(evidence.device_id || req.device_id || "-")} · ${esc(evidence.check || "check")} · ${esc(event.message || "")} · matched rows ${esc(summary.matched_rows ?? "-")}`;
+          })
+        : ["No read-only investigation is attached yet."]
+    ),
     `<article class="record-block"><h5>Rollback</h5><p>${
       record.rollback_record?.present
         ? proofLine(record.rollback_record, "Rollback executed")
@@ -2038,6 +2158,11 @@ function renderEvidence() {
       verify: appState.verify,
       rollback: appState.rollback,
     }),
+    troubleshooting: appState.troubleshoot
+      ? formatJson(appState.troubleshoot)
+      : appState.drift
+        ? formatJson(appState.drift)
+        : "No read-only investigation or drift check has run yet.",
     git: appState.gitPlan ? formatJson(appState.gitPlan) : appState.git ? formatJson(appState.git) : "No Git evidence yet.",
     configState: appState.uiConfig ? formatJson({ path: appState.uiConfigPath, config: appState.uiConfig, history: appState.configHistory }) : "No UI configuration loaded yet.",
     audit: appState.audit ? formatJson(appState.audit) : "No audit data loaded yet.",
@@ -2055,6 +2180,7 @@ function clearChangeProofState() {
   appState.rollback = null;
   appState.changeLive = false;
   appState.drift = null;
+  appState.troubleshoot = null;
   setRunState("Draft");
 }
 
@@ -2121,6 +2247,7 @@ function bindEvents() {
   $("rollback-change").addEventListener("click", rollbackChange);
   $("check-drift").addEventListener("click", checkDrift);
   $("check-device-drift").addEventListener("click", checkDeviceDrift);
+  $("run-troubleshoot").addEventListener("click", runTroubleshoot);
   $("refresh-evidence").addEventListener("click", refreshEvidence);
   $$("#change-form input, #change-form select, #change-form textarea").forEach((input) => input.addEventListener("input", resetChangeProof));
 }

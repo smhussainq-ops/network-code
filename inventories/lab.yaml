@@ -13,6 +13,8 @@ devices:
   - stores
   - access-switches
   site: store-1842
+  platform: arista_eos
+  port: 22
 - id: v2-store2
   hostname: v2-store2
   host: 172.100.1.42

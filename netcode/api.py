@@ -6,6 +6,7 @@ import json
 import os
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor, TimeoutError
 from pathlib import Path
 
 from fastapi import FastAPI, Header, HTTPException, Request, Response
@@ -63,6 +64,7 @@ from netcode.platform import platform_capabilities
 from netcode.scale import rollout_plan
 from netcode.source_of_truth import netbox_sync, netbox_test, provider_catalog, source_of_truth
 from netcode.store import DEFAULT_ORG_ID, PlatformStore, record_to_dict
+from netcode.troubleshooting import troubleshoot_state
 from netcode.ui_config import (
     configured_inventory_path,
     configured_template_dir,
@@ -134,6 +136,14 @@ class GenericVerifyRequest(BaseModel):
     params: dict[str, object] = {}
 
 
+class TroubleshootRequest(BaseModel):
+    device_id: str
+    check: str = "live_state"
+    target: str = ""
+    expected: str = ""
+    change_id: str | None = None
+
+
 class AssistantRequest(BaseModel):
     prompt: str
     context: dict[str, object] = {}
@@ -201,6 +211,9 @@ class NetBoxRequest(BaseModel):
     token: str = ""
 
 
+TROUBLESHOOT_READ_TIMEOUT_SECONDS = 20
+
+
 app = FastAPI(title="Netcode Platform", version="0.1.0")
 
 
@@ -260,7 +273,7 @@ def index() -> FileResponse:
     static = paths().static / "index.html"
     if not static.exists():
         raise HTTPException(status_code=404, detail="static/index.html not found")
-    return FileResponse(static)
+    return FileResponse(static, headers={"Cache-Control": "no-store"})
 
 
 @app.get("/app")
@@ -729,6 +742,27 @@ def _runner_read(p, action: str, payload: dict, org_id: str, timeout: float = 60
     return {"ok": False, "error": f"No runner completed the {action} read within {int(timeout)}s. Is a runner online for this pool? (Setup → Runners)"}
 
 
+def _collect_rez_state_for_troubleshooting(device) -> dict[str, object]:  # noqa: ANN001
+    executor = ThreadPoolExecutor(max_workers=1)
+    future = executor.submit(AdapterRegistry().rez.collect_device_state, device)
+    try:
+        return future.result(timeout=TROUBLESHOOT_READ_TIMEOUT_SECONDS)
+    except TimeoutError:
+        future.cancel()
+        return {
+            "ok": False,
+            "device_id": device.id,
+            "platform": device.platform,
+            "adapter": "rez",
+            "state": None,
+            "warnings": [],
+            "errors": [f"Rez state collection timed out after {TROUBLESHOOT_READ_TIMEOUT_SECONDS}s."],
+            "error": f"Rez state collection timed out after {TROUBLESHOOT_READ_TIMEOUT_SECONDS}s.",
+        }
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
+
+
 @app.post("/api/readiness/devices")
 def api_readiness_devices(request: Request) -> dict[str, object]:
     """Live read test: can the platform actually read the trusted devices right now?"""
@@ -883,6 +917,69 @@ def api_rez_collect_state(request: DeviceRequest) -> dict[str, object]:
     if not device:
         raise HTTPException(status_code=404, detail=f"Unknown device {device_id}")
     return AdapterRegistry().rez.collect_device_state(device)
+
+
+@app.post("/api/troubleshoot/run")
+def api_troubleshoot_run(request: TroubleshootRequest, http_request: Request) -> dict[str, object]:
+    """Read-only investigation: collect live state with Rez, summarize it, and optionally attach it to a change."""
+    p = paths()
+    org = _request_principal(http_request).org_id
+    if execution_mode() == "runner":
+        result = _runner_read(
+            p,
+            "troubleshoot",
+            {
+                "device_id": request.device_id,
+                "check": request.check,
+                "target": request.target,
+                "expected": request.expected,
+            },
+            org,
+        )
+    else:
+        inventory = Inventory(configured_inventory_path(p))
+        device = inventory.by_id.get(request.device_id)
+        if not device:
+            raise HTTPException(status_code=404, detail=f"Unknown device {request.device_id}")
+        state = _collect_rez_state_for_troubleshooting(device)
+        result = troubleshoot_state(
+            state,
+            check=request.check,
+            target=request.target,
+            expected=request.expected,
+        )
+
+    result.setdefault("change_event_recorded", False)
+    if request.change_id:
+        store = PlatformStore(p)
+        try:
+            change = store.get_change(request.change_id)
+            if change.org_id != org:
+                raise KeyError(request.change_id)
+            event = store.record_workflow_event(
+                change.id,
+                "troubleshoot",
+                change.workflow_state,
+                change.workflow_state,
+                str(result.get("message") or "Read-only investigation completed."),
+                {
+                    "device_id": request.device_id,
+                    "check": request.check,
+                    "target": request.target,
+                    "expected": request.expected,
+                    "status": result.get("status"),
+                    "summary": result.get("summary"),
+                    "read_path": result.get("read_path"),
+                    "device_config": result.get("device_config"),
+                    "evidence_rows": result.get("evidence_rows", [])[:10],
+                },
+            )
+            result["change_event_recorded"] = True
+            result["event_id"] = event.id
+        except Exception as exc:  # noqa: BLE001
+            result["change_event_recorded"] = False
+            result["change_event_error"] = str(exc)
+    return result
 
 
 @app.post("/api/verify/vlan")

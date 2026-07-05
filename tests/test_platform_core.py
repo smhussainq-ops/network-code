@@ -347,6 +347,7 @@ def test_runner_read_job_routing_roundtrip(tmp_path: Path, monkeypatch):
     import hashlib
     import hmac as hmac_mod
     import threading
+    import time
 
     from netcode.runner_hub import canonical_json
 
@@ -863,6 +864,29 @@ def test_device_drift_aggregates_committed_intents(tmp_path: Path):
     assert unknown["status"] == "unknown"
 
 
+def test_runner_read_has_fail_closed_timeout(monkeypatch):
+    """A hung device read must not wedge the runner's sequential job loop:
+    _execute_read enforces a hard deadline and returns an honest failure."""
+    import time as _time
+
+    from netcode import runner_agent
+
+    monkeypatch.setattr(runner_agent, "READ_TIMEOUT_SECONDS", 1)
+
+    def hang(action, payload):  # noqa: ANN001
+        _time.sleep(5)
+        return {"ok": True}
+
+    monkeypatch.setattr(runner_agent, "_execute_read_inner", hang)
+    started = _time.monotonic()
+    result = runner_agent._execute_read("troubleshoot", {"device_id": "x"})
+    elapsed = _time.monotonic() - started
+
+    assert result["ok"] is False
+    assert "timed out" in result["error"]
+    assert elapsed < 3  # returned at the deadline, not after the hang
+
+
 def test_workspace_gitignore_tracks_only_artifacts(tmp_path: Path):
     """The seeded workspace .gitignore must exclude platform code so branch switching
     never collides with source files (Marcus's branch-collision bug)."""
@@ -1258,19 +1282,67 @@ def test_rez_collect_state_endpoint_accepts_device_only_request(monkeypatch, tmp
     assert response.json() == {"ok": True, "device_id": "v2-store1", "adapter": "rez.arista_eos"}
 
 
+def test_troubleshoot_run_is_read_only_and_attaches_to_change(monkeypatch, tmp_path: Path):
+    paths = WorkspacePaths(tmp_path)
+    init_workspace(paths)
+    monkeypatch.chdir(tmp_path)
+    change = PlatformStore(paths).create_change(paths.intents / "examples" / "add_guest_vlan.yaml", "v2-store1")
+
+    class FakeRez:
+        def collect_device_state(self, device):
+            return {
+                "ok": True,
+                "device_id": device.id,
+                "platform": device.platform,
+                "adapter": f"rez.{device.platform}",
+                "driver": "drivers.arista_eos.AsyncAristaEOSDriver",
+                "state": {"layer2": {"vlans": [{"vlan_id": 90, "name": "GUEST_WIFI"}]}},
+                "warnings": [],
+                "errors": [],
+                "collection_time": 0.01,
+            }
+
+    class FakeRegistry:
+        rez = FakeRez()
+
+    monkeypatch.setattr(api, "AdapterRegistry", FakeRegistry)
+
+    response = TestClient(api.app).post(
+        "/api/troubleshoot/run",
+        json={
+            "device_id": "v2-store1",
+            "check": "vlans",
+            "target": "90",
+            "expected": "GUEST_WIFI",
+            "change_id": change.id,
+        },
+    )
+    body = response.json()
+    events = PlatformStore(paths).list_workflow_events(change.id)
+
+    assert response.status_code == 200
+    assert body["ok"] is True
+    assert body["device_config"] == "read_only_no_writes"
+    assert body["change_event_recorded"] is True
+    assert events[0].action == "troubleshoot"
+    assert events[0].evidence["summary"]["matched_rows"] == 1
+
+
 def test_app_route_serves_ui():
     response = TestClient(api.app).get("/app")
 
     assert response.status_code == 200
     assert "Netcode" in response.text
-    assert "Terraform-style network changes with audited lab proof" in response.text
+    assert "Network changes with plan, proof, and audit" in response.text
     assert "Home" in response.text
     assert "Network as code user stories" in response.text
+    assert "Lower change risk" in response.text
     assert "Get ready" in response.text
     assert "Bring devices under management" in response.text
     assert "Make a safe change" in response.text
+    assert "Troubleshoot / Investigate" in response.text
     assert "Prove it" in response.text
-    assert "Catch drift" in response.text
+    assert "Audit-ready proof" in response.text
     assert "readiness gates" in response.text
     assert "Send for review" in response.text
     assert "runners-panel" in response.text
@@ -1283,7 +1355,7 @@ def test_app_route_serves_ui():
     assert "Plan" in response.text
     assert "Validate" in response.text
     assert "Apply" in response.text
-    assert "Drift" in response.text
+    assert "Troubleshoot" in response.text
     assert "Evidence" in response.text
     assert "What do you want the network to look like?" in response.text
     assert "Editable platform configuration" in response.text

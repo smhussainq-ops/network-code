@@ -287,6 +287,7 @@ textarea:focus-visible {
 }
 
 .choice-grid,
+.value-strip,
 .story-board,
 .setup-grid,
 .summary-strip,
@@ -299,6 +300,40 @@ textarea:focus-visible {
 
 .choice-grid {
   grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.value-strip {
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  margin-bottom: 14px;
+}
+
+.value-strip article {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  min-width: 0;
+  padding: 14px;
+}
+
+.value-strip span {
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 750;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+}
+
+.value-strip strong {
+  display: block;
+  font-size: 15px;
+  margin-top: 6px;
+}
+
+.value-strip p {
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.35;
+  margin: 5px 0 0;
 }
 
 .story-board {
@@ -742,6 +777,10 @@ textarea:focus-visible {
   z-index: 100;
 }
 
+.login-overlay[hidden] {
+  display: none;
+}
+
 .login-card {
   background: white;
   border-radius: var(--radius);
@@ -1014,6 +1053,11 @@ legend,
   padding-top: 12px;
 }
 
+.form-section.first {
+  border-top: 0;
+  padding-top: 0;
+}
+
 .form-grid {
   display: grid;
   gap: 11px;
@@ -1112,6 +1156,20 @@ legend,
 .artifact-grid article {
   min-width: 0;
   padding: 14px;
+}
+
+.investigate-layout {
+  align-items: stretch;
+}
+
+.investigate-layout .result-panel {
+  display: grid;
+  gap: 10px;
+}
+
+.investigate-layout .mini-code {
+  max-height: 220px;
+  min-height: 130px;
 }
 
 .artifact-heading {
@@ -1288,6 +1346,7 @@ legend,
   }
 
   .choice-grid,
+  .value-strip,
   .story-board,
   .setup-grid,
   .config-form,

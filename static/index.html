@@ -3,9 +3,9 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Netcode MVP</title>
+    <title>Netcode</title>
     <link rel="icon" href="/static/favicon.svg" type="image/svg+xml" />
-    <link rel="stylesheet" href="/static/styles.css?v=20260703-mvp18" />
+    <link rel="stylesheet" href="/static/styles.css?v=20260705-stories2" />
   </head>
   <body>
     <div id="login-overlay" class="login-overlay" hidden>
@@ -22,10 +22,10 @@
     <main class="app-shell">
       <aside class="sidebar" aria-label="MVP navigation">
         <div class="brand">
-          <div class="brand-mark">NC</div>
+            <div class="brand-mark">NC</div>
           <div>
             <h1>Netcode</h1>
-            <p>Terraform-style network changes with audited lab proof.</p>
+            <p>Network changes with plan, proof, and audit.</p>
           </div>
         </div>
 
@@ -37,7 +37,7 @@
           <button class="nav-item" type="button" data-view="plan">Plan</button>
           <button class="nav-item" type="button" data-view="validate">Validate</button>
           <button class="nav-item" type="button" data-view="apply">Apply</button>
-          <button class="nav-item" type="button" data-view="drift">Drift</button>
+          <button class="nav-item" type="button" data-view="drift">Troubleshoot</button>
           <button class="nav-item" type="button" data-view="evidence">Evidence</button>
         </nav>
 
@@ -52,9 +52,9 @@
         <section class="main-stage">
           <header class="page-header">
             <div>
-              <p class="eyebrow">Arista MVP</p>
-              <h2 id="view-title">Define, plan, validate, apply, verify.</h2>
-              <p id="view-subtitle">A simple network-as-code flow using your Git repo, local YAML source of truth, Rez discovery, and the Arista ORB lab.</p>
+              <p class="eyebrow">Network as Code</p>
+              <h2 id="view-title">Five guided stories for Network as Code.</h2>
+              <p id="view-subtitle">Lower change risk, faster delivery, audit-ready proof, and a practical path for network engineers to adopt Git, source of truth, templates, validation, and Rez-driven device reads.</p>
             </div>
             <div class="run-state">
               <span id="run-state-label">Draft</span>
@@ -62,6 +62,28 @@
           </header>
 
           <section id="view-home" class="view active">
+            <section class="value-strip" aria-label="Netcode business outcomes">
+              <article>
+                <span>Outcome</span>
+                <strong>Lower change risk</strong>
+                <p>Every device write is gated by a plan, validation, and proof.</p>
+              </article>
+              <article>
+                <span>Outcome</span>
+                <strong>Faster delivery</strong>
+                <p>Engineers declare the result; the platform builds the artifacts.</p>
+              </article>
+              <article>
+                <span>Outcome</span>
+                <strong>Audit-ready proof</strong>
+                <p>Each change ends with commands, evidence, Git history, and rollback.</p>
+              </article>
+              <article>
+                <span>Outcome</span>
+                <strong>Practical adoption</strong>
+                <p>Use Git, YAML, templates, and Rez through guided workflows.</p>
+              </article>
+            </section>
             <section class="story-board" aria-label="Network as code user stories">
               <article class="story-card" id="story-ready">
                 <span>Story 01</span>
@@ -84,19 +106,19 @@
                 <strong>Waiting</strong>
                 <button type="button" data-go="desired">Start a change</button>
               </article>
-              <article class="story-card" id="story-audit">
+              <article class="story-card" id="story-troubleshoot">
                 <span>Story 04</span>
+                <h3>Troubleshoot / Investigate</h3>
+                <p>Run read-only Rez checks, compare expected vs live, attach evidence to the change.</p>
+                <strong>Not checked</strong>
+                <button type="button" data-go="drift">Investigate</button>
+              </article>
+              <article class="story-card" id="story-audit">
+                <span>Story 05</span>
                 <h3>Prove it</h3>
-                <p>One change record with every artifact and proof — ready to attach to a ticket.</p>
+                <p>One evidence package with request, intent, branch, commands, proof, investigation, rollback.</p>
                 <strong>Waiting</strong>
                 <button type="button" data-go="evidence">Open the record</button>
-              </article>
-              <article class="story-card" id="story-drift">
-                <span>Story 05</span>
-                <h3>Catch drift</h3>
-                <p>Compare live network state against trusted intent; reconcile with a new change.</p>
-                <strong>Not checked</strong>
-                <button type="button" data-go="drift">Check drift</button>
               </article>
             </section>
 
@@ -444,19 +466,50 @@
 
           <section id="view-drift" class="view">
             <section class="section-heading">
-              <h3>Drift</h3>
-              <p>Collect live state and compare it against trusted desired state. Drift checks are read-only. <strong>This change</strong> compares against the current plan's intent; <strong>whole device</strong> compares against every VLAN this platform has applied to the device — its committed source of truth.</p>
+              <h3>Troubleshoot / Investigate</h3>
+              <p>Read-only checks use Rez SSH/API adapters to collect live evidence. Use them before a change, after a change, or during an incident. If a change is active, the result is attached to that change record.</p>
             </section>
+            <div class="two-column investigate-layout">
+              <form id="troubleshoot-form" class="form-panel">
+                <section class="form-section first">
+                  <h4>Run a read-only check</h4>
+                  <p class="setup-hint">No config mode. No commit. This only reads live device state.</p>
+                  <label>Device<input name="device_id" placeholder="v2-store1" autocomplete="off" /></label>
+                  <label>Check type
+                    <select name="check">
+                      <option value="live_state">Live state summary</option>
+                      <option value="interfaces">Interfaces</option>
+                      <option value="vlans">VLANs</option>
+                      <option value="bgp">BGP neighbors</option>
+                      <option value="routes">Routes</option>
+                      <option value="acl">ACLs</option>
+                    </select>
+                  </label>
+                  <label>Target filter<input name="target" placeholder="Ethernet1, VLAN 90, 10.42.90.0/24, neighbor IP" autocomplete="off" /></label>
+                  <label>Expected live evidence<input name="expected" placeholder="up, GUEST_WIFI, established, permit" autocomplete="off" /></label>
+                  <div class="button-row">
+                    <button id="run-troubleshoot" type="button">Run read-only check</button>
+                  </div>
+                </section>
+              </form>
+              <article class="result-panel">
+                <span>Investigation result</span>
+                <h4 id="troubleshoot-title">No investigation run yet.</h4>
+                <p id="troubleshoot-summary">Pick a device and check type. The result will show the live evidence and whether it matches what you expected.</p>
+                <div id="troubleshoot-chips" class="stat-chips"></div>
+                <pre id="troubleshoot-evidence" class="mini-code">Read-only evidence will appear here.</pre>
+              </article>
+            </div>
             <section class="plan-summary">
-              <article><span>Compliance</span><strong id="drift-compliance">Unknown</strong></article>
-              <article><span>Current intent</span><strong id="drift-intent">None</strong></article>
+              <article><span>Investigation</span><strong id="drift-compliance">Unknown</strong></article>
+              <article><span>Scope</span><strong id="drift-intent">None</strong></article>
               <article><span>Live state</span><strong id="drift-live">Not collected</strong></article>
-              <article><span>Action</span><strong id="drift-action">Review</strong></article>
+              <article><span>Next action</span><strong id="drift-action">Review</strong></article>
             </section>
             <pre id="drift-output" class="code-box tall">Create a plan, then check drift for that intent.</pre>
             <div class="button-row">
-              <button id="check-drift" type="button">Check this change</button>
-              <button id="check-device-drift" class="secondary" type="button">Check whole device</button>
+              <button id="check-drift" class="secondary" type="button">Compare this change to live</button>
+              <button id="check-device-drift" class="secondary" type="button">Check whole-device drift</button>
               <button class="secondary" type="button" data-go="desired">Reconcile: start a new change</button>
               <button class="secondary" type="button" data-go="evidence">Review evidence</button>
             </div>
@@ -482,6 +535,7 @@
                 <button class="evidence-tab" type="button" data-artifact="config">Commands</button>
                 <button class="evidence-tab" type="button" data-artifact="validation">Validation</button>
                 <button class="evidence-tab" type="button" data-artifact="lab">Lab</button>
+                <button class="evidence-tab" type="button" data-artifact="troubleshooting">Investigation</button>
                 <button class="evidence-tab" type="button" data-artifact="git">Git</button>
                 <button class="evidence-tab" type="button" data-artifact="configState">Config</button>
                 <button class="evidence-tab" type="button" data-artifact="audit">Audit</button>
@@ -528,6 +582,6 @@
         </aside>
       </section>
     </main>
-    <script src="/static/app.js?v=20260703-mvp18"></script>
+    <script src="/static/app.js?v=20260705-stories2"></script>
   </body>
 </html>
