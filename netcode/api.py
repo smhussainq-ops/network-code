@@ -6,6 +6,7 @@ import json
 import os
 import re
 import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor, TimeoutError
 from pathlib import Path
 
@@ -142,6 +143,20 @@ class TroubleshootRequest(BaseModel):
     target: str = ""
     expected: str = ""
     change_id: str | None = None
+
+
+class ShellOpenRequest(BaseModel):
+    device_id: str
+
+
+class ShellInputRequest(BaseModel):
+    session_id: str
+    input: str
+
+
+class ShellAttachRequest(BaseModel):
+    session_id: str
+    change_id: str
 
 
 class AssistantRequest(BaseModel):
@@ -935,6 +950,7 @@ def api_troubleshoot_run(request: TroubleshootRequest, http_request: Request) ->
                 "expected": request.expected,
             },
             org,
+            timeout=TROUBLESHOOT_READ_TIMEOUT_SECONDS,
         )
     else:
         inventory = Inventory(configured_inventory_path(p))
@@ -980,6 +996,109 @@ def api_troubleshoot_run(request: TroubleshootRequest, http_request: Request) ->
             result["change_event_recorded"] = False
             result["change_event_error"] = str(exc)
     return result
+
+
+# ---- Netcode Shell (governed SSH, MVP1/2) -----------------------------------
+# Session state lives in memory (a restart drops live sessions — acceptable for
+# MVP); the transcript is written durably to reports/shell-<id>.jsonl as the
+# evidence artifact. The GUARD runs on the runner (trust boundary); the control
+# plane only orchestrates and records.
+_SHELL_SESSIONS: dict[str, dict[str, object]] = {}
+
+
+def _shell_transcript_path(p, session_id: str) -> Path:
+    return p.reports / f"shell-{session_id}.jsonl"
+
+
+def _shell_append(p, session_id: str, entry: dict[str, object]) -> None:
+    path = _shell_transcript_path(p, session_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(entry, default=str) + "\n")
+
+
+@app.post("/api/shell/open")
+def api_shell_open(request: ShellOpenRequest, http_request: Request) -> dict[str, object]:
+    """Open a governed, read-only CLI session against a device."""
+    p = paths()
+    org = _request_principal(http_request).org_id
+    inventory = Inventory(configured_inventory_path(p))
+    device = inventory.by_id.get(request.device_id)
+    if not device:
+        raise HTTPException(status_code=404, detail=f"Unknown device {request.device_id}")
+    session_id = uuid.uuid4().hex[:16]
+    state = {"mode": "read_only", "change_id": None, "in_config": False, "device_touched": False}
+    _SHELL_SESSIONS[session_id] = {"org_id": org, "device_id": device.id, "platform": device.platform, "state": state}
+    _shell_append(p, session_id, {"event": "session_opened", "device_id": device.id, "org_id": org})
+    return {"ok": True, "session_id": session_id, "device_id": device.id, "platform": device.platform,
+            "state": state, "message": f"Read-only session open on {device.id}. Config mode is guarded."}
+
+
+def _shell_session_or_404(session_id: str, org: str) -> dict[str, object]:
+    session = _SHELL_SESSIONS.get(session_id)
+    if not session or session.get("org_id") != org:
+        raise HTTPException(status_code=404, detail=f"Unknown shell session {session_id}")
+    return session
+
+
+@app.post("/api/shell/attach")
+def api_shell_attach(request: ShellAttachRequest, http_request: Request) -> dict[str, object]:
+    """Attach a change record so config mode becomes permitted."""
+    p = paths()
+    org = _request_principal(http_request).org_id
+    session = _shell_session_or_404(request.session_id, org)
+    try:
+        change = PlatformStore(p).get_change(request.change_id)
+        if change.org_id != org:
+            raise KeyError(request.change_id)
+    except Exception:
+        raise HTTPException(status_code=404, detail=f"Unknown change {request.change_id}")
+    state = dict(session["state"])  # type: ignore[arg-type]
+    state["mode"] = "change_attached"
+    state["change_id"] = request.change_id
+    session["state"] = state
+    _shell_append(p, request.session_id, {"event": "change_attached", "change_id": request.change_id})
+    return {"ok": True, "session_id": request.session_id, "state": state,
+            "message": f"Change {request.change_id} attached — config mode is now permitted under governance."}
+
+
+@app.post("/api/shell/input")
+def api_shell_input(request: ShellInputRequest, http_request: Request) -> dict[str, object]:
+    """Submit a line (or paste) to the governed session. The guard runs on the
+    runner; only cleared read-only lines reach the device."""
+    p = paths()
+    org = _request_principal(http_request).org_id
+    session = _shell_session_or_404(request.session_id, org)
+    payload = {"device_id": session["device_id"], "input": request.input, "state": session["state"]}
+    if execution_mode() == "runner":
+        result = _runner_read(p, "shell", payload, org)
+    else:
+        result = {"ok": False, "cleared": False, "output": "",
+                  "events": [{"type": "guard", "action": "no_runner",
+                              "message": "Governed shell executes on the on-prem runner; none is online for this pool."}],
+                  "state": session["state"], "device_touched": bool((session["state"] or {}).get("device_touched"))}
+    if isinstance(result.get("state"), dict):
+        session["state"] = result["state"]
+    _shell_append(p, request.session_id, {"event": "input", "input": request.input,
+                                          "cleared": result.get("cleared"), "executed": result.get("executed"),
+                                          "guard": [e.get("action") for e in result.get("events", [])],
+                                          "output_len": len(str(result.get("output") or ""))})
+    return result
+
+
+@app.get("/api/shell/{session_id}/transcript")
+def api_shell_transcript(session_id: str, request: Request) -> dict[str, object]:
+    """The durable session transcript — the shell's evidence artifact."""
+    p = paths()
+    org = _request_principal(request).org_id
+    _shell_session_or_404(session_id, org)  # ownership check
+    path = _shell_transcript_path(p, session_id)
+    lines = path.read_text(encoding="utf-8").splitlines() if path.exists() else []
+    entries = [json.loads(line) for line in lines if line.strip()]
+    state = _SHELL_SESSIONS.get(session_id, {}).get("state") or {}
+    return {"ok": True, "session_id": session_id, "entries": entries,
+            "device_touched": bool(state.get("device_touched")),
+            "artifact": str(path), "device_config": "touched" if state.get("device_touched") else "not_touched"}
 
 
 @app.post("/api/verify/vlan")

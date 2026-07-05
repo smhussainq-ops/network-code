@@ -281,6 +281,47 @@ def _execute_read_inner(action: str, payload: dict[str, Any]) -> dict[str, Any]:
             expected=str(payload.get("expected", "")),
         )
 
+    if action == "shell":
+        # Governed CLI: the guard runs HERE (the trust boundary), and only a
+        # cleared read-only line is executed on the device. Config execution is
+        # never done raw — it stays in the proven plan/dry-run/apply pipeline.
+        from netcode.lab import AristaEOSLabAdapter
+        from netcode.shell_guard import ShellSessionState, submit_line, submit_paste
+        inv = Inventory(INVENTORY_FILE)
+        device = inv.by_id.get(payload.get("device_id"))
+        if not device:
+            return {"ok": False, "error": f"Device {payload.get('device_id')} not in runner inventory."}
+        raw = dict(payload.get("state") or {})
+        state = ShellSessionState(
+            mode=str(raw.get("mode", "read_only")),
+            change_id=raw.get("change_id"),
+            in_config=bool(raw.get("in_config", False)),
+            device_touched=bool(raw.get("device_touched", False)),
+        )
+        text = str(payload.get("input", ""))
+        paste = submit_paste(state, text) if ("\n" in text or "\r" in text) else None
+        if paste is not None:
+            return {"ok": True, "cleared": False, "output": "", "events": paste["events"],
+                    "state": paste["state"], "device_touched": state.device_touched}
+        result = submit_line(state, text)
+        output = ""
+        executed = False
+        if result["cleared"] and not state.in_config and result["kind"] in ("read", "config_exit", "empty"):
+            adapter = AristaEOSLabAdapter(device)
+            try:
+                adapter.connect()
+                output = adapter.show(text.strip())
+                executed = True
+            except Exception as exc:  # noqa: BLE001
+                output = f"[shell] device read failed: {exc}"
+            finally:
+                adapter.disconnect()
+        elif result["cleared"] and state.in_config:
+            output = "[staged] config line captured — stage & apply through the change pipeline."
+        return {"ok": True, "cleared": result["cleared"], "executed": executed,
+                "output": output, "events": result["events"], "state": result["state"],
+                "device_touched": state.device_touched, "device_id": device.id, "platform": device.platform}
+
     if action == "discovery":
         from netcode.discovery import DiscoveryService
         return DiscoveryService(_runner_ws()).scan(
