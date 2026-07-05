@@ -5,7 +5,8 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Netcode</title>
     <link rel="icon" href="/static/favicon.svg" type="image/svg+xml" />
-    <link rel="stylesheet" href="/static/styles.css?v=20260705-shell1" />
+    <link rel="stylesheet" href="/static/vendor/xterm.css" />
+    <link rel="stylesheet" href="/static/styles.css?v=20260705-shell2" />
   </head>
   <body>
     <div id="login-overlay" class="login-overlay" hidden>
@@ -486,12 +487,8 @@
                 </div>
               </aside>
               <div class="shell-terminal-wrap">
-                <pre id="shell-terminal" class="shell-terminal" tabindex="0">Open a session to begin. Read-only commands run on the device; guarded commands are held with an explanation.</pre>
-                <form id="shell-input-form" class="shell-input">
-                  <span id="shell-prompt" class="shell-prompt">device#</span>
-                  <input id="shell-line" type="text" autocomplete="off" spellcheck="false" placeholder="Type a command, or paste config to stage it…" disabled />
-                  <button id="shell-send" type="submit" disabled>Run</button>
-                </form>
+                <div id="shell-xterm" class="shell-xterm"></div>
+                <div id="shell-hint" class="shell-hint-bar">Open a session for a live, guarded SSH terminal. Config mode is blocked until you attach a change; unrecognized commands are held with an explanation.</div>
               </div>
               <aside class="change-guard" aria-label="Change Guard">
                 <h4>Change Guard</h4>
@@ -625,6 +622,8 @@
         </aside>
       </section>
     </main>
-    <script src="/static/app.js?v=20260705-shell1"></script>
+    <script src="/static/vendor/xterm.js"></script>
+    <script src="/static/vendor/xterm-addon-fit.js"></script>
+    <script src="/static/app.js?v=20260705-shell2"></script>
   </body>
 </html>

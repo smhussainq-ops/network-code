@@ -10,7 +10,7 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor, TimeoutError
 from pathlib import Path
 
-from fastapi import FastAPI, Header, HTTPException, Request, Response
+from fastapi import FastAPI, Header, HTTPException, Request, Response, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -1084,6 +1084,95 @@ def api_shell_input(request: ShellInputRequest, http_request: Request) -> dict[s
                                           "guard": [e.get("action") for e in result.get("events", [])],
                                           "output_len": len(str(result.get("output") or ""))})
     return result
+
+
+# ---- Interactive streaming shell (MVP4) -------------------------------------
+# Transport (Teleport/HCP-agent pattern, since the runner is outbound-only and
+# the devices are reachable only from it):
+#   browser xterm  <--WS-->  control plane  <--persistent WS-->  runner  <-->  device PTY
+# The control plane is a pure broker: it holds one control-channel WS per runner
+# pool and one browser WS per session, and pipes JSON frames between them. The
+# guard and the device credentials live on the runner; the control plane never
+# sees a live device session or a credential.
+_RUNNER_CHANNELS: dict[str, WebSocket] = {}          # pool -> runner control WS
+_BROWSER_SOCKETS: dict[str, WebSocket] = {}          # session_id -> browser WS
+
+
+@app.websocket("/api/runner/stream")
+async def ws_runner_stream(ws: WebSocket) -> None:
+    """Persistent outbound control channel from a runner. The runner authenticates,
+    then this coroutine forwards the runner's output/event frames to the matching
+    browser sockets. Input frames flow the other way from the browser coroutine."""
+    await ws.accept()
+    pool = None
+    try:
+        auth = await ws.receive_json()
+        token = str(auth.get("token", ""))
+        store = PlatformStore(paths())
+        runner = authenticate_runner(store, token)
+        pool = runner.pool
+        _RUNNER_CHANNELS[pool] = ws
+        await ws.send_json({"t": "ready", "pool": pool})
+        while True:
+            frame = await ws.receive_json()
+            sid = str(frame.get("sid", ""))
+            browser = _BROWSER_SOCKETS.get(sid)
+            if browser is not None:
+                try:
+                    await browser.send_json(frame)
+                except Exception:  # noqa: BLE001
+                    pass
+    except WebSocketDisconnect:
+        pass
+    except Exception:  # noqa: BLE001 — auth failure or malformed frame ends the channel
+        pass
+    finally:
+        if pool and _RUNNER_CHANNELS.get(pool) is ws:
+            _RUNNER_CHANNELS.pop(pool, None)
+
+
+@app.websocket("/api/shell/session/{session_id}")
+async def ws_shell_session(ws: WebSocket, session_id: str) -> None:
+    """Browser terminal socket for one governed interactive session. Opens the
+    device PTY on the runner and pipes keystrokes down / device bytes up."""
+    await ws.accept()
+    session = _SHELL_SESSIONS.get(session_id)
+    if not session:
+        await ws.send_json({"t": "status", "s": "error", "m": "Unknown or expired session."})
+        await ws.close()
+        return
+    pool = runner_pool()
+    runner_ws = _RUNNER_CHANNELS.get(pool)
+    if runner_ws is None:
+        await ws.send_json({"t": "status", "s": "error", "m": f"No runner online for pool '{pool}'."})
+        await ws.close()
+        return
+    _BROWSER_SOCKETS[session_id] = ws
+    state = session.get("state") or {}
+    try:
+        await runner_ws.send_json({"t": "open", "sid": session_id,
+                                   "device_id": session["device_id"], "state": state})
+        _shell_append(paths(), session_id, {"event": "interactive_opened", "device_id": session["device_id"]})
+        while True:
+            frame = await ws.receive_json()
+            kind = frame.get("t")
+            if kind == "in":
+                await runner_ws.send_json({"t": "in", "sid": session_id, "d": frame.get("d", "")})
+            elif kind == "resize":
+                await runner_ws.send_json({"t": "resize", "sid": session_id,
+                                           "cols": frame.get("cols", 120), "rows": frame.get("rows", 40)})
+    except WebSocketDisconnect:
+        pass
+    except Exception:  # noqa: BLE001
+        pass
+    finally:
+        _BROWSER_SOCKETS.pop(session_id, None)
+        current = _RUNNER_CHANNELS.get(pool)
+        if current is not None:
+            try:
+                await current.send_json({"t": "close", "sid": session_id})
+            except Exception:  # noqa: BLE001
+                pass
 
 
 @app.get("/api/shell/{session_id}/transcript")

@@ -1438,3 +1438,8 @@ legend,
 .device-chip { display: inline-block; padding: 3px 10px; border-radius: 999px; font-size: 12px; font-weight: 700; }
 .device-chip.not-touched { background: #e6f5ec; color: #0b7a43; }
 .device-chip.touched { background: #fde7e3; color: #b23b1f; }
+
+/* ---- Netcode Shell: live xterm terminal (MVP4) ---- */
+.shell-xterm { flex: 1; min-height: 480px; padding: 8px 6px 4px 10px; background: #0b1622; overflow: hidden; }
+.shell-xterm .xterm { height: 100%; }
+.shell-hint-bar { padding: 8px 14px; background: #0e1c2c; border-top: 1px solid #142638; color: #6b7d92; font-size: 12.5px; }

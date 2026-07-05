@@ -351,6 +351,7 @@ def run(args: argparse.Namespace) -> int:
     signal.signal(signal.SIGTERM, _handle_sigterm)
     signal.signal(signal.SIGINT, _handle_sigterm)
     print(f"[runner] Polling {server} for pool '{pool}' as {identity['name']} (v{VERSION}). Ctrl-C to stop.")
+    _start_interactive_channel(server, token)  # persistent outbound WS for the interactive shell
     try:
         _post(server, "/api/runner/heartbeat", {"version": VERSION}, token=token)
     except Exception as exc:  # noqa: BLE001
@@ -380,6 +381,105 @@ def run(args: argparse.Namespace) -> int:
             print(f"[runner] Failed to report job {job_id}: {exc}", file=sys.stderr)
     print("[runner] Stopped.")
     return 0
+
+
+def _start_interactive_channel(server: str, token: str) -> None:
+    """Persistent OUTBOUND WebSocket to the control plane for interactive PTY
+    sessions. Runs in a daemon thread alongside the job-poll loop. On an 'open'
+    frame it launches a guarded InteractivePtySession to the device and streams
+    device bytes up / keystrokes down. Credentials never leave: paramiko resolves
+    them from the runner's local inventory."""
+    import base64
+    import threading
+
+    try:
+        import websocket as ws_client  # websocket-client (sync)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[runner] Interactive shell disabled (no websocket-client): {exc}", flush=True)
+        return
+
+    from netcode.inventory import Inventory
+    from netcode.shell_guard import ShellSessionState
+    from netcode.shell_pty import InteractivePtySession
+
+    ws_url = server.replace("https://", "wss://").replace("http://", "ws://").rstrip("/") + "/api/runner/stream"
+    holder: dict[str, Any] = {"ws": None}
+    send_lock = threading.Lock()
+    sessions: dict[str, InteractivePtySession] = {}
+
+    def send_frame(frame: dict[str, Any]) -> None:
+        w = holder["ws"]
+        if w is None:
+            return
+        with send_lock:  # paramiko reader threads + the recv loop all send here
+            try:
+                w.send(json.dumps(frame))
+            except Exception:  # noqa: BLE001
+                pass
+
+    def handle(frame: dict[str, Any]) -> None:
+        t, sid = frame.get("t"), str(frame.get("sid", ""))
+        if t == "open":
+            device = Inventory(INVENTORY_FILE).by_id.get(frame.get("device_id"))
+            if not device:
+                send_frame({"t": "status", "sid": sid, "s": "error", "m": "device not in runner inventory"})
+                return
+            raw = frame.get("state") or {}
+            state = ShellSessionState(mode=str(raw.get("mode", "read_only")),
+                                      change_id=raw.get("change_id"), in_config=bool(raw.get("in_config", False)))
+            sess = InteractivePtySession(
+                device, state,
+                on_output=lambda data, s=sid: send_frame({"t": "out", "sid": s, "d": base64.b64encode(data).decode()}),
+                on_event=lambda ev, s=sid: send_frame({"t": "event", "sid": s, "e": ev}),
+            )
+            sessions[sid] = sess
+            try:
+                sess.open()
+                send_frame({"t": "status", "sid": sid, "s": "open"})
+            except Exception as exc:  # noqa: BLE001
+                send_frame({"t": "status", "sid": sid, "s": "error", "m": str(exc)})
+                sessions.pop(sid, None)
+        elif t == "in":
+            s = sessions.get(sid)
+            if s:
+                s.write(str(frame.get("d", "")))
+        elif t == "resize":
+            s = sessions.get(sid)
+            if s:
+                s.resize(int(frame.get("cols", 120)), int(frame.get("rows", 40)))
+        elif t == "close":
+            s = sessions.pop(sid, None)
+            if s:
+                s.close()
+
+    def run_channel() -> None:
+        while not _stop:
+            try:
+                ws = ws_client.create_connection(ws_url, timeout=12)
+                ws.send(json.dumps({"token": token}))
+                ws.settimeout(None)  # connect had a timeout; recv() must block on an idle channel
+                holder["ws"] = ws
+                print("[runner] Interactive channel connected.", flush=True)
+                while not _stop:
+                    message = ws.recv()
+                    if not message:
+                        break
+                    handle(json.loads(message))
+            except Exception as exc:  # noqa: BLE001
+                print(f"[runner] Interactive channel error: {exc}", flush=True)
+            finally:
+                holder["ws"] = None
+                for s in list(sessions.values()):
+                    try:
+                        s.close()
+                    except Exception:  # noqa: BLE001
+                        pass
+                sessions.clear()
+            if _stop:
+                break
+            time.sleep(3)
+
+    threading.Thread(target=run_channel, name="netcode-interactive", daemon=True).start()
 
 
 def main(argv: list[str] | None = None) -> int:
