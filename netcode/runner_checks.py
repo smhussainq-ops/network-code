@@ -99,7 +99,11 @@ def local_policy_gate(
     for line in render.config.splitlines():
         if not line.strip():
             continue
-        lower = line.lower()
+        # Collapse whitespace runs the way device CLI parsers tokenize, so
+        # 'enable  secret' / 'username\tadmin' can't dodge the single-space
+        # floor fragments. (Red-team confirmed the raw-substring match was
+        # trivially bypassable.)
+        lower = " ".join(line.split()).lower()
         if any(fragment in lower for fragment in blocked):
             blocked_lines.append(line)
         if allowed and not line.startswith(allowed):

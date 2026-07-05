@@ -30,8 +30,16 @@ def test_classify_config_enter_covers_abbreviations():
 
 
 def test_classify_read_commands_pass():
-    for line in ("show vlan brief", "show run | sec vlan", "ping 10.0.0.1", "co", "con"):
+    for line in ("show vlan brief", "show run | sec vlan", "ping 10.0.0.1", "traceroute 10.0.0.1"):
         assert classify_line(line, in_config=False)["kind"] == "read", line
+
+
+def test_classify_unknown_commands_fail_closed():
+    """Allow-list, not deny-list: anything not a known read verb is blocked in a
+    read-only session (do/clear/copy/write/config-transaction/tclsh/bash/...)."""
+    for line in ("do reload", "clear ip bgp *", "copy running-config tftp://h/x",
+                 "write memory", "config-transaction", "configuration", "tclsh", "bash", "reload now"):
+        assert classify_line(line, in_config=False)["kind"] in ("blocked_unknown", "dangerous"), line
 
 
 def test_classify_credential_lines_always_blocked_even_in_config():
@@ -42,11 +50,23 @@ def test_classify_credential_lines_always_blocked_even_in_config():
 def test_classify_dangerous_context():
     assert classify_line("reload", in_config=False)["kind"] == "dangerous"
     assert classify_line("write erase", in_config=False)["kind"] == "dangerous"
-    # config-only dangers are plain reads outside config mode (e.g. "no vlan"
-    # is not a valid exec command anyway)
-    assert classify_line("shutdown", in_config=False)["kind"] == "read"
+    # 'shutdown' outside config isn't a read verb -> fail closed (not "read").
+    assert classify_line("shutdown", in_config=False)["kind"] == "blocked_unknown"
     assert classify_line("shutdown", in_config=True)["kind"] == "dangerous"
     assert classify_line("no vlan 90", in_config=True)["kind"] == "dangerous"
+
+
+def test_classify_do_prefix_and_chaining_and_whitespace():
+    # 'do <exec>' runs an exec command from anywhere -> dangerous, never read.
+    assert classify_line("do reload", in_config=False)["kind"] == "dangerous"
+    # command chaining can't smuggle a second command past first-token checks.
+    assert classify_line("show clock ; reload", in_config=False)["kind"] == "blocked_chain"
+    assert classify_line("show version && configure terminal", in_config=False)["kind"] == "blocked_chain"
+    # whitespace-collapse: double space / tab can't dodge the credential floor.
+    assert classify_line("enable  secret cisco", in_config=True)["kind"] == "always_blocked"
+    assert classify_line("username\tadmin secret x", in_config=True)["kind"] == "always_blocked"
+    # config-mode entry variants that aren't the exact token still fail closed.
+    assert classify_line("config-transaction", in_config=False)["kind"] == "blocked_unknown"
 
 
 # ---------------------------------------------------------------- the gate
@@ -212,3 +232,28 @@ def test_rest_config_enter_still_gated_via_guard_submit():
 def test_submit_line_rejects_control_bytes_directly():
     state = ShellSessionState()
     assert submit_line(state, "show ver\x08\x08x")["cleared"] is False
+
+
+def test_redteam_criticals_are_blocked_at_guard_submit():
+    """The confirmed red-team bypasses, at the real /api/shell/input entry point.
+    None may return run_reads from a read-only session."""
+    criticals = [
+        "do reload", "do write erase",
+        "clear ip bgp *", "clear logging",
+        "copy running-config tftp://198.51.100.9/rc",
+        "write memory", "wr",
+        "config-transaction", "configuration",
+        "show clock ; reload", "show version && configure terminal",
+        "tclsh", "bash", "python", "send log all shutdown",
+    ]
+    for cmd in criticals:
+        state = ShellSessionState()  # read-only
+        decision = guard_submit(state, cmd)
+        assert decision["kind"] == "blocked", f"{cmd!r} -> {decision['kind']} (must be blocked)"
+        assert state.in_config is False and state.device_touched is False, cmd
+
+
+def test_redteam_multiline_destructive_paste_blocked():
+    state = ShellSessionState()
+    assert guard_submit(state, "show clock\nclear logging")["kind"] == "blocked"
+    assert guard_submit(ShellSessionState(), "terminal length 0\nreload")["kind"] in ("blocked", "paste_intercept")

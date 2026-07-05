@@ -431,15 +431,22 @@ def test_discovery_credentials_never_exposed_via_jobs(tmp_path: Path):
     assert listed["payload"]["password"] == "***redacted***"
     assert "hunter2" not in json.dumps(listed)
 
-    # After the runner uses it, the secret is scrubbed from the DB at rest.
-    store.scrub_job_payload_secrets(job.id)
+    # Scrub-on-CLAIM: a runner that dies mid-read still can't leave the secret
+    # at rest — claiming the job scrubs the stored copy immediately, while the
+    # returned object still carries the real creds for the runner to use.
+    claimed = store.claim_next_job("org_default", "store-lab", "runner-x")
+    assert claimed.id == job.id
+    assert claimed.payload["password"] == "hunter2"  # runner gets the real cred
     reopened = PlatformStore(paths)
-    raw = reopened.get_job(job.id)
-    assert raw.payload["password"] == "***redacted***"  # gone from storage, not just the API
-    assert "hunter2" not in json.dumps(raw.payload)
+    at_rest = reopened.get_job(job.id)
+    assert at_rest.payload["password"] == "***redacted***"  # but the DB copy is scrubbed
+    assert "hunter2" not in json.dumps(at_rest.payload)
 
-    # The redactor is conservative: non-secret fields survive.
-    assert redact_secrets({"username": "admin", "host": "x"})["host"] == "x"
+    # Broadened redaction catches the spellings the red-team named; non-secret
+    # fields survive.
+    red = redact_secrets({"pwd": "x", "api_key": "y", "passphrase": "z", "host": "1.2.3.4", "port": 22})
+    assert red["pwd"] == "***redacted***" and red["api_key"] == "***redacted***" and red["passphrase"] == "***redacted***"
+    assert red["host"] == "1.2.3.4" and red["port"] == 22
 
 
 def test_runner_credential_floor_survives_empty_and_hostile_policy(tmp_path: Path):

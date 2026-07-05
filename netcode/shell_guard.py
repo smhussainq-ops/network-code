@@ -97,17 +97,51 @@ class GuardDecision:
     events: list[dict[str, Any]] = field(default_factory=list)
 
 
+# A STRICT allow-list of read-only exec verbs. In a read-only session ONLY these
+# clear as "read" — everything unrecognized fails closed. This is the structural
+# fix for deny-list-by-omission: 'do reload', 'clear ip bgp *', 'copy run tftp:',
+# 'config-transaction', 'write', etc. are all rejected because they aren't here,
+# not because we remembered to blocklist them. (Red-team confirmed the deny-list
+# approach was trivially under-inclusive.)
+_READ_VERBS = frozenset({
+    "show", "sh", "sho", "ping", "traceroute", "trace", "tracert",
+    "dir", "more", "who", "whoami", "uptime", "which", "pwd",
+    "exit", "quit", "logout", "end", "enable", "disable",
+})
+
+# Command-chaining / redirection separators that let a benign-looking first token
+# smuggle a second command. Pipe is NOT here: EOS/IOS only pipe to output filters
+# (include/section/grep), which is safe and heavily used for reads.
+_CHAIN_SEPARATORS = (";", "&", "`", "$(", "$(", ">", "<", "\x00", "\n", "\r")
+
+
+def _collapse_ws(text: str) -> str:
+    """Collapse every run of whitespace to a single space, matching how device
+    CLI parsers tokenize. Defeats double-space/tab evasion of the fragment lists."""
+    return " ".join(text.split())
+
+
 def _first_token(line: str) -> str:
-    stripped = line.replace("\t", " ").strip().lower()
-    return stripped.split(" ", 1)[0] if stripped else ""
+    normalized = _collapse_ws(line).strip().lower()
+    return normalized.split(" ", 1)[0] if normalized else ""
 
 
 def classify_line(line: str, in_config: bool) -> dict[str, Any]:
-    """Classify one completed command line. Pure function; heavily tested."""
-    normalized = line.replace("\t", " ").strip()
+    """Classify one completed command line. Pure function; heavily tested.
+
+    Fail-closed: in a read-only session, a line is "read" ONLY if its first token
+    is in the strict read allow-list; anything else is "blocked_unknown"."""
+    normalized = _collapse_ws(line).strip()
     lowered = normalized.lower()
     if not lowered:
         return {"kind": "empty"}
+    # Command chaining lets 'show x ; reload' smuggle a second command past
+    # first-token classification. Reject outright.
+    for sep in _CHAIN_SEPARATORS:
+        if sep in lowered:
+            return {"kind": "blocked_chain", "match": sep.strip() or "control"}
+    # Credential/AAA floor — matched on the whitespace-collapsed line so
+    # 'enable  secret' / 'username\tadmin' can't dodge it.
     for fragment in ALWAYS_BLOCKED_FRAGMENTS:
         if fragment in lowered + " ":
             return {"kind": "always_blocked", "fragment": fragment.strip()}
@@ -116,44 +150,39 @@ def classify_line(line: str, in_config: bool) -> dict[str, Any]:
         return {"kind": "config_enter"}
     if in_config and lowered in ("end", "exit", "abort"):
         return {"kind": "config_exit"}
+    # 'do <exec>' runs an exec command from config mode — treat as dangerous.
+    if token == "do":
+        return {"kind": "dangerous", "match": "do"}
     for prefix in DANGEROUS_PREFIXES:
         config_only = prefix in ("no vlan", "no interface", "no router", "shutdown")
         if lowered.startswith(prefix) and (in_config or not config_only):
             return {"kind": "dangerous", "match": prefix}
     if in_config:
         return {"kind": "config_line"}
-    return {"kind": "read"}
+    if token in _READ_VERBS:
+        return {"kind": "read"}
+    # Unrecognized in a read-only session: fail closed (clear/copy/write/
+    # config-transaction/tclsh/bash/... all land here).
+    return {"kind": "blocked_unknown", "token": token}
 
 
 def looks_like_paste(chunk: str) -> bool:
     return chunk.count("\n") + chunk.count("\r") >= 2
 
 
-# First tokens that are provably read-only; a pasted line with any OTHER
-# token makes the whole paste config-ish (fail closed: unknown = intercept).
-_PASTE_READ_TOKENS = {
-    "show", "sh", "sho", "ping", "traceroute", "dir", "more", "enable", "en",
-    "terminal", "exit", "quit", "bash", "watch",
-}
-
-
 def _paste_decision(state: ShellSessionState, chunk: str) -> GuardDecision | None:
-    """Intercept multi-line pastes containing configuration content, before
-    ANY byte reaches the device. Fail closed: a paste passes only when every
-    line is provably read-only."""
+    """Intercept multi-line pastes containing anything that isn't a plain read,
+    before ANY byte reaches the device. Fail closed: a paste passes only when
+    EVERY line classifies as a strict read (or is blank)."""
     if not looks_like_paste(chunk):
         return None
     lines = [l for l in chunk.replace("\r", "\n").split("\n") if l.strip()]
     configish = False
     for line in lines:
-        verdict = classify_line(line, state.in_config)
-        if verdict["kind"] in ("config_enter", "config_line", "always_blocked", "dangerous"):
-            configish = True
-            break
         if line[:1].isspace():  # indented lines are config-block style
             configish = True
             break
-        if _first_token(line) not in _PASTE_READ_TOKENS:
+        if classify_line(line, state.in_config)["kind"] not in ("read", "empty"):
             configish = True
             break
     if not configish:
@@ -252,6 +281,20 @@ def _enter_decision(state: ShellSessionState, enter_byte: str) -> GuardDecision:
         state.pending_confirm = None
         return GuardDecision(forward=enter_byte, events=[])
 
+    if kind in ("blocked_unknown", "blocked_chain"):
+        state.pending_confirm = None
+        reason = ("command chaining/redirection is not allowed" if kind == "blocked_chain"
+                  else f"'{verdict.get('token', '')}' is not a recognized read-only command")
+        return GuardDecision(forward=KILL_LINE, events=[{
+            "type": "guard", "action": kind,
+            "message": (
+                f"Blocked: {reason}. Read-only sessions allow only known read "
+                "commands (show/ping/traceroute/...). To change the device, "
+                "attach a change record. Nothing was sent to the device."
+            ),
+        }])
+
+    # read / empty
     state.pending_confirm = None
     return GuardDecision(forward=enter_byte, events=[])
 

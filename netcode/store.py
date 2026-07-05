@@ -631,7 +631,14 @@ class PlatformStore:
             )
             if cursor.rowcount != 1:
                 return None  # another runner won the race
-        return self.get_job(row["id"])
+        # Fetch the job WITH its real payload to hand back to the runner (it
+        # needs any discovery credentials to reach the not-yet-trusted device),
+        # then scrub the STORED copy immediately. A runner that dies mid-read
+        # therefore never leaves the credential at rest in the control plane —
+        # the previous scrub-on-successful-result missed exactly that case.
+        claimed = self.get_job(row["id"])
+        self.scrub_job_payload_secrets(claimed.id)
+        return claimed
 
     def record_job_signature(self, job_id: str, signature: str) -> None:
         with self._connect() as conn:
@@ -724,7 +731,11 @@ class PlatformStore:
         )
 
 
-_SENSITIVE_PAYLOAD_KEYS = ("password", "secret", "token", "passwd", "credential", "enable_secret")
+_SENSITIVE_PAYLOAD_KEYS = (
+    "password", "passwd", "pwd", "secret", "token", "credential", "enable_secret",
+    "passphrase", "api_key", "apikey", "private_key", "privatekey",
+    "username", "login",  # the account name to reach an untrusted device is recon-sensitive
+)
 
 
 def redact_secrets(value: Any) -> Any:
