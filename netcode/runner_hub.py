@@ -118,6 +118,9 @@ def submit_job_result(
         read_ok = result.get("ok", result.get("status") == "pass")
         final_job = store.update_job(job.id, "completed" if read_ok else "failed", str(result.get("message", "read complete")), result)
         store.record_job_signature(job.id, signature)
+        # The runner has used any discovery credentials in the payload; purge them
+        # from the DB now so they never sit at rest in the control plane.
+        store.scrub_job_payload_secrets(job.id)
         store.touch_runner(runner.id, status="online")
         return {"ok": True, "job": record_to_dict(final_job), "message": "Read result accepted."}
 

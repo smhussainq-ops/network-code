@@ -414,6 +414,61 @@ def test_runner_local_policy_gate_blocks_forbidden_config(tmp_path: Path):
     assert local_policy_gate(intent, clean, "{{ not: valid: yaml")["ok"] is False
 
 
+def test_discovery_credentials_never_exposed_via_jobs(tmp_path: Path):
+    """Trust-debt #1: a discovery read job carries device creds to the runner,
+    but they must never be readable back out — redacted on return AND scrubbed
+    at rest once the runner has used them."""
+    from netcode.store import record_to_dict, redact_secrets
+
+    paths = WorkspacePaths(tmp_path)
+    init_workspace(paths)
+    store = PlatformStore(paths)
+
+    job = store.create_read_job("org_default", "store-lab", "discovery",
+                                {"host": "10.0.0.9", "username": "admin", "password": "hunter2", "platform": "arista_eos"})
+    # On return, the password is redacted even while the job is still queued.
+    listed = record_to_dict(store.list_jobs(org_id="org_default")[0])
+    assert listed["payload"]["password"] == "***redacted***"
+    assert "hunter2" not in json.dumps(listed)
+
+    # After the runner uses it, the secret is scrubbed from the DB at rest.
+    store.scrub_job_payload_secrets(job.id)
+    reopened = PlatformStore(paths)
+    raw = reopened.get_job(job.id)
+    assert raw.payload["password"] == "***redacted***"  # gone from storage, not just the API
+    assert "hunter2" not in json.dumps(raw.payload)
+
+    # The redactor is conservative: non-secret fields survive.
+    assert redact_secrets({"username": "admin", "host": "x"})["host"] == "x"
+
+
+def test_runner_credential_floor_survives_empty_and_hostile_policy(tmp_path: Path):
+    """Trust-debt #2: a compromised control plane shipping an EMPTY policy (or a
+    custom_config intent, whose allow-list is empty) still cannot push
+    credentials — the hardcoded floor is enforced regardless of policy."""
+    from types import SimpleNamespace
+
+    from netcode.models import RenderResult
+    from netcode.runner_checks import local_policy_gate
+
+    # custom_config: allow-list is empty, so only blocked-fragments protect us.
+    intent = SimpleNamespace(change_type="custom_config")  # gate reads only .change_type
+    creds = RenderResult(template_path="x", config="username backdoor secret oops\n", variables={})
+
+    # Empty payload policy AND empty local policy -> floor still blocks.
+    gate = local_policy_gate(intent, creds, "", "")
+    assert gate["ok"] is False and gate["blocked_lines"]
+
+    # Hostile policy that explicitly clears blocked_fragments -> floor still blocks.
+    hostile = "render_scope:\n  blocked_fragments: []\n  custom_config_allowed_prefixes: ['username ']\n"
+    gate = local_policy_gate(intent, creds, hostile, "")
+    assert gate["ok"] is False and gate["blocked_lines"]
+
+    # A benign custom_config line passes under empty policy (floor doesn't over-block).
+    benign = RenderResult(template_path="x", config="ntp server 10.0.0.1\n", variables={})
+    assert local_policy_gate(intent, benign, "", "")["ok"] is True
+
+
 def test_backend_blocks_apply_before_dry_run(tmp_path: Path, monkeypatch):
     init_workspace(WorkspacePaths(tmp_path))
     monkeypatch.chdir(tmp_path)

@@ -256,10 +256,40 @@ def _enter_decision(state: ShellSessionState, enter_byte: str) -> GuardDecision:
     return GuardDecision(forward=enter_byte, events=[])
 
 
+def has_forbidden_control(text: str) -> bool:
+    """True if the text carries control/escape bytes that could make what the
+    DEVICE executes differ from the classified text (backspace edits the line,
+    Ctrl-U wipes it, ESC starts a terminal sequence). Over REST we cannot
+    reconstruct keystroke intent, so any such byte is fail-closed."""
+    for ch in text:
+        if ch in ("\n", "\r", "\t"):
+            continue
+        if ch == "\x1b" or ord(ch) < 0x20 or ch == "\x7f":
+            return True
+    return False
+
+
+def _tainted_block(state: ShellSessionState, line: str) -> dict[str, Any]:
+    return {
+        "cleared": False, "line": line, "kind": "tainted",
+        "events": [{
+            "type": "guard", "action": "blocked_unverifiable_line",
+            "message": (
+                "Blocked: the input contained control or escape characters the "
+                "guard can't verify (e.g. backspace/kill/escape). Send plain "
+                "command text. Nothing was sent to the device."
+            ),
+        }],
+        "state": state.as_dict(),
+    }
+
+
 def submit_line(state: ShellSessionState, line: str) -> dict[str, Any]:
     """Line-oriented gate for the REST Shell (MVP1/2). Runs the SAME tested
-    decision as the streaming path. Returns whether the line is cleared to
-    reach the device and the guard events to surface."""
+    decision as the streaming path. Fail-closed on control/escape bytes so the
+    device can't execute something other than the classified text."""
+    if has_forbidden_control(line):
+        return _tainted_block(state, line)
     state.line_buffer = line.rstrip("\r\n")
     state.tainted = False
     decision = _enter_decision(state, "\r")
@@ -272,6 +302,49 @@ def submit_line(state: ShellSessionState, line: str) -> dict[str, Any]:
         "events": decision.events,
         "state": state.as_dict(),
     }
+
+
+def guard_submit(state: ShellSessionState, text: str) -> dict[str, Any]:
+    """The single fail-closed entry for REST input (one line OR a multi-line
+    paste). Centralizes every decision so the runner just executes the result.
+
+    Returns a dict with `kind`:
+      - "run_reads": `lines` are cleared read-only commands to execute
+      - "config_staged": a cleared config line (never raw-executed here)
+      - "paste_intercept": a config-ish paste to stage as a change
+      - "blocked": guard refused; see `events`
+    """
+    if has_forbidden_control(text):
+        blocked = _tainted_block(state, text)
+        return {"kind": "blocked", "lines": [], "events": blocked["events"], "state": blocked["state"]}
+
+    lines = [l for l in text.replace("\r", "\n").split("\n") if l.strip()]
+
+    if len(lines) > 1:
+        paste = submit_paste(state, text)
+        if paste is not None:
+            return {"kind": "paste_intercept", "lines": [], "events": paste["events"], "state": paste["state"]}
+        # Multi-line, not config-ish: allow ONLY if EVERY line is a plain read.
+        for line in lines:
+            verdict = classify_line(line, state.in_config)
+            if verdict["kind"] not in ("read", "empty"):
+                return {"kind": "blocked", "lines": [], "state": state.as_dict(), "events": [{
+                    "type": "guard", "action": "blocked_mixed_multiline",
+                    "message": (
+                        "Blocked: multi-line input mixes reads with non-read "
+                        "commands. Send read commands one per line, or stage a "
+                        "configuration change. Nothing was sent to the device."
+                    ),
+                }]}
+        return {"kind": "run_reads", "lines": lines, "events": [], "state": state.as_dict()}
+
+    single = lines[0] if lines else ""
+    result = submit_line(state, single)
+    if result["cleared"] and not state.in_config and result["kind"] in ("read", "config_exit", "empty"):
+        return {"kind": "run_reads", "lines": [single], "events": result["events"], "state": result["state"]}
+    if result["cleared"] and state.in_config:
+        return {"kind": "config_staged", "lines": [], "events": result["events"], "state": result["state"]}
+    return {"kind": "blocked", "lines": [], "events": result["events"], "state": result["state"]}
 
 
 def submit_paste(state: ShellSessionState, text: str) -> dict[str, Any] | None:

@@ -122,8 +122,11 @@ def _execute_job(job: dict[str, Any]) -> dict[str, Any]:
     render = render_intent(intent, _RunnerPaths(ws_root))
 
     # Second safety gate: local fail-closed policy re-check. A compromised control
-    # plane cannot make the runner push forbidden config.
-    gate = local_policy_gate(intent, render, payload.get("policy_yaml", ""))
+    # plane cannot make the runner push forbidden config — the runner's OWN
+    # policy file (if present) and a hardcoded credential floor are enforced on
+    # top of whatever policy the control plane shipped.
+    local_policy_yaml = POLICY_FILE.read_text(encoding="utf-8") if POLICY_FILE.exists() else ""
+    gate = local_policy_gate(intent, render, payload.get("policy_yaml", ""), local_policy_yaml)
     if not gate["ok"]:
         return {
             "status": "fail",
@@ -286,7 +289,7 @@ def _execute_read_inner(action: str, payload: dict[str, Any]) -> dict[str, Any]:
         # cleared read-only line is executed on the device. Config execution is
         # never done raw — it stays in the proven plan/dry-run/apply pipeline.
         from netcode.lab import AristaEOSLabAdapter
-        from netcode.shell_guard import ShellSessionState, submit_line, submit_paste
+        from netcode.shell_guard import ShellSessionState, guard_submit
         inv = Inventory(INVENTORY_FILE)
         device = inv.by_id.get(payload.get("device_id"))
         if not device:
@@ -298,29 +301,26 @@ def _execute_read_inner(action: str, payload: dict[str, Any]) -> dict[str, Any]:
             in_config=bool(raw.get("in_config", False)),
             device_touched=bool(raw.get("device_touched", False)),
         )
-        text = str(payload.get("input", ""))
-        paste = submit_paste(state, text) if ("\n" in text or "\r" in text) else None
-        if paste is not None:
-            return {"ok": True, "cleared": False, "output": "", "events": paste["events"],
-                    "state": paste["state"], "device_touched": state.device_touched}
-        result = submit_line(state, text)
+        decision = guard_submit(state, str(payload.get("input", "")))
         output = ""
         executed = False
-        if result["cleared"] and not state.in_config and result["kind"] in ("read", "config_exit", "empty"):
+        cleared = decision["kind"] in ("run_reads", "config_staged")
+        if decision["kind"] == "run_reads":
             adapter = AristaEOSLabAdapter(device)
             try:
                 adapter.connect()
-                output = adapter.show(text.strip())
+                output = "\n".join(adapter.show(line.strip()) for line in decision["lines"])
                 executed = True
             except Exception as exc:  # noqa: BLE001
                 output = f"[shell] device read failed: {exc}"
             finally:
                 adapter.disconnect()
-        elif result["cleared"] and state.in_config:
+        elif decision["kind"] == "config_staged":
             output = "[staged] config line captured — stage & apply through the change pipeline."
-        return {"ok": True, "cleared": result["cleared"], "executed": executed,
-                "output": output, "events": result["events"], "state": result["state"],
-                "device_touched": state.device_touched, "device_id": device.id, "platform": device.platform}
+        return {"ok": True, "cleared": cleared, "executed": executed, "guard_kind": decision["kind"],
+                "output": output, "events": decision["events"], "state": decision["state"],
+                "device_touched": bool(decision["state"].get("device_touched")),
+                "device_id": device.id, "platform": device.platform}
 
     if action == "discovery":
         from netcode.discovery import DiscoveryService

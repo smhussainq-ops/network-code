@@ -33,18 +33,61 @@ _DEFAULT_ALLOWED = {
     "custom_config": [],
 }
 
+# A hardcoded floor the runner enforces for EVERY change type, regardless of the
+# policy shipped by the control plane or configured locally. A compromised
+# control plane shipping an empty policy still cannot push credentials/AAA —
+# these can never be disabled. (Mirrors the shell guard's ALWAYS_BLOCKED set.)
+_ALWAYS_BLOCKED = (
+    "username ",
+    "enable secret",
+    "enable password",
+    "aaa ",
+    "tacacs",
+    "radius",
+    "snmp-server community",
+    "crypto key",
+    "key config-key",
+)
 
-def local_policy_gate(intent: Intent, render: RenderResult, policy_yaml: str) -> dict[str, Any]:
-    """Return {ok, message, blocked_lines, unexpected_lines}. ok=False blocks execution."""
-    try:
-        policy = yaml.safe_load(io.StringIO(policy_yaml)) or {}
-    except Exception as exc:  # noqa: BLE001 — malformed policy must fail closed
-        return {"ok": False, "message": f"Local policy could not be parsed (fail-closed): {exc}"}
 
-    scope = policy.get("render_scope", {}) if isinstance(policy, dict) else {}
+def local_policy_gate(
+    intent: Intent,
+    render: RenderResult,
+    policy_yaml: str,
+    local_policy_yaml: str = "",
+) -> dict[str, Any]:
+    """Return {ok, message, blocked_lines, unexpected_lines}. ok=False blocks execution.
+
+    Fail-closed and does NOT trust the control plane: blocked fragments are the
+    UNION of the hardcoded floor, the runner's LOCAL policy, and the payload
+    policy (more blocking is always safer). Allowed prefixes prefer the local
+    policy, then payload, then built-in defaults."""
+    def parse(text: str) -> dict[str, Any]:
+        try:
+            value = yaml.safe_load(io.StringIO(text)) or {}
+        except Exception:  # noqa: BLE001 — malformed policy contributes nothing (never fail open)
+            return {"__error__": True}
+        return value if isinstance(value, dict) else {}
+
+    payload_policy = parse(policy_yaml)
+    local_policy = parse(local_policy_yaml)
+    if payload_policy.get("__error__") and not local_policy:
+        return {"ok": False, "message": "Control-plane policy could not be parsed (fail-closed)."}
+
     change_type = intent.change_type
-    allowed = tuple(scope.get(f"{change_type}_allowed_prefixes", _DEFAULT_ALLOWED.get(change_type, [])))
-    blocked = [str(v).lower() for v in scope.get("blocked_fragments", [])]
+    payload_scope = payload_policy.get("render_scope", {}) if isinstance(payload_policy, dict) else {}
+    local_scope = local_policy.get("render_scope", {}) if isinstance(local_policy, dict) else {}
+
+    # Allowed prefixes: local wins, then payload, then built-in defaults.
+    key = f"{change_type}_allowed_prefixes"
+    allowed_list = local_scope.get(key) or payload_scope.get(key) or _DEFAULT_ALLOWED.get(change_type, [])
+    allowed = tuple(allowed_list)
+
+    # Blocked fragments: hardcoded floor ∪ local ∪ payload (union = strictly safer).
+    blocked = {frag.lower() for frag in _ALWAYS_BLOCKED}
+    blocked |= {str(v).lower() for v in payload_scope.get("blocked_fragments", [])}
+    blocked |= {str(v).lower() for v in local_scope.get("blocked_fragments", [])}
+    blocked = list(blocked)
     # Same per-change-type carve-outs the control plane uses, applied locally.
     if change_type == "bgp_neighbor":
         blocked = [fragment for fragment in blocked if fragment != "router bgp"]

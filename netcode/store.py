@@ -637,6 +637,21 @@ class PlatformStore:
         with self._connect() as conn:
             conn.execute("UPDATE jobs SET signature = ? WHERE id = ?", (signature, job_id))
 
+    def scrub_job_payload_secrets(self, job_id: str) -> None:
+        """Purge credentials from a job's stored payload once the runner has used
+        them. Discovery must ship creds to the runner (the device isn't trusted
+        yet), but they must not sit at rest in the control-plane DB afterward."""
+        with self._connect() as conn:
+            row = conn.execute("SELECT payload_json FROM jobs WHERE id = ?", (job_id,)).fetchone()
+            if not row or not self._col(row, "payload_json"):
+                return
+            try:
+                payload = json.loads(self._col(row, "payload_json"))
+            except Exception:  # noqa: BLE001
+                return
+            conn.execute("UPDATE jobs SET payload_json = ? WHERE id = ?",
+                         (json.dumps(redact_secrets(payload)), job_id))
+
     # ── Orgs / users / sessions (M5 auth + multi-tenancy) ─────────────────
 
     def ensure_org(self, org_id: str, name: str, slug: str) -> None:
@@ -709,5 +724,28 @@ class PlatformStore:
         )
 
 
+_SENSITIVE_PAYLOAD_KEYS = ("password", "secret", "token", "passwd", "credential", "enable_secret")
+
+
+def redact_secrets(value: Any) -> Any:
+    """Recursively replace sensitive values so device credentials are never
+    surfaced through the API. Discovery of an untrusted device is the one moment
+    creds transit; they must never be read back out of a job payload."""
+    if isinstance(value, dict):
+        redacted: dict[str, Any] = {}
+        for key, item in value.items():
+            if any(marker in str(key).lower() for marker in _SENSITIVE_PAYLOAD_KEYS) and item not in (None, ""):
+                redacted[key] = "***redacted***"
+            else:
+                redacted[key] = redact_secrets(item)
+        return redacted
+    if isinstance(value, list):
+        return [redact_secrets(item) for item in value]
+    return value
+
+
 def record_to_dict(record: ChangeRecord | JobRecord | WorkflowEventRecord) -> dict[str, Any]:
-    return record.__dict__.copy()
+    data = record.__dict__.copy()
+    if "payload" in data and data["payload"]:
+        data["payload"] = redact_secrets(data["payload"])
+    return data

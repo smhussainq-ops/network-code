@@ -10,7 +10,9 @@ from netcode.shell_guard import (
     ShellSessionState,
     classify_line,
     feed,
+    guard_submit,
     looks_like_paste,
+    submit_line,
 )
 
 
@@ -151,3 +153,62 @@ def test_show_command_paste_passes_through():
 def test_paste_detection_thresholds():
     assert looks_like_paste("show ver\nshow vlan\n") is True
     assert looks_like_paste("show ver\r") is False
+
+
+# -------------------------------------------------- REST taint/injection gap
+
+def test_rest_backspace_injection_cannot_smuggle_config_enter():
+    """The classic injection: classify as a read, but backspaces edit the line
+    on the device into 'conf t'. Must be fail-closed on control bytes."""
+    state = ShellSessionState()  # read_only
+    d = guard_submit(state, "show ver\x08\x08\x08\x08\x08\x08\x08\x08conf t")
+    assert d["kind"] == "blocked"
+    assert any(e["action"] == "blocked_unverifiable_line" for e in d["events"])
+    assert state.in_config is False
+
+
+def test_rest_kill_line_and_escape_are_blocked():
+    for hostile in ("show ver\x15conf t", "show ver\x1b[Dconf t", "conf\tt"[:0] + "sh\x1bver"):
+        state = ShellSessionState()
+        d = guard_submit(state, hostile)
+        assert d["kind"] == "blocked", hostile
+
+
+def test_rest_embedded_newline_credential_is_not_smuggled_past_a_read():
+    """'show version\\nusername evil ...' must never be forwarded as one read."""
+    state = ShellSessionState(mode="change_attached", change_id="CHG-1")
+    d = guard_submit(state, "show version\nusername evil secret x")
+    assert d["kind"] in ("blocked", "paste_intercept")  # never run_reads
+    assert d["kind"] != "run_reads"
+
+
+def test_rest_multiline_all_reads_runs_each_line():
+    state = ShellSessionState()
+    d = guard_submit(state, "show version\nshow vlan brief\nshow ip route")
+    assert d["kind"] == "run_reads"
+    assert d["lines"] == ["show version", "show vlan brief", "show ip route"]
+
+
+def test_rest_multiline_mixing_read_and_nonread_blocks():
+    state = ShellSessionState()
+    d = guard_submit(state, "show version\nreload")
+    assert d["kind"] == "blocked"
+    assert any(e["action"] in ("blocked_mixed_multiline", "paste_intercepted") for e in d["events"]) or d["kind"] == "blocked"
+
+
+def test_rest_single_read_runs():
+    state = ShellSessionState()
+    d = guard_submit(state, "show vlan brief")
+    assert d["kind"] == "run_reads" and d["lines"] == ["show vlan brief"]
+
+
+def test_rest_config_enter_still_gated_via_guard_submit():
+    read_only = ShellSessionState()
+    assert guard_submit(read_only, "conf t")["kind"] == "blocked"
+    attached = ShellSessionState(mode="change_attached", change_id="CHG-1")
+    assert guard_submit(attached, "conf t")["kind"] == "config_staged"
+
+
+def test_submit_line_rejects_control_bytes_directly():
+    state = ShellSessionState()
+    assert submit_line(state, "show ver\x08\x08x")["cleared"] is False
