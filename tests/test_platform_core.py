@@ -541,6 +541,31 @@ def test_rez_runner_read_endpoint_strips_credentials_and_queues_only_supported_a
     assert scan_payload["_runner_timeout_seconds"] == 1.0
     assert "username" not in scan_payload and "password" not in scan_payload
 
+    probe_resp = client.post(
+        "/api/rez/runner-read",
+        json={
+            "action": "rez_server_listener_probe",
+            "timeout": 1,
+            "payload": {
+                "source_device": "arista-dc",
+                "src_ip": "10.10.0.10",
+                "dst_ip": "10.20.0.10",
+                "dst_port": 443,
+                "username": "should-not-queue",
+                "password": "should-not-queue",
+            },
+        },
+    )
+    assert probe_resp.status_code == 200
+    jobs = client.get("/api/jobs").json()["jobs"]
+    probe_jobs = [j for j in jobs if j["action"] == "read_rez_server_listener_probe"]
+    assert probe_jobs
+    probe_payload = probe_jobs[0]["payload"]
+    assert probe_payload["source_device"] == "arista-dc"
+    assert probe_payload["dst_port"] == 443
+    assert probe_payload["_runner_timeout_seconds"] == 1.0
+    assert "username" not in probe_payload and "password" not in probe_payload
+
 
 def test_rez_runner_read_endpoint_roundtrip_returns_runner_stdout(tmp_path: Path, monkeypatch):
     import hashlib
@@ -803,6 +828,91 @@ devices:
     assert result["state"]["interfaces"] == {"Ethernet1": {"status": "up"}}
     assert seen["device"].username == "runner-admin"
     assert seen["device"].password == "runner-secret"
+
+
+def test_runner_rez_source_probes_use_local_inventory_and_fixed_commands(tmp_path: Path, monkeypatch):
+    import sys
+    import types
+
+    from netcode import runner_agent
+
+    inv = tmp_path / "inventory.yaml"
+    inv.write_text(
+        """
+defaults:
+  username: default-admin
+  password: default-secret
+devices:
+  - id: arista-dc
+    hostname: arista-dc
+    host: 127.0.0.1
+    platform: arista_eos
+    username: runner-admin
+    password: runner-secret
+    port: 3401
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(runner_agent, "INVENTORY_FILE", inv)
+    captured = []
+
+    class FakeConn:
+        def __init__(self, **kwargs):  # noqa: ANN001
+            captured.append({"connect": kwargs})
+
+        def enable(self):
+            return None
+
+        def send_command(self, command, **_kwargs):  # noqa: ANN001
+            captured.append({"command": command})
+            if "nc -vz" in command:
+                return "Ncat: Connection refused."
+            return "HTTP/1.1 403 Forbidden\nblocked"
+
+        def send_command_timing(self, command, **_kwargs):  # noqa: ANN001
+            return self.send_command(command)
+
+        def disconnect(self):
+            return None
+
+    monkeypatch.setitem(sys.modules, "netmiko", types.SimpleNamespace(ConnectHandler=lambda **kwargs: FakeConn(**kwargs)))
+
+    listener = runner_agent._execute_read_inner(
+        "rez_server_listener_probe",
+        {
+            "source_device": "arista-dc",
+            "src_ip": "10.10.0.10",
+            "dst_ip": "10.20.0.10",
+            "dst_port": 443,
+            "timeout_seconds": 2,
+            "username": "must-not-use",
+            "password": "must-not-use",
+        },
+    )
+    http = runner_agent._execute_read_inner(
+        "rez_http_flow_probe",
+        {
+            "source_device": "arista-dc",
+            "src_ip": "10.10.0.10",
+            "dst_ip": "1.1.1.1",
+            "dst_port": 80,
+            "timeout_seconds": 3,
+        },
+    )
+
+    assert listener["ok"] is True
+    assert listener["source_matches_flow"] is True
+    assert listener["listener_present"] is False
+    assert listener["rootable"] is True
+    assert http["ok"] is True
+    assert http["root_atom"] == "FW_URL_FILTER_BLOCK"
+    assert captured[0]["connect"]["username"] == "runner-admin"
+    assert captured[0]["connect"]["password"] == "runner-secret"
+    commands = [entry["command"] for entry in captured if "command" in entry]
+    assert commands == [
+        "bash timeout 2 nc -vz 10.20.0.10 443",
+        "bash timeout 3 curl -v -m 3 http://1.1.1.1/ 2>&1 | head -120",
+    ]
 
 
 def test_runner_read_timeout_cancels_queued_job(tmp_path: Path, monkeypatch):

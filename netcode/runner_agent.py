@@ -21,6 +21,7 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import signal
 import sys
 import time
@@ -431,6 +432,231 @@ def _collect_rez_runner_state(device_id: str) -> tuple[Any, dict[str, Any] | Non
     return device, state, None
 
 
+def _resolve_inventory_device(identifier: str):
+    from netcode.inventory import Inventory
+
+    target = str(identifier or "").strip()
+    if not target:
+        return None
+    inv = Inventory(INVENTORY_FILE)
+    direct = inv.by_id.get(target)
+    if direct:
+        return direct
+    for device in inv.devices:
+        host_port = f"{getattr(device, 'host', '')}:{getattr(device, 'port', '')}"
+        candidates = {
+            str(getattr(device, "id", "") or ""),
+            str(getattr(device, "hostname", "") or ""),
+            str(getattr(device, "host", "") or ""),
+            host_port,
+        }
+        if target in candidates:
+            return device
+    return None
+
+
+def _http_status_from_probe_output(output: str) -> int | None:
+    matches = re.findall(r"HTTP/(?:1\.[01]|2)\s+(\d{3})\b", str(output or ""), flags=re.IGNORECASE)
+    if not matches:
+        return None
+    try:
+        return int(matches[-1])
+    except Exception:
+        return None
+
+
+def _probe_timeout_seconds(value: Any, *, default: float, maximum: float) -> int:
+    try:
+        requested = float(value or default)
+    except Exception:
+        requested = default
+    return max(1, min(int(requested), int(maximum)))
+
+
+def _execute_source_probe_command(
+    *,
+    source_device: str,
+    command: str,
+    timeout_seconds: float,
+    max_chars: int,
+) -> tuple[Any | None, str, dict[str, Any] | None]:
+    device = _resolve_inventory_device(source_device)
+    if not device:
+        return None, "", {"ok": False, "status": "fail", "error": f"Source device {source_device} not in local runner inventory."}
+    platform = str(getattr(device, "platform", "") or "").lower()
+    if "arista" not in platform and "eos" not in platform:
+        return device, "", {"ok": False, "status": "fail", "error": "Source-side probes currently require an Arista/EOS source device."}
+    try:
+        from netmiko import ConnectHandler
+    except Exception as exc:  # noqa: BLE001
+        return device, "", {"ok": False, "status": "fail", "error": f"netmiko is required for source probes: {exc}"}
+
+    conn = None
+    started = time.monotonic()
+    try:
+        conn = ConnectHandler(
+            device_type=_netmiko_device_type(device.platform),
+            host=device.host,
+            username=device.username,
+            password=device.password,
+            port=device.port,
+            fast_cli=False,
+            conn_timeout=max(5, int(timeout_seconds) + 5),
+            auth_timeout=20,
+            banner_timeout=20,
+        )
+        try:
+            conn.enable()
+        except Exception:
+            pass
+        try:
+            output = conn.send_command(command, strip_prompt=False, strip_command=False, read_timeout=max(10, int(timeout_seconds) + 5))
+        except Exception:
+            output = conn.send_command_timing(command, strip_prompt=False, strip_command=False, read_timeout=max(10, int(timeout_seconds) + 5))
+        return device, str(output or "")[:max_chars], None
+    except Exception as exc:  # noqa: BLE001
+        return device, "", {
+            "ok": False,
+            "status": "fail",
+            "error": str(exc),
+            "duration_ms": int((time.monotonic() - started) * 1000),
+        }
+    finally:
+        if conn is not None:
+            try:
+                conn.disconnect()
+            except Exception:
+                pass
+
+
+def _execute_rez_server_listener_probe(payload: dict[str, Any]) -> dict[str, Any]:
+    source_device = str(payload.get("source_device") or "").strip()
+    src_ip = str(payload.get("src_ip") or "").strip()
+    dst_ip = str(payload.get("dst_ip") or "").strip()
+    try:
+        dst_port = int(payload.get("dst_port") or 0)
+    except Exception:
+        dst_port = 0
+    if not source_device or not dst_ip or dst_port < 1 or dst_port > 65535:
+        return {"ok": False, "status": "fail", "error": "source_device, dst_ip, and dst_port are required"}
+    timeout_i = _probe_timeout_seconds(payload.get("timeout_seconds"), default=2.0, maximum=3.0)
+    command = f"bash timeout {timeout_i} nc -vz {dst_ip} {dst_port}"
+    device, output, error = _execute_source_probe_command(
+        source_device=source_device,
+        command=command,
+        timeout_seconds=timeout_i,
+        max_chars=2000,
+    )
+    if error:
+        return {
+            **error,
+            "source": "server_listener_probe",
+            "probe_source": source_device,
+            "source_matches_flow": True,
+            "src_ip": src_ip,
+            "dst_ip": dst_ip,
+            "dst_port": dst_port,
+            "protocol": "tcp",
+            "fresh": True,
+            "server_reachable": False,
+            "listener_present": None,
+            "rootable": False,
+            "runner_version": VERSION,
+        }
+    text = str(output or "")
+    connected = "Connected to" in text
+    refused = "Connection refused" in text
+    timed_out = "timed out" in text.lower() or "Killed" in text
+    return {
+        "ok": True,
+        "status": "pass",
+        "source": "server_listener_probe",
+        "probe_source": getattr(device, "id", source_device),
+        "device": getattr(device, "id", source_device),
+        "source_matches_flow": True,
+        "src_ip": src_ip,
+        "dst_ip": dst_ip,
+        "dst_port": dst_port,
+        "protocol": "tcp",
+        "fresh": True,
+        "server_reachable": bool(connected or refused),
+        "listener_present": True if connected else False if refused else None,
+        "rootable": bool(refused),
+        "reason": (
+            "source_equivalent_tcp_refused"
+            if refused
+            else "source_equivalent_tcp_connected"
+            if connected
+            else "source_equivalent_tcp_timeout"
+            if timed_out
+            else "source_equivalent_tcp_unknown"
+        ),
+        "command": command,
+        "output_preview": text[:1200],
+        "runner_version": VERSION,
+    }
+
+
+def _execute_rez_http_flow_probe(payload: dict[str, Any]) -> dict[str, Any]:
+    source_device = str(payload.get("source_device") or "").strip()
+    src_ip = str(payload.get("src_ip") or "").strip()
+    dst_ip = str(payload.get("dst_ip") or "").strip()
+    try:
+        dst_port = int(payload.get("dst_port") or 0)
+    except Exception:
+        dst_port = 0
+    if not source_device or not dst_ip or dst_port not in {80, 8080}:
+        return {"ok": False, "status": "fail", "error": "source_device, dst_ip, and HTTP dst_port are required"}
+    timeout_i = _probe_timeout_seconds(payload.get("timeout_seconds"), default=3.0, maximum=5.0)
+    url = f"http://{dst_ip}/" if dst_port == 80 else f"http://{dst_ip}:{dst_port}/"
+    command = f"bash timeout {timeout_i} curl -v -m {timeout_i} {url} 2>&1 | head -120"
+    device, output, error = _execute_source_probe_command(
+        source_device=source_device,
+        command=command,
+        timeout_seconds=timeout_i,
+        max_chars=4000,
+    )
+    if error:
+        return {
+            **error,
+            "source": "observed_http_profile_verdict",
+            "probe_source": source_device,
+            "source_matches_flow": True,
+            "src_ip": src_ip,
+            "dst_ip": dst_ip,
+            "dst_port": dst_port,
+            "protocol": "tcp",
+            "fresh": True,
+            "rootable": False,
+            "runner_version": VERSION,
+        }
+    text = str(output or "")
+    status = _http_status_from_probe_output(text)
+    blocked = status in {403, 451}
+    return {
+        "ok": True,
+        "status": "pass",
+        "source": "observed_http_profile_verdict",
+        "probe_source": getattr(device, "id", source_device),
+        "device": getattr(device, "id", source_device),
+        "source_matches_flow": True,
+        "src_ip": src_ip,
+        "dst_ip": dst_ip,
+        "dst_port": dst_port,
+        "protocol": "tcp",
+        "fresh": True,
+        "rootable": bool(blocked),
+        "root_atom": "FW_URL_FILTER_BLOCK" if blocked else None,
+        "subtype": "url_filter_block",
+        "action": "blocked" if blocked else "allowed" if status and status < 400 else "not_observed",
+        "http_status": status,
+        "reason": "source_equivalent_http_block_status" if blocked else "source_equivalent_http_no_block",
+        "command": command,
+        "output_preview": text[:1200],
+        "runner_version": VERSION,
+    }
+
+
 def _execute_rez_api_get_state(payload: dict[str, Any]) -> dict[str, Any]:
     device_id = str(payload.get("device") or payload.get("device_id") or "").strip()
     if not device_id:
@@ -797,6 +1023,12 @@ def _execute_read_inner(action: str, payload: dict[str, Any]) -> dict[str, Any]:
 
     if action == "rez_scan_device":
         return _execute_rez_scan_device(payload)
+
+    if action == "rez_server_listener_probe":
+        return _execute_rez_server_listener_probe(payload)
+
+    if action == "rez_http_flow_probe":
+        return _execute_rez_http_flow_probe(payload)
 
     if action == "verify":
         from netcode.lab import AristaEOSLabAdapter

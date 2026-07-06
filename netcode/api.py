@@ -851,7 +851,15 @@ def api_rez_runner_read(request: RunnerReadRequest, http_request: Request, autho
     bridge_token = os.environ.get("NETCODE_REZ_BRIDGE_TOKEN", "").strip()
     if bridge_token and authorization != f"Bearer {bridge_token}":
         raise HTTPException(status_code=401, detail="Rez bridge token required.")
-    if request.action not in {"rez_ssh_command", "rez_api_query", "rez_api_get_state", "rez_refresh_targeted", "rez_scan_device"}:
+    if request.action not in {
+        "rez_ssh_command",
+        "rez_api_query",
+        "rez_api_get_state",
+        "rez_refresh_targeted",
+        "rez_scan_device",
+        "rez_server_listener_probe",
+        "rez_http_flow_probe",
+    }:
         raise HTTPException(status_code=400, detail="Unsupported Rez runner action.")
     payload = dict(request.payload or {})
     for secret_key in ("username", "password", "passwd", "secret", "api_token", "private_key"):
