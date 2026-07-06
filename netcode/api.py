@@ -845,14 +845,13 @@ def _runner_read(p, action: str, payload: dict, org_id: str, timeout: float = 60
 def api_rez_runner_read(request: RunnerReadRequest, http_request: Request, authorization: str | None = Header(default=None)) -> dict[str, object]:
     """Bridge endpoint for Rez control-plane tools to execute device reads on the runner.
 
-    Slice 1 accepts only `rez_ssh_command`. The runner resolves credentials from
-    its local inventory; this endpoint strips credential-shaped fields before
-    queueing the job.
+    The runner resolves credentials from its local inventory; this endpoint
+    strips credential-shaped fields before queueing the job.
     """
     bridge_token = os.environ.get("NETCODE_REZ_BRIDGE_TOKEN", "").strip()
     if bridge_token and authorization != f"Bearer {bridge_token}":
         raise HTTPException(status_code=401, detail="Rez bridge token required.")
-    if request.action != "rez_ssh_command":
+    if request.action not in {"rez_ssh_command", "rez_api_query", "rez_api_get_state"}:
         raise HTTPException(status_code=400, detail="Unsupported Rez runner action.")
     payload = dict(request.payload or {})
     for secret_key in ("username", "password", "passwd", "secret", "api_token", "private_key"):

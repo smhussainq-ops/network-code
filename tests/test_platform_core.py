@@ -571,6 +571,101 @@ def test_rez_runner_read_endpoint_roundtrip_returns_runner_stdout(tmp_path: Path
     assert resp.json()["stdout"] == "EOS version 4.31.0F"
 
 
+def test_runner_rez_api_get_state_filters_sections(tmp_path: Path, monkeypatch):
+    import types
+
+    from netcode import runner_agent
+    import netcode.adapters.registry as registry
+
+    inv = tmp_path / "inventory.yaml"
+    inv.write_text(
+        """
+defaults:
+  username: admin
+  password: admin
+devices:
+  - id: fgt-hub
+    hostname: fgt-hub
+    host: 127.0.0.1
+    platform: fortinet
+    port: 2222
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(runner_agent, "INVENTORY_FILE", inv)
+
+    class FakeRez:
+        def collect_device_state(self, device):  # noqa: ANN001
+            return {
+                "ok": True,
+                "state": {
+                    "hostname": "fgt-hub",
+                    "platform": "fortinet",
+                    "interfaces": {"port1": {"status": "up"}},
+                    "routing": {"routes": []},
+                },
+            }
+
+    monkeypatch.setattr(registry, "AdapterRegistry", lambda: types.SimpleNamespace(rez=FakeRez()))
+
+    result = runner_agent._execute_read_inner(
+        "rez_api_get_state",
+        {"device": "fgt-hub", "sections": ["interfaces"]},
+    )
+
+    assert result["ok"] is True
+    assert result["state"]["interfaces"] == {"port1": {"status": "up"}}
+    assert "routing" not in result["state"]
+    assert "interfaces" in result["available_sections"]
+
+
+def test_runner_rez_api_query_extracts_nested_security_category(tmp_path: Path, monkeypatch):
+    import types
+
+    from netcode import runner_agent
+    import netcode.adapters.registry as registry
+
+    inv = tmp_path / "inventory.yaml"
+    inv.write_text(
+        """
+defaults:
+  username: admin
+  password: admin
+devices:
+  - id: fgt-hub
+    hostname: fgt-hub
+    host: 127.0.0.1
+    platform: fortinet
+    port: 2222
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(runner_agent, "INVENTORY_FILE", inv)
+
+    class FakeRez:
+        def collect_device_state(self, device):  # noqa: ANN001
+            return {
+                "ok": True,
+                "state": {
+                    "security": {
+                        "firewall_policies": [{"id": 3, "action": "accept"}],
+                        "nat_rules": [{"id": "policy-nat-3"}],
+                    }
+                },
+            }
+
+    monkeypatch.setattr(registry, "AdapterRegistry", lambda: types.SimpleNamespace(rez=FakeRez()))
+
+    result = runner_agent._execute_read_inner(
+        "rez_api_query",
+        {"device": "fgt-hub", "category": "firewall_policies"},
+    )
+
+    assert result["ok"] is True
+    assert result["source_section"] == "firewall_policies"
+    assert result["data"] == [{"id": 3, "action": "accept"}]
+
+
 def test_runner_read_timeout_cancels_queued_job(tmp_path: Path, monkeypatch):
     init_workspace(WorkspacePaths(tmp_path))
     monkeypatch.chdir(tmp_path)

@@ -318,6 +318,174 @@ def _execute_rez_ssh_command(payload: dict[str, Any]) -> dict[str, Any]:
                 pass
 
 
+def _public_state_metadata(state: dict[str, Any], device: Any) -> dict[str, Any]:
+    nested_device = state.get("device") if isinstance(state.get("device"), dict) else {}
+    meta: dict[str, Any] = {
+        "node_id": state.get("node_id") or state.get("device_id") or getattr(device, "id", ""),
+        "hostname": state.get("hostname") or nested_device.get("hostname") or getattr(device, "hostname", ""),
+        "vendor": state.get("vendor") or nested_device.get("vendor") or "",
+        "platform": state.get("platform") or getattr(device, "platform", ""),
+    }
+    return {k: v for k, v in meta.items() if v not in (None, "")}
+
+
+def _filter_state_sections(state: dict[str, Any], sections: list[str] | None, device: Any) -> tuple[dict[str, Any], list[str]]:
+    available = sorted(k for k, v in state.items() if isinstance(v, (dict, list)))
+    if not sections:
+        return state, available
+    wanted = {str(section).strip() for section in sections if str(section).strip()}
+    filtered = _public_state_metadata(state, device)
+    for section in wanted:
+        if section in state:
+            filtered[section] = state[section]
+    return filtered, available
+
+
+_CATEGORY_ALIASES: dict[str, tuple[str, ...]] = {
+    "system_status": ("device", "system", "system_status", "identity"),
+    "device_info": ("device", "system", "system_status", "identity"),
+    "interfaces": ("interfaces", "interface_status", "ports"),
+    "routing": ("routing", "routes", "route_table"),
+    "bgp_summary": ("bgp", "bgp_summary"),
+    "bgp_neighbors": ("bgp", "bgp_neighbors"),
+    "ospf_neighbors": ("ospf", "ospf_neighbors"),
+    "lldp_neighbors": ("lldp", "lldp_neighbors", "neighbors"),
+    "arp_table": ("arp_table", "arp", "arp_entries"),
+    "vlans": ("vlans", "layer2"),
+    "system_resources": ("system_resources", "resources"),
+    "firewall_sessions": ("firewall_sessions", "sessions"),
+    "firewall_policies": ("firewall_policies", "security_policies", "policies"),
+    "address_objects": ("address_objects",),
+    "service_objects": ("service_objects",),
+    "vip_objects": ("vip_objects",),
+    "nat_rules": ("nat_rules",),
+    "ha_status": ("ha_status", "ha"),
+    "ha_config": ("ha_config",),
+    "vpn_ipsec": ("vpn_ipsec", "tunnels"),
+    "vpn_phase1": ("vpn_phase1",),
+    "vpn_phase2": ("vpn_phase2",),
+    "sdwan_health": ("sdwan_health", "health_checks"),
+    "sdwan_members": ("sdwan_members", "members"),
+    "sdwan_sla": ("sdwan_sla", "sla"),
+    "sdwan_services": ("sdwan_services", "services"),
+}
+
+
+def _first_present(mapping: dict[str, Any], keys: tuple[str, ...]) -> tuple[str, Any] | None:
+    for key in keys:
+        if key in mapping and mapping[key] not in (None, "", [], {}):
+            return key, mapping[key]
+    return None
+
+
+def _extract_category(state: dict[str, Any], category: str) -> tuple[str, Any] | None:
+    normalized = str(category or "").strip().lower()
+    if not normalized:
+        return None
+    direct = _first_present(state, (normalized,))
+    if direct:
+        return direct
+    aliases = _CATEGORY_ALIASES.get(normalized, ())
+    found = _first_present(state, aliases)
+    if found:
+        return found
+    # Common Rez state shapes keep security-related facts under state["security"].
+    security = state.get("security")
+    if isinstance(security, dict):
+        found = _first_present(security, aliases + (normalized,))
+        if found:
+            return found
+    # SD-WAN drivers may keep facts under a nested sdwan block.
+    sdwan = state.get("sdwan")
+    if isinstance(sdwan, dict):
+        found = _first_present(sdwan, aliases + (normalized,))
+        if found:
+            return found
+    return None
+
+
+def _collect_rez_runner_state(device_id: str) -> tuple[Any, dict[str, Any] | None, dict[str, Any] | None]:
+    from netcode.adapters.registry import AdapterRegistry
+    from netcode.inventory import Inventory
+
+    inv = Inventory(INVENTORY_FILE)
+    device = inv.by_id.get(device_id)
+    if not device:
+        return None, None, {"ok": False, "status": "fail", "device": device_id, "error": f"Device {device_id} not in local runner inventory."}
+    result = AdapterRegistry().rez.collect_device_state(device)
+    if not result.get("ok"):
+        return device, None, {
+            "ok": False,
+            "status": "fail",
+            "device": device.id,
+            "platform": device.platform,
+            "error": str(result.get("error") or (result.get("errors") or ["state collection failed"])[0]),
+            "errors": result.get("errors") or [],
+            "warnings": result.get("warnings") or [],
+        }
+    state = result.get("state")
+    if not isinstance(state, dict):
+        return device, None, {"ok": False, "status": "fail", "device": device.id, "platform": device.platform, "error": "Rez driver returned non-object state."}
+    return device, state, None
+
+
+def _execute_rez_api_get_state(payload: dict[str, Any]) -> dict[str, Any]:
+    device_id = str(payload.get("device") or payload.get("device_id") or "").strip()
+    if not device_id:
+        return {"ok": False, "status": "fail", "error": "device_id is required"}
+    raw_sections = payload.get("sections")
+    sections = [str(item) for item in raw_sections] if isinstance(raw_sections, list) else None
+    device, state, error = _collect_rez_runner_state(device_id)
+    if error:
+        return error
+    assert device is not None and state is not None
+    filtered, available = _filter_state_sections(state, sections, device)
+    return {
+        "ok": True,
+        "status": "pass",
+        "device": device.id,
+        "platform": device.platform,
+        "state": filtered,
+        "available_sections": available,
+        "runner_version": VERSION,
+    }
+
+
+def _execute_rez_api_query(payload: dict[str, Any]) -> dict[str, Any]:
+    device_id = str(payload.get("device") or payload.get("device_id") or "").strip()
+    category = str(payload.get("category") or "").strip().lower()
+    if not device_id:
+        return {"ok": False, "status": "fail", "error": "device_id is required"}
+    if not category:
+        return {"ok": False, "status": "fail", "device": device_id, "error": "category is required"}
+    device, state, error = _collect_rez_runner_state(device_id)
+    if error:
+        return error
+    assert device is not None and state is not None
+    found = _extract_category(state, category)
+    if not found:
+        return {
+            "ok": False,
+            "status": "fail",
+            "device": device.id,
+            "platform": device.platform,
+            "category": category,
+            "error": f"Category {category!r} was not present in collected runner state.",
+            "available_sections": sorted(k for k, v in state.items() if isinstance(v, (dict, list))),
+        }
+    source_key, data = found
+    return {
+        "ok": True,
+        "status": "pass",
+        "device": device.id,
+        "platform": device.platform,
+        "category": category,
+        "source_section": source_key,
+        "data": data,
+        "runner_version": VERSION,
+    }
+
+
 def _execute_read(action: str, payload: dict[str, Any]) -> dict[str, Any]:
     """Fail-closed wrapper: a hung device read must never wedge the runner's
     sequential job loop (a dead container / unreachable device can otherwise
@@ -422,6 +590,12 @@ def _execute_read_inner(action: str, payload: dict[str, Any]) -> dict[str, Any]:
 
     if action == "rez_ssh_command":
         return _execute_rez_ssh_command(payload)
+
+    if action == "rez_api_get_state":
+        return _execute_rez_api_get_state(payload)
+
+    if action == "rez_api_query":
+        return _execute_rez_api_query(payload)
 
     if action == "verify":
         from netcode.lab import AristaEOSLabAdapter
