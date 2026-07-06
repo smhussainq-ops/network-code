@@ -26,6 +26,19 @@ def execution_mode() -> str:
     return os.environ.get("NETCODE_EXECUTION", "local").strip().lower() or "local"
 
 
+def approval_required() -> bool:
+    """Apply requires a second engineer's approval. Explicit env wins; otherwise
+    approval is on exactly when auth is on (identities exist to tell requester
+    from approver). Solo/local mode stays frictionless."""
+    raw = os.environ.get("NETCODE_REQUIRE_APPROVAL", "").strip().lower()
+    if raw in ("1", "true", "yes", "on"):
+        return True
+    if raw in ("0", "false", "no", "off"):
+        return False
+    from netcode.auth import auth_enabled
+    return auth_enabled()
+
+
 def runner_pool() -> str:
     return os.environ.get("NETCODE_RUNNER_POOL", "store-lab").strip() or "store-lab"
 
@@ -64,6 +77,18 @@ class JobRunner:
 
     def run_lab_action(self, intent_path: Path, action: str, device_id: str | None, change_id: str | None = None) -> dict[str, object]:
         change = self.store.get_change(change_id) if change_id else self.store.get_or_create_change(intent_path, device_id)
+        if action == "apply" and approval_required() and change.workflow_state != "approved":
+            message = ("Approval gate: a second engineer must approve this change before apply. "
+                       "The requester cannot approve their own change.")
+            self.store.record_workflow_event(change.id, "apply", change.workflow_state, change.workflow_state,
+                                             message, {"blocked": True, "approval_required": True})
+            return {
+                "ok": False,
+                "change": record_to_dict(self.store.get_change(change.id)),
+                "job": None,
+                "result": {"status": "fail", "message": message,
+                           "workflow_state": change.workflow_state, "approval_required": True},
+            }
         try:
             require_action_allowed(change.workflow_state, action)
         except Exception as exc:

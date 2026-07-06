@@ -36,11 +36,15 @@ from netcode.gitflow import (
     setup_git_workspace,
 )
 from netcode.fleet import (
+    approve_rollout,
+    create_remediation_rollouts,
+    drift_watch_status,
     fleet_drift_snapshot,
     plan_fleet_rollout,
     reconcile_rollouts_on_startup,
     request_halt,
     rollout_status,
+    set_drift_watch,
     start_fleet_drift,
     start_rollout,
 )
@@ -156,6 +160,19 @@ class TroubleshootRequest(BaseModel):
 
 class ShellOpenRequest(BaseModel):
     device_id: str
+    guard_enabled: bool = True
+
+
+class ShellManualDeviceRequest(BaseModel):
+    device_id: str
+    host: str
+    platform: str = "arista_eos"
+    hostname: str = ""
+    username: str = ""
+    password: str = ""
+    port: int = 22
+    site: str = "manual"
+    groups: list[str] = []
 
 
 class ShellInputRequest(BaseModel):
@@ -186,6 +203,14 @@ class FleetRolloutRequest(BaseModel):
 
 class FleetHaltRequest(BaseModel):
     reason: str = ""
+
+
+class ApproveRequest(BaseModel):
+    approved_by: str = ""  # used when auth is off; with auth on the principal is the approver
+
+
+class DriftWatchRequest(BaseModel):
+    minutes: int = 0
 
 
 class AssistantRequest(BaseModel):
@@ -270,6 +295,13 @@ def _startup() -> None:
     try:
         reconcile_rollouts_on_startup(paths())
     except Exception:  # noqa: BLE001 — reconciliation must never block startup
+        pass
+    # Continuous drift watch (env-driven; 0/unset = off). UI can change it later.
+    try:
+        minutes = int(os.environ.get("NETCODE_DRIFT_WATCH_MINUTES", "0") or "0")
+        if minutes > 0:
+            set_drift_watch(paths(), DEFAULT_ORG_ID, minutes, load_intent)
+    except Exception:  # noqa: BLE001
         pass
 
 
@@ -876,6 +908,58 @@ def api_source_of_truth_import_device(request: SourceOfTruthDeviceImportRequest)
     return DiscoveryService(paths()).import_candidate(request.candidate)
 
 
+@app.post("/api/shell/devices/manual")
+def api_shell_manual_device(request: ShellManualDeviceRequest, http_request: Request) -> dict[str, object]:
+    """Add or update a device from the Shell.
+
+    Source of truth receives only non-secret device facts. In runner mode, the
+    credentialed runner inventory is updated by an outbound runner job so the
+    next shell session can connect without the browser ever handling SSH.
+    """
+    p = paths()
+    groups = request.groups or ["manual"]
+    public_candidate = {
+        "id": request.device_id,
+        "hostname": request.hostname or request.device_id,
+        "host": request.host,
+        "platform": request.platform,
+        "site": request.site or "manual",
+        "groups": groups,
+        "port": request.port,
+    }
+    source_result = DiscoveryService(p).import_candidate(public_candidate)
+    if not source_result.get("ok"):
+        return {"ok": False, "source_of_truth": source_result, "message": source_result.get("error") or "Source of truth update failed."}
+
+    runner_result: dict[str, object] | None = None
+    if execution_mode() == "runner":
+        runner_candidate = dict(public_candidate)
+        runner_candidate["username"] = request.username
+        runner_candidate["password"] = request.password
+        runner_result = _runner_read(
+            p,
+            "manual_device_add",
+            {"candidate": runner_candidate},
+            _request_principal(http_request).org_id,
+            timeout=30,
+        )
+        if not runner_result.get("ok"):
+            return {
+                "ok": False,
+                "source_of_truth": source_result,
+                "runner_inventory": runner_result,
+                "message": runner_result.get("error") or runner_result.get("message") or "Runner inventory update failed.",
+            }
+
+    return {
+        "ok": True,
+        "source_of_truth": source_result,
+        "runner_inventory": runner_result,
+        "device": source_result.get("device"),
+        "message": f"Device {public_candidate['id']} is ready for Shell sessions.",
+    }
+
+
 @app.get("/api/templates/{platform}/{name}")
 def api_template(platform: str, name: str) -> dict[str, object]:
     if "/" in platform or "/" in name or ".." in platform or ".." in name:
@@ -1057,31 +1141,32 @@ def _record_shell_command(session_id: str, ev: dict[str, object]) -> None:
     the change report shows exactly what was done on the device, and when."""
     change_id = str(ev.get("change_id") or "").strip()
     line = str(ev.get("line") or "").strip()
-    if not change_id or not line:
+    if not line:
         return
     session = _SHELL_SESSIONS.get(session_id) or {}
     device_id = str(session.get("device_id") or "?")
     kind = str(ev.get("kind") or "")
     p = paths()
-    try:
-        store = PlatformStore(p)
-        change = store.get_change(change_id)
-        current = change.workflow_state
-        store.record_workflow_event(
-            change_id, action="shell_command", from_state=current, to_state=current,
-            message=f"[shell · {device_id}] {line}",
-            evidence={"source": "shell", "device_id": device_id, "command": line,
-                      "kind": kind, "session_id": session_id},
-        )
-    except Exception:  # noqa: BLE001 — reporting must never break the live stream
-        pass
+    if change_id:
+        try:
+            store = PlatformStore(p)
+            change = store.get_change(change_id)
+            current = change.workflow_state
+            store.record_workflow_event(
+                change_id, action="shell_command", from_state=current, to_state=current,
+                message=f"[shell · {device_id}] {line}",
+                evidence={"source": "shell", "device_id": device_id, "command": line,
+                          "kind": kind, "session_id": session_id},
+            )
+        except Exception:  # noqa: BLE001 — reporting must never break the live stream
+            pass
     _shell_append(p, session_id, {"event": "command", "device_id": device_id,
                                   "command": line, "kind": kind, "change_id": change_id})
 
 
 @app.post("/api/shell/open")
 def api_shell_open(request: ShellOpenRequest, http_request: Request) -> dict[str, object]:
-    """Open a governed, read-only CLI session against a device."""
+    """Open a CLI session against a device."""
     p = paths()
     org = _request_principal(http_request).org_id
     inventory = Inventory(configured_inventory_path(p))
@@ -1089,11 +1174,23 @@ def api_shell_open(request: ShellOpenRequest, http_request: Request) -> dict[str
     if not device:
         raise HTTPException(status_code=404, detail=f"Unknown device {request.device_id}")
     session_id = uuid.uuid4().hex[:16]
-    state = {"mode": "read_only", "change_id": None, "in_config": False, "device_touched": False}
+    mode = "read_only" if request.guard_enabled else "direct"
+    state = {
+        "mode": mode,
+        "change_id": None,
+        "in_config": False,
+        "device_touched": False,
+        "guard_enabled": bool(request.guard_enabled),
+    }
     _SHELL_SESSIONS[session_id] = {"org_id": org, "device_id": device.id, "platform": device.platform, "state": state}
-    _shell_append(p, session_id, {"event": "session_opened", "device_id": device.id, "org_id": org})
+    _shell_append(p, session_id, {"event": "session_opened", "device_id": device.id, "org_id": org,
+                                  "guard_enabled": bool(request.guard_enabled)})
+    if request.guard_enabled:
+        message = f"Guarded session open on {device.id}. Config mode is guarded until a change is attached."
+    else:
+        message = f"Direct CLI session open on {device.id}. Governance blocking is disabled; transcript logging remains on."
     return {"ok": True, "session_id": session_id, "device_id": device.id, "platform": device.platform,
-            "state": state, "message": f"Read-only session open on {device.id}. Config mode is guarded."}
+            "state": state, "message": message}
 
 
 def _shell_session_or_404(session_id: str, org: str) -> dict[str, object]:
@@ -1209,8 +1306,23 @@ async def ws_runner_stream(ws: WebSocket) -> None:
             sid = str(frame.get("sid", ""))
             if frame.get("t") == "event":
                 ev = frame.get("e") or {}
-                if isinstance(ev, dict) and ev.get("type") == "command":
-                    _record_shell_command(sid, ev)
+                if isinstance(ev, dict):
+                    session = _SHELL_SESSIONS.get(sid)
+                    if session:
+                        state = dict(session.get("state") or {})
+                        if "in_config" in ev:
+                            state["in_config"] = bool(ev.get("in_config"))
+                        elif ev.get("action") == "config_mode_entered":
+                            state["in_config"] = True
+                        elif ev.get("action") == "config_mode_exited":
+                            state["in_config"] = False
+                        if "device_touched" in ev:
+                            state["device_touched"] = bool(ev.get("device_touched"))
+                        elif ev.get("action") == "config_mode_entered":
+                            state["device_touched"] = True
+                        session["state"] = state
+                    if ev.get("type") == "command":
+                        _record_shell_command(sid, ev)
             browser = _BROWSER_SOCKETS.get(sid)
             if browser is not None:
                 try:
@@ -1505,6 +1617,89 @@ def api_fleet_rollout_halt(rollout_id: str, request: FleetHaltRequest, http_requ
     return request_halt(paths(), rollout_id, request.reason)
 
 
+def _approver_identity(principal, fallback_name: str, requester: str, requester_user_id: str | None,
+                       created_by: str | None = None) -> str:
+    """Resolve who is approving and enforce requester != approver. With auth on,
+    the logged-in principal IS the approver; with auth off, a named approver is
+    required (advisory but still recorded and still must differ)."""
+    if principal.kind == "user":
+        approver = principal.email or principal.user_id or ""
+        if principal.user_id and requester_user_id and principal.user_id == requester_user_id:
+            raise HTTPException(status_code=403, detail="The requester cannot approve their own change.")
+        if approver and approver == requester:
+            raise HTTPException(status_code=403, detail="The requester cannot approve their own change.")
+        return approver
+    approver = (fallback_name or "").strip()
+    if not approver:
+        raise HTTPException(status_code=400, detail="Approver name is required (auth is off, so name the second engineer).")
+    if approver == requester:
+        raise HTTPException(status_code=400, detail="The requester cannot approve their own change — name a second engineer.")
+    return approver
+
+
+@app.post("/api/change/{change_id}/approve")
+def api_change_approve(change_id: str, request: ApproveRequest, http_request: Request) -> dict[str, object]:
+    """Approval gate: a second engineer approves a proven (dry-run-passed) change,
+    unlocking apply. The approver identity is part of the evidence record."""
+    p = paths()
+    principal = _request_principal(http_request)
+    store = PlatformStore(p)
+    try:
+        change = store.get_change(change_id)
+    except Exception as exc:
+        raise HTTPException(status_code=404, detail=f"Unknown change {change_id}") from exc
+    if change.org_id != principal.org_id:
+        raise HTTPException(status_code=404, detail=f"Unknown change {change_id}")
+    if change.workflow_state != "dry_run_passed":
+        raise HTTPException(status_code=400,
+                            detail=f"Only a dry-run-proven change can be approved (state: {change.workflow_state}).")
+    approver = _approver_identity(principal, request.approved_by, change.requested_by,
+                                  getattr(principal, "user_id", None), change.created_by_user_id)
+    store.record_workflow_event(
+        change_id, "approve", change.workflow_state, "approved",
+        f"Approved by {approver} (requester: {change.requested_by}).",
+        {"approved_by": approver, "requested_by": change.requested_by},
+    )
+    return {"ok": True, "change": record_to_dict(store.get_change(change_id)),
+            "approved_by": approver,
+            "message": f"Approved by {approver}. Apply is now unlocked."}
+
+
+@app.post("/api/fleet/rollouts/{rollout_id}/approve")
+def api_fleet_rollout_approve(rollout_id: str, request: ApproveRequest, http_request: Request) -> dict[str, object]:
+    principal = _request_principal(http_request)
+    rollout = _rollout_or_404(rollout_id, principal.org_id)
+    approver = _approver_identity(principal, request.approved_by, str(rollout.get("requested_by") or ""),
+                                  getattr(principal, "user_id", None), rollout.get("created_by_user_id"))
+    try:
+        return approve_rollout(paths(), rollout_id, approver)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/fleet/remediate")
+def api_fleet_remediate(http_request: Request) -> dict[str, object]:
+    """Closed loop: turn the latest drift findings into governed remediation
+    rollouts targeting only the drifted devices."""
+    principal = _request_principal(http_request)
+    try:
+        rollouts = create_remediation_rollouts(
+            paths(), principal.org_id,
+            requested_by=principal.email or "netcode-user",
+            created_by_user_id=principal.user_id,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"ok": True, "rollouts": rollouts, "count": len(rollouts)}
+
+
+@app.post("/api/fleet/drift/watch")
+def api_fleet_drift_watch(request: DriftWatchRequest, http_request: Request) -> dict[str, object]:
+    org = _request_principal(http_request).org_id
+    minutes = max(0, min(int(request.minutes), 1440))
+    return set_drift_watch(paths(), org, minutes, load_intent)
+
+
 @app.post("/api/fleet/drift/refresh")
 def api_fleet_drift_refresh(request: Request) -> dict[str, object]:
     return start_fleet_drift(paths(), _request_principal(request).org_id, load_intent)
@@ -1512,7 +1707,10 @@ def api_fleet_drift_refresh(request: Request) -> dict[str, object]:
 
 @app.get("/api/fleet/drift")
 def api_fleet_drift(request: Request) -> dict[str, object]:
-    return fleet_drift_snapshot(_request_principal(request).org_id)
+    org = _request_principal(request).org_id
+    snapshot = fleet_drift_snapshot(org)
+    snapshot["watch"] = drift_watch_status(org)
+    return snapshot
 
 
 @app.post("/api/assistant")

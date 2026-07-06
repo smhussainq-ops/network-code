@@ -197,6 +197,61 @@ def _execute_read_inner(action: str, payload: dict[str, Any]) -> dict[str, Any]:
     import tempfile
     from netcode.inventory import Inventory
     from netcode.models import load_intent
+    from netcode.yamlio import read_yaml, write_yaml
+
+    if action == "manual_device_add":
+        candidate = dict(payload.get("candidate") or {})
+        required = ("id", "host", "platform")
+        missing = [key for key in required if not str(candidate.get(key) or "").strip()]
+        if missing:
+            return {"ok": False, "status": "fail", "error": f"Missing required field(s): {', '.join(missing)}"}
+        try:
+            inventory = read_yaml(INVENTORY_FILE) if INVENTORY_FILE.exists() else {"defaults": {}, "devices": []}
+            devices = list(inventory.get("devices") or [])
+            groups = candidate.get("groups") or ["manual"]
+            if isinstance(groups, str):
+                groups = [item.strip() for item in groups.split(",") if item.strip()]
+            sanitized = {
+                "id": str(candidate.get("id")).strip(),
+                "hostname": str(candidate.get("hostname") or candidate.get("id")).strip(),
+                "host": str(candidate.get("host")).strip(),
+                "platform": str(candidate.get("platform")).strip(),
+                "site": str(candidate.get("site") or "manual").strip(),
+                "groups": [str(group) for group in groups],
+                "port": int(candidate.get("port") or 22),
+            }
+            # The control plane REDACTS credentials in cloud payloads, so a
+            # candidate may arrive carrying placeholder text. Never let a
+            # placeholder clobber the runner's real credential store.
+            def _usable_secret(value: str) -> bool:
+                cleaned = value.strip()
+                return bool(cleaned) and "redact" not in cleaned.lower() and cleaned != "***"
+
+            if _usable_secret(str(candidate.get("username") or "")):
+                sanitized["username"] = str(candidate.get("username")).strip()
+            if _usable_secret(str(candidate.get("password") or "")):
+                sanitized["password"] = str(candidate.get("password"))
+            action_taken = "added"
+            for index, existing in enumerate(devices):
+                if str(existing.get("id")) == sanitized["id"] or str(existing.get("host")) == sanitized["host"]:
+                    devices[index] = {**existing, **sanitized}
+                    action_taken = "updated"
+                    break
+            else:
+                devices.append(sanitized)
+            inventory["devices"] = devices
+            write_yaml(INVENTORY_FILE, inventory)
+            public_device = {key: value for key, value in sanitized.items() if key not in {"username", "password"}}
+            return {
+                "ok": True,
+                "status": "pass",
+                "action": action_taken,
+                "inventory": str(INVENTORY_FILE),
+                "device": public_device,
+                "message": f"Device {sanitized['id']} {action_taken} in runner inventory.",
+            }
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "status": "fail", "error": str(exc)}
 
     if not INVENTORY_FILE.exists():
         return {"ok": False, "error": f"No local runner inventory at {INVENTORY_FILE}."}
@@ -427,10 +482,12 @@ def _start_interactive_channel(server: str, token: str) -> None:
             raw = frame.get("state") or {}
             state = ShellSessionState(mode=str(raw.get("mode", "read_only")),
                                       change_id=raw.get("change_id"), in_config=bool(raw.get("in_config", False)))
+            guard_enabled = bool(raw.get("guard_enabled", True))
             sess = InteractivePtySession(
                 device, state,
                 on_output=lambda data, s=sid: send_frame({"t": "out", "sid": s, "d": base64.b64encode(data).decode()}),
                 on_event=lambda ev, s=sid: send_frame({"t": "event", "sid": s, "e": ev}),
+                guard_enabled=guard_enabled,
             )
             sessions[sid] = sess
             try:

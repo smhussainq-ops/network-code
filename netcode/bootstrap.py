@@ -79,6 +79,13 @@ SITE_DEVICE_INTENT_TEMPLATE = """! Source-of-truth only intent.
 CUSTOM_CONFIG_TEMPLATE = """{{ custom.config_lines }}
 """
 
+NTP_STANDARDIZE_TEMPLATE = """{% for server in ntp.servers %}
+ntp server {{ server }}{% if ntp.prefer_first and loop.first %} prefer{% endif %}
+
+{% endfor %}
+"""
+
+
 
 WORKSPACE_GITIGNORE = """# Netcode change workspace: Git tracks ONLY change artifacts, never platform code,
 # UI, runtime state, or dev files. This keeps branch switching from colliding with
@@ -105,6 +112,7 @@ def init_workspace(paths: WorkspacePaths, force: bool = False) -> list[Path]:
         (paths.templates / "arista" / "acl_rule.j2", ACL_RULE_TEMPLATE),
         (paths.templates / "arista" / "site_device_intent.j2", SITE_DEVICE_INTENT_TEMPLATE),
         (paths.templates / "arista" / "custom_config.j2", CUSTOM_CONFIG_TEMPLATE),
+        (paths.templates / "arista" / "ntp_standardize.j2", NTP_STANDARDIZE_TEMPLATE),
     ]
     for path, content in files:
         if force or not path.exists():

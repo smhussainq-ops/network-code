@@ -12,7 +12,7 @@ const EMPTY_CHANGE_TYPE = {
 };
 
 const appState = {
-  view: "home",
+  view: "shell",
   artifact: "overview",
   selectedChangeType: "add_vlan",
   formValues: {},
@@ -37,6 +37,7 @@ const appState = {
   drift: null,
   troubleshoot: null,
   shell: null,
+  shellMode: localStorage.getItem("netcode_shell_mode") || "direct",
   uiConfig: null,
   uiConfigPath: "",
   configHistory: [],
@@ -161,6 +162,7 @@ function setRunState(label, status = "info") {
 }
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+const ADVANCED_VIEWS = new Set(["home", "inventory", "desired", "plan", "validate", "apply", "drift"]);
 
 // In runner mode, lab write actions return {queued:true, job}. The on-prem runner
 // executes them and reports back, so poll the job to a terminal state and normalize
@@ -221,6 +223,20 @@ function setOutcome({ state = "Info", status = "info", title, summary, expected,
   $("next-action").textContent = next;
 }
 
+function resetOutcomeForShell() {
+  setOutcome({
+    state: "Ready",
+    status: "info",
+    title: "Shell workspace ready.",
+    summary: "Open a governed SSH session. Read-only commands run normally; config mode is gated by a change record.",
+    expected: "Use SSH without changing device config until a change is attached.",
+    actual: appState.shell?.sessionId ? "Shell session is open." : "Waiting for a session.",
+    artifact: appState.shell?.sessionId ? `Shell session ${appState.shell.sessionId}` : "No shell transcript yet.",
+    device: appState.shell?.deviceTouched ? "Touched under an attached change." : "No device config changed.",
+    next: appState.shell?.sessionId ? "Run a read command or attach a change." : "Open a session.",
+  });
+}
+
 function startOutcome(title, expected) {
   setOutcome({
     state: "Running",
@@ -250,18 +266,21 @@ function failOutcome(title, error, next = "Review the error, then retry the same
 
 function setView(view) {
   appState.view = view;
+  document.body.classList.toggle("shell-product-view", view === "shell");
   $$(".view").forEach((panel) => panel.classList.toggle("active", panel.id === `view-${view}`));
   $$(".nav-item").forEach((button) => button.classList.toggle("active", button.dataset.view === view));
+  const advancedNav = document.querySelector(".nav-advanced");
+  if (advancedNav) advancedNav.open = ADVANCED_VIEWS.has(view);
   const titles = {
-    home: ["Five guided stories for Network as Code.", "Lower change risk, faster delivery, audit-ready proof, and a practical path for network engineers to adopt Git, source of truth, templates, validation, and Rez-driven device reads."],
-    setup: ["Set up the workspace.", "Check Git, source of truth, adapters, and lab reachability before making a change."],
+    home: ["Learning map.", "A guided explanation of the pieces behind Network as Code. Daily work should happen in Shell."],
+    setup: ["Setup Wizard.", "Run once to connect Git, source of truth, runners, and proof mode. After that, Shell is the daily workspace."],
     inventory: ["Discover and trust devices.", "Use Rez read adapters to discover devices, then import reviewed records into source of truth."],
     desired: ["Create desired state.", "Choose the network outcome, fill the intent fields, and let the platform create YAML and candidate config."],
     plan: ["Preview exact impact.", "Review the Terraform-style plan, generated commands, affected devices, risk, and apply gate."],
     validate: ["Validate before apply.", "Policy checks and lab dry-run proof must pass before apply is unlocked."],
     apply: ["Apply and verify.", "Commit only after validation and dry-run proof, then prove live state and keep rollback available."],
     fleet: ["Fleet operations.", "Roll one change across many devices as canary then batches with auto-halt on failure, and sweep the whole fleet for drift against the committed baseline."],
-    shell: ["Netcode Shell — governed SSH.", "Keep CLI control while every session is guarded, staged, verified, and captured as evidence. The guard runs on the on-prem runner; the browser never touches the device."],
+    shell: ["Netcode Shell.", "The daily workspace for network engineers: direct SSH when you need speed, guarded SSH when you need governance, and evidence for every session."],
     drift: ["Troubleshoot / investigate.", "Run read-only Rez checks, compare expected vs live state, detect drift, and attach findings to the change record."],
     evidence: ["Prove / audit.", "One package per change: request, intent, branch, commands, validation, dry-run, apply, verify, troubleshooting, rollback."],
   };
@@ -269,7 +288,10 @@ function setView(view) {
   $("view-subtitle").textContent = titles[view][1];
   if (view === "evidence") renderEvidence();
   if (view === "drift") renderDrift();
-  if (view === "shell") renderShell();
+  if (view === "shell") {
+    renderShell();
+    resetOutcomeForShell();
+  }
   if (view === "fleet") { renderFleet(); hydrateFleet(); }
 }
 
@@ -2256,10 +2278,15 @@ function renderFleet() {
     else if (groups.includes("stores")) groupSelect.value = "stores";
   }
   const rollout = appState.fleet.rollout;
-  const canStart = rollout && rollout.status === "planned";
+  const needsApproval = Boolean(rollout?.approval_required) && !rollout?.approved_by;
+  const canApprove = rollout && rollout.status === "planned" && !rollout.approved_by;
+  const canStart = rollout && rollout.status === "planned" && !needsApproval;
   const canHalt = rollout && ["running", "halt_requested"].includes(rollout.status);
+  $("fleet-approve").disabled = !canApprove;
   $("fleet-start").disabled = !canStart;
   $("fleet-halt").disabled = !canHalt;
+  // Approver name input only matters when there is no logged-in identity.
+  $("fleet-approver-row").hidden = !(canApprove && !appState.authEnabled);
   if (!rollout) {
     $("fleet-title").textContent = "No rollout planned yet.";
     $("fleet-summary").textContent = "Plan a rollout to see the canary and batch waves before anything touches a device.";
@@ -2271,7 +2298,9 @@ function renderFleet() {
     $("fleet-title").textContent = `${rollout.description} — ${rollout.status.replace(/_/g, " ")}`;
     $("fleet-summary").textContent =
       `${rollout.device_count} devices · canary ${rollout.canary_size} · batches of ${rollout.batch_size} · ` +
-      `rollout ${String(rollout.id).slice(0, 8)}`;
+      `rollout ${String(rollout.id).slice(0, 8)}` +
+      (rollout.approved_by ? ` · approved by ${rollout.approved_by}` :
+       rollout.approval_required && rollout.status === "planned" ? " · awaiting approval" : "");
     chipRow($("fleet-chips"), [
       { text: `status: ${rollout.status.replace(/_/g, " ")}`,
         tone: rollout.status === "completed" ? "good" : ["halted", "blocked"].includes(rollout.status) ? "bad" : "warn" },
@@ -2323,6 +2352,72 @@ function renderFleetDrift() {
       <span class="chip ${tones[d.status] || "muted"}">${escapeHtml(labels[d.status] || d.status)}</span>
       <span class="fleet-drift-msg">${escapeHtml(d.message || (d.status === "no_baseline" ? "No committed intents to compare yet." : ""))}</span>
     </div>`).join("");
+  // Closed loop: offer remediation when the finished sweep found drift.
+  const drifted = drift.status === "done" && (drift.devices || []).some((d) => d.status === "drifted");
+  $("fleet-remediate").hidden = !drifted;
+  // Watch selector reflects backend state (unless the user is choosing).
+  const watchSelect = $("fleet-drift-watch");
+  if (drift.watch && document.activeElement !== watchSelect) {
+    watchSelect.value = String(drift.watch.minutes || 0);
+  }
+}
+
+async function fleetRemediate() {
+  if ($("fleet-remediate").disabled) return;
+  $("fleet-remediate").disabled = true;
+  startOutcome("Creating remediation plan", "Drift findings become governed rollouts targeting only the drifted devices.");
+  try {
+    const res = await postJson("/api/fleet/remediate", {});
+    const first = (res.rollouts || [])[0];
+    if (first) appState.fleet.rollout = first;
+    renderFleet();
+    setOutcome({ state: "Planned", status: "pass",
+      title: `${res.count} remediation plan${res.count === 1 ? "" : "s"} created from drift findings.`,
+      summary: first ? first.description : "See the rollout panel.",
+      expected: "Only drifted devices are targeted; the fix runs the full safety spine.",
+      actual: `Rollout ${first ? String(first.id).slice(0, 8) : ""} planned — nothing has touched a device.`,
+      artifact: "Per-device change records with plan, policy checks, and rollback.",
+      device: "No device config was changed.",
+      next: first && first.approval_required ? "Approve the rollout, then start it." : "Review the waves, then Start rollout." });
+  } catch (error) { failOutcome("Could not create a remediation plan.", error); }
+  finally { $("fleet-remediate").disabled = false; }
+}
+
+async function fleetApproveRollout() {
+  const rollout = appState.fleet.rollout;
+  if (!rollout || $("fleet-approve").disabled) return;
+  const approvedBy = appState.authEnabled ? "" : ($("fleet-approver").value || "").trim();
+  try {
+    appState.fleet.rollout = await postJson(`/api/fleet/rollouts/${rollout.id}/approve`, { approved_by: approvedBy });
+    renderFleet();
+    setOutcome({ state: "Approved", status: "pass",
+      title: `Rollout approved by ${appState.fleet.rollout.approved_by}.`,
+      summary: "A second engineer has signed off; the approval is part of the evidence record.",
+      expected: "Requester and approver are different people.",
+      actual: `Approved by ${appState.fleet.rollout.approved_by} (requested by ${rollout.requested_by}).`,
+      artifact: "Approval recorded on the rollout and every per-device change.",
+      device: "No device config was changed.",
+      next: "Start the rollout — canary first." });
+  } catch (error) { failOutcome("Could not approve the rollout.", error); }
+}
+
+async function fleetWatchChange() {
+  const minutes = Number($("fleet-drift-watch").value) || 0;
+  try {
+    const watch = await postJson("/api/fleet/drift/watch", { minutes });
+    if (appState.fleet.drift) appState.fleet.drift.watch = watch;
+    if (minutes > 0) pollFleetDriftWatch();
+  } catch (error) { failOutcome("Could not update the drift watch.", error); }
+}
+
+async function pollFleetDriftWatch() {
+  // The watch sweeps in the background; refresh the dashboard shortly after enabling.
+  await sleep(1500);
+  try {
+    appState.fleet.drift = await getJson("/api/fleet/drift");
+    renderFleetDrift();
+    if (appState.fleet.drift.status === "running") pollFleetDrift();
+  } catch (error) { /* next manual refresh will catch up */ }
 }
 
 async function fleetPlanRollout() {
@@ -2480,6 +2575,28 @@ function shellDevices() {
   return (appState.source?.devices || []).map((d) => d.id).filter(Boolean);
 }
 
+function shellGuardEnabled() {
+  return appState.shellMode !== "direct";
+}
+
+function setShellMode(mode) {
+  if (appState.shell?.sessionId) return;
+  appState.shellMode = mode === "guarded" ? "guarded" : "direct";
+  localStorage.setItem("netcode_shell_mode", appState.shellMode);
+  renderChangeGuard();
+}
+
+function renderShellMode() {
+  const direct = appState.shellMode !== "guarded";
+  $("shell-mode-direct").classList.toggle("active", direct);
+  $("shell-mode-guarded").classList.toggle("active", !direct);
+  $("shell-mode-direct").disabled = Boolean(appState.shell?.sessionId);
+  $("shell-mode-guarded").disabled = Boolean(appState.shell?.sessionId);
+  $("shell-mode-note").textContent = direct
+    ? "Direct CLI behaves like normal SSH. Commands are not blocked, but the session is logged."
+    : "Guarded mode blocks config mode until a change is attached and intercepts risky commands.";
+}
+
 function termWrite(text) {
   if (shellTerm) shellTerm.write(text);
 }
@@ -2494,23 +2611,28 @@ function renderShell() {
   if (current && devices.includes(current)) select.value = current;
   else if (selectedDeviceId() && devices.includes(selectedDeviceId())) select.value = selectedDeviceId();
   if (shellFit) { try { shellFit.fit(); } catch (e) {} }
+  renderShellMode();
   renderChangeGuard();
 }
 
 function renderChangeGuard() {
   const s = appState.shell;
-  const modeText = !s ? "No session" : s.mode === "change_attached" ? (s.in_config ? "Config mode" : "Change attached") : "Read-only";
+  renderShellMode();
+  const directMode = s ? s.guardEnabled === false : !shellGuardEnabled();
+  const modeText = !s ? (directMode ? "Direct ready" : "Guarded ready") :
+    directMode ? (s.in_config ? "Direct config" : "Direct CLI") :
+    s.mode === "change_attached" ? (s.in_config ? "Config mode" : "Change attached") : "Read-only";
   const chip = $("guard-mode-chip");
   chip.textContent = modeText;
-  chip.className = "guard-mode" + (s?.in_config ? " config" : s?.mode === "change_attached" ? " attached" : s ? " read" : "");
+  chip.className = "guard-mode" + (directMode ? " direct" : s?.in_config ? " config" : s?.mode === "change_attached" ? " attached" : s ? " read" : "");
   $("shell-session-id").textContent = s?.sessionId ? s.sessionId.slice(0, 10) : "none";
   $("shell-change").textContent = s?.changeId ? s.changeId.slice(0, 8) : "none";
   const touched = Boolean(s?.deviceTouched);
   const deviceChip = $("guard-device-chip");
-  deviceChip.textContent = touched ? "Touched" : "Not touched";
-  deviceChip.className = "device-chip " + (touched ? "touched" : "not-touched");
+  deviceChip.textContent = touched ? "Touched" : directMode && s ? "Direct mode" : "Not touched";
+  deviceChip.className = "device-chip " + (touched ? "touched" : directMode && s ? "direct" : "not-touched");
   const hasSession = Boolean(s?.sessionId);
-  $("shell-attach").disabled = !hasSession || s?.mode === "change_attached";
+  $("shell-attach").disabled = !hasSession || directMode || s?.mode === "change_attached";
   $("shell-evidence").disabled = !hasSession;
   $("shell-open").textContent = hasSession ? "Close session" : "Open session";
   // Terminal title bar + trust bar
@@ -2520,6 +2642,15 @@ function renderChangeGuard() {
   const runnerOk = isRunnerReady();
   $("tb-runner").textContent = runnerOk ? "Runner online" : "Runner offline";
   $("tb-runner-dot").className = "tb-dot " + (runnerOk ? "ok" : "bad");
+  $("tb-writes").textContent = directMode ? "Direct" : "Guarded";
+  if (!s) {
+    setGuardFacts(
+      "—",
+      directMode ? "Normal SSH behavior with session logging." : "Read-only commands run; config mode requires an attached change.",
+      "Waiting for a session.",
+      "Open a session to begin."
+    );
+  }
 }
 
 function isRunnerReady() {
@@ -2561,8 +2692,25 @@ function sendResize() {
 function applyGuardEvent(ev) {
   const s = appState.shell;
   // command events are reporting-only (captured into the change); no UI noise.
-  if (ev.type === "command") { if (s) s.deviceTouched = true; renderChangeGuard(); return; }
+  if (ev.type === "command") {
+    if (s) {
+      if (ev.in_config !== undefined) s.in_config = Boolean(ev.in_config);
+      if (ev.device_touched !== undefined) s.deviceTouched = Boolean(ev.device_touched);
+      else if (s.guardEnabled !== false) s.deviceTouched = true;
+    }
+    if (s?.guardEnabled === false) {
+      setGuardFacts("Command sent", "Direct CLI sends commands without governance blocking.", ev.line || "Command sent to device.", "Continue, or open Evidence to review the transcript.");
+    }
+    renderChangeGuard();
+    return;
+  }
   const action = ev.action || "";
+  if (action === "direct_mode") {
+    termWrite(`\r\n\x1b[38;5;114m✓ ${ev.message || "Direct CLI mode active."}\x1b[0m\r\n`);
+    setGuardFacts("Direct mode", "Commands are sent exactly as typed.", "Governance blocking is disabled; transcript logging remains on.", "Use the CLI normally. Open Evidence to review the session log.");
+    renderChangeGuard();
+    return;
+  }
   if (action === "config_mode_entered") { s.in_config = true; s.deviceTouched = true; }
   if (action === "config_mode_exited") { s.in_config = false; }
   if (action === "change_attached_live") {
@@ -2590,13 +2738,27 @@ async function openShell() {
   if (appState.shell?.sessionId) { closeShell(); return; }
   const deviceId = $("shell-device").value;
   if (!deviceId) { failOutcome("Pick a device.", new Error("No device selected for the shell session.")); return; }
+  const guardEnabled = shellGuardEnabled();
   try {
-    const res = await postJson("/api/shell/open", { device_id: deviceId });
-    appState.shell = { sessionId: res.session_id, deviceId, changeId: null, mode: res.state.mode, in_config: false, deviceTouched: false };
+    const res = await postJson("/api/shell/open", { device_id: deviceId, guard_enabled: guardEnabled });
+    appState.shell = {
+      sessionId: res.session_id,
+      deviceId,
+      changeId: null,
+      mode: res.state.mode,
+      guardEnabled: Boolean(res.state.guard_enabled),
+      in_config: false,
+      deviceTouched: false,
+    };
     ensureTerm();
     shellTerm.clear();
-    termWrite(`\x1b[38;5;74mNetcode Shell — governed SSH to ${deviceId} via the on-prem runner. Read-only; config mode is guarded.\x1b[0m\r\n`);
-    $("shell-hint").textContent = "Live session. Type as you would in SSH. Config mode is blocked until you attach a change.";
+    const banner = guardEnabled
+      ? `Netcode Shell — guarded SSH to ${deviceId} via the on-prem runner. Config mode requires an attached change.`
+      : `Netcode Shell — direct SSH to ${deviceId} via the on-prem runner. Normal CLI behavior; session logging is on.`;
+    termWrite(`\x1b[38;5;74m${banner}\x1b[0m\r\n`);
+    $("shell-hint").textContent = guardEnabled
+      ? "Live guarded session. Config mode is blocked until you attach a change."
+      : "Live direct session. Commands are sent exactly as typed and logged to evidence.";
     const proto = location.protocol === "https:" ? "wss" : "ws";
     shellSocket = new WebSocket(`${proto}://${location.host}/api/shell/session/${res.session_id}`);
     shellSocket.onmessage = (msg) => {
@@ -2610,11 +2772,14 @@ async function openShell() {
     };
     shellSocket.onclose = () => { termWrite("\r\n\x1b[38;5;244m[session closed]\x1b[0m\r\n"); };
     renderChangeGuard();
-    setOutcome({ state: "Read-only", status: "pass", title: `Governed SSH session open on ${deviceId}.`,
-      summary: "A live PTY through the on-prem runner. Every keystroke is guarded; the browser never touches the device.",
-      expected: "A read-only interactive session where config mode is guarded.", actual: res.message,
+    setOutcome({ state: guardEnabled ? "Guarded" : "Direct", status: "pass", title: `${guardEnabled ? "Guarded" : "Direct"} SSH session open on ${deviceId}.`,
+      summary: guardEnabled
+        ? "A live PTY through the on-prem runner. Commands are guarded; the browser never touches the device."
+        : "A live PTY through the on-prem runner. Commands are sent normally; the browser never touches the device.",
+      expected: guardEnabled ? "A guarded interactive session where config mode requires an attached change." : "A normal interactive SSH session with evidence capture.",
+      actual: res.message,
       artifact: "The session transcript is the evidence record.", device: "No device config was changed.",
-      next: "Work at the CLI; attach a change to configure." });
+      next: guardEnabled ? "Work at the CLI; attach a change to configure." : "Work at the CLI normally; open Evidence to review the transcript." });
   } catch (error) { failOutcome("Could not open session.", error); }
 }
 
@@ -2622,12 +2787,16 @@ function closeShell() {
   if (shellSocket) { try { shellSocket.close(); } catch (e) {} shellSocket = null; }
   appState.shell = null;
   renderChangeGuard();
-  $("shell-hint").textContent = "Session closed. Open a new session for a live, guarded SSH terminal.";
+  $("shell-hint").textContent = "Session closed. Open a new session for a live SSH terminal.";
 }
 
 async function shellAttach() {
   const s = appState.shell;
   if (!s?.sessionId) return;
+  if (s.guardEnabled === false) {
+    setGuardFacts("Attach skipped", "Direct CLI does not require attach to configure.", "Session is already unblocked.", "Use Evidence to review the transcript, or close and reopen in Guarded mode.");
+    return;
+  }
   openAttachPicker();
 }
 
@@ -2733,6 +2902,102 @@ async function openShellEvidence() {
   } catch (error) { failOutcome("Could not load transcript.", error); }
 }
 
+function shellPlatformOptions() {
+  const raw = appState.rezPlatforms?.platforms || appState.rezPlatforms || {};
+  let platforms = [];
+  if (Array.isArray(raw)) platforms = raw.map((item) => typeof item === "string" ? item : item.platform || item.id).filter(Boolean);
+  else if (raw && typeof raw === "object") platforms = Object.keys(raw);
+  if (!platforms.length) platforms = ["arista_eos", "cisco_ios", "cisco_nxos", "juniper_junos", "aruba_aoscx"];
+  return [...new Set(platforms)].sort();
+}
+
+function closeManualDeviceModal() {
+  const el = $("manual-device-modal");
+  if (el) el.remove();
+}
+
+function openManualDeviceModal() {
+  closeManualDeviceModal();
+  const platformOptions = shellPlatformOptions().map((platform) =>
+    `<option value="${escapeHtml(platform)}" ${platform === "arista_eos" ? "selected" : ""}>${escapeHtml(platform)}</option>`
+  ).join("");
+  const overlay = document.createElement("div");
+  overlay.id = "manual-device-modal";
+  overlay.className = "nc-modal-overlay";
+  overlay.innerHTML = `
+    <form class="nc-modal nc-modal-wide" id="manual-device-form" role="dialog" aria-label="Add device">
+      <div class="nc-modal-head">
+        <h3>Add device to Shell</h3>
+        <p>Add a device manually when discovery is not ready. Source of truth stores device facts; credentials are sent only to the runner inventory.</p>
+      </div>
+      <div class="nc-modal-body manual-device-grid">
+        <label class="nc-field"><span>Device name</span><input name="device_id" value="v2-store1" autocomplete="off" required /></label>
+        <label class="nc-field"><span>Host / IP</span><input name="host" value="172.100.1.41" autocomplete="off" required /></label>
+        <label class="nc-field"><span>Vendor driver</span><select name="platform">${platformOptions}</select></label>
+        <label class="nc-field"><span>SSH port</span><input name="port" type="number" min="1" max="65535" value="22" required /></label>
+        <label class="nc-field"><span>Username</span><input name="username" value="admin" autocomplete="username" /></label>
+        <label class="nc-field"><span>Password</span><input name="password" type="password" value="admin" autocomplete="current-password" /></label>
+        <label class="nc-field"><span>Site</span><input name="site" value="manual" autocomplete="off" /></label>
+        <label class="nc-field"><span>Groups</span><input name="groups" value="manual" autocomplete="off" /></label>
+      </div>
+      <div class="nc-modal-actions">
+        <button id="manual-device-cancel" class="secondary" type="button">Cancel</button>
+        <button id="manual-device-save" type="submit">Add device</button>
+      </div>
+    </form>`;
+  document.body.appendChild(overlay);
+  overlay.addEventListener("click", (event) => { if (event.target === overlay) closeManualDeviceModal(); });
+  $("manual-device-cancel").addEventListener("click", closeManualDeviceModal);
+  $("manual-device-form").addEventListener("submit", submitManualDevice);
+}
+
+async function submitManualDevice(event) {
+  event.preventDefault();
+  const form = event.currentTarget;
+  const button = $("manual-device-save");
+  const values = Object.fromEntries(new FormData(form).entries());
+  const payload = {
+    device_id: String(values.device_id || "").trim(),
+    hostname: String(values.device_id || "").trim(),
+    host: String(values.host || "").trim(),
+    platform: String(values.platform || "arista_eos").trim(),
+    username: String(values.username || "").trim(),
+    password: String(values.password || ""),
+    port: Number(values.port || 22),
+    site: String(values.site || "manual").trim(),
+    groups: String(values.groups || "manual").split(",").map((item) => item.trim()).filter(Boolean),
+  };
+  if (!payload.device_id || !payload.host || !payload.platform) {
+    failOutcome("Device details incomplete.", new Error("Device name, host/IP, and vendor driver are required."));
+    return;
+  }
+  button.disabled = true;
+  button.textContent = "Adding...";
+  try {
+    const res = await postJson("/api/shell/devices/manual", payload);
+    await checkWorkspace({ silent: true });
+    if ($("shell-device")) $("shell-device").value = payload.device_id;
+    renderShell();
+    closeManualDeviceModal();
+    setOutcome({
+      state: "Device added",
+      status: "pass",
+      title: `${payload.device_id} is available in Shell.`,
+      summary: res.message || "Device facts were written to source of truth and the runner inventory was updated.",
+      expected: "The Shell can target this device without running discovery first.",
+      actual: res.runner_inventory?.message || res.source_of_truth?.message || "Device saved.",
+      artifact: res.source_of_truth?.inventory || "Source of truth updated.",
+      device: "No device config was changed.",
+      next: "Open a Direct CLI session to connect.",
+    });
+  } catch (error) {
+    failOutcome("Could not add device.", error);
+  } finally {
+    button.disabled = false;
+    button.textContent = "Add device";
+  }
+}
+
 function bindEvents() {
   $$(".nav-item").forEach((button) => button.addEventListener("click", () => setView(button.dataset.view)));
   $$("[data-go]").forEach((button) => button.addEventListener("click", () => setView(button.dataset.go)));
@@ -2774,12 +3039,18 @@ function bindEvents() {
   $("check-device-drift").addEventListener("click", checkDeviceDrift);
   $("run-troubleshoot").addEventListener("click", runTroubleshoot);
   $("shell-open").addEventListener("click", openShell);
+  $("shell-add-device").addEventListener("click", openManualDeviceModal);
+  $("shell-mode-direct").addEventListener("click", () => setShellMode("direct"));
+  $("shell-mode-guarded").addEventListener("click", () => setShellMode("guarded"));
   $("shell-attach").addEventListener("click", shellAttach);
   $("shell-evidence").addEventListener("click", openShellEvidence);
   $("fleet-plan").addEventListener("click", fleetPlanRollout);
+  $("fleet-approve").addEventListener("click", fleetApproveRollout);
   $("fleet-start").addEventListener("click", fleetStartRollout);
   $("fleet-halt").addEventListener("click", fleetHaltRollout);
   $("fleet-drift-refresh").addEventListener("click", fleetDriftRefresh);
+  $("fleet-remediate").addEventListener("click", fleetRemediate);
+  $("fleet-drift-watch").addEventListener("change", fleetWatchChange);
   $("fleet-waves").addEventListener("click", fleetWaveClicks);
   $("refresh-evidence").addEventListener("click", refreshEvidence);
   $$("#change-form input, #change-form select, #change-form textarea").forEach((input) => input.addEventListener("input", resetChangeProof));
@@ -2789,6 +3060,7 @@ async function boot() {
   const ready = await initAuth();
   if (!ready) return; // login overlay shown; boot resumes after successful login
   await checkWorkspace({ silent: true });
+  setView(appState.view || "shell");
 }
 
 $("login-form").addEventListener("submit", handleLogin);

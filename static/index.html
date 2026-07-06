@@ -6,9 +6,9 @@
     <title>Netcode</title>
     <link rel="icon" href="/static/favicon.svg" type="image/svg+xml" />
     <link rel="stylesheet" href="/static/vendor/xterm.css" />
-    <link rel="stylesheet" href="/static/styles.css?v=20260706-fleet2" />
+    <link rel="stylesheet" href="/static/styles.css?v=20260706-shellmain2" />
   </head>
-  <body>
+  <body class="shell-product-view">
     <div id="login-overlay" class="login-overlay" hidden>
       <form id="login-form" class="login-card">
         <div class="brand-mark">NC</div>
@@ -21,7 +21,7 @@
       </form>
     </div>
     <main class="app-shell">
-      <aside class="sidebar" aria-label="MVP navigation">
+      <aside class="sidebar" aria-label="Netcode navigation">
         <div class="brand">
             <div class="brand-mark">NC</div>
           <div>
@@ -31,17 +31,22 @@
         </div>
 
         <nav class="nav-list">
-          <button class="nav-item active" type="button" data-view="home">Home</button>
-          <button class="nav-item" type="button" data-view="setup">Setup</button>
-          <button class="nav-item" type="button" data-view="inventory">Inventory</button>
-          <button class="nav-item" type="button" data-view="desired">Desired State</button>
-          <button class="nav-item" type="button" data-view="plan">Plan</button>
-          <button class="nav-item" type="button" data-view="validate">Validate</button>
-          <button class="nav-item" type="button" data-view="apply">Apply</button>
+          <p class="nav-section">Daily workspace</p>
+          <button class="nav-item active" type="button" data-view="shell">Shell</button>
           <button class="nav-item" type="button" data-view="fleet">Fleet</button>
-          <button class="nav-item" type="button" data-view="shell">Shell</button>
-          <button class="nav-item" type="button" data-view="drift">Troubleshoot</button>
           <button class="nav-item" type="button" data-view="evidence">Evidence</button>
+          <p class="nav-section">One-time setup</p>
+          <button class="nav-item" type="button" data-view="setup">Setup Wizard</button>
+          <details class="nav-advanced">
+            <summary>Advanced workflows</summary>
+            <button class="nav-item compact" type="button" data-view="inventory">Inventory</button>
+            <button class="nav-item compact" type="button" data-view="desired">Desired State</button>
+            <button class="nav-item compact" type="button" data-view="plan">Plan</button>
+            <button class="nav-item compact" type="button" data-view="validate">Validate</button>
+            <button class="nav-item compact" type="button" data-view="apply">Apply</button>
+            <button class="nav-item compact" type="button" data-view="drift">Troubleshoot</button>
+            <button class="nav-item compact" type="button" data-view="home" aria-label="Home learning map">Learning Map</button>
+          </details>
         </nav>
 
         <section class="workspace-card">
@@ -56,15 +61,15 @@
           <header class="page-header">
             <div>
               <p class="eyebrow">Network as Code</p>
-              <h2 id="view-title">Five guided stories for Network as Code.</h2>
-              <p id="view-subtitle">Lower change risk, faster delivery, audit-ready proof, and a practical path for network engineers to adopt Git, source of truth, templates, validation, and Rez-driven device reads.</p>
+              <h2 id="view-title">Netcode Shell — governed SSH.</h2>
+              <p id="view-subtitle">The daily workspace for network engineers: direct SSH when you need speed, guarded SSH when you need governance, and evidence for every session.</p>
             </div>
             <div class="run-state">
               <span id="run-state-label">Draft</span>
             </div>
           </header>
 
-          <section id="view-home" class="view active">
+          <section id="view-home" class="view">
             <section class="value-strip" aria-label="Netcode business outcomes">
               <article>
                 <span>Outcome</span>
@@ -129,8 +134,8 @@
 
           <section id="view-setup" class="view">
             <section class="section-heading">
-              <h3>Setup — readiness gates</h3>
-              <p>Gates 1–2 (Git, source of truth) unlock changes. Gates 3–4 tell you how changes will be proven — with a lab, with on-device dry-runs, or plan-only. A missing lab never blocks planning.</p>
+              <h3>Setup Wizard — run this once</h3>
+              <p>Connect the pieces Netcode needs before daily SSH work: Git, source of truth, runner reachability, and proof mode. After these gates are green, most engineers should live in Shell.</p>
             </section>
             <p class="gate-group-label">Required before you can start a change</p>
             <div class="setup-grid two">
@@ -487,8 +492,10 @@
                     <label>Canary size<input name="canary_size" type="number" min="1" value="1" /></label>
                     <label>Batch size<input name="batch_size" type="number" min="1" value="3" /></label>
                   </div>
+                  <label id="fleet-approver-row" hidden>Approver (second engineer)<input id="fleet-approver" type="text" placeholder="e.g. jane@corp" autocomplete="off" /></label>
                   <div class="button-row">
                     <button id="fleet-plan" type="button">Plan rollout</button>
+                    <button id="fleet-approve" class="secondary" type="button" disabled>Approve</button>
                     <button id="fleet-start" class="secondary" type="button" disabled>Start rollout</button>
                     <button id="fleet-halt" class="danger" type="button" disabled>Halt</button>
                   </div>
@@ -509,16 +516,25 @@
             </section>
             <div class="fleet-drift-bar">
               <button id="fleet-drift-refresh" type="button">Run fleet drift sweep</button>
+              <button id="fleet-remediate" class="secondary" type="button" hidden>Create remediation plan</button>
+              <label class="fleet-watch-label">Watch
+                <select id="fleet-drift-watch">
+                  <option value="0">off</option>
+                  <option value="5">every 5m</option>
+                  <option value="15">every 15m</option>
+                  <option value="60">hourly</option>
+                </select>
+              </label>
               <span id="fleet-drift-meta" class="setup-hint">Never run in this session.</span>
             </div>
             <div id="fleet-drift-table" class="fleet-drift-table"></div>
           </section>
 
-          <section id="view-shell" class="view">
+          <section id="view-shell" class="view active">
             <div class="shell-trustbar">
               <span class="tb-title">Netcode Shell</span>
               <span class="tb-item"><i class="tb-dot ok" id="tb-runner-dot"></i><span id="tb-runner">Runner</span></span>
-              <span class="tb-item"><i class="tb-lock"></i>Prod writes: <b id="tb-writes">Guarded</b></span>
+              <span class="tb-item"><i class="tb-lock"></i>Shell mode: <b id="tb-writes">Direct</b></span>
               <span class="tb-item"><i class="tb-key"></i>Credentials stay on the runner</span>
               <span class="tb-item tb-muted">The browser never touches the device</span>
             </div>
@@ -527,7 +543,16 @@
                 <label class="shell-field">Device
                   <select id="shell-device"></select>
                 </label>
+                <div class="shell-mode-block">
+                  <span class="shell-mode-label">Mode</span>
+                  <div class="shell-mode-toggle" role="group" aria-label="Shell mode">
+                    <button id="shell-mode-direct" type="button" data-mode="direct">Direct CLI</button>
+                    <button id="shell-mode-guarded" type="button" data-mode="guarded">Guarded</button>
+                  </div>
+                  <p id="shell-mode-note">Direct CLI behaves like normal SSH. Commands are not blocked, but the session is logged.</p>
+                </div>
                 <button id="shell-open" type="button">Open session</button>
+                <button id="shell-add-device" class="secondary" type="button">Add device</button>
                 <div class="shell-session-meta">
                   <p><span>Session</span><strong id="shell-session-id">none</strong></p>
                   <p><span>Change</span><strong id="shell-change">none</strong></p>
@@ -536,7 +561,7 @@
                   <button id="shell-attach" class="secondary" type="button" disabled>Attach change</button>
                   <button id="shell-evidence" class="secondary" type="button" disabled>Evidence</button>
                 </div>
-                <p class="shell-help">Type as you would in SSH. <b>show / ping / enable</b> and normal commands run live. <b>conf t</b> is gated until you attach a change; <b>reload / clear / copy</b> ask you to confirm; credentials are always blocked.</p>
+                <p class="shell-help">Use <b>Direct CLI</b> when you want a normal terminal with evidence capture. Use <b>Guarded</b> when you want config mode and risky commands intercepted until a change is attached.</p>
               </aside>
               <div class="shell-terminal-wrap">
                 <div class="shell-term-titlebar">
@@ -558,7 +583,7 @@
                 </div>
                 <dl class="guard-facts">
                   <dt>Last action</dt><dd id="guard-last">—</dd>
-                  <dt>Expected</dt><dd id="guard-expected">Normal commands run; config mode is guarded.</dd>
+                  <dt>Expected</dt><dd id="guard-expected">Normal SSH behavior with session logging.</dd>
                   <dt>Actual</dt><dd id="guard-actual">Waiting for a session.</dd>
                   <dt>Next safe action</dt><dd id="guard-next">Open a session to begin.</dd>
                 </dl>
@@ -686,6 +711,6 @@
     </main>
     <script src="/static/vendor/xterm.js"></script>
     <script src="/static/vendor/xterm-addon-fit.js"></script>
-    <script src="/static/app.js?v=20260706-fleet2"></script>
+    <script src="/static/app.js?v=20260706-shellmain2"></script>
   </body>
 </html>

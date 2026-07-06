@@ -86,6 +86,17 @@ DEFAULT_UI_CONFIG: dict[str, Any] = {
                     {"name": "pci_reachable", "label": "PCI reachable", "type": "checkbox", "value": False},
                 ],
             },
+            "ntp_standardize": {
+                "label": "NTP Standardization",
+                "outcome": "Ensure every device uses the approved time sources.",
+                "risk": "Low: additive time-source configuration",
+                "lab_write_supported": True,
+                "production_write_supported": False,
+                "fields": [
+                    {"name": "servers", "label": "Approved NTP servers", "type": "text", "value": "10.42.0.10, 10.42.0.11", "placeholder": "comma separated IPs/hostnames"},
+                    {"name": "prefer_first", "label": "Prefer first server", "type": "checkbox", "value": True},
+                ],
+            },
             "interface_config": {
                 "label": "Interface Config",
                 "outcome": "Configure access, trunk, or routed interface intent.",

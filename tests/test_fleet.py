@@ -200,3 +200,128 @@ def test_drift_status_collapse():
     assert fleet._drift_status({"status": "unknown"}, [{"vlan_id": 1}]) == "unreachable"
     assert fleet._drift_status({"error": "boom"}, [{"vlan_id": 1}]) == "unreachable"
     assert fleet._drift_status({"status": "in_sync"}, []) == "no_baseline"
+
+
+# ── Approval gate ────────────────────────────────────────────────────────────
+
+def test_apply_blocked_until_approved_when_approval_required(tmp_path: Path, monkeypatch):
+    from netcode.jobs import JobRunner
+    paths = _fleet_workspace(tmp_path, device_count=1)
+    monkeypatch.setenv("NETCODE_REQUIRE_APPROVAL", "1")
+    monkeypatch.setenv("NETCODE_EXECUTION", "runner")  # queue path: no device I/O
+    rollout = _plan(paths)
+    target = rollout["waves"][0]["targets"][0]
+    store = PlatformStore(paths)
+    change = store.get_change(target["change_id"])
+    # simulate the proven state
+    store.record_workflow_event(change.id, "dry-run", change.workflow_state, "dry_run_passed", "proof", {})
+    blocked = JobRunner(paths).run_lab_action(Path(target["intent_path"]), "apply", target["device_id"], change.id)
+    assert blocked["ok"] is False
+    assert blocked["result"]["approval_required"] is True
+    # approve (second engineer), then apply queues
+    store.record_workflow_event(change.id, "approve", "dry_run_passed", "approved", "Approved by reviewer.", {})
+    queued = JobRunner(paths).run_lab_action(Path(target["intent_path"]), "apply", target["device_id"], change.id)
+    assert queued["ok"] is True and queued["queued"] is True
+
+
+def test_rollout_approval_requester_cannot_self_approve(tmp_path: Path, monkeypatch):
+    paths = _fleet_workspace(tmp_path, device_count=2)
+    rollout = _plan(paths)  # requested_by="tester"
+    with pytest.raises(ValueError, match="cannot approve their own"):
+        fleet.approve_rollout(paths, rollout["id"], "tester")
+    approved = fleet.approve_rollout(paths, rollout["id"], "reviewer")
+    assert approved["approved_by"] == "reviewer"
+
+
+def test_rollout_start_requires_approval_when_gate_is_on(tmp_path: Path, monkeypatch):
+    paths = _fleet_workspace(tmp_path, device_count=2)
+    monkeypatch.setenv("NETCODE_REQUIRE_APPROVAL", "1")
+    rollout = _plan(paths)
+    with pytest.raises(ValueError, match="Approval gate"):
+        fleet.start_rollout(paths, rollout["id"])
+    fleet.approve_rollout(paths, rollout["id"], "reviewer")
+    monkeypatch.setattr(fleet, "_run_rollout_safe", lambda p, rid: None)
+    started = fleet.start_rollout(paths, rollout["id"])
+    assert started["status"] == "running"
+
+
+# ── Closed loop: drift -> remediation ────────────────────────────────────────
+
+def test_remediation_targets_only_drifted_devices(tmp_path: Path):
+    paths = _fleet_workspace(tmp_path, device_count=4)
+    org = "org_default"
+    with fleet._DRIFT_LOCK:
+        fleet._DRIFT_STATES[org] = {
+            "status": "done", "started_at": "t", "finished_at": "t",
+            "progress": {"done": 4, "total": 4}, "report_path": None,
+            "devices": [
+                {"device_id": "sw1", "status": "in_sync", "detail": {}},
+                {"device_id": "sw2", "status": "drifted", "detail": {"vlans": [
+                    {"vlan_id": 777, "name": "GUEST_WIFI", "status": "drifted"}]}},
+                {"device_id": "sw3", "status": "drifted", "detail": {"vlans": [
+                    {"vlan_id": 777, "name": "GUEST_WIFI", "status": "drifted"},
+                    {"vlan_id": 90, "name": "GUEST_WIFI", "status": "in_sync"}]}},
+                {"device_id": "sw4", "status": "unreachable", "detail": {}},
+            ],
+        }
+    rollouts = fleet.create_remediation_rollouts(paths, org, requested_by="tester")
+    assert len(rollouts) == 1
+    remediation = rollouts[0]
+    devices = sorted(t["device_id"] for w in remediation["waves"] for t in w["targets"])
+    assert devices == ["sw2", "sw3"]
+    assert "777" in remediation["description"]
+    assert remediation["status"] == "planned"
+
+
+def test_remediation_requires_a_finished_sweep(tmp_path: Path):
+    paths = _fleet_workspace(tmp_path, device_count=1)
+    with fleet._DRIFT_LOCK:
+        fleet._DRIFT_STATES.pop("org_x", None)
+    with pytest.raises(ValueError, match="drift sweep"):
+        fleet.create_remediation_rollouts(paths, "org_x", requested_by="tester")
+
+
+# ── Drift watch ──────────────────────────────────────────────────────────────
+
+def test_drift_watch_toggle(tmp_path: Path, monkeypatch):
+    paths = _fleet_workspace(tmp_path, device_count=1)
+    monkeypatch.setattr(fleet, "start_fleet_drift", lambda *a, **k: None)
+    from netcode.models import load_intent
+    status = fleet.set_drift_watch(paths, "org_default", 30, load_intent)
+    assert status == {"enabled": True, "minutes": 30}
+    status = fleet.set_drift_watch(paths, "org_default", 0, load_intent)
+    assert status == {"enabled": False, "minutes": 0}
+
+
+# ── NTP pack ─────────────────────────────────────────────────────────────────
+
+def test_ntp_pack_full_static_spine(tmp_path: Path):
+    from netcode.orchestrator import create_desired_state_intent, run_static_pipeline
+    paths = _fleet_workspace(tmp_path, device_count=1)
+    intent_path = create_desired_state_intent(
+        paths, change_type="ntp_standardize", site="store-1", device_id="sw1",
+        requested_by="tester", values={"servers": "10.42.0.10, 10.42.0.11"})
+    result = run_static_pipeline(paths, intent_path)
+    assert result.status == "pass"
+    rendered = result.render.config
+    assert "ntp server 10.42.0.10 prefer" in rendered
+    assert "ntp server 10.42.0.11" in rendered
+    from netcode.change_types import spec_for
+    from netcode.models import load_intent
+    rollback = spec_for("ntp_standardize").rollback(load_intent(intent_path))
+    assert "no ntp server 10.42.0.10" in rollback and "no ntp server 10.42.0.11" in rollback
+
+
+def test_ntp_pack_blocks_rogue_server_against_approved_list(tmp_path: Path):
+    from netcode.orchestrator import create_desired_state_intent, run_static_pipeline
+    from netcode.ui_config import configured_policy_path
+    paths = _fleet_workspace(tmp_path, device_count=1)
+    policy_path = configured_policy_path(paths)
+    policy_path.write_text(policy_path.read_text() + "\nntp:\n  approved_servers:\n  - 10.42.0.10\n", encoding="utf-8")
+    intent_path = create_desired_state_intent(
+        paths, change_type="ntp_standardize", site="store-1", device_id="sw1",
+        requested_by="tester", values={"servers": "10.42.0.10, 6.6.6.6"})
+    result = run_static_pipeline(paths, intent_path)
+    assert result.status == "fail"
+    failing = [c for c in result.validation.checks if c.status != "pass"]
+    assert any("approved NTP server list" in c.message for c in failing)

@@ -175,16 +175,43 @@ def rollout_status(p: WorkspacePaths, rollout_id: str) -> dict[str, Any]:
     rollout["waves"] = waves
     rollout["target_counts"] = counts
     rollout["device_count"] = len(targets)
+    from netcode.jobs import approval_required
+    rollout["approval_required"] = approval_required()
     return rollout
 
 
 # ── Rollout execution ────────────────────────────────────────────────────────
 
+def approve_rollout(p: WorkspacePaths, rollout_id: str, approved_by: str) -> dict[str, Any]:
+    store = PlatformStore(p)
+    rollout = store.get_rollout(rollout_id)
+    if rollout["status"] != "planned":
+        raise ValueError(f"Rollout is '{rollout['status']}' — only a planned rollout can be approved.")
+    approver = (approved_by or "").strip()
+    if not approver:
+        raise ValueError("Approver identity is required.")
+    if approver == rollout["requested_by"]:
+        raise ValueError("The requester cannot approve their own rollout — a second engineer must approve.")
+    rollout = store.approve_rollout(rollout_id, approver)
+    for target in store.list_rollout_targets(rollout_id):
+        if target.get("change_id"):
+            change = store.get_change(str(target["change_id"]))
+            store.record_workflow_event(
+                str(target["change_id"]), "approve", change.workflow_state, change.workflow_state,
+                f"Approved via rollout {rollout_id[:8]} by {approver}.",
+                {"rollout_id": rollout_id, "approved_by": approver},
+            )
+    return rollout_status(p, rollout_id)
+
+
 def start_rollout(p: WorkspacePaths, rollout_id: str) -> dict[str, Any]:
+    from netcode.jobs import approval_required
     store = PlatformStore(p)
     rollout = store.get_rollout(rollout_id)
     if rollout["status"] not in ("planned",):
         raise ValueError(f"Rollout is '{rollout['status']}' — only a planned rollout can start.")
+    if approval_required() and not rollout.get("approved_by"):
+        raise ValueError("Approval gate: a second engineer must approve this rollout before it can start.")
     with _THREADS_LOCK:
         existing = _ROLLOUT_THREADS.get(rollout_id)
         if existing and existing.is_alive():
@@ -293,6 +320,8 @@ def _run_device(p: WorkspacePaths, store: PlatformStore, rollout_id: str, target
                                 message="Dry-run proof on the device.")
 
     for action in ("dry-run", "apply"):
+        if action == "apply":
+            _inherit_rollout_approval(store, rollout_id, change_id)
         store.update_rollout_target(rollout_id, device_id, stage=action)
         ok, message = _lab_action_and_wait(p, store, intent_path, action, device_id, change_id)
         if not ok:
@@ -307,6 +336,26 @@ def _run_device(p: WorkspacePaths, store: PlatformStore, rollout_id: str, target
     store.update_rollout_target(rollout_id, device_id, status="passed", stage="done",
                                 message="Applied and verified on the device.")
     return True
+
+
+def _inherit_rollout_approval(store: PlatformStore, rollout_id: str, change_id: str) -> None:
+    """A rollout is approved once, up front; each per-device change inherits that
+    approval right before its apply (the change reaches dry_run_passed first, so
+    the approved state must be stamped after the dry-run, not at approval time)."""
+    from netcode.jobs import approval_required
+    if not approval_required():
+        return
+    rollout = store.get_rollout(rollout_id)
+    approver = rollout.get("approved_by")
+    if not approver:
+        return  # start_rollout blocks unapproved rollouts; fail-closed at jobs gate anyway
+    change = store.get_change(change_id)
+    if change.workflow_state == "dry_run_passed":
+        store.record_workflow_event(
+            change_id, "approve", change.workflow_state, "approved",
+            f"Apply authorized by rollout {rollout_id[:8]} approval ({approver}).",
+            {"rollout_id": rollout_id, "approved_by": approver},
+        )
 
 
 def _lab_action_and_wait(
@@ -475,3 +524,81 @@ def _drift_status(report: dict[str, Any], expected: list[dict[str, Any]]) -> str
     if not expected:
         return "no_baseline"
     return status or "unreachable"
+
+
+# ── Closed loop: drift finding -> remediation rollout ───────────────────────
+
+def create_remediation_rollouts(
+    p: WorkspacePaths, org_id: str, requested_by: str,
+    created_by_user_id: str | None = None,
+    canary_size: int = 1, batch_size: int = 3,
+) -> list[dict[str, Any]]:
+    """Turn the latest drift sweep's findings into governed remediation plans:
+    one rollout per violated intent, targeting ONLY the devices that drifted
+    from it. The rollout then runs the full spine (plan/policy/dry-run/apply/
+    verify) — remediation is never a blind push."""
+    snapshot = fleet_drift_snapshot(org_id)
+    if snapshot["status"] not in ("done",):
+        raise ValueError("Run a fleet drift sweep first — remediation plans are built from its findings.")
+    missing: dict[tuple[int, str], list[str]] = {}
+    for device in snapshot.get("devices", []):
+        if device.get("status") != "drifted":
+            continue
+        for vlan in (device.get("detail") or {}).get("vlans", []):
+            if vlan.get("status") == "drifted":
+                key = (int(vlan["vlan_id"]), str(vlan.get("name") or f"VLAN_{vlan['vlan_id']}"))
+                missing.setdefault(key, []).append(str(device["device_id"]))
+    if not missing:
+        raise ValueError("No drifted intents in the last sweep — nothing to remediate.")
+    rollouts = []
+    for (vlan_id, name), device_ids in sorted(missing.items()):
+        rollouts.append(plan_fleet_rollout(
+            p, change_type="add_vlan", values={"vlan_id": vlan_id, "name": name},
+            device_ids=sorted(set(device_ids)), device_group=None,
+            canary_size=min(canary_size, len(set(device_ids))), batch_size=batch_size,
+            description=f"Remediation: restore VLAN {vlan_id} ({name}) on {len(set(device_ids))} drifted device(s)",
+            requested_by=requested_by, org_id=org_id, created_by_user_id=created_by_user_id,
+        ))
+    return rollouts
+
+
+# ── Continuous drift watch ───────────────────────────────────────────────────
+
+_WATCH_LOCK = threading.Lock()
+_WATCH_STATE: dict[str, dict[str, Any]] = {}  # org_id -> {minutes, thread, stop}
+
+
+def set_drift_watch(p: WorkspacePaths, org_id: str, minutes: int,
+                    load_intent_fn: Callable[[Path], Any]) -> dict[str, Any]:
+    """Enable/disable the periodic fleet sweep for an org. minutes=0 turns it off."""
+    with _WATCH_LOCK:
+        current = _WATCH_STATE.get(org_id)
+        if current:
+            current["stop"].set()
+            _WATCH_STATE.pop(org_id, None)
+        if minutes > 0:
+            stop = threading.Event()
+            thread = threading.Thread(
+                target=_drift_watch_loop, args=(p, org_id, minutes, stop, load_intent_fn),
+                name=f"drift-watch-{org_id[:8]}", daemon=True)
+            _WATCH_STATE[org_id] = {"minutes": minutes, "thread": thread, "stop": stop}
+            thread.start()
+    return drift_watch_status(org_id)
+
+
+def drift_watch_status(org_id: str) -> dict[str, Any]:
+    with _WATCH_LOCK:
+        state = _WATCH_STATE.get(org_id)
+        return {"enabled": bool(state), "minutes": state["minutes"] if state else 0}
+
+
+def _drift_watch_loop(p: WorkspacePaths, org_id: str, minutes: int,
+                      stop: threading.Event, load_intent_fn: Callable[[Path], Any]) -> None:
+    # Sweep immediately, then every interval until stopped.
+    while not stop.is_set():
+        try:
+            start_fleet_drift(p, org_id, load_intent_fn)
+        except Exception:  # noqa: BLE001 — the watch itself must never die
+            pass
+        if stop.wait(timeout=minutes * 60):
+            return

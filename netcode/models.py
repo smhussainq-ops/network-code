@@ -228,7 +228,31 @@ class CustomConfigIntent(BaseModel):
     metadata: IntentMetadata = Field(default_factory=IntentMetadata)
 
 
-Intent = AddVlanIntent | InterfaceConfigIntent | BgpNeighborIntent | AclRuleIntent | SiteDeviceIntent | CustomConfigIntent
+class NtpSpec(BaseModel):
+    servers: list[str]
+    prefer_first: bool = True
+
+    @field_validator("servers")
+    @classmethod
+    def servers_required(cls, value: list[str]) -> list[str]:
+        cleaned = [s.strip() for s in value if s and s.strip()]
+        if not cleaned:
+            raise ValueError("at least one NTP server is required")
+        if len(cleaned) > 8:
+            raise ValueError("at most 8 NTP servers")
+        return list(dict.fromkeys(cleaned))
+
+
+class NtpStandardizeIntent(BaseModel):
+    change_type: Literal["ntp_standardize"] = "ntp_standardize"
+    site: str
+    targets: TargetSpec
+    ntp: NtpSpec
+    policy: PolicySpec = Field(default_factory=PolicySpec)
+    metadata: IntentMetadata = Field(default_factory=IntentMetadata)
+
+
+Intent = AddVlanIntent | InterfaceConfigIntent | BgpNeighborIntent | AclRuleIntent | SiteDeviceIntent | CustomConfigIntent | NtpStandardizeIntent
 
 
 class CheckResult(BaseModel):

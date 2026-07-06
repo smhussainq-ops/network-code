@@ -32,3 +32,8 @@ render_scope:
   - router bgp
   - router ospf
   - enable secret
+ntp:
+  approved_servers:
+  - 10.42.0.10
+  - 10.42.0.11
+  - time.google.com

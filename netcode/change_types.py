@@ -24,6 +24,7 @@ from netcode.models import (
     CustomConfigIntent,
     Intent,
     InterfaceConfigIntent,
+    NtpStandardizeIntent,
     SiteDeviceIntent,
 )
 
@@ -323,4 +324,34 @@ register(ChangeTypeSpec(
     verification_hint=lambda i: {"check": "running_config_contains", "params": {"section": i.custom.verify_contains.strip() or _custom_first_line(i)}},
     policy_checks=["_custom_config_policy"], verify_method="_verify_custom",
     allow_prefixes=[],
+))
+
+
+# ── ntp_standardize ────────────────────────────────────────────────────────
+def _build_ntp(common: dict, values: dict, device_id: str) -> dict:
+    raw = values.get("servers", "")
+    servers = [s.strip() for s in str(raw).replace("\n", ",").split(",") if s.strip()] if not isinstance(raw, list) else [str(s).strip() for s in raw if str(s).strip()]
+    common["ntp"] = {"servers": servers, "prefer_first": bool(values.get("prefer_first", True))}
+    return common
+
+
+def _rollback_ntp(intent: NtpStandardizeIntent) -> str:
+    return "".join(f"no ntp server {server}\n" for server in intent.ntp.servers)
+
+
+register(ChangeTypeSpec(
+    key="ntp_standardize", label="NTP Standardization", model=NtpStandardizeIntent, template="ntp_standardize.j2",
+    risk="Low: additive time-source configuration", lab_write=True, build=_build_ntp,
+    title=lambda i: f"Standardize NTP ({len(i.ntp.servers)} approved server{'s' if len(i.ntp.servers) != 1 else ''})",
+    slug=lambda i: f"{i.site}-ntp-standardize",
+    rollback=_rollback_ntp,
+    rollback_confidence=lambda i: {"level": "high", "reason": "Exact inverse: removes only the servers this change added."},
+    blast_objects=lambda i: [f"NTP server {server}" for server in i.ntp.servers],
+    checks=lambda i: {
+        "pre": [{"id": "ntp_reachability", "description": "Approved NTP servers should be reachable from the device.", "executable": False, "note": "Live pre-check not wired yet."}],
+        "post": [{"id": "ntp_servers_present", "description": f"Running config lists all {len(i.ntp.servers)} approved NTP servers.", "executable": True}],
+    },
+    verification_hint=lambda i: {"check": "running_config_contains", "params": {"section": f"ntp server {i.ntp.servers[0]}"}},
+    policy_checks=["_ntp_policy"], verify_method="_verify_ntp",
+    allow_prefixes=["ntp server "],
 ))

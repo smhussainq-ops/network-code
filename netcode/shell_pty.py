@@ -1,11 +1,14 @@
 """Interactive PTY bridge — runs on the RUNNER, next to the device.
 
 Opens a real SSH shell channel (paramiko invoke_shell) and bridges it to an
-upstream message stream. Every byte of engineer INPUT is run through the
-streaming shell guard (shell_guard.feed) before it can reach the device:
-config mode is blocked until a change is attached, credential/dangerous/unknown
-commands are killed at Enter, pastes are staged, history-recall taints the
-line. Device OUTPUT streams back upstream in real time (the read direction).
+upstream message stream. When guard mode is enabled, every byte of engineer
+INPUT is run through the streaming shell guard (shell_guard.feed) before it can
+reach the device: config mode is blocked until a change is attached,
+credential/dangerous/unknown commands are killed at Enter, pastes are staged,
+history-recall taints the line. In direct mode, input is passed through as a
+normal SSH terminal while command lines are still emitted for the evidence
+transcript. Device OUTPUT streams back upstream in real time (the read
+direction).
 
 The whole session — every guarded input decision and a size-bounded sample of
 output — is emitted as the evidence transcript. Credentials never leave the
@@ -28,11 +31,21 @@ class InteractivePtySession:
     """One live, guarded SSH shell to a device. Thread-safe for a single reader
     thread (device -> upstream) plus caller-driven writes (upstream -> device)."""
 
-    def __init__(self, device: Any, state: ShellSessionState, on_output: OnOutput, on_event: OnEvent):
+    def __init__(
+        self,
+        device: Any,
+        state: ShellSessionState,
+        on_output: OnOutput,
+        on_event: OnEvent,
+        *,
+        guard_enabled: bool = True,
+    ):
         self.device = device
         self.state = state
         self.on_output = on_output
         self.on_event = on_event
+        self.guard_enabled = guard_enabled
+        self._direct_line = ""
         self._client = None
         self._chan = None
         self._stop = False
@@ -57,7 +70,19 @@ class InteractivePtySession:
         self._chan.settimeout(0.0)
         self._reader = threading.Thread(target=self._read_loop, name="pty-reader", daemon=True)
         self._reader.start()
-        self.on_event({"type": "session", "action": "opened", "device_id": getattr(self.device, "id", "")})
+        self.on_event({
+            "type": "session",
+            "action": "opened",
+            "device_id": getattr(self.device, "id", ""),
+            "guard_enabled": self.guard_enabled,
+        })
+        if not self.guard_enabled:
+            self.on_event({
+                "type": "guard",
+                "action": "direct_mode",
+                "guard_enabled": False,
+                "message": "Direct CLI mode active. Governance blocking is disabled; commands are still logged.",
+            })
 
     def _read_loop(self) -> None:
         while not self._stop:
@@ -75,16 +100,64 @@ class InteractivePtySession:
         self.on_event({"type": "session", "action": "closed"})
 
     def write(self, text: str) -> None:
-        """Engineer input: run it through the guard, then send only what clears."""
-        with self._lock:
-            decision = feed(self.state, text)
-        for event in decision.events:
-            self.on_event(event)
-        if decision.forward and self._chan is not None:
+        """Engineer input: guard it when enabled; otherwise pass it through."""
+        forward = text
+        if self.guard_enabled:
+            with self._lock:
+                decision = feed(self.state, text)
+            for event in decision.events:
+                self.on_event(event)
+            forward = decision.forward
+        else:
+            self._record_direct_input(text)
+
+        if forward and self._chan is not None:
             try:
-                self._chan.send(decision.forward)
+                self._chan.send(forward)
             except Exception as exc:  # noqa: BLE001
                 self.on_event({"type": "session", "action": "error", "message": str(exc)})
+
+    def _record_direct_input(self, text: str) -> None:
+        """Best-effort command capture for raw SSH mode.
+
+        This does not gate or rewrite input. It only reconstructs line-oriented
+        commands so the control plane can produce a useful session audit trail.
+        """
+        for char in text:
+            if char in ("\r", "\n"):
+                line = self._direct_line.strip()
+                self._direct_line = ""
+                if line:
+                    self._update_direct_state(line)
+                    self.on_event({
+                        "type": "command",
+                        "action": "direct_command",
+                        "line": line,
+                        "kind": "direct",
+                        "change_id": self.state.change_id,
+                        "mode": self.state.mode,
+                        "in_config": self.state.in_config,
+                        "device_touched": self.state.device_touched,
+                    })
+            elif char in ("\b", "\x7f"):
+                self._direct_line = self._direct_line[:-1]
+            elif char == "\x03":
+                self._direct_line = ""
+            elif char.isprintable():
+                self._direct_line += char
+
+    def _update_direct_state(self, line: str) -> None:
+        normalized = " ".join(line.lower().split())
+        if normalized in ("configure terminal", "conf t", "configure"):
+            self.state.in_config = True
+            return
+        elif normalized in ("end", "disable"):
+            self.state.in_config = False
+            return
+        elif normalized == "exit" and self.state.in_config:
+            return
+        elif self.state.in_config and normalized not in ("exit", "end") and not normalized.startswith(("show ", "do show ")):
+            self.state.device_touched = True
 
     def resize(self, width: int, height: int) -> None:
         try:

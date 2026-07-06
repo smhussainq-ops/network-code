@@ -226,6 +226,32 @@ class StaticValidator:
             sequence=intent.acl.sequence,
         )
 
+    def _ntp_policy(self, intent, render: RenderResult) -> CheckResult:
+        """Approved-source check: if the policy file names approved NTP servers,
+        every server in the intent must be on that list (fail-closed standardization)."""
+        servers = intent.ntp.servers
+        for server in servers:
+            try:
+                ip_address(server)
+            except ValueError:
+                if not re.match(r"^[A-Za-z0-9][A-Za-z0-9.-]{1,253}$", server):
+                    return self._fail("ntp_policy", "NTP Policy", f"'{server}' is not a valid IP or hostname.", server=server)
+        approved = [str(s) for s in (self.policy.get("ntp", {}).get("approved_servers") or [])]
+        if approved:
+            rogue = [s for s in servers if s not in approved]
+            if rogue:
+                return self._fail(
+                    "ntp_policy", "NTP Policy",
+                    f"Not on the approved NTP server list: {', '.join(rogue)}. Approved: {', '.join(approved)}.",
+                    rogue=rogue,
+                )
+        return self._pass(
+            "ntp_policy", "NTP Policy",
+            f"{len(servers)} NTP server{'s' if len(servers) != 1 else ''} "
+            + ("validated against the approved list." if approved else "well-formed (no approved list in policy — add ntp.approved_servers to enforce)."),
+            servers=servers,
+        )
+
     def _custom_config_policy(self, intent: CustomConfigIntent, render: RenderResult) -> CheckResult:
         lines = [line for line in intent.custom.config_lines.splitlines() if line.strip()]
         if not lines:

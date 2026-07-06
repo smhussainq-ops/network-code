@@ -971,7 +971,7 @@ def test_change_type_registry_contract_is_complete():
     from netcode.lab import AristaEOSLabAdapter
     from netcode.validation import StaticValidator
 
-    assert set(REGISTRY) == {"add_vlan", "interface_config", "bgp_neighbor", "acl_rule", "site_device_intent", "custom_config"}
+    assert set(REGISTRY) == {"add_vlan", "interface_config", "bgp_neighbor", "acl_rule", "site_device_intent", "custom_config", "ntp_standardize"}
     for key, spec in REGISTRY.items():
         assert spec.template.endswith(".j2"), key
         assert spec.policy_checks, f"{key} has no policy checks"
@@ -1396,22 +1396,18 @@ def test_app_route_serves_ui():
     assert response.status_code == 200
     assert "Netcode" in response.text
     assert "Network changes with plan, proof, and audit" in response.text
-    assert "Home" in response.text
-    assert "Network as code user stories" in response.text
-    assert "Lower change risk" in response.text
-    assert "Get ready" in response.text
-    assert "Bring devices under management" in response.text
-    assert "Make a safe change" in response.text
-    assert "Troubleshoot / Investigate" in response.text
-    assert "Prove it" in response.text
-    assert "Audit-ready proof" in response.text
-    assert "readiness gates" in response.text
-    assert "Send for review" in response.text
+    assert "Netcode Shell" in response.text
+    assert "Direct CLI" in response.text
+    assert "Guarded" in response.text
+    assert "Add device" in response.text
+    assert "Shell mode" in response.text
+    assert "Credentials stay on the runner" in response.text
+    assert "Setup Wizard" in response.text
     assert "runners-panel" in response.text
     assert "On-prem runners" in response.text
-    assert "Rollback plan (known before apply)" in response.text
     assert "change-record" in response.text
-    assert "Setup" in response.text
+    assert "Daily workspace" in response.text
+    assert "Learning Map" in response.text
     assert "Inventory" in response.text
     assert "Desired State" in response.text
     assert "Plan" in response.text

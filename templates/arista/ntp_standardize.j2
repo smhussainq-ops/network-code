@@ -1,0 +1,4 @@
+{% for server in ntp.servers %}
+ntp server {{ server }}{% if ntp.prefer_first and loop.first %} prefer{% endif %}
+
+{% endfor %}

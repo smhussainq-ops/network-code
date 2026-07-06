@@ -313,6 +313,8 @@ class PlatformStore:
                 )
                 """
             )
+            self._ensure_column(conn, "rollouts", "approved_by", "TEXT")
+            self._ensure_column(conn, "rollouts", "approved_at", "TEXT")
             for table in ("changes", "jobs", "runners", "join_tokens"):
                 self._ensure_column(conn, table, "org_id", f"TEXT DEFAULT '{DEFAULT_ORG_ID}'")
             self._ensure_column(conn, "changes", "created_by_user_id", "TEXT")
@@ -708,11 +710,23 @@ class PlatformStore:
             sets.append("current_wave = ?"); params.append(current_wave)
         params.append(rollout_id)
         where = "id = ?"
+        # (approved_by/approved_at are set only via approve_rollout)
         if expected_status is not None:
             where += " AND status = ?"
             params.append(expected_status)
         with self._connect() as conn:
             conn.execute(f"UPDATE rollouts SET {', '.join(sets)} WHERE {where}", tuple(params))
+        return self.get_rollout(rollout_id)
+
+    def approve_rollout(self, rollout_id: str, approved_by: str) -> dict[str, Any]:
+        """Compare-and-set approval: only a planned, not-yet-approved rollout."""
+        now = utc_now()
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE rollouts SET approved_by = ?, approved_at = ?, updated_at = ? "
+                "WHERE id = ? AND status = 'planned' AND approved_by IS NULL",
+                (approved_by, now, now, rollout_id),
+            )
         return self.get_rollout(rollout_id)
 
     def cancel_queued_jobs_for_change(self, change_id: str, reason: str) -> int:

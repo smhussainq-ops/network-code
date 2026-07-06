@@ -15,7 +15,7 @@ from netcode.adapters.registry import AdapterRegistry
 from netcode.change_types import spec_for
 from netcode.inventory import Device, Inventory
 from netcode.intent_utils import lab_write_supported, report_stem, rollback_config
-from netcode.models import AclRuleIntent, AddVlanIntent, BgpNeighborIntent, CustomConfigIntent, EndToEndArtifacts, EndToEndResult, Intent, InterfaceConfigIntent, PhaseResult, load_intent
+from netcode.models import AclRuleIntent, AddVlanIntent, BgpNeighborIntent, CustomConfigIntent, EndToEndArtifacts, EndToEndResult, Intent, InterfaceConfigIntent, NtpStandardizeIntent, PhaseResult, load_intent
 from netcode.paths import WorkspacePaths
 from netcode.rendering import render_intent
 from netcode.reporting import write_end_to_end_reports
@@ -357,6 +357,28 @@ class AristaEOSLabAdapter(ExecutionAdapter):
                 else "No verify fragment available for this custom config."
             ),
             evidence={"command": command, "needle": needle, "found": found},
+        )
+
+
+    def _verify_ntp(self, intent: NtpStandardizeIntent, present: bool) -> LabResult:
+        command = "show running-config | include ntp server"
+        output = self.show(command)
+        missing = [s for s in intent.ntp.servers if f"ntp server {s}" not in output]
+        if present:
+            ok = not missing
+            message = (f"All {len(intent.ntp.servers)} approved NTP servers are configured."
+                       if ok else f"Missing NTP servers: {', '.join(missing)}.")
+        else:
+            still = [s for s in intent.ntp.servers if f"ntp server {s}" in output]
+            ok = not still
+            message = ("Rollback verified: added NTP servers are gone."
+                       if ok else f"Rollback incomplete: still configured: {', '.join(still)}.")
+        return LabResult(
+            status="pass" if ok else "fail",
+            action="verify" if present else "verify_rollback",
+            device_id=self.device.id,
+            message=message,
+            evidence={"commands": {command: output}, "servers": intent.ntp.servers},
         )
 
 
