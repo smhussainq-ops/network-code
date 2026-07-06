@@ -1443,3 +1443,57 @@ legend,
 .shell-xterm { flex: 1; min-height: 480px; padding: 8px 6px 4px 10px; background: #0b1622; overflow: hidden; }
 .shell-xterm .xterm { height: 100%; }
 .shell-hint-bar { padding: 8px 14px; background: #0e1c2c; border-top: 1px solid #142638; color: #6b7d92; font-size: 12.5px; }
+
+/* ---- Netcode Shell v2 (premium) ---- */
+#view-shell { display: flex; flex-direction: column; gap: 14px; }
+.shell-trustbar {
+  display: flex; align-items: center; gap: 18px; flex-wrap: wrap;
+  padding: 11px 16px; border-radius: 12px;
+  background: linear-gradient(90deg,#0c1a2b,#0e2233);
+  border: 1px solid #17324a; color: #b9cbdc; font-size: 12.5px;
+}
+.shell-trustbar .tb-title { font-weight: 700; color: #eaf2fb; letter-spacing: .01em; font-size: 14px; }
+.shell-trustbar .tb-item { display: inline-flex; align-items: center; gap: 7px; }
+.shell-trustbar b { color: #eaf2fb; }
+.shell-trustbar .tb-muted { color: #6b8299; margin-left: auto; }
+.tb-dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
+.tb-dot.ok { background: #37d296; box-shadow: 0 0 0 3px rgba(55,210,150,.15); }
+.tb-dot.bad { background: #e0654f; box-shadow: 0 0 0 3px rgba(224,101,79,.15); }
+.tb-lock::before { content: "🔒"; font-size: 11px; }
+.tb-key::before { content: "🔑"; font-size: 11px; }
+
+.shell-workspace { grid-template-columns: 232px 1fr 292px; min-height: 560px; }
+.shell-devices, .change-guard { background: var(--panel,#fff); border: 1px solid var(--border,#e2e5ea); border-radius: 16px; }
+.shell-devices { padding: 18px; }
+.shell-devices > button#shell-open { width: 100%; padding: 10px; font-weight: 600; border-radius: 10px; }
+.shell-actions-col { display: flex; flex-direction: column; gap: 8px; }
+.shell-actions-col button { width: 100%; }
+.shell-help { font-size: 12px; line-height: 1.5; color: var(--muted,#6b7280); margin: 4px 0 0; padding-top: 12px; border-top: 1px solid var(--line-2,#eef0f3); }
+.shell-help b { color: var(--ink,#1f2733); font-weight: 600; }
+
+.shell-terminal-wrap { border-radius: 16px; border: 1px solid #0c1a2b; box-shadow: 0 10px 30px rgba(6,16,28,.12); }
+.shell-term-titlebar {
+  display: flex; align-items: center; gap: 12px; padding: 9px 14px;
+  background: #0e1c2c; border-bottom: 1px solid #16283a; border-radius: 16px 16px 0 0;
+}
+.term-dots { display: inline-flex; gap: 6px; }
+.term-dots i { width: 11px; height: 11px; border-radius: 50%; background: #26384a; display: inline-block; }
+.term-dots i:nth-child(1){ background:#e0654f;} .term-dots i:nth-child(2){ background:#e0b24f;} .term-dots i:nth-child(3){ background:#37d296;}
+.term-target { font-family: ui-monospace,Menlo,monospace; font-size: 12.5px; color: #9fc0dd; }
+.term-state { margin-left: auto; font-family: ui-monospace,Menlo,monospace; font-size: 11px; text-transform: uppercase; letter-spacing: .06em; color: #5c7590; padding: 3px 9px; border-radius: 999px; background: #13273a; }
+.term-state.live { color: #37d296; background: rgba(55,210,150,.12); }
+.term-state.config { color: #e0b24f; background: rgba(224,178,79,.12); }
+.shell-xterm { min-height: 470px; border-radius: 0; }
+
+.change-guard { padding: 18px; gap: 0; }
+.guard-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 14px; }
+.guard-head h4 { margin: 0; font-size: 15px; }
+.guard-mode { padding: 5px 12px; border-radius: 999px; font-size: 11.5px; font-weight: 700; background: #eef1f6; color: #45505f; letter-spacing: .02em; }
+.guard-mode.read { background: #e6f0fb; color: #1f5fb0; }
+.guard-mode.attached { background: #e7f0ff; color: #1d4ed8; }
+.guard-mode.config { background: #fdeede; color: #9a5b12; }
+.guard-devicebox { display: flex; align-items: center; justify-content: space-between; padding: 12px 14px; border-radius: 12px; background: var(--panel-2,#f7f8fa); border: 1px solid var(--line-2,#eef0f3); margin-bottom: 8px; }
+.guard-devicebox-label { font-size: 12px; color: var(--muted,#6b7280); font-weight: 600; }
+.guard-facts dt { font-size: 10.5px; text-transform: uppercase; letter-spacing: .07em; color: var(--muted,#8b94a2); margin-top: 14px; font-family: ui-monospace,Menlo,monospace; }
+.guard-facts dd { margin: 3px 0 0; font-size: 13.5px; line-height: 1.45; color: var(--ink,#1f2733); }
+.shell-hint-bar b { color: #b9cbdc; }

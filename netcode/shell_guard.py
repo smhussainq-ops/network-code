@@ -97,22 +97,30 @@ class GuardDecision:
     events: list[dict[str, Any]] = field(default_factory=list)
 
 
-# A STRICT allow-list of read-only exec verbs. In a read-only session ONLY these
-# clear as "read" — everything unrecognized fails closed. This is the structural
-# fix for deny-list-by-omission: 'do reload', 'clear ip bgp *', 'copy run tftp:',
-# 'config-transaction', 'write', etc. are all rejected because they aren't here,
-# not because we remembered to blocklist them. (Red-team confirmed the deny-list
-# approach was trivially under-inclusive.)
-_READ_VERBS = frozenset({
-    "show", "sh", "sho", "ping", "traceroute", "trace", "tracert",
-    "dir", "more", "who", "whoami", "uptime", "which", "pwd",
-    "exit", "quit", "logout", "end", "enable", "disable",
+# Philosophy: this is a real SSH terminal for good-faith engineers, so it is
+# ALLOW-BY-DEFAULT — any command flows unless it's one of three things:
+#   1. entering configuration mode (gated behind a change record),
+#   2. a genuinely destructive/disruptive exec command (needs a confirm),
+#   3. a credential/AAA line (always blocked) or command chaining.
+# Everything else — show/enable/en/terminal/ping/traceroute/bash-less reads,
+# vendor abbreviations, pipes to filters — just works, like SecureCRT.
+
+# Exec commands that change/disrupt the device or can exfiltrate config. Matched
+# by whole first-token OR an unambiguous abbreviation prefix. These get a
+# re-Enter confirm, not a hard block (a real engineer sometimes needs them).
+_DESTRUCTIVE_VERBS = frozenset({
+    "reload", "write", "wr", "copy", "clear", "delete", "erase", "format",
+    "boot", "install", "request", "rollback", "commit",
 })
+# Verbs whose 3+ char abbreviations should also be treated as destructive.
+_DESTRUCTIVE_ABBREV = ("reload", "clear", "copy", "delete", "erase", "format")
+# Shell escapes bypass the guard entirely -> confirm before dropping to a shell.
+_SHELL_ESCAPES = frozenset({"bash", "python", "python3", "tclsh", "ash", "zsh"})
 
 # Command-chaining / redirection separators that let a benign-looking first token
 # smuggle a second command. Pipe is NOT here: EOS/IOS only pipe to output filters
 # (include/section/grep), which is safe and heavily used for reads.
-_CHAIN_SEPARATORS = (";", "&", "`", "$(", "$(", ">", "<", "\x00", "\n", "\r")
+_CHAIN_SEPARATORS = (";", "&", "`", "$(", ">", "<", "\x00", "\n", "\r")
 
 
 def _collapse_ws(text: str) -> str:
@@ -126,11 +134,34 @@ def _first_token(line: str) -> str:
     return normalized.split(" ", 1)[0] if normalized else ""
 
 
+def _is_config_enter(token: str) -> bool:
+    """A token that enters configuration mode, incl. vendor abbreviations."""
+    if token in ("configuration", "config-transaction", "edit"):
+        return True
+    # any 4+ char prefix of "configure" (conf, confi, config, configure, ...)
+    return len(token) >= 4 and "configure".startswith(token)
+
+
+def _is_destructive(effective_lower: str, in_config: bool) -> str | None:
+    """Return the matched destructive verb, or None. `effective_lower` has any
+    leading 'do ' already stripped and whitespace collapsed."""
+    token = effective_lower.split(" ", 1)[0] if effective_lower else ""
+    if token in _DESTRUCTIVE_VERBS:
+        return token
+    for verb in _DESTRUCTIVE_ABBREV:
+        if len(token) >= 3 and verb.startswith(token):
+            return verb
+    if in_config and (token == "no" or token in ("shutdown", "shut")):
+        return token
+    return None
+
+
 def classify_line(line: str, in_config: bool) -> dict[str, Any]:
     """Classify one completed command line. Pure function; heavily tested.
 
-    Fail-closed: in a read-only session, a line is "read" ONLY if its first token
-    is in the strict read allow-list; anything else is "blocked_unknown"."""
+    ALLOW-BY-DEFAULT: returns "read" (flows to the device) unless the line
+    enters config mode, is destructive, is a shell escape, touches credentials,
+    or chains commands."""
     normalized = _collapse_ws(line).strip()
     lowered = normalized.lower()
     if not lowered:
@@ -146,24 +177,24 @@ def classify_line(line: str, in_config: bool) -> dict[str, Any]:
         if fragment in lowered + " ":
             return {"kind": "always_blocked", "fragment": fragment.strip()}
     token = _first_token(lowered)
-    if token in _CONFIG_ENTER_TOKENS:
+    # Unwrap 'do <exec>' so a config-mode do-command is judged as the exec it runs.
+    effective = lowered[3:].strip() if lowered.startswith("do ") else lowered
+    eff_token = effective.split(" ", 1)[0] if effective else ""
+
+    if _is_config_enter(token) or _is_config_enter(eff_token):
         return {"kind": "config_enter"}
     if in_config and lowered in ("end", "exit", "abort"):
         return {"kind": "config_exit"}
-    # 'do <exec>' runs an exec command from config mode — treat as dangerous.
-    if token == "do":
-        return {"kind": "dangerous", "match": "do"}
-    for prefix in DANGEROUS_PREFIXES:
-        config_only = prefix in ("no vlan", "no interface", "no router", "shutdown")
-        if lowered.startswith(prefix) and (in_config or not config_only):
-            return {"kind": "dangerous", "match": prefix}
-    if in_config:
+    match = _is_destructive(effective, in_config)
+    if match:
+        return {"kind": "dangerous", "match": match}
+    if eff_token in _SHELL_ESCAPES:
+        return {"kind": "dangerous", "match": eff_token}
+    # 'do <exec>' is an exec command, not a config line, even inside config mode.
+    if in_config and not lowered.startswith("do "):
         return {"kind": "config_line"}
-    if token in _READ_VERBS:
-        return {"kind": "read"}
-    # Unrecognized in a read-only session: fail closed (clear/copy/write/
-    # config-transaction/tclsh/bash/... all land here).
-    return {"kind": "blocked_unknown", "token": token}
+    # Default: a normal exec/read command — let it flow, like real SSH.
+    return {"kind": "read"}
 
 
 def looks_like_paste(chunk: str) -> bool:

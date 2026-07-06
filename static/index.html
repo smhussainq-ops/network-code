@@ -6,7 +6,7 @@
     <title>Netcode</title>
     <link rel="icon" href="/static/favicon.svg" type="image/svg+xml" />
     <link rel="stylesheet" href="/static/vendor/xterm.css" />
-    <link rel="stylesheet" href="/static/styles.css?v=20260705-shell2" />
+    <link rel="stylesheet" href="/static/styles.css?v=20260705-shell3" />
   </head>
   <body>
     <div id="login-overlay" class="login-overlay" hidden>
@@ -467,10 +467,13 @@
           </section>
 
           <section id="view-shell" class="view">
-            <section class="section-heading">
-              <h3>Netcode Shell — governed SSH</h3>
-              <p>Keep CLI control. Every session starts read-only; config mode is guarded until a change record is attached; credentials and dangerous commands are blocked; config pastes are staged, not sent. Every keystroke is captured as evidence. The guard runs on the on-prem runner — the browser never touches the device.</p>
-            </section>
+            <div class="shell-trustbar">
+              <span class="tb-title">Netcode Shell</span>
+              <span class="tb-item"><i class="tb-dot ok" id="tb-runner-dot"></i><span id="tb-runner">Runner</span></span>
+              <span class="tb-item"><i class="tb-lock"></i>Prod writes: <b id="tb-writes">Guarded</b></span>
+              <span class="tb-item"><i class="tb-key"></i>Credentials stay on the runner</span>
+              <span class="tb-item tb-muted">The browser never touches the device</span>
+            </div>
             <div class="shell-workspace">
               <aside class="shell-devices">
                 <label class="shell-field">Device
@@ -481,24 +484,35 @@
                   <p><span>Session</span><strong id="shell-session-id">none</strong></p>
                   <p><span>Change</span><strong id="shell-change">none</strong></p>
                 </div>
-                <div class="button-row compact">
+                <div class="shell-actions-col">
                   <button id="shell-attach" class="secondary" type="button" disabled>Attach change</button>
                   <button id="shell-evidence" class="secondary" type="button" disabled>Evidence</button>
                 </div>
+                <p class="shell-help">Type as you would in SSH. <b>show / ping / enable</b> and normal commands run live. <b>conf t</b> is gated until you attach a change; <b>reload / clear / copy</b> ask you to confirm; credentials are always blocked.</p>
               </aside>
               <div class="shell-terminal-wrap">
+                <div class="shell-term-titlebar">
+                  <span class="term-dots"><i></i><i></i><i></i></span>
+                  <span class="term-target" id="shell-term-target">no session</span>
+                  <span class="term-state" id="shell-term-state">idle</span>
+                </div>
                 <div id="shell-xterm" class="shell-xterm"></div>
-                <div id="shell-hint" class="shell-hint-bar">Open a session for a live, guarded SSH terminal. Config mode is blocked until you attach a change; unrecognized commands are held with an explanation.</div>
+                <div id="shell-hint" class="shell-hint-bar">Pick a device and press <b>Open session</b> for a live, guarded SSH terminal.</div>
               </div>
               <aside class="change-guard" aria-label="Change Guard">
-                <h4>Change Guard</h4>
-                <div class="guard-mode" id="guard-mode-chip">Read-only</div>
+                <div class="guard-head">
+                  <h4>Change Guard</h4>
+                  <div class="guard-mode" id="guard-mode-chip">No session</div>
+                </div>
+                <div class="guard-devicebox">
+                  <span class="guard-devicebox-label">Device config</span>
+                  <span id="guard-device-chip" class="device-chip not-touched">Not touched</span>
+                </div>
                 <dl class="guard-facts">
                   <dt>Last action</dt><dd id="guard-last">—</dd>
-                  <dt>Expected</dt><dd id="guard-expected">Read commands run; config mode is guarded.</dd>
-                  <dt>Actual</dt><dd id="guard-actual">Waiting for input.</dd>
-                  <dt>Device config</dt><dd><span id="guard-device-chip" class="device-chip not-touched">Not touched</span></dd>
-                  <dt>Next safe action</dt><dd id="guard-next">Run a read command, or attach a change to configure.</dd>
+                  <dt>Expected</dt><dd id="guard-expected">Normal commands run; config mode is guarded.</dd>
+                  <dt>Actual</dt><dd id="guard-actual">Waiting for a session.</dd>
+                  <dt>Next safe action</dt><dd id="guard-next">Open a session to begin.</dd>
                 </dl>
               </aside>
             </div>
@@ -624,6 +638,6 @@
     </main>
     <script src="/static/vendor/xterm.js"></script>
     <script src="/static/vendor/xterm-addon-fit.js"></script>
-    <script src="/static/app.js?v=20260705-shell2"></script>
+    <script src="/static/app.js?v=20260705-shell3"></script>
   </body>
 </html>

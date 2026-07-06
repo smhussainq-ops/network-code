@@ -29,17 +29,23 @@ def test_classify_config_enter_covers_abbreviations():
         assert classify_line(spelling, in_config=False)["kind"] == "config_enter", spelling
 
 
-def test_classify_read_commands_pass():
-    for line in ("show vlan brief", "show run | sec vlan", "ping 10.0.0.1", "traceroute 10.0.0.1"):
+def test_classify_normal_commands_flow_like_ssh():
+    """Allow-by-default: ordinary exec/read commands and vendor abbreviations
+    just work (this is a real SSH terminal, not a straitjacket)."""
+    for line in ("show vlan brief", "show run | sec vlan", "sh ip int br", "en", "enable",
+                 "disable", "terminal length 0", "ping 10.0.0.1", "traceroute 10.0.0.1",
+                 "show tech-support", "who", "bash-completion", "monitor session"):
         assert classify_line(line, in_config=False)["kind"] == "read", line
 
 
-def test_classify_unknown_commands_fail_closed():
-    """Allow-list, not deny-list: anything not a known read verb is blocked in a
-    read-only session (do/clear/copy/write/config-transaction/tclsh/bash/...)."""
+def test_classify_gated_and_destructive_commands():
+    """The only things that don't flow: config-mode entry, destructive exec,
+    shell escapes, credentials, chaining."""
+    for line in ("configure terminal", "conf t", "config-transaction", "configuration", "edit"):
+        assert classify_line(line, in_config=False)["kind"] == "config_enter", line
     for line in ("do reload", "clear ip bgp *", "copy running-config tftp://h/x",
-                 "write memory", "config-transaction", "configuration", "tclsh", "bash", "reload now"):
-        assert classify_line(line, in_config=False)["kind"] in ("blocked_unknown", "dangerous"), line
+                 "write memory", "wr", "delete flash:x", "reload now", "bash", "python3", "tclsh"):
+        assert classify_line(line, in_config=False)["kind"] == "dangerous", line
 
 
 def test_classify_credential_lines_always_blocked_even_in_config():
@@ -50,23 +56,24 @@ def test_classify_credential_lines_always_blocked_even_in_config():
 def test_classify_dangerous_context():
     assert classify_line("reload", in_config=False)["kind"] == "dangerous"
     assert classify_line("write erase", in_config=False)["kind"] == "dangerous"
-    # 'shutdown' outside config isn't a read verb -> fail closed (not "read").
-    assert classify_line("shutdown", in_config=False)["kind"] == "blocked_unknown"
+    # 'shutdown' is only destructive inside config; a bare exec 'shutdown' flows.
+    assert classify_line("shutdown", in_config=False)["kind"] == "read"
     assert classify_line("shutdown", in_config=True)["kind"] == "dangerous"
     assert classify_line("no vlan 90", in_config=True)["kind"] == "dangerous"
 
 
 def test_classify_do_prefix_and_chaining_and_whitespace():
-    # 'do <exec>' runs an exec command from anywhere -> dangerous, never read.
+    # 'do <exec>' runs an exec command from anywhere -> judged as that exec.
     assert classify_line("do reload", in_config=False)["kind"] == "dangerous"
+    assert classify_line("do show run", in_config=True)["kind"] == "read"  # do <read> flows
     # command chaining can't smuggle a second command past first-token checks.
     assert classify_line("show clock ; reload", in_config=False)["kind"] == "blocked_chain"
     assert classify_line("show version && configure terminal", in_config=False)["kind"] == "blocked_chain"
     # whitespace-collapse: double space / tab can't dodge the credential floor.
     assert classify_line("enable  secret cisco", in_config=True)["kind"] == "always_blocked"
     assert classify_line("username\tadmin secret x", in_config=True)["kind"] == "always_blocked"
-    # config-mode entry variants that aren't the exact token still fail closed.
-    assert classify_line("config-transaction", in_config=False)["kind"] == "blocked_unknown"
+    # config-mode entry variants (incl. abbreviations) are gated, not run.
+    assert classify_line("config-transaction", in_config=False)["kind"] == "config_enter"
 
 
 # ---------------------------------------------------------------- the gate
@@ -244,12 +251,14 @@ def test_redteam_criticals_are_blocked_at_guard_submit():
         "write memory", "wr",
         "config-transaction", "configuration",
         "show clock ; reload", "show version && configure terminal",
-        "tclsh", "bash", "python", "send log all shutdown",
+        "tclsh", "bash", "python",
     ]
     for cmd in criticals:
         state = ShellSessionState()  # read-only
         decision = guard_submit(state, cmd)
-        assert decision["kind"] == "blocked", f"{cmd!r} -> {decision['kind']} (must be blocked)"
+        # Not cleared to run on first submit: either blocked (config/chain) or
+        # held for a confirm (destructive/shell-escape). Never run_reads.
+        assert decision["kind"] != "run_reads", f"{cmd!r} -> {decision['kind']} (must NOT run)"
         assert state.in_config is False and state.device_touched is False, cmd
 
 

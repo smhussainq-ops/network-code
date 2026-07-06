@@ -2240,10 +2240,10 @@ function renderShell() {
 
 function renderChangeGuard() {
   const s = appState.shell;
-  const modeText = !s ? "No session" : s.mode === "change_attached" ? "Change attached" : s.in_config ? "Config mode" : "Read-only";
+  const modeText = !s ? "No session" : s.mode === "change_attached" ? (s.in_config ? "Config mode" : "Change attached") : "Read-only";
   const chip = $("guard-mode-chip");
   chip.textContent = modeText;
-  chip.className = "guard-mode" + (s?.in_config ? " config" : s?.mode === "change_attached" ? " attached" : "");
+  chip.className = "guard-mode" + (s?.in_config ? " config" : s?.mode === "change_attached" ? " attached" : s ? " read" : "");
   $("shell-session-id").textContent = s?.sessionId ? s.sessionId.slice(0, 10) : "none";
   $("shell-change").textContent = s?.changeId ? s.changeId.slice(0, 8) : "none";
   const touched = Boolean(s?.deviceTouched);
@@ -2254,6 +2254,18 @@ function renderChangeGuard() {
   $("shell-attach").disabled = !hasSession || s?.mode === "change_attached";
   $("shell-evidence").disabled = !hasSession;
   $("shell-open").textContent = hasSession ? "Close session" : "Open session";
+  // Terminal title bar + trust bar
+  $("shell-term-target").textContent = s ? `ssh · ${s.deviceId}` : "no session";
+  $("shell-term-state").textContent = !s ? "idle" : s.in_config ? "config" : "live";
+  $("shell-term-state").className = "term-state" + (!s ? "" : s.in_config ? " config" : " live");
+  const runnerOk = isRunnerReady();
+  $("tb-runner").textContent = runnerOk ? "Runner online" : "Runner offline";
+  $("tb-runner-dot").className = "tb-dot " + (runnerOk ? "ok" : "bad");
+}
+
+function isRunnerReady() {
+  const r = (appState.runners?.runners || [])[0];
+  return Boolean(r && r.status === "online");
 }
 
 function setGuardFacts(last, expected, actual, next) {
