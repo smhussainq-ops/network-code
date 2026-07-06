@@ -518,6 +518,29 @@ def test_rez_runner_read_endpoint_strips_credentials_and_queues_only_supported_a
     assert payload["_runner_timeout_seconds"] == 1.0
     assert "username" not in payload and "password" not in payload
 
+    scan_resp = client.post(
+        "/api/rez/runner-read",
+        json={
+            "action": "rez_scan_device",
+            "timeout": 1,
+            "payload": {
+                "host": "192.0.2.10",
+                "platform": "arista_eos",
+                "username": "should-not-queue",
+                "password": "should-not-queue",
+            },
+        },
+    )
+    assert scan_resp.status_code == 200
+    jobs = client.get("/api/jobs").json()["jobs"]
+    scan_jobs = [j for j in jobs if j["action"] == "read_rez_scan_device"]
+    assert scan_jobs
+    scan_payload = scan_jobs[0]["payload"]
+    assert scan_payload["host"] == "192.0.2.10"
+    assert scan_payload["platform"] == "arista_eos"
+    assert scan_payload["_runner_timeout_seconds"] == 1.0
+    assert "username" not in scan_payload and "password" not in scan_payload
+
 
 def test_rez_runner_read_endpoint_roundtrip_returns_runner_stdout(tmp_path: Path, monkeypatch):
     import hashlib
@@ -714,6 +737,72 @@ devices:
     assert result["skipped"] == []
     assert result["device_states"]["fgt-hub"]["_refreshed"] is True
     assert result["device_states"]["fgt-hub"]["interfaces"] == {"port1": {"status": "up"}}
+
+
+def test_runner_rez_scan_device_uses_local_inventory_defaults(tmp_path: Path, monkeypatch):
+    import types
+
+    from netcode import runner_agent
+    import netcode.adapters.registry as registry
+
+    inv = tmp_path / "inventory.yaml"
+    inv.write_text(
+        """
+defaults:
+  username: runner-admin
+  password: runner-secret
+devices:
+  - id: seed
+    hostname: seed
+    host: 127.0.0.1
+    platform: arista_eos
+    port: 2222
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(runner_agent, "INVENTORY_FILE", inv)
+    seen = {}
+
+    class FakeRez:
+        def normalize_platform(self, value):  # noqa: ANN001
+            return value or ""
+
+        def driver_map(self):
+            return {"arista_eos": object}
+
+        def summary(self):
+            return {}
+
+        def collect_device_state(self, device):  # noqa: ANN001
+            seen["device"] = device
+            return {
+                "ok": True,
+                "adapter": "rez.arista_eos",
+                "driver": "drivers.arista_eos.AsyncAristaEOSDriver",
+                "state": {
+                    "hostname": "new-edge",
+                    "platform": "arista_eos",
+                    "interfaces": {"Ethernet1": {"status": "up"}},
+                    "routing": {"routes": [{"prefix": "0.0.0.0/0"}]},
+                },
+                "warnings": [],
+                "errors": [],
+            }
+
+    monkeypatch.setattr(registry, "AdapterRegistry", lambda: types.SimpleNamespace(rez=FakeRez()))
+
+    result = runner_agent._execute_read_inner(
+        "rez_scan_device",
+        {"host": "192.0.2.10", "platform": "arista_eos", "device_id": "new-edge", "username": "must-not-use", "password": "must-not-use"},
+    )
+
+    assert result["ok"] is True
+    assert result["provider"] == "rez-runner"
+    assert result["source_of_truth_candidate"]["id"] == "new-edge"
+    assert result["source_of_truth_candidate"]["host"] == "192.0.2.10"
+    assert result["state"]["interfaces"] == {"Ethernet1": {"status": "up"}}
+    assert seen["device"].username == "runner-admin"
+    assert seen["device"].password == "runner-secret"
 
 
 def test_runner_read_timeout_cancels_queued_job(tmp_path: Path, monkeypatch):

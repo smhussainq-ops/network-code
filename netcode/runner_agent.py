@@ -526,10 +526,153 @@ def _execute_rez_refresh_targeted(payload: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _execute_rez_scan_device(payload: dict[str, Any]) -> dict[str, Any]:
+    from netcode.adapters.registry import AdapterRegistry
+    from netcode.discovery import SSH_AUTODETECT_ORDER, _extract_state_summary, _safe_device_id
+    from netcode.inventory import Device, Inventory
+
+    host = str(payload.get("host") or "").strip()
+    if not host:
+        return {"ok": False, "status": "fail", "error": "host is required"}
+
+    device_id = str(payload.get("device_id") or "").strip()
+    requested_platform = str(payload.get("platform") or "").strip()
+    site = str(payload.get("site") or "").strip()
+    groups_raw = payload.get("groups")
+    groups = [str(group) for group in groups_raw] if isinstance(groups_raw, list) else []
+    try:
+        requested_port = int(payload.get("port") or 0)
+    except Exception:
+        requested_port = 0
+
+    inventory = Inventory(INVENTORY_FILE)
+    existing = inventory.by_id.get(device_id) if device_id else None
+    if existing is None:
+        for candidate in inventory.devices:
+            if candidate.host == host or candidate.hostname == host or candidate.id == host:
+                existing = candidate
+                break
+
+    defaults = inventory.defaults
+    username = existing.username if existing else str(defaults.get("username") or "")
+    password = existing.password if existing else str(defaults.get("password") or "")
+    port = requested_port or (existing.port if existing else int(defaults.get("port") or 22))
+
+    rez = AdapterRegistry().rez
+    driver_map = rez.driver_map()
+    if not driver_map:
+        return {"ok": False, "status": "fail", "host": host, "error": rez.summary().get("error") or "Rez drivers unavailable"}
+    normalized_platform = rez.normalize_platform(requested_platform) or (existing.platform if existing else "")
+    if normalized_platform and normalized_platform not in driver_map:
+        return {
+            "ok": False,
+            "status": "fail",
+            "host": host,
+            "requested_platform": normalized_platform,
+            "error": f"Rez has no driver for platform {normalized_platform}",
+            "supported_platforms": sorted(driver_map.keys()),
+        }
+    if normalized_platform:
+        platforms = [normalized_platform]
+    else:
+        ordered = [platform for platform in SSH_AUTODETECT_ORDER if platform in driver_map]
+        platforms = ordered + sorted(set(driver_map) - set(ordered))
+
+    attempts: list[dict[str, Any]] = []
+    for platform in platforms:
+        probe_id = device_id or (existing.id if existing else _safe_device_id(host))
+        probe = Device(
+            id=probe_id,
+            hostname=device_id or (existing.hostname if existing else _safe_device_id(host)),
+            host=host,
+            platform=platform,
+            username=username,
+            password=password,
+            port=port,
+            site=site or (existing.site if existing else None),
+            groups=tuple(groups or (list(existing.groups) if existing else [])),
+        )
+        result = rez.collect_device_state(probe)
+        attempts.append(
+            {
+                "platform": platform,
+                "ok": bool(result.get("ok")),
+                "adapter": result.get("adapter"),
+                "error": result.get("error"),
+                "warnings": result.get("warnings", []),
+                "collection_time": result.get("collection_time"),
+            }
+        )
+        if not result.get("ok"):
+            if normalized_platform:
+                break
+            continue
+        state = result.get("state")
+        if not isinstance(state, dict):
+            return {"ok": False, "status": "fail", "host": host, "platform": platform, "error": "Rez driver returned non-object state."}
+        state_summary = _extract_state_summary(state, device_id or host, platform)
+        hostname = str(state_summary.get("hostname") or device_id or _safe_device_id(host))
+        candidate = {
+            "id": _safe_device_id(device_id or hostname),
+            "hostname": hostname,
+            "host": host,
+            "platform": platform,
+            "site": site or (existing.site if existing else "unassigned"),
+            "groups": groups or (list(existing.groups) if existing else ["discovered"]),
+            "port": port,
+        }
+        return {
+            "ok": True,
+            "status": "pass",
+            "found": True,
+            "provider": "rez-runner",
+            "host": host,
+            "platform": platform,
+            "adapter": result.get("adapter"),
+            "driver": result.get("driver"),
+            "existing_device_id": existing.id if existing else None,
+            "state": state,
+            "state_summary": state_summary,
+            "source_of_truth_candidate": candidate,
+            "tried_platforms": attempts,
+            "supported_platforms": sorted(driver_map.keys()),
+            "warnings": result.get("warnings", []),
+            "errors": result.get("errors", []),
+            "safety": {
+                "device_writes": "none",
+                "source_of_truth_written": False,
+                "message": "Discovery used runner-local Rez read/state collection only. Review before importing.",
+            },
+            "runner_version": VERSION,
+        }
+
+    return {
+        "ok": False,
+        "status": "fail",
+        "found": False,
+        "host": host,
+        "provider": "rez-runner",
+        "requested_platform": normalized_platform or "auto",
+        "tried_platforms": attempts,
+        "supported_platforms": sorted(driver_map.keys()),
+        "safety": {
+            "device_writes": "none",
+            "source_of_truth_written": False,
+            "message": "Discovery failed or the device did not accept the tried Rez driver.",
+        },
+    }
+
+
 def _read_deadline_seconds(action: str, payload: dict[str, Any]) -> float:
     if action == "readiness":
         return float(READINESS_TIMEOUT_SECONDS)
     if action == "rez_refresh_targeted":
+        try:
+            requested = float(payload.get("_runner_timeout_seconds") or READINESS_TIMEOUT_SECONDS)
+        except Exception:
+            requested = float(READINESS_TIMEOUT_SECONDS)
+        return max(1.0, min(requested, float(MAX_READ_TIMEOUT_SECONDS)))
+    if action == "rez_scan_device":
         try:
             requested = float(payload.get("_runner_timeout_seconds") or READINESS_TIMEOUT_SECONDS)
         except Exception:
@@ -651,6 +794,9 @@ def _execute_read_inner(action: str, payload: dict[str, Any]) -> dict[str, Any]:
 
     if action == "rez_refresh_targeted":
         return _execute_rez_refresh_targeted(payload)
+
+    if action == "rez_scan_device":
+        return _execute_rez_scan_device(payload)
 
     if action == "verify":
         from netcode.lab import AristaEOSLabAdapter
