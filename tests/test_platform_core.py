@@ -666,6 +666,55 @@ devices:
     assert result["data"] == [{"id": 3, "action": "accept"}]
 
 
+def test_runner_rez_refresh_targeted_returns_merge_shape(tmp_path: Path, monkeypatch):
+    import types
+
+    from netcode import runner_agent
+    import netcode.adapters.registry as registry
+
+    inv = tmp_path / "inventory.yaml"
+    inv.write_text(
+        """
+defaults:
+  username: admin
+  password: admin
+devices:
+  - id: fgt-hub
+    hostname: fgt-hub
+    host: 127.0.0.1
+    platform: fortinet
+    port: 2222
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(runner_agent, "INVENTORY_FILE", inv)
+
+    class FakeRez:
+        def collect_device_state(self, device):  # noqa: ANN001
+            return {
+                "ok": True,
+                "state": {
+                    "hostname": "fgt-hub",
+                    "platform": "fortinet",
+                    "interfaces": {"port1": {"status": "up"}},
+                },
+            }
+
+    monkeypatch.setattr(registry, "AdapterRegistry", lambda: types.SimpleNamespace(rez=FakeRez()))
+
+    result = runner_agent._execute_read_inner(
+        "rez_refresh_targeted",
+        {"devices": ["fgt-hub"]},
+    )
+
+    assert result["ok"] is True
+    assert result["refreshed"] == ["fgt-hub"]
+    assert result["failed"] == []
+    assert result["skipped"] == []
+    assert result["device_states"]["fgt-hub"]["_refreshed"] is True
+    assert result["device_states"]["fgt-hub"]["interfaces"] == {"port1": {"status": "up"}}
+
+
 def test_runner_read_timeout_cancels_queued_job(tmp_path: Path, monkeypatch):
     init_workspace(WorkspacePaths(tmp_path))
     monkeypatch.chdir(tmp_path)

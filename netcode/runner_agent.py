@@ -26,6 +26,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -486,6 +487,44 @@ def _execute_rez_api_query(payload: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _execute_rez_refresh_targeted(payload: dict[str, Any]) -> dict[str, Any]:
+    raw_devices = payload.get("devices")
+    if not isinstance(raw_devices, list):
+        return {"ok": False, "status": "fail", "error": "devices must be a list[str]"}
+    device_ids = [str(item).strip() for item in raw_devices if str(item).strip()]
+    if not device_ids:
+        return {"ok": False, "status": "fail", "error": "devices must be a non-empty list[str]"}
+
+    started = time.monotonic()
+    refreshed_states: dict[str, dict[str, Any]] = {}
+    refreshed: list[str] = []
+    failed: list[list[str]] = []
+
+    for device_id in device_ids:
+        device, state, error = _collect_rez_runner_state(device_id)
+        if error:
+            failed.append([device_id, str(error.get("error") or "state collection failed")])
+            continue
+        assert device is not None and state is not None
+        state = dict(state)
+        state["_refreshed"] = True
+        state["_collected_at"] = datetime.now(timezone.utc).isoformat()
+        refreshed_states[device.id] = state
+        refreshed.append(device.id)
+
+    return {
+        "ok": True,
+        "status": "pass" if refreshed else "fail",
+        "device_states": refreshed_states,
+        "refreshed": refreshed,
+        "failed": failed,
+        "skipped": [],
+        "elapsed_sec": round(time.monotonic() - started, 3),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "runner_version": VERSION,
+    }
+
+
 def _execute_read(action: str, payload: dict[str, Any]) -> dict[str, Any]:
     """Fail-closed wrapper: a hung device read must never wedge the runner's
     sequential job loop (a dead container / unreachable device can otherwise
@@ -596,6 +635,9 @@ def _execute_read_inner(action: str, payload: dict[str, Any]) -> dict[str, Any]:
 
     if action == "rez_api_query":
         return _execute_rez_api_query(payload)
+
+    if action == "rez_refresh_targeted":
+        return _execute_rez_refresh_targeted(payload)
 
     if action == "verify":
         from netcode.lab import AristaEOSLabAdapter
