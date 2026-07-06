@@ -857,6 +857,7 @@ def api_rez_runner_read(request: RunnerReadRequest, http_request: Request, autho
     for secret_key in ("username", "password", "passwd", "secret", "api_token", "private_key"):
         payload.pop(secret_key, None)
     timeout = max(1.0, min(float(request.timeout or 60.0), 120.0))
+    payload["_runner_timeout_seconds"] = timeout
     return _runner_read(paths(), request.action, payload, _request_principal(http_request).org_id, timeout=timeout)
 
 

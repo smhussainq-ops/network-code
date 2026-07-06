@@ -515,6 +515,7 @@ def test_rez_runner_read_endpoint_strips_credentials_and_queues_only_supported_a
     payload = read_jobs[0]["payload"]
     assert payload["device"] == "v2-store1"
     assert payload["command"] == "show version"
+    assert payload["_runner_timeout_seconds"] == 1.0
     assert "username" not in payload and "password" not in payload
 
 
@@ -553,7 +554,7 @@ def test_rez_runner_read_endpoint_roundtrip_returns_runner_stdout(tmp_path: Path
             if claim.status_code == 200:
                 job = claim.json()["job"]
                 assert job["action"] == "read_rez_ssh_command"
-                assert job["payload"] == {"device": "edge-1", "command": "show version"}
+                assert job["payload"] == {"device": "edge-1", "command": "show version", "_runner_timeout_seconds": 60.0}
                 sig = hmac_mod.new(secret.encode(), canonical_json(canned).encode(), hashlib.sha256).hexdigest()
                 client.post(f"/api/runner/jobs/{job['id']}/result", json={"result": canned, "signature": sig}, headers=auth)
                 return
@@ -1305,6 +1306,19 @@ def test_runner_read_has_fail_closed_timeout(monkeypatch):
     assert result["ok"] is False
     assert "timed out" in result["error"]
     assert elapsed < 3  # returned at the deadline, not after the hang
+
+
+def test_rez_refresh_runner_deadline_uses_bridge_timeout(monkeypatch):
+    from netcode import runner_agent
+
+    monkeypatch.setattr(runner_agent, "READ_TIMEOUT_SECONDS", 30)
+    monkeypatch.setattr(runner_agent, "READINESS_TIMEOUT_SECONDS", 55)
+    monkeypatch.setattr(runner_agent, "MAX_READ_TIMEOUT_SECONDS", 120)
+
+    assert runner_agent._read_deadline_seconds("rez_ssh_command", {"_runner_timeout_seconds": 90}) == 30.0
+    assert runner_agent._read_deadline_seconds("rez_refresh_targeted", {"_runner_timeout_seconds": 90}) == 90.0
+    assert runner_agent._read_deadline_seconds("rez_refresh_targeted", {"_runner_timeout_seconds": 500}) == 120.0
+    assert runner_agent._read_deadline_seconds("rez_refresh_targeted", {"_runner_timeout_seconds": "bad"}) == 55.0
 
 
 def test_workspace_gitignore_tracks_only_artifacts(tmp_path: Path):

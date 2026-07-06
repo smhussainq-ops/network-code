@@ -169,6 +169,7 @@ def _runner_ws():
 
 READ_TIMEOUT_SECONDS = 30
 READINESS_TIMEOUT_SECONDS = 55  # multi-device sweep; still under the control plane's 60s poll
+MAX_READ_TIMEOUT_SECONDS = 120
 
 
 def _collapse_command(command: str) -> str:
@@ -525,6 +526,18 @@ def _execute_rez_refresh_targeted(payload: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _read_deadline_seconds(action: str, payload: dict[str, Any]) -> float:
+    if action == "readiness":
+        return float(READINESS_TIMEOUT_SECONDS)
+    if action == "rez_refresh_targeted":
+        try:
+            requested = float(payload.get("_runner_timeout_seconds") or READINESS_TIMEOUT_SECONDS)
+        except Exception:
+            requested = float(READINESS_TIMEOUT_SECONDS)
+        return max(1.0, min(requested, float(MAX_READ_TIMEOUT_SECONDS)))
+    return float(READ_TIMEOUT_SECONDS)
+
+
 def _execute_read(action: str, payload: dict[str, Any]) -> dict[str, Any]:
     """Fail-closed wrapper: a hung device read must never wedge the runner's
     sequential job loop (a dead container / unreachable device can otherwise
@@ -532,7 +545,7 @@ def _execute_read(action: str, payload: dict[str, Any]) -> dict[str, Any]:
     from concurrent.futures import ThreadPoolExecutor
     from concurrent.futures import TimeoutError as FuturesTimeout
 
-    deadline = READINESS_TIMEOUT_SECONDS if action == "readiness" else READ_TIMEOUT_SECONDS
+    deadline = _read_deadline_seconds(action, payload)
     executor = ThreadPoolExecutor(max_workers=1)
     future = executor.submit(_execute_read_inner, action, payload)
     try:
