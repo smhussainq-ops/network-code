@@ -1,0 +1,21 @@
+#!/usr/bin/env zsh
+set -euo pipefail
+
+repo_dir="$(cd "$(dirname "$0")/.." && pwd)"
+port="${NETCODE_PORT:-8095}"
+host="${NETCODE_HOST:-0.0.0.0}"
+url="http://127.0.0.1:${port}/app?ui=shellmain2"
+
+cd "$repo_dir"
+
+if command -v lsof >/dev/null 2>&1 && lsof -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1; then
+  open "$url" >/dev/null 2>&1 || true
+  echo "Netcode Shell is already running: $url"
+  exit 0
+fi
+
+export NETCODE_EXECUTION="${NETCODE_EXECUTION:-runner}"
+export NETCODE_RUNNER_POOL="${NETCODE_RUNNER_POOL:-store-lab}"
+
+open "$url" >/dev/null 2>&1 || true
+exec .venv/bin/uvicorn netcode.api:app --host "$host" --port "$port"

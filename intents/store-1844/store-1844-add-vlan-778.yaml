@@ -1,0 +1,21 @@
+change_type: add_vlan
+site: store-1844
+targets:
+  device_ids:
+  - v2-store3
+  device_group: access-switches
+policy:
+  pci_reachable: false
+  internet_reachable: true
+metadata:
+  requested_by: netcode-user
+  ticket_id: null
+  learning_mode: true
+vlan:
+  id: 778
+  name: HALT_PROOF
+  subnet: 10.42.90.0/24
+  purpose: guest
+  svi:
+    enabled: false
+    gateway_ip: null

@@ -7,3 +7,6 @@ __pycache__/
 ._*
 .netcode/
 .claude/
+# Runtime outputs (regenerable; evidence stays on disk + in the DB, not in git)
+rendered/
+reports/

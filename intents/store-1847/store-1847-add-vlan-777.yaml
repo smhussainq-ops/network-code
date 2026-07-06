@@ -1,0 +1,21 @@
+change_type: add_vlan
+site: store-1847
+targets:
+  device_ids:
+  - v2-store6
+  device_group: access-switches
+policy:
+  pci_reachable: false
+  internet_reachable: true
+metadata:
+  requested_by: netcode-user
+  ticket_id: null
+  learning_mode: true
+vlan:
+  id: 777
+  name: GUEST_WIFI
+  subnet: 10.42.90.0/24
+  purpose: guest
+  svi:
+    enabled: false
+    gateway_ip: null
