@@ -159,6 +159,12 @@ class ShellAttachRequest(BaseModel):
     change_id: str
 
 
+class ShellQuickChangeRequest(BaseModel):
+    session_id: str
+    title: str = ""
+    ticket: str = ""
+
+
 class AssistantRequest(BaseModel):
     prompt: str
     context: dict[str, object] = {}
@@ -1017,6 +1023,33 @@ def _shell_append(p, session_id: str, entry: dict[str, object]) -> None:
         handle.write(json.dumps(entry, default=str) + "\n")
 
 
+def _record_shell_command(session_id: str, ev: dict[str, object]) -> None:
+    """Fold a command run in a governed shell session into its change record so
+    the change report shows exactly what was done on the device, and when."""
+    change_id = str(ev.get("change_id") or "").strip()
+    line = str(ev.get("line") or "").strip()
+    if not change_id or not line:
+        return
+    session = _SHELL_SESSIONS.get(session_id) or {}
+    device_id = str(session.get("device_id") or "?")
+    kind = str(ev.get("kind") or "")
+    p = paths()
+    try:
+        store = PlatformStore(p)
+        change = store.get_change(change_id)
+        current = change.workflow_state
+        store.record_workflow_event(
+            change_id, action="shell_command", from_state=current, to_state=current,
+            message=f"[shell · {device_id}] {line}",
+            evidence={"source": "shell", "device_id": device_id, "command": line,
+                      "kind": kind, "session_id": session_id},
+        )
+    except Exception:  # noqa: BLE001 — reporting must never break the live stream
+        pass
+    _shell_append(p, session_id, {"event": "command", "device_id": device_id,
+                                  "command": line, "kind": kind, "change_id": change_id})
+
+
 @app.post("/api/shell/open")
 def api_shell_open(request: ShellOpenRequest, http_request: Request) -> dict[str, object]:
     """Open a governed, read-only CLI session against a device."""
@@ -1060,6 +1093,35 @@ def api_shell_attach(request: ShellAttachRequest, http_request: Request) -> dict
     _shell_append(p, request.session_id, {"event": "change_attached", "change_id": request.change_id})
     return {"ok": True, "session_id": request.session_id, "state": state,
             "message": f"Change {request.change_id} attached — config mode is now permitted under governance."}
+
+
+@app.post("/api/shell/quick-change")
+def api_shell_quick_change(request: ShellQuickChangeRequest, http_request: Request) -> dict[str, object]:
+    """Create a lightweight change record for ad-hoc shell config work, so the
+    engineer can attach and configure without leaving the terminal. Everything
+    typed under it is captured into this change's report."""
+    p = paths()
+    principal = _request_principal(http_request)
+    org = principal.org_id
+    session = _shell_session_or_404(request.session_id, org)
+    device_id = str(session.get("device_id") or "")
+    title = request.title.strip() or f"Shell change on {device_id}"
+    intent_dir = p.intents / "shell"
+    intent_dir.mkdir(parents=True, exist_ok=True)
+    intent_path = intent_dir / f"{request.session_id}.yaml"
+    intent_path.write_text(
+        "change_type: shell_session\n"
+        f"description: {json.dumps(title)}\n"
+        f"device: {json.dumps(device_id)}\n"
+        f"ticket: {json.dumps(request.ticket.strip())}\n"
+        "commands: []  # captured live from the governed shell session\n",
+        encoding="utf-8",
+    )
+    change = PlatformStore(p).create_change(
+        intent_path, device_id, requested_by=principal.email or "netcode-user",
+        org_id=org, created_by_user_id=getattr(principal, "user_id", None))
+    return {"ok": True, "change_id": change.id, "title": title, "device_id": device_id,
+            "message": f"Change {change.id[:8]} created for this session."}
 
 
 @app.post("/api/shell/input")
@@ -1116,6 +1178,10 @@ async def ws_runner_stream(ws: WebSocket) -> None:
         while True:
             frame = await ws.receive_json()
             sid = str(frame.get("sid", ""))
+            if frame.get("t") == "event":
+                ev = frame.get("e") or {}
+                if isinstance(ev, dict) and ev.get("type") == "command":
+                    _record_shell_command(sid, ev)
             browser = _BROWSER_SOCKETS.get(sid)
             if browser is not None:
                 try:
@@ -1161,6 +1227,23 @@ async def ws_shell_session(ws: WebSocket, session_id: str) -> None:
             elif kind == "resize":
                 await runner_ws.send_json({"t": "resize", "sid": session_id,
                                            "cols": frame.get("cols", 120), "rows": frame.get("rows", 40)})
+            elif kind == "attach":
+                change_id = str(frame.get("change_id", "")).strip()
+                org = session.get("org_id")
+                try:
+                    change = PlatformStore(paths()).get_change(change_id)
+                    if change.org_id != org:
+                        raise KeyError(change_id)
+                except Exception:  # noqa: BLE001
+                    await ws.send_json({"t": "status", "s": "attach_error",
+                                        "m": f"Unknown change {change_id}."})
+                    continue
+                new_state = dict(session.get("state") or {})
+                new_state["mode"] = "change_attached"
+                new_state["change_id"] = change_id
+                session["state"] = new_state
+                await runner_ws.send_json({"t": "attach", "sid": session_id, "change_id": change_id})
+                _shell_append(paths(), session_id, {"event": "change_attached", "change_id": change_id})
     except WebSocketDisconnect:
         pass
     except Exception:  # noqa: BLE001

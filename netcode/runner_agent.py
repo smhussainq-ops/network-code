@@ -439,6 +439,15 @@ def _start_interactive_channel(server: str, token: str) -> None:
             except Exception as exc:  # noqa: BLE001
                 send_frame({"t": "status", "sid": sid, "s": "error", "m": str(exc)})
                 sessions.pop(sid, None)
+        elif t == "attach":
+            s = sessions.get(sid)
+            if s:
+                s.state.mode = "change_attached"
+                s.state.change_id = frame.get("change_id")
+                send_frame({"t": "event", "sid": sid, "e": {
+                    "type": "guard", "action": "change_attached_live",
+                    "change_id": frame.get("change_id"),
+                    "message": f"Change {frame.get('change_id')} attached — config mode is now unlocked under governance."}})
         elif t == "in":
             s = sessions.get(sid)
             if s:

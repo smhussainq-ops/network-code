@@ -2301,9 +2301,17 @@ function sendResize() {
 
 function applyGuardEvent(ev) {
   const s = appState.shell;
+  // command events are reporting-only (captured into the change); no UI noise.
+  if (ev.type === "command") { if (s) s.deviceTouched = true; renderChangeGuard(); return; }
   const action = ev.action || "";
   if (action === "config_mode_entered") { s.in_config = true; s.deviceTouched = true; }
   if (action === "config_mode_exited") { s.in_config = false; }
+  if (action === "change_attached_live") {
+    if (s) { s.mode = "change_attached"; if (ev.change_id) s.changeId = ev.change_id; }
+    termWrite(`\r\n\x1b[38;5;114m✓ ${ev.message || "Change attached — config mode unlocked."}\x1b[0m\r\n`);
+    renderChangeGuard();
+    return;
+  }
   if (ev.message) {
     // surface the guard's decision inline in the terminal, in amber
     termWrite(`\r\n\x1b[38;5;214m⛔ ${ev.message}\x1b[0m\r\n`);
@@ -2361,14 +2369,96 @@ function closeShell() {
 async function shellAttach() {
   const s = appState.shell;
   if (!s?.sessionId) return;
-  const changeId = s.changeId || appState.plan?.change?.id || prompt("Change ID to attach (unlocks config mode):", appState.plan?.change?.id || "");
-  if (!changeId) return;
+  openAttachPicker();
+}
+
+function closeAttachPicker() {
+  const el = $("attach-modal");
+  if (el) el.remove();
+}
+
+async function openAttachPicker() {
+  closeAttachPicker();
+  const s = appState.shell;
+  const overlay = document.createElement("div");
+  overlay.id = "attach-modal";
+  overlay.className = "nc-modal-overlay";
+  overlay.innerHTML = `
+    <div class="nc-modal" role="dialog" aria-label="Attach a change">
+      <div class="nc-modal-head">
+        <h3>Attach a change</h3>
+        <p>Config mode stays locked until this session is tied to a change record. Everything you type under it is captured into that change's report.</p>
+      </div>
+      <div class="nc-modal-body">
+        <label class="nc-field">
+          <span>Existing change</span>
+          <select id="attach-pick"><option value="">Loading changes…</option></select>
+        </label>
+        <div class="nc-or">or</div>
+        <label class="nc-field">
+          <span>Create a change for this session</span>
+          <input id="attach-quick-title" type="text" placeholder="e.g. Fix trunk on ${s.deviceId}" />
+        </label>
+      </div>
+      <div class="nc-modal-actions">
+        <button id="attach-cancel" class="secondary" type="button">Cancel</button>
+        <button id="attach-quick" class="secondary" type="button">Create &amp; attach</button>
+        <button id="attach-confirm" type="button" disabled>Attach change</button>
+      </div>
+    </div>`;
+  document.body.appendChild(overlay);
+  overlay.addEventListener("click", (e) => { if (e.target === overlay) closeAttachPicker(); });
+  $("attach-cancel").addEventListener("click", closeAttachPicker);
+  $("attach-confirm").addEventListener("click", () => {
+    const id = $("attach-pick").value;
+    if (id) doAttach(id);
+  });
+  $("attach-quick").addEventListener("click", doQuickChange);
+  // populate existing changes
   try {
+    const data = await getJson("/api/changes");
+    const changes = (data.changes || []).slice().reverse();
+    const pick = $("attach-pick");
+    if (!changes.length) {
+      pick.innerHTML = '<option value="">No changes yet — create one below</option>';
+    } else {
+      pick.innerHTML = '<option value="">Select a change…</option>' + changes.map((c) => {
+        const dev = c.device_id || "—";
+        const state = c.workflow_state || c.status || "draft";
+        const label = `${(c.id || "").slice(0, 8)} · ${dev} · ${state}`;
+        return `<option value="${c.id}">${label}</option>`;
+      }).join("");
+      pick.addEventListener("change", () => { $("attach-confirm").disabled = !pick.value; });
+    }
+  } catch (e) {
+    $("attach-pick").innerHTML = '<option value="">Could not load changes</option>';
+  }
+}
+
+async function doQuickChange() {
+  const s = appState.shell;
+  if (!s?.sessionId) return;
+  const title = ($("attach-quick-title")?.value || "").trim();
+  try {
+    const res = await postJson("/api/shell/quick-change", { session_id: s.sessionId, title });
+    await doAttach(res.change_id);
+  } catch (error) { failOutcome("Could not create change.", error); }
+}
+
+async function doAttach(changeId) {
+  const s = appState.shell;
+  if (!s?.sessionId || !changeId) return;
+  try {
+    // Validate + record on the control plane, then unlock the LIVE runner session over the socket.
     const res = await postJson("/api/shell/attach", { session_id: s.sessionId, change_id: changeId });
+    if (shellSocket && shellSocket.readyState === WebSocket.OPEN) {
+      shellSocket.send(JSON.stringify({ t: "attach", change_id: changeId }));
+    }
     appState.shell.changeId = changeId;
     appState.shell.mode = res.state.mode;
-    termWrite(`\r\n\x1b[38;5;114m✓ ${res.message}\x1b[0m\r\n`);
-    setGuardFacts("Change attached", "Config mode is now permitted under this change.", `Change ${changeId.slice(0, 8)} attached.`, "Enter config mode; changes are governed and evidenced.");
+    closeAttachPicker();
+    termWrite(`\r\n\x1b[38;5;114m✓ Change ${changeId.slice(0, 8)} attached — config mode unlocked. Everything you type is captured into this change.\x1b[0m\r\n`);
+    setGuardFacts("Change attached", "Config mode is now permitted under this change.", `Change ${changeId.slice(0, 8)} attached.`, "Type 'conf t' to configure; every line is recorded to the change report.");
     renderChangeGuard();
     if (shellTerm) shellTerm.focus();
   } catch (error) { failOutcome("Could not attach change.", error); }

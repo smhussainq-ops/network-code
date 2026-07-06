@@ -277,7 +277,8 @@ def _enter_decision(state: ShellSessionState, enter_byte: str) -> GuardDecision:
             "type": "guard", "action": "config_mode_entered",
             "change_id": state.change_id,
             "message": f"Config mode entered under change {state.change_id}.",
-        }])
+        }, {"type": "command", "line": line.strip(), "kind": "config_enter",
+            "change_id": state.change_id}])
 
     if kind == "dangerous":
         if state.pending_confirm == line:
@@ -287,7 +288,8 @@ def _enter_decision(state: ShellSessionState, enter_byte: str) -> GuardDecision:
             return GuardDecision(forward=enter_byte, events=[{
                 "type": "guard", "action": "dangerous_confirmed",
                 "match": verdict["match"],
-            }])
+            }, {"type": "command", "line": line.strip(), "kind": "dangerous",
+                "change_id": state.change_id}])
         state.pending_confirm = line
         # Keep the buffer so the SECOND Enter confirms the same line.
         state.line_buffer = line
@@ -305,12 +307,15 @@ def _enter_decision(state: ShellSessionState, enter_byte: str) -> GuardDecision:
         state.in_config = False
         return GuardDecision(forward=enter_byte, events=[{
             "type": "guard", "action": "config_mode_exited",
-        }])
+        }, {"type": "command", "line": line.strip(), "kind": "config_exit",
+            "change_id": state.change_id}])
 
     if kind == "config_line":
         state.device_touched = True
         state.pending_confirm = None
-        return GuardDecision(forward=enter_byte, events=[])
+        return GuardDecision(forward=enter_byte, events=[
+            {"type": "command", "line": line.strip(), "kind": "config_line",
+             "change_id": state.change_id}])
 
     if kind in ("blocked_unknown", "blocked_chain"):
         state.pending_confirm = None

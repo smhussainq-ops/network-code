@@ -1497,3 +1497,20 @@ legend,
 .guard-facts dt { font-size: 10.5px; text-transform: uppercase; letter-spacing: .07em; color: var(--muted,#8b94a2); margin-top: 14px; font-family: ui-monospace,Menlo,monospace; }
 .guard-facts dd { margin: 3px 0 0; font-size: 13.5px; line-height: 1.45; color: var(--ink,#1f2733); }
 .shell-hint-bar b { color: #b9cbdc; }
+
+/* Attach-change picker modal */
+.nc-modal-overlay { position: fixed; inset: 0; z-index: 60; display: flex; align-items: center; justify-content: center;
+  background: rgb(11 22 34 / 45%); backdrop-filter: blur(3px); padding: 24px; }
+.nc-modal { width: 100%; max-width: 460px; background: var(--surface); border: 1px solid var(--line-strong);
+  border-radius: 14px; box-shadow: 0 24px 60px rgb(16 32 51 / 28%); overflow: hidden; }
+.nc-modal-head { padding: 20px 22px 12px; border-bottom: 1px solid var(--line); }
+.nc-modal-head h3 { margin: 0 0 6px; font-size: 16px; color: var(--text); }
+.nc-modal-head p { margin: 0; font-size: 12.5px; line-height: 1.5; color: var(--muted); }
+.nc-modal-body { padding: 18px 22px; display: flex; flex-direction: column; gap: 14px; }
+.nc-field { display: flex; flex-direction: column; gap: 6px; }
+.nc-field > span { font-size: 11px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted-2); font-weight: 600; }
+.nc-field select, .nc-field input { padding: 9px 11px; border: 1px solid var(--line-strong); border-radius: 9px;
+  font-size: 13.5px; color: var(--text); background: var(--surface-soft); }
+.nc-field select:focus, .nc-field input:focus { outline: none; box-shadow: var(--focus); border-color: var(--blue); }
+.nc-or { text-align: center; font-size: 11px; text-transform: uppercase; letter-spacing: .1em; color: var(--muted-2); }
+.nc-modal-actions { display: flex; justify-content: flex-end; gap: 10px; padding: 14px 22px 20px; }
