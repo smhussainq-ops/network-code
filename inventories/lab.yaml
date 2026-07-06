@@ -29,6 +29,41 @@ devices:
   - stores
   - access-switches
   site: store-1844
+- id: v2-store4
+  hostname: v2-store4
+  host: 172.100.1.44
+  groups:
+  - stores
+  - access-switches
+  site: store-1845
+- id: v2-store5
+  hostname: v2-store5
+  host: 172.100.1.45
+  groups:
+  - stores
+  - access-switches
+  site: store-1846
+- id: v2-store6
+  hostname: v2-store6
+  host: 172.100.1.46
+  groups:
+  - stores
+  - access-switches
+  site: store-1847
+- id: v2-store7
+  hostname: v2-store7
+  host: 172.100.1.47
+  groups:
+  - stores
+  - access-switches
+  site: store-1848
+- id: v2-store8
+  hostname: v2-store8
+  host: 172.100.1.48
+  groups:
+  - stores
+  - access-switches
+  site: store-1849
 known_subnets:
   store-1842:
   - 10.42.30.0/24
@@ -39,3 +74,18 @@ known_subnets:
   store-1844:
   - 10.44.30.0/24
   - 10.44.40.0/24
+  store-1845:
+  - 10.45.30.0/24
+  - 10.45.40.0/24
+  store-1846:
+  - 10.46.30.0/24
+  - 10.46.40.0/24
+  store-1847:
+  - 10.47.30.0/24
+  - 10.47.40.0/24
+  store-1848:
+  - 10.48.30.0/24
+  - 10.48.40.0/24
+  store-1849:
+  - 10.49.30.0/24
+  - 10.49.40.0/24

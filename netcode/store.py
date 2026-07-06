@@ -271,6 +271,48 @@ class PlatformStore:
                 )
                 """
             )
+            # Fleet rollouts: one intent orchestrated over many devices as
+            # canary -> batch waves. Each target device gets its OWN change record,
+            # so the whole single-change safety spine (plan/dry-run/apply/verify,
+            # evidence, state machine) applies per device; these tables only add
+            # the wave structure and halt state on top.
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS rollouts (
+                    id TEXT PRIMARY KEY,
+                    org_id TEXT NOT NULL,
+                    description TEXT NOT NULL,
+                    change_type TEXT NOT NULL,
+                    values_json TEXT,
+                    status TEXT NOT NULL,
+                    canary_size INTEGER NOT NULL,
+                    batch_size INTEGER NOT NULL,
+                    requested_by TEXT NOT NULL,
+                    created_by_user_id TEXT,
+                    halt_reason TEXT,
+                    current_wave INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS rollout_targets (
+                    rollout_id TEXT NOT NULL,
+                    device_id TEXT NOT NULL,
+                    wave_index INTEGER NOT NULL,
+                    change_id TEXT,
+                    intent_path TEXT,
+                    status TEXT NOT NULL,
+                    stage TEXT NOT NULL DEFAULT '',
+                    message TEXT NOT NULL DEFAULT '',
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (rollout_id, device_id),
+                    FOREIGN KEY(rollout_id) REFERENCES rollouts(id)
+                )
+                """
+            )
             for table in ("changes", "jobs", "runners", "join_tokens"):
                 self._ensure_column(conn, table, "org_id", f"TEXT DEFAULT '{DEFAULT_ORG_ID}'")
             self._ensure_column(conn, "changes", "created_by_user_id", "TEXT")
@@ -601,6 +643,155 @@ class PlatformStore:
                 (pool, json.dumps(payload), f"Queued for runner pool {pool}", job.id),
             )
         return self.get_job(job.id)
+
+    # ── Fleet rollouts ────────────────────────────────────────────────────
+
+    def create_rollout(
+        self,
+        *,
+        description: str,
+        change_type: str,
+        values: dict[str, Any],
+        canary_size: int,
+        batch_size: int,
+        requested_by: str = "netcode-user",
+        org_id: str = DEFAULT_ORG_ID,
+        created_by_user_id: str | None = None,
+    ) -> dict[str, Any]:
+        rollout_id = str(uuid.uuid4())
+        now = utc_now()
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT INTO rollouts (id, org_id, description, change_type, values_json, status,"
+                " canary_size, batch_size, requested_by, created_by_user_id, halt_reason, current_wave, created_at, updated_at)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (rollout_id, org_id, description, change_type, json.dumps(values), "planned",
+                 canary_size, batch_size, requested_by, created_by_user_id, None, 0, now, now),
+            )
+        return self.get_rollout(rollout_id)
+
+    def get_rollout(self, rollout_id: str) -> dict[str, Any]:
+        with self._connect() as conn:
+            row = conn.execute("SELECT * FROM rollouts WHERE id = ?", (rollout_id,)).fetchone()
+        if not row:
+            raise KeyError(f"Unknown rollout {rollout_id}")
+        return self._rollout(row)
+
+    def list_rollouts(self, org_id: str | None = None, limit: int = 50) -> list[dict[str, Any]]:
+        with self._connect() as conn:
+            if org_id is None:
+                rows = conn.execute("SELECT * FROM rollouts ORDER BY created_at DESC LIMIT ?", (limit,)).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM rollouts WHERE org_id = ? ORDER BY created_at DESC LIMIT ?", (org_id, limit)
+                ).fetchall()
+        return [self._rollout(row) for row in rows]
+
+    def update_rollout(
+        self,
+        rollout_id: str,
+        *,
+        status: str | None = None,
+        halt_reason: str | None = None,
+        current_wave: int | None = None,
+        expected_status: str | None = None,
+    ) -> dict[str, Any]:
+        """Update a rollout. With expected_status the write is conditional
+        (compare-and-set), so a halt request can never clobber a terminal state
+        and a 'completed' write can never overwrite a pending halt."""
+        sets, params = ["updated_at = ?"], [utc_now()]
+        if status is not None:
+            sets.append("status = ?"); params.append(status)
+        if halt_reason is not None:
+            sets.append("halt_reason = ?"); params.append(halt_reason)
+        if current_wave is not None:
+            sets.append("current_wave = ?"); params.append(current_wave)
+        params.append(rollout_id)
+        where = "id = ?"
+        if expected_status is not None:
+            where += " AND status = ?"
+            params.append(expected_status)
+        with self._connect() as conn:
+            conn.execute(f"UPDATE rollouts SET {', '.join(sets)} WHERE {where}", tuple(params))
+        return self.get_rollout(rollout_id)
+
+    def cancel_queued_jobs_for_change(self, change_id: str, reason: str) -> int:
+        """Fail-close any still-queued jobs for a change so an offline runner can
+        never claim and execute them later (zombie apply). Returns cancelled count."""
+        now = utc_now()
+        with self._connect() as conn:
+            cursor = conn.execute(
+                "UPDATE jobs SET status = 'failed', message = ?, updated_at = ? "
+                "WHERE change_id = ? AND status = 'queued'",
+                (f"Cancelled: {reason}", now, change_id),
+            )
+            count = cursor.rowcount if cursor.rowcount is not None else 0
+        return count
+
+    def cancel_job_if_queued(self, job_id: str, reason: str) -> bool:
+        """Atomically cancel ONE job if (and only if) it is still queued."""
+        now = utc_now()
+        with self._connect() as conn:
+            cursor = conn.execute(
+                "UPDATE jobs SET status = 'failed', message = ?, updated_at = ? "
+                "WHERE id = ? AND status = 'queued'",
+                (f"Cancelled: {reason}", now, job_id),
+            )
+            return bool(cursor.rowcount)
+
+    def list_rollouts_in_status(self, statuses: tuple[str, ...]) -> list[dict[str, Any]]:
+        marks = ", ".join("?" for _ in statuses)
+        with self._connect() as conn:
+            rows = conn.execute(f"SELECT * FROM rollouts WHERE status IN ({marks})", statuses).fetchall()
+        return [self._rollout(row) for row in rows]
+
+    def add_rollout_target(
+        self, rollout_id: str, device_id: str, wave_index: int,
+        change_id: str | None = None, intent_path: str | None = None,
+    ) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT INTO rollout_targets (rollout_id, device_id, wave_index, change_id, intent_path,"
+                " status, stage, message, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (rollout_id, device_id, wave_index, change_id, intent_path, "pending", "", "", utc_now()),
+            )
+
+    def list_rollout_targets(self, rollout_id: str) -> list[dict[str, Any]]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM rollout_targets WHERE rollout_id = ? ORDER BY wave_index ASC, device_id ASC",
+                (rollout_id,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def update_rollout_target(
+        self, rollout_id: str, device_id: str, *,
+        status: str | None = None, stage: str | None = None,
+        message: str | None = None, change_id: str | None = None,
+    ) -> None:
+        sets, params = ["updated_at = ?"], [utc_now()]
+        if status is not None:
+            sets.append("status = ?"); params.append(status)
+        if stage is not None:
+            sets.append("stage = ?"); params.append(stage)
+        if message is not None:
+            sets.append("message = ?"); params.append(message)
+        if change_id is not None:
+            sets.append("change_id = ?"); params.append(change_id)
+        params.extend([rollout_id, device_id])
+        with self._connect() as conn:
+            conn.execute(
+                f"UPDATE rollout_targets SET {', '.join(sets)} WHERE rollout_id = ? AND device_id = ?",
+                tuple(params),
+            )
+
+    def _rollout(self, row: sqlite3.Row) -> dict[str, Any]:
+        data = dict(row)
+        try:
+            data["values"] = json.loads(data.pop("values_json") or "{}")
+        except Exception:  # noqa: BLE001
+            data["values"] = {}
+        return data
 
     def create_read_job(self, org_id: str, pool: str, action: str, payload: dict[str, Any]) -> JobRecord:
         """Queue a device-READ job for a runner. Not tied to a change (uses the '__read__'

@@ -51,6 +51,7 @@ const appState = {
   lastCommit: null,
   lastPush: null,
   changeRecord: null,
+  fleet: { rollout: null, drift: null, rolloutPolling: false, driftPolling: false },
 };
 
 function escapeHtml(value) {
@@ -259,6 +260,7 @@ function setView(view) {
     plan: ["Preview exact impact.", "Review the Terraform-style plan, generated commands, affected devices, risk, and apply gate."],
     validate: ["Validate before apply.", "Policy checks and lab dry-run proof must pass before apply is unlocked."],
     apply: ["Apply and verify.", "Commit only after validation and dry-run proof, then prove live state and keep rollback available."],
+    fleet: ["Fleet operations.", "Roll one change across many devices as canary then batches with auto-halt on failure, and sweep the whole fleet for drift against the committed baseline."],
     shell: ["Netcode Shell — governed SSH.", "Keep CLI control while every session is guarded, staged, verified, and captured as evidence. The guard runs on the on-prem runner; the browser never touches the device."],
     drift: ["Troubleshoot / investigate.", "Run read-only Rez checks, compare expected vs live state, detect drift, and attach findings to the change record."],
     evidence: ["Prove / audit.", "One package per change: request, intent, branch, commands, validation, dry-run, apply, verify, troubleshooting, rollback."],
@@ -268,6 +270,7 @@ function setView(view) {
   if (view === "evidence") renderEvidence();
   if (view === "drift") renderDrift();
   if (view === "shell") renderShell();
+  if (view === "fleet") { renderFleet(); hydrateFleet(); }
 }
 
 function getPath(object, path, fallback = "") {
@@ -1462,6 +1465,7 @@ function renderAll() {
   renderApply();
   renderDrift();
   renderShell();
+  renderFleet();
   renderEvidence();
   renderStoryRail();
   renderModeGuards();
@@ -2217,6 +2221,261 @@ let shellTerm = null;
 let shellFit = null;
 let shellSocket = null;
 
+// ── Fleet rollouts + fleet drift ────────────────────────────────────────────
+
+const FLEET_STATUS_TONE = { passed: "good", running: "warn", failed: "bad", skipped: "muted",
+  pending: "muted", blocked: "bad" };
+
+async function hydrateFleet() {
+  // A running rollout must survive a page reload: rehydrate the newest rollout
+  // and the drift snapshot from the backend, then resume polling if either is live.
+  try {
+    if (!appState.fleet.rollout) {
+      const data = await getJson("/api/fleet/rollouts");
+      const newest = (data.rollouts || [])[0];
+      if (newest) {
+        appState.fleet.rollout = await getJson(`/api/fleet/rollouts/${newest.id}`);
+        if (["running", "halt_requested"].includes(appState.fleet.rollout.status)) pollFleetRollout();
+      }
+    }
+    if (!appState.fleet.drift || appState.fleet.drift.status === "never_run") {
+      appState.fleet.drift = await getJson("/api/fleet/drift");
+      if (appState.fleet.drift.status === "running") pollFleetDrift();
+    }
+    renderFleet();
+  } catch (error) { /* fleet view still renders empty-state */ }
+}
+
+function renderFleet() {
+  const groupSelect = $("fleet-group");
+  const groups = appState.source?.groups || [];
+  if (groups.length && document.activeElement !== groupSelect) {
+    const current = groupSelect.value;
+    groupSelect.innerHTML = groups.map((g) => `<option value="${escapeHtml(g)}">${escapeHtml(g)}</option>`).join("");
+    if (current && groups.includes(current)) groupSelect.value = current;
+    else if (groups.includes("stores")) groupSelect.value = "stores";
+  }
+  const rollout = appState.fleet.rollout;
+  const canStart = rollout && rollout.status === "planned";
+  const canHalt = rollout && ["running", "halt_requested"].includes(rollout.status);
+  $("fleet-start").disabled = !canStart;
+  $("fleet-halt").disabled = !canHalt;
+  if (!rollout) {
+    $("fleet-title").textContent = "No rollout planned yet.";
+    $("fleet-summary").textContent = "Plan a rollout to see the canary and batch waves before anything touches a device.";
+    $("fleet-chips").innerHTML = "";
+    $("fleet-waves").innerHTML = "";
+    $("fleet-halt-banner").hidden = true;
+  } else {
+    const counts = rollout.target_counts || {};
+    $("fleet-title").textContent = `${rollout.description} — ${rollout.status.replace(/_/g, " ")}`;
+    $("fleet-summary").textContent =
+      `${rollout.device_count} devices · canary ${rollout.canary_size} · batches of ${rollout.batch_size} · ` +
+      `rollout ${String(rollout.id).slice(0, 8)}`;
+    chipRow($("fleet-chips"), [
+      { text: `status: ${rollout.status.replace(/_/g, " ")}`,
+        tone: rollout.status === "completed" ? "good" : ["halted", "blocked"].includes(rollout.status) ? "bad" : "warn" },
+      ...Object.entries(counts).map(([status, count]) => ({
+        text: `${status}: ${count}`, tone: FLEET_STATUS_TONE[status] || "muted" })),
+    ]);
+    const banner = $("fleet-halt-banner");
+    if (rollout.halt_reason) {
+      banner.hidden = false;
+      banner.textContent = rollout.halt_reason;
+    } else banner.hidden = true;
+    $("fleet-waves").innerHTML = (rollout.waves || []).map((wave) => {
+      const isCurrent = rollout.status === "running" && wave.index === rollout.current_wave;
+      const chips = wave.targets.map((t) => {
+        const cls = FLEET_STATUS_TONE[t.status] === "good" ? "passed" : t.status;
+        const stage = t.status === "running" && t.stage ? ` · ${t.stage}` : "";
+        const tip = `${t.stage || "pending"}${t.message ? " — " + t.message : ""}`;
+        const link = t.change_id ? ` data-change="${escapeHtml(t.change_id)}"` : "";
+        return `<button type="button" class="fleet-device ${escapeHtml(cls)}"${link} title="${escapeHtml(tip)}">` +
+               `${escapeHtml(t.device_id)}${escapeHtml(stage)}</button>`;
+      }).join("");
+      return `<div class="fleet-wave${isCurrent ? " current" : ""}">` +
+             `<span class="fleet-wave-label">${escapeHtml(wave.label)}</span>` +
+             `<div class="fleet-wave-devices">${chips}</div></div>`;
+    }).join("");
+  }
+  renderFleetDrift();
+}
+
+function renderFleetDrift() {
+  const drift = appState.fleet.drift;
+  const meta = $("fleet-drift-meta");
+  const table = $("fleet-drift-table");
+  if (!drift || drift.status === "never_run") {
+    meta.textContent = "Never run in this session.";
+    table.innerHTML = "";
+    return;
+  }
+  const progress = drift.progress || { done: 0, total: 0 };
+  meta.textContent = drift.status === "running"
+    ? `Sweeping… ${progress.done}/${progress.total} devices`
+    : `Last sweep finished ${drift.finished_at || ""} · ${progress.total} devices` +
+      (drift.report_path ? ` · evidence: ${drift.report_path.split("/").pop()}` : "");
+  const tones = { in_sync: "good", drifted: "bad", unreachable: "warn", no_baseline: "muted" };
+  const labels = { in_sync: "In sync", drifted: "DRIFTED", unreachable: "Unreachable", no_baseline: "No baseline" };
+  table.innerHTML = (drift.devices || []).map((d) => `
+    <div class="fleet-drift-row">
+      <strong>${escapeHtml(d.device_id)}</strong>
+      <span class="chip ${tones[d.status] || "muted"}">${escapeHtml(labels[d.status] || d.status)}</span>
+      <span class="fleet-drift-msg">${escapeHtml(d.message || (d.status === "no_baseline" ? "No committed intents to compare yet." : ""))}</span>
+    </div>`).join("");
+}
+
+async function fleetPlanRollout() {
+  if ($("fleet-plan").disabled) return;
+  $("fleet-plan").disabled = true;
+  try {
+    await fleetPlanRolloutInner();
+  } finally { $("fleet-plan").disabled = false; }
+}
+
+async function fleetPlanRolloutInner() {
+  const form = new FormData($("fleet-form"));
+  const vlanId = Number(form.get("vlan_id"));
+  const payload = {
+    change_type: "add_vlan",
+    values: { vlan_id: vlanId, name: String(form.get("vlan_name") || "").trim() || `vlan-${vlanId}` },
+    device_group: String(form.get("device_group") || "stores"),
+    canary_size: Number(form.get("canary_size")) || 1,
+    batch_size: Number(form.get("batch_size")) || 3,
+    description: String(form.get("description") || "").trim() || `VLAN ${vlanId} fleet rollout`,
+  };
+  startOutcome("Planning fleet rollout", "Waves computed and every device planned + policy-checked before anything can start.");
+  try {
+    const rollout = await postJson("/api/fleet/rollouts", payload);
+    appState.fleet.rollout = rollout;
+    renderFleet();
+    const blocked = rollout.status === "blocked";
+    setOutcome({
+      state: blocked ? "Blocked" : "Planned", status: blocked ? "fail" : "pass",
+      title: blocked ? "Rollout blocked by policy/validation." : `Rollout planned across ${rollout.device_count} devices.`,
+      summary: blocked ? rollout.halt_reason : `Canary first (${rollout.canary_size}), then batches of ${rollout.batch_size}. Nothing has touched a device.`,
+      expected: "Every device passes the static plan and policy gate.",
+      actual: blocked ? rollout.halt_reason : "All devices validated.",
+      artifact: `Per-device change records created (rollout ${String(rollout.id).slice(0, 8)}).`,
+      device: "No device config was changed.",
+      next: blocked ? "Fix the blocked devices, then plan again." : "Review the waves, then Start rollout.",
+    });
+  } catch (error) { failOutcome("Could not plan the rollout.", error); }
+}
+
+async function fleetStartRollout() {
+  const rollout = appState.fleet.rollout;
+  if (!rollout || $("fleet-start").disabled) return;
+  $("fleet-start").disabled = true; // re-enabled by renderFleet from real status
+  startOutcome("Starting fleet rollout", "Canary applies first; a failure anywhere halts every untouched device.");
+  try {
+    appState.fleet.rollout = await postJson(`/api/fleet/rollouts/${rollout.id}/start`, {});
+    renderFleet();
+    pollFleetRollout();
+    setOutcome({ state: "Running", status: "warn", title: "Rollout running — canary first.",
+      summary: "Each device runs dry-run proof, gated apply, and live verify through the on-prem runner.",
+      expected: "Canary passes, then batches proceed; auto-halt on the first failure.",
+      actual: "Canary wave started.", artifact: "Watch each device chip advance through dry-run, apply, verify.",
+      device: "Devices change only after their own dry-run proof passes.",
+      next: "Watch the waves. Halt stops before the next device." });
+  } catch (error) { failOutcome("Could not start the rollout.", error); }
+}
+
+async function fleetHaltRollout() {
+  const rollout = appState.fleet.rollout;
+  if (!rollout) return;
+  try {
+    appState.fleet.rollout = await postJson(`/api/fleet/rollouts/${rollout.id}/halt`, { reason: "Halted by operator from the Fleet view." });
+    renderFleet();
+  } catch (error) { failOutcome("Could not halt the rollout.", error); }
+}
+
+async function pollFleetRollout() {
+  if (appState.fleet.rolloutPolling) return;
+  appState.fleet.rolloutPolling = true;
+  let pollErrors = 0;
+  try {
+    while (appState.fleet.rollout && ["running", "halt_requested"].includes(appState.fleet.rollout.status)) {
+      await sleep(2000);
+      try {
+        appState.fleet.rollout = await getJson(`/api/fleet/rollouts/${appState.fleet.rollout.id}`);
+        pollErrors = 0;
+        renderFleet();
+      } catch (error) {
+        if (++pollErrors >= 10) {
+          failOutcome("Lost contact with the rollout.", error, "Reload the Fleet view to reattach; the rollout continues on the server.");
+          return;
+        }
+      }
+    }
+    const rollout = appState.fleet.rollout;
+    if (rollout && rollout.status === "completed") {
+      setOutcome({ state: "Completed", status: "pass", title: "Fleet rollout completed.",
+        summary: `All ${rollout.device_count} devices applied and verified, wave by wave.`,
+        expected: "Canary, then every batch, with per-device verify.", actual: "Every wave passed.",
+        artifact: "Each device chip links to its own change record with full evidence.",
+        device: "All targets now carry the change, verified live.", next: "Run a fleet drift sweep to confirm the fleet baseline." });
+    } else if (rollout && rollout.status === "halted") {
+      setOutcome({ state: "Halted", status: "fail", title: "Rollout halted.",
+        summary: rollout.halt_reason || "Halted.",
+        expected: "Auto-halt on first failure so the blast radius stays bounded.",
+        actual: rollout.halt_reason || "Halted before completing every wave.",
+        artifact: "Failed device chips carry the failure message; untouched devices are marked skipped.",
+        device: "No device beyond the failure point was touched.",
+        next: "Open the failed device's change record, fix, then plan a new rollout." });
+    }
+  } finally { appState.fleet.rolloutPolling = false; }
+}
+
+async function fleetDriftRefresh() {
+  startOutcome("Fleet drift sweep", "Every device compared against its committed baseline via the runner.");
+  try {
+    appState.fleet.drift = await postJson("/api/fleet/drift/refresh", {});
+    renderFleetDrift();
+    pollFleetDrift();
+  } catch (error) { failOutcome("Could not start the drift sweep.", error); }
+}
+
+async function pollFleetDrift() {
+  if (appState.fleet.driftPolling) return;
+  appState.fleet.driftPolling = true;
+  let pollErrors = 0;
+  try {
+    while (appState.fleet.drift && appState.fleet.drift.status === "running") {
+      await sleep(1500);
+      try {
+        appState.fleet.drift = await getJson("/api/fleet/drift");
+        pollErrors = 0;
+        renderFleetDrift();
+      } catch (error) {
+        if (++pollErrors >= 10) return;
+      }
+    }
+    const drift = appState.fleet.drift;
+    if (drift && drift.status === "done") {
+      const drifted = (drift.devices || []).filter((d) => d.status === "drifted");
+      setOutcome({
+        state: drifted.length ? "Drift found" : "In sync", status: drifted.length ? "fail" : "pass",
+        title: drifted.length ? `${drifted.length} device(s) drifted from the committed baseline.` : "Fleet matches the committed baseline.",
+        summary: `${(drift.devices || []).length} devices swept on the runner.`,
+        expected: "Live state matches every applied intent, fleet-wide.",
+        actual: drifted.length ? `Drifted: ${drifted.map((d) => d.device_id).join(", ")}` : "No out-of-band changes detected.",
+        artifact: drift.report_path ? `Evidence report: ${drift.report_path}` : "Sweep recorded.",
+        device: "Read-only sweep — nothing was changed.",
+        next: drifted.length ? "Open the drifted device and reconcile with a governed change." : "Nothing to do — the fleet is provably in sync.",
+      });
+    }
+  } finally { appState.fleet.driftPolling = false; }
+}
+
+function fleetWaveClicks(event) {
+  const button = event.target.closest(".fleet-device[data-change]");
+  if (!button) return;
+  appState.activeChangeId = button.dataset.change;
+  loadChangeRecord(button.dataset.change);
+  setView("evidence");
+}
+
 function shellDevices() {
   return (appState.source?.devices || []).map((d) => d.id).filter(Boolean);
 }
@@ -2517,6 +2776,11 @@ function bindEvents() {
   $("shell-open").addEventListener("click", openShell);
   $("shell-attach").addEventListener("click", shellAttach);
   $("shell-evidence").addEventListener("click", openShellEvidence);
+  $("fleet-plan").addEventListener("click", fleetPlanRollout);
+  $("fleet-start").addEventListener("click", fleetStartRollout);
+  $("fleet-halt").addEventListener("click", fleetHaltRollout);
+  $("fleet-drift-refresh").addEventListener("click", fleetDriftRefresh);
+  $("fleet-waves").addEventListener("click", fleetWaveClicks);
   $("refresh-evidence").addEventListener("click", refreshEvidence);
   $$("#change-form input, #change-form select, #change-form textarea").forEach((input) => input.addEventListener("input", resetChangeProof));
 }

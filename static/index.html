@@ -6,7 +6,7 @@
     <title>Netcode</title>
     <link rel="icon" href="/static/favicon.svg" type="image/svg+xml" />
     <link rel="stylesheet" href="/static/vendor/xterm.css" />
-    <link rel="stylesheet" href="/static/styles.css?v=20260705-shell4" />
+    <link rel="stylesheet" href="/static/styles.css?v=20260706-fleet2" />
   </head>
   <body>
     <div id="login-overlay" class="login-overlay" hidden>
@@ -38,6 +38,7 @@
           <button class="nav-item" type="button" data-view="plan">Plan</button>
           <button class="nav-item" type="button" data-view="validate">Validate</button>
           <button class="nav-item" type="button" data-view="apply">Apply</button>
+          <button class="nav-item" type="button" data-view="fleet">Fleet</button>
           <button class="nav-item" type="button" data-view="shell">Shell</button>
           <button class="nav-item" type="button" data-view="drift">Troubleshoot</button>
           <button class="nav-item" type="button" data-view="evidence">Evidence</button>
@@ -466,6 +467,53 @@
             </section>
           </section>
 
+          <section id="view-fleet" class="view">
+            <section class="section-heading">
+              <h3>Fleet rollout — canary, then batches, halt on first failure</h3>
+              <p>One change, many devices. Every device gets its own change record with the full safety spine (plan, policy gate, dry-run proof, apply, verify) — the rollout only sequences the waves. A failure anywhere stops everything that has not started.</p>
+            </section>
+            <div class="two-column fleet-layout">
+              <form id="fleet-form" class="form-panel">
+                <section class="form-section first">
+                  <h4>Launch a fleet change</h4>
+                  <p class="setup-hint">Golden path: add a VLAN across the fleet. The canary proves it before any batch runs.</p>
+                  <label>Description<input name="description" placeholder="Guest wifi VLAN to all stores" autocomplete="off" /></label>
+                  <label>VLAN ID<input name="vlan_id" type="number" min="2" max="4094" value="777" /></label>
+                  <label>VLAN name<input name="vlan_name" value="FLEET_GUEST_WIFI" autocomplete="off" /></label>
+                  <label>Target group
+                    <select name="device_group" id="fleet-group"><option value="stores">stores</option></select>
+                  </label>
+                  <div class="field-row">
+                    <label>Canary size<input name="canary_size" type="number" min="1" value="1" /></label>
+                    <label>Batch size<input name="batch_size" type="number" min="1" value="3" /></label>
+                  </div>
+                  <div class="button-row">
+                    <button id="fleet-plan" type="button">Plan rollout</button>
+                    <button id="fleet-start" class="secondary" type="button" disabled>Start rollout</button>
+                    <button id="fleet-halt" class="danger" type="button" disabled>Halt</button>
+                  </div>
+                </section>
+              </form>
+              <article class="result-panel">
+                <span>Rollout</span>
+                <h4 id="fleet-title">No rollout planned yet.</h4>
+                <p id="fleet-summary">Plan a rollout to see the canary and batch waves before anything touches a device.</p>
+                <div id="fleet-chips" class="stat-chips"></div>
+                <div id="fleet-halt-banner" class="fleet-halt-banner" hidden></div>
+                <div id="fleet-waves" class="fleet-waves"></div>
+              </article>
+            </div>
+            <section class="section-heading">
+              <h3>Fleet drift</h3>
+              <p>Live state vs the committed baseline for every device in the source of truth — the out-of-band change finder. Runs on the on-prem runner; the sweep is recorded as an evidence report.</p>
+            </section>
+            <div class="fleet-drift-bar">
+              <button id="fleet-drift-refresh" type="button">Run fleet drift sweep</button>
+              <span id="fleet-drift-meta" class="setup-hint">Never run in this session.</span>
+            </div>
+            <div id="fleet-drift-table" class="fleet-drift-table"></div>
+          </section>
+
           <section id="view-shell" class="view">
             <div class="shell-trustbar">
               <span class="tb-title">Netcode Shell</span>
@@ -638,6 +686,6 @@
     </main>
     <script src="/static/vendor/xterm.js"></script>
     <script src="/static/vendor/xterm-addon-fit.js"></script>
-    <script src="/static/app.js?v=20260705-shell4"></script>
+    <script src="/static/app.js?v=20260706-fleet2"></script>
   </body>
 </html>

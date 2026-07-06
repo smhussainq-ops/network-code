@@ -35,6 +35,15 @@ from netcode.gitflow import (
     push_current_branch,
     setup_git_workspace,
 )
+from netcode.fleet import (
+    fleet_drift_snapshot,
+    plan_fleet_rollout,
+    reconcile_rollouts_on_startup,
+    request_halt,
+    rollout_status,
+    start_fleet_drift,
+    start_rollout,
+)
 from netcode.gitops import gitops_plan
 from netcode.inventory import Inventory
 from netcode.intent_utils import lab_write_supported, plan_metadata, production_write_supported
@@ -165,6 +174,20 @@ class ShellQuickChangeRequest(BaseModel):
     ticket: str = ""
 
 
+class FleetRolloutRequest(BaseModel):
+    change_type: str = "add_vlan"
+    values: dict = {}
+    device_ids: list[str] | None = None
+    device_group: str | None = None
+    canary_size: int = 1
+    batch_size: int = 3
+    description: str = ""
+
+
+class FleetHaltRequest(BaseModel):
+    reason: str = ""
+
+
 class AssistantRequest(BaseModel):
     prompt: str
     context: dict[str, object] = {}
@@ -242,6 +265,12 @@ app = FastAPI(title="Netcode Platform", version="0.1.0")
 def _startup() -> None:
     init_workspace(paths())
     _bootstrap_admin()
+    # Rollout orchestrator threads die with the process: fail any orphaned
+    # running rollouts closed (halted + queued jobs cancelled) at boot.
+    try:
+        reconcile_rollouts_on_startup(paths())
+    except Exception:  # noqa: BLE001 — reconciliation must never block startup
+        pass
 
 
 def _bootstrap_admin() -> None:
@@ -1407,6 +1436,83 @@ def api_compliance_summary() -> dict[str, object]:
 @app.post("/api/scale/plan")
 def api_scale_plan(request: ScalePlanRequest) -> dict[str, object]:
     return rollout_plan(paths(), request.device_ids, request.canary_size, request.batch_size)
+
+
+# ── Fleet rollouts: canary -> batch waves with auto-halt ─────────────────────
+
+def _rollout_or_404(rollout_id: str, org: str) -> dict[str, object]:
+    try:
+        rollout = PlatformStore(paths()).get_rollout(rollout_id)
+    except Exception as exc:
+        raise HTTPException(status_code=404, detail=f"Unknown rollout {rollout_id}") from exc
+    if rollout.get("org_id") != org:  # 404 (not 403) so existence never leaks across tenants
+        raise HTTPException(status_code=404, detail=f"Unknown rollout {rollout_id}")
+    return rollout
+
+
+@app.post("/api/fleet/rollouts")
+def api_fleet_rollout_create(request: FleetRolloutRequest, http_request: Request) -> dict[str, object]:
+    principal = _request_principal(http_request)
+    try:
+        return plan_fleet_rollout(
+            paths(),
+            change_type=request.change_type, values=request.values,
+            device_ids=request.device_ids, device_group=request.device_group,
+            canary_size=request.canary_size, batch_size=request.batch_size,
+            description=request.description,
+            requested_by=principal.email or "netcode-user",
+            org_id=principal.org_id, created_by_user_id=principal.user_id,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/api/fleet/rollouts")
+def api_fleet_rollouts(request: Request) -> dict[str, object]:
+    p = paths()
+    org = _request_principal(request).org_id
+    store = PlatformStore(p)
+    rollouts = []
+    for rollout in store.list_rollouts(org_id=org):
+        targets = store.list_rollout_targets(str(rollout["id"]))
+        counts: dict[str, int] = {}
+        for t in targets:
+            counts[t["status"]] = counts.get(t["status"], 0) + 1
+        rollout["target_counts"] = counts
+        rollout["device_count"] = len(targets)
+        rollouts.append(rollout)
+    return {"ok": True, "rollouts": rollouts}
+
+
+@app.get("/api/fleet/rollouts/{rollout_id}")
+def api_fleet_rollout(rollout_id: str, request: Request) -> dict[str, object]:
+    _rollout_or_404(rollout_id, _request_principal(request).org_id)
+    return rollout_status(paths(), rollout_id)
+
+
+@app.post("/api/fleet/rollouts/{rollout_id}/start")
+def api_fleet_rollout_start(rollout_id: str, request: Request) -> dict[str, object]:
+    _rollout_or_404(rollout_id, _request_principal(request).org_id)
+    try:
+        return start_rollout(paths(), rollout_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/fleet/rollouts/{rollout_id}/halt")
+def api_fleet_rollout_halt(rollout_id: str, request: FleetHaltRequest, http_request: Request) -> dict[str, object]:
+    _rollout_or_404(rollout_id, _request_principal(http_request).org_id)
+    return request_halt(paths(), rollout_id, request.reason)
+
+
+@app.post("/api/fleet/drift/refresh")
+def api_fleet_drift_refresh(request: Request) -> dict[str, object]:
+    return start_fleet_drift(paths(), _request_principal(request).org_id, load_intent)
+
+
+@app.get("/api/fleet/drift")
+def api_fleet_drift(request: Request) -> dict[str, object]:
+    return fleet_drift_snapshot(_request_principal(request).org_id)
 
 
 @app.post("/api/assistant")
