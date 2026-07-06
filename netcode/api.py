@@ -269,6 +269,12 @@ class RunnerHeartbeatRequest(BaseModel):
     version: str = ""
 
 
+class RunnerReadRequest(BaseModel):
+    action: str
+    payload: dict = {}
+    timeout: float = 60.0
+
+
 class LoginRequest(BaseModel):
     email: str
     password: str
@@ -325,6 +331,11 @@ _PUBLIC_EXACT = {"/", "/app", "/app/", "/api/health", "/api/auth/login", "/api/a
 _ADMIN_PATHS = {"/api/runners/join-token"}
 
 
+def _is_rez_bridge_request(path: str, authorization: str | None) -> bool:
+    token = os.environ.get("NETCODE_REZ_BRIDGE_TOKEN", "").strip()
+    return bool(token) and path == "/api/rez/runner-read" and authorization == f"Bearer {token}"
+
+
 def _request_principal(request: Request) -> Principal:
     return getattr(request.state, "principal", SYSTEM_PRINCIPAL)
 
@@ -340,7 +351,12 @@ async def _rbac(request: Request, call_next):
 
     # Public UI shell, health, login, static assets, and the runner data plane
     # (which authenticates with its own runner token) bypass user RBAC.
-    bypass = path in _PUBLIC_EXACT or path.startswith("/static") or path.startswith("/api/runner/")
+    bypass = (
+        path in _PUBLIC_EXACT
+        or path.startswith("/static")
+        or path.startswith("/api/runner/")
+        or _is_rez_bridge_request(path, request.headers.get("authorization"))
+    )
     if auth_enabled() and not bypass:
         if not principal.authenticated:
             return JSONResponse({"detail": "Authentication required."}, status_code=401)
@@ -821,7 +837,28 @@ def _runner_read(p, action: str, payload: dict, org_id: str, timeout: float = 60
         if current.status in ("completed", "failed"):
             return current.result or {"ok": current.status == "completed", "message": current.message}
         time.sleep(0.4)
+    store.cancel_job_if_queued(job.id, f"read deadline: {action} exceeded {int(timeout)}s")
     return {"ok": False, "error": f"No runner completed the {action} read within {int(timeout)}s. Is a runner online for this pool? (Setup → Runners)"}
+
+
+@app.post("/api/rez/runner-read")
+def api_rez_runner_read(request: RunnerReadRequest, http_request: Request, authorization: str | None = Header(default=None)) -> dict[str, object]:
+    """Bridge endpoint for Rez control-plane tools to execute device reads on the runner.
+
+    Slice 1 accepts only `rez_ssh_command`. The runner resolves credentials from
+    its local inventory; this endpoint strips credential-shaped fields before
+    queueing the job.
+    """
+    bridge_token = os.environ.get("NETCODE_REZ_BRIDGE_TOKEN", "").strip()
+    if bridge_token and authorization != f"Bearer {bridge_token}":
+        raise HTTPException(status_code=401, detail="Rez bridge token required.")
+    if request.action != "rez_ssh_command":
+        raise HTTPException(status_code=400, detail="Unsupported Rez runner action.")
+    payload = dict(request.payload or {})
+    for secret_key in ("username", "password", "passwd", "secret", "api_token", "private_key"):
+        payload.pop(secret_key, None)
+    timeout = max(1.0, min(float(request.timeout or 60.0), 120.0))
+    return _runner_read(paths(), request.action, payload, _request_principal(http_request).org_id, timeout=timeout)
 
 
 def _collect_rez_state_for_troubleshooting(device) -> dict[str, object]:  # noqa: ANN001

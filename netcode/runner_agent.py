@@ -170,6 +170,154 @@ READ_TIMEOUT_SECONDS = 30
 READINESS_TIMEOUT_SECONDS = 55  # multi-device sweep; still under the control plane's 60s poll
 
 
+def _collapse_command(command: str) -> str:
+    return " ".join(str(command or "").strip().split())
+
+
+def _rez_read_command_allowed(command: str) -> tuple[bool, str]:
+    """Deny-by-default guard for Rez runner SSH reads.
+
+    This intentionally does not reuse the interactive shell guard, which is
+    good-faith allow-by-default for humans. Rez runner reads are machine-issued
+    RCA commands, so the safer floor is a small set of read verbs plus no
+    chaining/redirection.
+    """
+    cleaned = _collapse_command(command)
+    lowered = cleaned.lower()
+    if not lowered:
+        return False, "empty command"
+    for sep in (";", "&", "`", "$(", ">", "<", "\x00", "\n", "\r"):
+        if sep in lowered:
+            return False, f"blocked command separator {sep!r}"
+    first = lowered.split(" ", 1)[0]
+    allowed = {
+        "show",
+        "get",
+        "display",
+        "ping",
+        "traceroute",
+        "traceroute6",
+        "nslookup",
+    }
+    if first not in allowed:
+        return False, f"verb {first!r} is not in the read-only allowlist"
+    return True, "allowed"
+
+
+def _netmiko_device_type(platform: str) -> str:
+    normalized = str(platform or "").strip().lower().replace("-", "_").replace(" ", "_")
+    aliases = {
+        "arista": "arista_eos",
+        "arista_eos": "arista_eos",
+        "eos": "arista_eos",
+        "cisco_ios": "cisco_ios",
+        "ios": "cisco_ios",
+        "iosxe": "cisco_xe",
+        "cisco_iosxe": "cisco_xe",
+        "cisco_xe": "cisco_xe",
+        "nxos": "cisco_nxos",
+        "cisco_nxos": "cisco_nxos",
+        "fortigate": "fortinet",
+        "fortinet": "fortinet",
+        "fortios": "fortinet",
+        "palo_alto": "paloalto_panos",
+        "panos": "paloalto_panos",
+        "paloalto_panos": "paloalto_panos",
+        "junos": "juniper_junos",
+        "juniper_junos": "juniper_junos",
+    }
+    return aliases.get(normalized, normalized or "arista_eos")
+
+
+def _execute_rez_ssh_command(payload: dict[str, Any]) -> dict[str, Any]:
+    import time as _time
+
+    from netcode.inventory import Inventory
+
+    device_id = str(payload.get("device") or payload.get("device_id") or "").strip()
+    command = _collapse_command(str(payload.get("command") or ""))
+    if not device_id:
+        return {"ok": False, "status": "fail", "error": "device_id is required"}
+    ok, reason = _rez_read_command_allowed(command)
+    if not ok:
+        return {
+            "ok": False,
+            "status": "blocked",
+            "device": device_id,
+            "command": command,
+            "error": f"Command blocked by runner read-only policy: {reason}",
+        }
+    inv = Inventory(INVENTORY_FILE)
+    device = inv.by_id.get(device_id)
+    if not device:
+        return {"ok": False, "status": "fail", "device": device_id, "command": command, "error": f"Device {device_id} not in local runner inventory."}
+    started = _time.monotonic()
+    try:
+        from netmiko import ConnectHandler
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "status": "fail", "device": device.id, "command": command, "error": f"netmiko is required for Rez SSH reads: {exc}"}
+
+    conn = None
+    try:
+        conn = ConnectHandler(
+            device_type=_netmiko_device_type(device.platform),
+            host=device.host,
+            username=device.username,
+            password=device.password,
+            port=device.port,
+            fast_cli=False,
+            conn_timeout=20,
+            auth_timeout=20,
+            banner_timeout=20,
+        )
+        try:
+            conn.enable()
+        except Exception:
+            pass
+        if _netmiko_device_type(device.platform) in {"arista_eos", "cisco_ios", "cisco_xe", "cisco_nxos"}:
+            try:
+                conn.send_command_timing("terminal length 0", strip_prompt=False, strip_command=False, read_timeout=10)
+            except Exception:
+                pass
+        try:
+            output = conn.send_command(command, strip_prompt=False, strip_command=False, read_timeout=30)
+        except Exception:
+            output = conn.send_command_timing(command, strip_prompt=False, strip_command=False, read_timeout=30)
+        return {
+            "ok": True,
+            "status": "pass",
+            "device": device.id,
+            "hostname": device.hostname,
+            "platform": device.platform,
+            "host": device.host,
+            "port": device.port,
+            "command": command,
+            "stdout": output,
+            "stderr": "",
+            "duration_ms": int((_time.monotonic() - started) * 1000),
+            "runner_version": VERSION,
+        }
+    except Exception as exc:  # noqa: BLE001
+        return {
+            "ok": False,
+            "status": "fail",
+            "device": device.id,
+            "platform": device.platform,
+            "command": command,
+            "stdout": "",
+            "stderr": str(exc),
+            "error": str(exc),
+            "duration_ms": int((_time.monotonic() - started) * 1000),
+            "runner_version": VERSION,
+        }
+    finally:
+        if conn is not None:
+            try:
+                conn.disconnect()
+            except Exception:
+                pass
+
+
 def _execute_read(action: str, payload: dict[str, Any]) -> dict[str, Any]:
     """Fail-closed wrapper: a hung device read must never wedge the runner's
     sequential job loop (a dead container / unreachable device can otherwise
@@ -271,6 +419,9 @@ def _execute_read_inner(action: str, payload: dict[str, Any]) -> dict[str, Any]:
             rows.append({"id": d.id, "host": d.host, "platform": d.platform, "ok": ok, "error": err})
         return {"ok": readable > 0, "tested": len(devices), "readable": readable, "devices": rows,
                 "message": f"{readable}/{len(devices)} trusted devices are readable."}
+
+    if action == "rez_ssh_command":
+        return _execute_rez_ssh_command(payload)
 
     if action == "verify":
         from netcode.lab import AristaEOSLabAdapter

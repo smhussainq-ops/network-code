@@ -391,6 +391,220 @@ def test_runner_read_job_routing_roundtrip(tmp_path: Path, monkeypatch):
     assert read_jobs[0]["status"] == "completed"
 
 
+def test_runner_rez_ssh_command_is_deny_by_default(tmp_path: Path, monkeypatch):
+    from netcode import runner_agent
+
+    inv = tmp_path / "inventory.yaml"
+    inv.write_text(
+        """
+defaults:
+  username: admin
+  password: admin
+devices:
+  - id: fgt-hub
+    host: 127.0.0.1
+    platform: fortinet
+    port: 2222
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(runner_agent, "INVENTORY_FILE", inv)
+
+    result = runner_agent._execute_read_inner(
+        "rez_ssh_command",
+        {"device": "fgt-hub", "command": "execute factoryreset"},
+    )
+
+    assert result["ok"] is False
+    assert result["status"] == "blocked"
+    assert "read-only policy" in result["error"]
+
+
+def test_runner_rez_ssh_command_uses_vendor_dispatch(tmp_path: Path, monkeypatch):
+    import sys
+    import types
+
+    from netcode import runner_agent
+
+    inv = tmp_path / "inventory.yaml"
+    inv.write_text(
+        """
+defaults:
+  username: admin
+  password: admin
+devices:
+  - id: fgt-hub
+    host: 127.0.0.1
+    platform: fortios
+    port: 2222
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(runner_agent, "INVENTORY_FILE", inv)
+    calls = {}
+
+    class FakeConnection:
+        def __init__(self, **kwargs):
+            calls.update(kwargs)
+
+        def enable(self):
+            raise RuntimeError("no enable")
+
+        def send_command(self, command, **kwargs):  # noqa: ANN001
+            return f"ran {command}"
+
+        def disconnect(self):
+            calls["disconnect"] = True
+
+    monkeypatch.setitem(sys.modules, "netmiko", types.SimpleNamespace(ConnectHandler=FakeConnection))
+
+    result = runner_agent._execute_read_inner(
+        "rez_ssh_command",
+        {"device": "fgt-hub", "command": "get system status"},
+    )
+
+    assert result["ok"] is True
+    assert result["stdout"] == "ran get system status"
+    assert calls["device_type"] == "fortinet"
+    assert calls["host"] == "127.0.0.1"
+    assert calls["port"] == 2222
+    assert calls["disconnect"] is True
+
+
+def test_rez_runner_read_endpoint_strips_credentials_and_queues_only_supported_action(tmp_path: Path, monkeypatch):
+    init_workspace(WorkspacePaths(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("NETCODE_EXECUTION", "runner")
+    monkeypatch.setenv("NETCODE_RUNNER_POOL", "store-lab")
+
+    class FastClock:
+        current = 0.0
+
+        @classmethod
+        def monotonic(cls):
+            cls.current += 1.0
+            return cls.current
+
+        @staticmethod
+        def sleep(_seconds):  # noqa: ANN001
+            return None
+
+    monkeypatch.setattr(api, "time", FastClock)
+    client = TestClient(api.app)
+
+    blocked = client.post("/api/rez/runner-read", json={"action": "discovery", "payload": {}})
+    assert blocked.status_code == 400
+
+    resp = client.post(
+        "/api/rez/runner-read",
+        json={
+            "action": "rez_ssh_command",
+            "timeout": 1,
+            "payload": {
+                "device": "v2-store1",
+                "command": "show version",
+                "username": "should-not-queue",
+                "password": "should-not-queue",
+            },
+        },
+    )
+    assert resp.status_code == 200
+    jobs = client.get("/api/jobs").json()["jobs"]
+    read_jobs = [j for j in jobs if j["action"] == "read_rez_ssh_command"]
+    assert read_jobs
+    payload = read_jobs[0]["payload"]
+    assert payload["device"] == "v2-store1"
+    assert payload["command"] == "show version"
+    assert "username" not in payload and "password" not in payload
+
+
+def test_rez_runner_read_endpoint_roundtrip_returns_runner_stdout(tmp_path: Path, monkeypatch):
+    import hashlib
+    import hmac as hmac_mod
+    import threading
+    import time
+
+    from netcode.runner_hub import canonical_json
+
+    init_workspace(WorkspacePaths(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("NETCODE_EXECUTION", "runner")
+    monkeypatch.setenv("NETCODE_RUNNER_POOL", "store-lab")
+    client = TestClient(api.app)
+
+    enroll = client.post(
+        "/api/runner/enroll",
+        json={"join_token": client.post("/api/runners/join-token", json={"pool": "store-lab"}).json()["join_token"], "name": "r1"},
+    ).json()
+    token, secret = enroll["runner_token"], enroll["hmac_secret"]
+    auth = {"Authorization": f"Bearer {token}"}
+    canned = {
+        "ok": True,
+        "status": "pass",
+        "device": "edge-1",
+        "command": "show version",
+        "stdout": "EOS version 4.31.0F",
+        "stderr": "",
+    }
+
+    def fake_runner():
+        for _ in range(60):
+            claim = client.post("/api/runner/poll", json={"wait_seconds": 0}, headers=auth)
+            if claim.status_code == 200:
+                job = claim.json()["job"]
+                assert job["action"] == "read_rez_ssh_command"
+                assert job["payload"] == {"device": "edge-1", "command": "show version"}
+                sig = hmac_mod.new(secret.encode(), canonical_json(canned).encode(), hashlib.sha256).hexdigest()
+                client.post(f"/api/runner/jobs/{job['id']}/result", json={"result": canned, "signature": sig}, headers=auth)
+                return
+            time.sleep(0.1)
+
+    t = threading.Thread(target=fake_runner, daemon=True)
+    t.start()
+    resp = client.post(
+        "/api/rez/runner-read",
+        json={"action": "rez_ssh_command", "payload": {"device": "edge-1", "command": "show version"}},
+    )
+    t.join(timeout=10)
+
+    assert resp.status_code == 200
+    assert resp.json()["stdout"] == "EOS version 4.31.0F"
+
+
+def test_runner_read_timeout_cancels_queued_job(tmp_path: Path, monkeypatch):
+    init_workspace(WorkspacePaths(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("NETCODE_RUNNER_POOL", "store-lab")
+
+    class FastClock:
+        current = 0.0
+
+        @classmethod
+        def monotonic(cls):
+            cls.current += 1.0
+            return cls.current
+
+        @staticmethod
+        def sleep(_seconds):  # noqa: ANN001
+            return None
+
+    monkeypatch.setattr(api, "time", FastClock)
+
+    result = api._runner_read(
+        WorkspacePaths(tmp_path),
+        "rez_ssh_command",
+        {"device": "v2-store1", "command": "show version"},
+        "org_default",
+        timeout=1,
+    )
+
+    assert result["ok"] is False
+    jobs = PlatformStore(WorkspacePaths(tmp_path)).list_jobs()
+    assert jobs[0].action == "read_rez_ssh_command"
+    assert jobs[0].status == "failed"
+    assert "Cancelled: read deadline" in jobs[0].message
+
+
 def test_runner_local_policy_gate_blocks_forbidden_config(tmp_path: Path):
     """The runner's own fail-closed gate must reject credential/out-of-scope config
     even if the control plane said it was fine."""
