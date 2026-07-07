@@ -1154,6 +1154,42 @@ def test_read_job_payload_redaction_remains_defense_in_depth(tmp_path: Path):
     assert red["host"] == "1.2.3.4" and red["port"] == 22
 
 
+def test_verification_handoff_builds_rez_context_without_writes(tmp_path: Path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    paths = WorkspacePaths(tmp_path)
+    init_workspace(paths)
+    client = TestClient(api.app)
+
+    before_changes = client.get("/api/changes").json()["changes"]
+    response = client.post(
+        "/api/diagnostics/verification-handoff",
+        json={
+            "device_id": "edge-fw-01",
+            "check": "vlan_exists",
+            "expected": "VLAN 210 present on uplink",
+            "actual": "VLAN 210 missing from trunk allowed list",
+            "verification": {"ok": False, "status": "fail", "message": "VLAN 210 not found"},
+            "change_id": "chg-2048",
+            "intent_path": "intents/chg-2048.yaml",
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["handoff_type"] == "verification_failure_to_rez"
+    assert "expected state" in body["question"]
+    assert "VLAN 210 present" in body["question"]
+    assert "VLAN 210 missing" in body["question"]
+    assert body["context"]["failed"] is True
+    assert body["context"]["read_only"] is True
+    assert body["remediation_plan"]["status"] == "not_created"
+    assert body["remediation_plan"]["direct_write_allowed"] is False
+    assert body["safety"]["device_writes"] == "none"
+
+    after_changes = client.get("/api/changes").json()["changes"]
+    assert after_changes == before_changes
+
+
 def test_runner_credential_floor_survives_empty_and_hostile_policy(tmp_path: Path):
     """Trust-debt #2: a compromised control plane shipping an EMPTY policy (or a
     custom_config intent, whose allow-list is empty) still cannot push

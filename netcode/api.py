@@ -19,6 +19,7 @@ from netcode.ai_assistant import assistant_response
 from netcode.adapters.registry import AdapterRegistry
 from netcode.bootstrap import init_workspace
 from netcode.discovery import DiscoveryService
+from netcode.diagnostics_handoff import build_verification_handoff
 from netcode.drift import (
     aggregate_device_vlans,
     baseline_for_state,
@@ -156,6 +157,16 @@ class TroubleshootRequest(BaseModel):
     target: str = ""
     expected: str = ""
     change_id: str | None = None
+
+
+class VerificationHandoffRequest(BaseModel):
+    device_id: str
+    check: str
+    expected: str = ""
+    actual: str = ""
+    verification: dict[str, object] = {}
+    change_id: str = ""
+    intent_path: str = ""
 
 
 class ShellOpenRequest(BaseModel):
@@ -1170,6 +1181,20 @@ def api_troubleshoot_run(request: TroubleshootRequest, http_request: Request) ->
             result["change_event_recorded"] = False
             result["change_event_error"] = str(exc)
     return result
+
+
+@app.post("/api/diagnostics/verification-handoff")
+def api_diagnostics_verification_handoff(request: VerificationHandoffRequest) -> dict[str, object]:
+    """Build a read-only Rez Diagnostics handoff from a failed Netcode verification."""
+    return build_verification_handoff(
+        device_id=request.device_id,
+        check=request.check,
+        expected=request.expected,
+        actual=request.actual,
+        verification=dict(request.verification or {}),
+        change_id=request.change_id,
+        intent_path=request.intent_path,
+    )
 
 
 # ---- Netcode Shell (governed SSH, MVP1/2) -----------------------------------
