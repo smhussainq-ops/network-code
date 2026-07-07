@@ -1426,6 +1426,121 @@ def test_workflow_pack_catalog_endpoint(tmp_path: Path, monkeypatch):
     assert all(pack["status"] == "ready" for pack in data["packs"])
 
 
+def test_ansible_pack_plan_requires_rollback_for_apply(tmp_path: Path):
+    from netcode.ansible_backend import build_ansible_pack_plan
+
+    playbook = tmp_path / "site.yml"
+    playbook.write_text(
+        """
+- hosts: all
+  gather_facts: false
+  tasks:
+    - name: Configure NTP
+      arista.eos.eos_config:
+        lines:
+          - ntp server 10.10.10.20
+""",
+        encoding="utf-8",
+    )
+
+    plan = build_ansible_pack_plan(tmp_path, playbook_path="site.yml", mode="apply", targets=["Access-SW-01"])
+
+    assert plan["ok"] is False
+    assert plan["status"] == "blocked"
+    assert "rollback_playbook_required" in plan["blockers"]
+    assert plan["execution"] == {
+        "location": "runner",
+        "runner_local_inventory": True,
+        "cloud_device_access": False,
+        "credentials_leave_runner": False,
+        "check_mode_first": True,
+    }
+
+
+def test_ansible_pack_plan_flags_high_risk_modules_without_cloud_execution(tmp_path: Path):
+    from netcode.ansible_backend import build_ansible_pack_plan
+
+    playbook = tmp_path / "site.yml"
+    rollback = tmp_path / "rollback.yml"
+    playbook.write_text(
+        """
+- hosts: all
+  tasks:
+    - name: High risk operational shell
+      shell: show version
+""",
+        encoding="utf-8",
+    )
+    rollback.write_text(
+        """
+- hosts: all
+  tasks:
+    - name: Rollback placeholder
+      debug:
+        msg: rollback reviewed
+""",
+        encoding="utf-8",
+    )
+
+    plan = build_ansible_pack_plan(
+        tmp_path,
+        playbook_path="site.yml",
+        rollback_playbook_path="rollback.yml",
+        mode="canary",
+        targets=["Core-RTR-02"],
+    )
+
+    assert plan["ok"] is True
+    assert plan["status"] == "review_required"
+    assert plan["playbook"]["high_risk_modules"] == ["shell"]
+    assert "peer_review_high_risk_modules" in plan["required_gates"]
+    assert plan["execution"]["location"] == "runner"
+    assert plan["execution"]["cloud_device_access"] is False
+
+
+def test_ansible_pack_plan_rejects_path_escape(tmp_path: Path):
+    from netcode.ansible_backend import build_ansible_pack_plan
+
+    outside = tmp_path.parent / "outside.yml"
+    outside.write_text("- hosts: all\n  tasks: []\n", encoding="utf-8")
+
+    try:
+        build_ansible_pack_plan(tmp_path, playbook_path=str(outside))
+    except ValueError as exc:
+        assert "inside the Netcode workspace" in str(exc)
+    else:
+        raise AssertionError("path escape must be rejected")
+
+
+def test_ansible_pack_plan_endpoint(tmp_path: Path, monkeypatch):
+    init_workspace(WorkspacePaths(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    playbook = tmp_path / "playbooks" / "ntp.yml"
+    playbook.parent.mkdir(parents=True, exist_ok=True)
+    playbook.write_text(
+        """
+- hosts: all
+  tasks:
+    - name: Preview approved NTP
+      debug:
+        msg: ntp server 10.10.10.20
+""",
+        encoding="utf-8",
+    )
+
+    response = TestClient(api.app).post(
+        "/api/workflow-packs/ansible/plan",
+        json={"playbook_path": "playbooks/ntp.yml", "targets": ["Access-SW-01"], "mode": "check"},
+    )
+    data = response.json()
+
+    assert response.status_code == 200
+    assert data["ok"] is True
+    assert data["backend"] == "ansible"
+    assert data["execution"]["runner_local_inventory"] is True
+    assert data["execution"]["credentials_leave_runner"] is False
+
+
 def test_ui_config_persists_editable_options_and_catalog(tmp_path: Path, monkeypatch):
     init_workspace(WorkspacePaths(tmp_path))
     monkeypatch.chdir(tmp_path)

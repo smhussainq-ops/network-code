@@ -16,6 +16,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from netcode.ai_assistant import assistant_response
+from netcode.ansible_backend import build_ansible_pack_plan
 from netcode.adapters.registry import AdapterRegistry
 from netcode.bootstrap import init_workspace
 from netcode.discovery import DiscoveryService
@@ -112,6 +113,14 @@ class DesiredStatePlanRequest(BaseModel):
     device_id: str = "v2-store1"
     requested_by: str = "lab-engineer"
     values: dict[str, object] = {}
+
+
+class AnsiblePackPlanRequest(BaseModel):
+    playbook_path: str
+    rollback_playbook_path: str = ""
+    targets: list[str] = []
+    mode: str = "check"
+    requested_by: str = "operator"
 
 
 class IntentPathRequest(BaseModel):
@@ -526,6 +535,21 @@ def desired_state_catalog() -> dict[str, object]:
 @app.get("/api/workflow-packs")
 def api_workflow_packs() -> dict[str, object]:
     return workflow_pack_catalog()
+
+
+@app.post("/api/workflow-packs/ansible/plan")
+def api_ansible_pack_plan(request: AnsiblePackPlanRequest) -> dict[str, object]:
+    try:
+        return build_ansible_pack_plan(
+            paths().root,
+            playbook_path=request.playbook_path,
+            rollback_playbook_path=request.rollback_playbook_path,
+            targets=request.targets,
+            mode=request.mode,
+            requested_by=request.requested_by,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @app.post("/api/desired-state/plan")
