@@ -263,12 +263,7 @@ class DiscoveryService:
 
     def _match_existing_device(self, inventory: Inventory, host: str, device_id: str = "") -> Device | None:
         lookup = (device_id or "").strip()
-        if lookup and lookup in inventory.by_id:
-            return inventory.by_id[lookup]
-        for device in inventory.devices:
-            if device.host == host or device.hostname == host or device.id == host:
-                return device
-        return None
+        return inventory.find_device(lookup) if lookup else inventory.find_device(host)
 
     def _candidate_platforms(self, requested_platform: str, driver_map: dict[str, Any]) -> list[str]:
         if requested_platform:

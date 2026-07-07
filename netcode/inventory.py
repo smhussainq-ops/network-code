@@ -30,6 +30,7 @@ class Inventory:
         self.defaults = self.raw.get("defaults", {})
         self.devices = [self._device(d) for d in self.raw.get("devices", [])]
         self.by_id = {d.id: d for d in self.devices}
+        self.by_id_normalized = {self.normalize_id(d.id): d for d in self.devices}
 
     def _device(self, raw: dict[str, Any]) -> Device:
         defaults = self.defaults
@@ -46,11 +47,45 @@ class Inventory:
             groups=tuple(raw.get("groups") or []),
         )
 
+    @staticmethod
+    def normalize_id(value: str) -> str:
+        return str(value or "").strip().lower()
+
+    def find_device(self, identifier: str) -> Device | None:
+        """Resolve common cross-product identifiers without requiring exact case.
+
+        Netcode source-of-truth ids are slugged/lowercase while Rez device ids can
+        preserve mixed case. The runner is the shared trust boundary, so lookup
+        must be tolerant at that boundary without changing the public id stored
+        for each device.
+        """
+        target = str(identifier or "").strip()
+        if not target:
+            return None
+        direct = self.by_id.get(target)
+        if direct:
+            return direct
+        normalized = self.normalize_id(target)
+        by_normalized = self.by_id_normalized.get(normalized)
+        if by_normalized:
+            return by_normalized
+        for device in self.devices:
+            host_port = f"{device.host}:{device.port}"
+            candidates = {
+                str(device.id),
+                str(device.hostname),
+                str(device.host),
+                host_port,
+            }
+            if target in candidates or normalized in {self.normalize_id(item) for item in candidates}:
+                return device
+        return None
+
     def resolve_targets(self, target: TargetSpec, site: str | None = None) -> list[Device]:
         selected: list[Device] = []
         missing: list[str] = []
         for device_id in target.device_ids:
-            device = self.by_id.get(device_id)
+            device = self.find_device(device_id)
             if device:
                 selected.append(device)
             else:

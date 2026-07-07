@@ -419,6 +419,14 @@ devices:
     assert result["status"] == "blocked"
     assert "read-only policy" in result["error"]
 
+    pipe_escape = runner_agent._execute_read_inner(
+        "rez_ssh_command",
+        {"device": "fgt-hub", "command": "show version | bash echo pwned"},
+    )
+    assert pipe_escape["ok"] is False
+    assert pipe_escape["status"] == "blocked"
+    assert "post-pipe" in pipe_escape["error"]
+
 
 def test_runner_rez_ssh_command_uses_vendor_dispatch(tmp_path: Path, monkeypatch):
     import sys
@@ -460,7 +468,7 @@ devices:
 
     result = runner_agent._execute_read_inner(
         "rez_ssh_command",
-        {"device": "fgt-hub", "command": "get system status"},
+        {"device": "FGT-HUB", "command": "get system status"},
     )
 
     assert result["ok"] is True
@@ -1004,26 +1012,59 @@ def test_runner_local_policy_gate_blocks_forbidden_config(tmp_path: Path):
     assert local_policy_gate(intent, clean, "{{ not: valid: yaml")["ok"] is False
 
 
-def test_discovery_credentials_never_exposed_via_jobs(tmp_path: Path):
-    """Trust-debt #1: a discovery read job carries device creds to the runner,
-    but they must never be readable back out — redacted on return AND scrubbed
-    at rest once the runner has used them."""
+def test_runner_mode_device_credentials_rejected_before_queue_or_import(tmp_path: Path, monkeypatch):
+    """Enterprise mode: cloud paths never accept device credentials. Credentials
+    are configured on the runner, then discovery/manual-add submit public facts
+    only."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("NETCODE_EXECUTION", "runner")
+    monkeypatch.setenv("NETCODE_RUNNER_POOL", "store-lab")
+    paths = WorkspacePaths(tmp_path)
+    init_workspace(paths)
+    client = TestClient(api.app)
+
+    discovery = client.post(
+        "/api/discovery/scan",
+        json={"host": "10.0.0.9", "username": "admin", "password": "hunter2", "platform": "arista_eos"},
+    )
+    assert discovery.status_code == 400
+    assert "runner" in discovery.json()["detail"].lower()
+
+    manual = client.post(
+        "/api/shell/devices/manual",
+        json={
+            "device_id": "edge-1",
+            "hostname": "edge-1",
+            "host": "10.0.0.9",
+            "platform": "arista_eos",
+            "username": "admin",
+            "password": "hunter2",
+            "port": 22,
+        },
+    )
+    assert manual.status_code == 400
+    assert "hunter2" not in json.dumps(client.get("/api/source-of-truth").json())
+
+
+def test_read_job_payload_redaction_remains_defense_in_depth(tmp_path: Path):
     from netcode.store import record_to_dict, redact_secrets
 
     paths = WorkspacePaths(tmp_path)
     init_workspace(paths)
     store = PlatformStore(paths)
 
-    job = store.create_read_job("org_default", "store-lab", "discovery",
-                                {"host": "10.0.0.9", "username": "admin", "password": "hunter2", "platform": "arista_eos"})
+    job = store.create_read_job(
+        "org_default",
+        "store-lab",
+        "legacy_or_external_read",
+        {"host": "10.0.0.9", "username": "admin", "password": "hunter2", "platform": "arista_eos"},
+    )
     # On return, the password is redacted even while the job is still queued.
     listed = record_to_dict(store.list_jobs(org_id="org_default")[0])
     assert listed["payload"]["password"] == "***redacted***"
     assert "hunter2" not in json.dumps(listed)
 
-    # Scrub-on-CLAIM: a runner that dies mid-read still can't leave the secret
-    # at rest — claiming the job scrubs the stored copy immediately, while the
-    # returned object still carries the real creds for the runner to use.
+    # Scrub-on-CLAIM remains defense-in-depth for legacy/external callers.
     claimed = store.claim_next_job("org_default", "store-lab", "runner-x")
     assert claimed.id == job.id
     assert claimed.payload["password"] == "hunter2"  # runner gets the real cred

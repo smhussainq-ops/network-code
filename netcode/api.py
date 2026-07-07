@@ -841,6 +841,16 @@ def _runner_read(p, action: str, payload: dict, org_id: str, timeout: float = 60
     return {"ok": False, "error": f"No runner completed the {action} read within {int(timeout)}s. Is a runner online for this pool? (Setup → Runners)"}
 
 
+def _reject_cloud_credentials_in_runner_mode(*values: str) -> None:
+    if execution_mode() != "runner":
+        return
+    if any(str(value or "").strip() for value in values):
+        raise HTTPException(
+            status_code=400,
+            detail="Runner mode keeps device credentials local. Configure credentials on the local runner, then submit only public device facts.",
+        )
+
+
 @app.post("/api/rez/runner-read")
 def api_rez_runner_read(request: RunnerReadRequest, http_request: Request, authorization: str | None = Header(default=None)) -> dict[str, object]:
     """Bridge endpoint for Rez control-plane tools to execute device reads on the runner.
@@ -932,7 +942,8 @@ def api_readiness_devices(request: Request) -> dict[str, object]:
 def api_discovery_scan(request: DiscoveryScanRequest, http_request: Request) -> dict[str, object]:
     p = paths()
     if execution_mode() == "runner":
-        payload = {"host": request.host, "username": request.username, "password": request.password,
+        _reject_cloud_credentials_in_runner_mode(request.username, request.password)
+        payload = {"host": request.host,
                    "platform": request.platform, "port": request.port, "device_id": request.device_id,
                    "site": request.site, "groups": request.groups}
         return _runner_read(p, "discovery", payload, _request_principal(http_request).org_id)
@@ -962,6 +973,7 @@ def api_shell_manual_device(request: ShellManualDeviceRequest, http_request: Req
     next shell session can connect without the browser ever handling SSH.
     """
     p = paths()
+    _reject_cloud_credentials_in_runner_mode(request.username, request.password)
     groups = request.groups or ["manual"]
     public_candidate = {
         "id": request.device_id,
@@ -979,8 +991,6 @@ def api_shell_manual_device(request: ShellManualDeviceRequest, http_request: Req
     runner_result: dict[str, object] | None = None
     if execution_mode() == "runner":
         runner_candidate = dict(public_candidate)
-        runner_candidate["username"] = request.username
-        runner_candidate["password"] = request.password
         runner_result = _runner_read(
             p,
             "manual_device_add",
@@ -1056,7 +1066,7 @@ def api_workflow_change(change_id: str) -> dict[str, object]:
 def api_device_adapters(device_id: str) -> dict[str, object]:
     p = paths()
     inventory = Inventory(configured_inventory_path(p))
-    device = inventory.by_id.get(device_id)
+    device = inventory.find_device(device_id)
     if not device:
         raise HTTPException(status_code=404, detail=f"Unknown device {device_id}")
     return AdapterRegistry().device_capabilities(device)
@@ -1081,7 +1091,7 @@ def api_adapter_conformance() -> dict[str, object]:
 def api_rez_device_state(device_id: str) -> dict[str, object]:
     p = paths()
     inventory = Inventory(configured_inventory_path(p))
-    device = inventory.by_id.get(device_id)
+    device = inventory.find_device(device_id)
     if not device:
         raise HTTPException(status_code=404, detail=f"Unknown device {device_id}")
     return AdapterRegistry().rez.collect_device_state(device)
@@ -1092,7 +1102,7 @@ def api_rez_collect_state(request: DeviceRequest) -> dict[str, object]:
     p = paths()
     inventory = Inventory(configured_inventory_path(p))
     device_id = request.device_id
-    device = inventory.by_id.get(device_id)
+    device = inventory.find_device(device_id)
     if not device:
         raise HTTPException(status_code=404, detail=f"Unknown device {device_id}")
     return AdapterRegistry().rez.collect_device_state(device)
@@ -1118,7 +1128,7 @@ def api_troubleshoot_run(request: TroubleshootRequest, http_request: Request) ->
         )
     else:
         inventory = Inventory(configured_inventory_path(p))
-        device = inventory.by_id.get(request.device_id)
+        device = inventory.find_device(request.device_id)
         if not device:
             raise HTTPException(status_code=404, detail=f"Unknown device {request.device_id}")
         state = _collect_rez_state_for_troubleshooting(device)
@@ -1215,7 +1225,7 @@ def api_shell_open(request: ShellOpenRequest, http_request: Request) -> dict[str
     p = paths()
     org = _request_principal(http_request).org_id
     inventory = Inventory(configured_inventory_path(p))
-    device = inventory.by_id.get(request.device_id)
+    device = inventory.find_device(request.device_id)
     if not device:
         raise HTTPException(status_code=404, detail=f"Unknown device {request.device_id}")
     session_id = uuid.uuid4().hex[:16]
@@ -1463,7 +1473,7 @@ def api_shell_transcript(session_id: str, request: Request) -> dict[str, object]
 def api_verify_vlan(request: VlanVerifyRequest) -> dict[str, object]:
     p = paths()
     inventory = Inventory(configured_inventory_path(p))
-    device = inventory.by_id.get(request.device_id)
+    device = inventory.find_device(request.device_id)
     if not device:
         raise HTTPException(status_code=404, detail=f"Unknown device {request.device_id}")
     state = AdapterRegistry().rez.collect_device_state(device)
@@ -1488,7 +1498,7 @@ def api_verify_vlan(request: VlanVerifyRequest) -> dict[str, object]:
 def api_verify(request: GenericVerifyRequest) -> dict[str, object]:
     p = paths()
     inventory = Inventory(configured_inventory_path(p))
-    device = inventory.by_id.get(request.device_id)
+    device = inventory.find_device(request.device_id)
     if not device:
         raise HTTPException(status_code=404, detail=f"Unknown device {request.device_id}")
     state = AdapterRegistry().rez.collect_device_state(device)
@@ -1520,7 +1530,7 @@ def api_verify_intent(request: IntentPathRequest, http_request: Request) -> dict
     intent = load_intent(Path(request.intent_path))
     inventory = Inventory(configured_inventory_path(p))
     device_id = request.device_id or (intent.targets.device_ids[0] if intent.targets.device_ids else "")
-    device = inventory.by_id.get(device_id)
+    device = inventory.find_device(device_id)
     if not device:
         raise HTTPException(status_code=404, detail=f"Unknown device {device_id}")
     adapter = AristaEOSLabAdapter(device)
@@ -1559,7 +1569,7 @@ def api_vlan_drift(request: IntentPathRequest, http_request: Request) -> dict[st
                    "expected_present": base["expected_present"], "baseline": base["label"], "context": base["context"]}
         return _runner_read(p, "drift", payload, _request_principal(http_request).org_id)
     inventory = Inventory(configured_inventory_path(p))
-    device = inventory.by_id.get(device_id)
+    device = inventory.find_device(device_id)
     if not device:
         raise HTTPException(status_code=404, detail=f"Unknown device {device_id}")
     state = AdapterRegistry().rez.collect_device_state(device)
@@ -1578,7 +1588,7 @@ def api_device_drift(request: DeviceRequest, http_request: Request) -> dict[str,
     if execution_mode() == "runner":
         return _runner_read(p, "device_drift", {"device_id": request.device_id, "expected": expected}, org)
     inventory = Inventory(configured_inventory_path(p))
-    device = inventory.by_id.get(request.device_id)
+    device = inventory.find_device(request.device_id)
     if not device:
         raise HTTPException(status_code=404, detail=f"Unknown device {request.device_id}")
     state = AdapterRegistry().rez.collect_device_state(device)

@@ -144,7 +144,7 @@ def _execute_job(job: dict[str, Any]) -> dict[str, Any]:
         return {"status": "fail", "action": action, "device_id": device_id,
                 "message": f"No local inventory at {INVENTORY_FILE}; cannot resolve credentials."}
     inventory = Inventory(INVENTORY_FILE)
-    device = inventory.by_id.get(device_id)
+    device = inventory.find_device(device_id)
     if device is None:
         return {"status": "fail", "action": action, "device_id": device_id,
                 "message": f"Device {device_id} not in local runner inventory."}
@@ -178,6 +178,66 @@ def _collapse_command(command: str) -> str:
     return " ".join(str(command or "").strip().split())
 
 
+_POST_PIPE_BLOCKED = (
+    "bash",
+    "system",
+    "redirect",
+    "append",
+    "tee",
+    "save",
+    "request",
+    "exec",
+    "python",
+    "perl",
+    "sh",
+)
+
+_POST_PIPE_BLOCKED_PREFIXES = (
+    "conf",
+    "write",
+    "reload",
+    "erase",
+    "delete",
+    "format",
+    "shutdown",
+    "copy ",
+    "clear",
+    "debug",
+    "set ",
+    "commit",
+    "rollback",
+    "load ",
+    "edit ",
+    "activate",
+    "deactivate",
+    "move ",
+    "rename ",
+    "mkdir ",
+    "rmdir ",
+    "boot ",
+    "upgrade ",
+    "install ",
+    "execute ",
+    "tools ",
+)
+
+
+def _pipe_segments_allowed(command: str) -> tuple[bool, str]:
+    if "|" not in command:
+        return True, "allowed"
+    for segment in command.split("|")[1:]:
+        lowered = segment.strip().lower()
+        if not lowered:
+            continue
+        for blocked in _POST_PIPE_BLOCKED:
+            if lowered == blocked or lowered.startswith(blocked + " "):
+                return False, f"blocked post-pipe command '| {blocked}'"
+        for prefix in _POST_PIPE_BLOCKED_PREFIXES:
+            if lowered.startswith(prefix):
+                return False, f"blocked post-pipe pattern '| {prefix}'"
+    return True, "allowed"
+
+
 def _rez_read_command_allowed(command: str) -> tuple[bool, str]:
     """Deny-by-default guard for Rez runner SSH reads.
 
@@ -193,6 +253,9 @@ def _rez_read_command_allowed(command: str) -> tuple[bool, str]:
     for sep in (";", "&", "`", "$(", ">", "<", "\x00", "\n", "\r"):
         if sep in lowered:
             return False, f"blocked command separator {sep!r}"
+    pipe_ok, pipe_reason = _pipe_segments_allowed(cleaned)
+    if not pipe_ok:
+        return False, pipe_reason
     first = lowered.split(" ", 1)[0]
     allowed = {
         "show",
@@ -252,7 +315,7 @@ def _execute_rez_ssh_command(payload: dict[str, Any]) -> dict[str, Any]:
             "error": f"Command blocked by runner read-only policy: {reason}",
         }
     inv = Inventory(INVENTORY_FILE)
-    device = inv.by_id.get(device_id)
+    device = inv.find_device(device_id)
     if not device:
         return {"ok": False, "status": "fail", "device": device_id, "command": command, "error": f"Device {device_id} not in local runner inventory."}
     started = _time.monotonic()
@@ -413,7 +476,7 @@ def _collect_rez_runner_state(device_id: str) -> tuple[Any, dict[str, Any] | Non
     from netcode.inventory import Inventory
 
     inv = Inventory(INVENTORY_FILE)
-    device = inv.by_id.get(device_id)
+    device = inv.find_device(device_id)
     if not device:
         return None, None, {"ok": False, "status": "fail", "device": device_id, "error": f"Device {device_id} not in local runner inventory."}
     result = AdapterRegistry().rez.collect_device_state(device)
@@ -440,20 +503,7 @@ def _resolve_inventory_device(identifier: str):
     if not target:
         return None
     inv = Inventory(INVENTORY_FILE)
-    direct = inv.by_id.get(target)
-    if direct:
-        return direct
-    for device in inv.devices:
-        host_port = f"{getattr(device, 'host', '')}:{getattr(device, 'port', '')}"
-        candidates = {
-            str(getattr(device, "id", "") or ""),
-            str(getattr(device, "hostname", "") or ""),
-            str(getattr(device, "host", "") or ""),
-            host_port,
-        }
-        if target in candidates:
-            return device
-    return None
+    return inv.find_device(target)
 
 
 def _http_status_from_probe_output(output: str) -> int | None:
@@ -802,12 +852,7 @@ def _execute_rez_scan_device(payload: dict[str, Any]) -> dict[str, Any]:
         requested_port = 0
 
     inventory = Inventory(INVENTORY_FILE)
-    existing = inventory.by_id.get(device_id) if device_id else None
-    if existing is None:
-        for candidate in inventory.devices:
-            if candidate.host == host or candidate.hostname == host or candidate.id == host:
-                existing = candidate
-                break
+    existing = inventory.find_device(device_id) if device_id else inventory.find_device(host)
 
     defaults = inventory.defaults
     username = existing.username if existing else str(defaults.get("username") or "")
@@ -1089,7 +1134,7 @@ def _execute_read_inner(action: str, payload: dict[str, Any]) -> dict[str, Any]:
         intent = load_intent(ip)
         inv = Inventory(INVENTORY_FILE)
         device_id = payload.get("device_id") or (intent.targets.device_ids[0] if intent.targets.device_ids else "")
-        device = inv.by_id.get(device_id)
+        device = inv.find_device(str(device_id or ""))
         if not device:
             return {"ok": False, "error": f"Device {device_id} not in runner inventory."}
         adapter = AristaEOSLabAdapter(device)
@@ -1110,7 +1155,7 @@ def _execute_read_inner(action: str, payload: dict[str, Any]) -> dict[str, Any]:
         ip = wd / "intent.yaml"
         ip.write_text(payload.get("intent_yaml", ""), encoding="utf-8")
         inv = Inventory(INVENTORY_FILE)
-        device = inv.by_id.get(payload.get("device_id"))
+        device = inv.find_device(str(payload.get("device_id") or ""))
         if not device:
             return {"ok": False, "error": f"Device {payload.get('device_id')} not in runner inventory."}
         state = AdapterRegistry().rez.collect_device_state(device)
@@ -1127,7 +1172,7 @@ def _execute_read_inner(action: str, payload: dict[str, Any]) -> dict[str, Any]:
         from netcode.adapters.registry import AdapterRegistry
         from netcode.drift import device_drift_from_state
         inv = Inventory(INVENTORY_FILE)
-        device = inv.by_id.get(payload.get("device_id"))
+        device = inv.find_device(str(payload.get("device_id") or ""))
         if not device:
             return {"ok": False, "error": f"Device {payload.get('device_id')} not in runner inventory."}
         state = AdapterRegistry().rez.collect_device_state(device)
@@ -1137,7 +1182,7 @@ def _execute_read_inner(action: str, payload: dict[str, Any]) -> dict[str, Any]:
         from netcode.adapters.registry import AdapterRegistry
         from netcode.troubleshooting import troubleshoot_state
         inv = Inventory(INVENTORY_FILE)
-        device = inv.by_id.get(payload.get("device_id"))
+        device = inv.find_device(str(payload.get("device_id") or ""))
         if not device:
             return {"ok": False, "error": f"Device {payload.get('device_id')} not in runner inventory."}
         state = AdapterRegistry().rez.collect_device_state(device)
@@ -1155,7 +1200,7 @@ def _execute_read_inner(action: str, payload: dict[str, Any]) -> dict[str, Any]:
         from netcode.lab import AristaEOSLabAdapter
         from netcode.shell_guard import ShellSessionState, guard_submit
         inv = Inventory(INVENTORY_FILE)
-        device = inv.by_id.get(payload.get("device_id"))
+        device = inv.find_device(str(payload.get("device_id") or ""))
         if not device:
             return {"ok": False, "error": f"Device {payload.get('device_id')} not in runner inventory."}
         raw = dict(payload.get("state") or {})
@@ -1284,7 +1329,7 @@ def _start_interactive_channel(server: str, token: str) -> None:
     def handle(frame: dict[str, Any]) -> None:
         t, sid = frame.get("t"), str(frame.get("sid", ""))
         if t == "open":
-            device = Inventory(INVENTORY_FILE).by_id.get(frame.get("device_id"))
+            device = Inventory(INVENTORY_FILE).find_device(str(frame.get("device_id") or ""))
             if not device:
                 send_frame({"t": "status", "sid": sid, "s": "error", "m": "device not in runner inventory"})
                 return
