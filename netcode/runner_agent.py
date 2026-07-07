@@ -785,6 +785,7 @@ def _execute_rez_scan_device(payload: dict[str, Any]) -> dict[str, Any]:
     from netcode.adapters.registry import AdapterRegistry
     from netcode.discovery import SSH_AUTODETECT_ORDER, _extract_state_summary, _safe_device_id
     from netcode.inventory import Device, Inventory
+    from netcode.yamlio import write_yaml
 
     host = str(payload.get("host") or "").strip()
     if not host:
@@ -876,6 +877,22 @@ def _execute_rez_scan_device(payload: dict[str, Any]) -> dict[str, Any]:
             "groups": groups or (list(existing.groups) if existing else ["discovered"]),
             "port": port,
         }
+        inventory_data = dict(inventory.raw or {})
+        devices = list(inventory_data.get("devices") or [])
+        persisted = dict(candidate)
+        action_taken = "added"
+        for index, raw_device in enumerate(devices):
+            if not isinstance(raw_device, dict):
+                continue
+            if str(raw_device.get("id") or "") == str(candidate["id"]) or str(raw_device.get("host") or "") == host:
+                # Preserve any device-specific secrets already stored on the runner.
+                devices[index] = {**raw_device, **persisted}
+                action_taken = "updated"
+                break
+        else:
+            devices.append(persisted)
+        inventory_data["devices"] = devices
+        write_yaml(INVENTORY_FILE, inventory_data)
         return {
             "ok": True,
             "status": "pass",
@@ -889,6 +906,11 @@ def _execute_rez_scan_device(payload: dict[str, Any]) -> dict[str, Any]:
             "state": state,
             "state_summary": state_summary,
             "source_of_truth_candidate": candidate,
+            "runner_inventory": {
+                "action": action_taken,
+                "device": candidate,
+                "inventory": str(INVENTORY_FILE),
+            },
             "tried_platforms": attempts,
             "supported_platforms": sorted(driver_map.keys()),
             "warnings": result.get("warnings", []),

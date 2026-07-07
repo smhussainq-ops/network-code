@@ -825,9 +825,14 @@ devices:
     assert result["provider"] == "rez-runner"
     assert result["source_of_truth_candidate"]["id"] == "new-edge"
     assert result["source_of_truth_candidate"]["host"] == "192.0.2.10"
+    assert result["runner_inventory"]["action"] == "added"
     assert result["state"]["interfaces"] == {"Ethernet1": {"status": "up"}}
     assert seen["device"].username == "runner-admin"
     assert seen["device"].password == "runner-secret"
+    updated = Inventory(inv)
+    assert updated.by_id["new-edge"].host == "192.0.2.10"
+    assert updated.by_id["new-edge"].username == "runner-admin"
+    assert updated.by_id["new-edge"].password == "runner-secret"
 
 
 def test_runner_rez_source_probes_use_local_inventory_and_fixed_commands(tmp_path: Path, monkeypatch):
