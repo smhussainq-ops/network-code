@@ -1382,6 +1382,50 @@ def test_desired_state_catalog_and_dynamic_plans(tmp_path: Path, monkeypatch):
     assert "Source-of-truth only intent" in site_plan.json()["pipeline"]["render"]["config"]
 
 
+def test_workflow_pack_catalog_references_supported_native_change_types():
+    from netcode.workflow_packs import workflow_pack_catalog
+
+    catalog = workflow_pack_catalog()
+    packs = {pack["id"]: pack for pack in catalog["packs"]}
+
+    assert catalog["ok"] is True
+    assert catalog["catalog_version"] == "netcode-native-workflow-packs.v1"
+    assert set(packs) == {
+        "golden-baseline-standardization",
+        "branch-site-onboarding",
+        "controlled-routing-acl-update",
+    }
+    assert catalog["safety"] == {
+        "credentials": "runner-local",
+        "writes": "gated",
+        "diagnostics": "read-only",
+    }
+    for pack in packs.values():
+        assert pack["status"] == "ready"
+        assert pack["missing_change_types"] == []
+        assert pack["native_engine"] is True
+        assert pack["ansible_backend"] is False
+        assert pack["diagnostics_handoff"] is True
+        assert pack["production_writes"] == "locked_until_approved"
+
+
+def test_workflow_pack_catalog_endpoint(tmp_path: Path, monkeypatch):
+    init_workspace(WorkspacePaths(tmp_path))
+    monkeypatch.chdir(tmp_path)
+
+    response = TestClient(api.app).get("/api/workflow-packs")
+    data = response.json()
+
+    assert response.status_code == 200
+    assert data["ok"] is True
+    assert {pack["id"] for pack in data["packs"]} == {
+        "golden-baseline-standardization",
+        "branch-site-onboarding",
+        "controlled-routing-acl-update",
+    }
+    assert all(pack["status"] == "ready" for pack in data["packs"])
+
+
 def test_ui_config_persists_editable_options_and_catalog(tmp_path: Path, monkeypatch):
     init_workspace(WorkspacePaths(tmp_path))
     monkeypatch.chdir(tmp_path)

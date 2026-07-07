@@ -92,6 +92,7 @@ from netcode.ui_config import (
 )
 from netcode.verification import verify_state, verify_vlan_state
 from netcode.workflow import state_after_lab_action, state_after_static_validation, workflow_snapshot
+from netcode.workflow_packs import workflow_pack_catalog
 
 
 class AddVlanRequest(BaseModel):
@@ -520,6 +521,11 @@ def desired_state_catalog() -> dict[str, object]:
         "change_types": desired_state_catalog_from_config(read_ui_config(paths())),
         "config_path": str(ui_config_path(paths())),
     }
+
+
+@app.get("/api/workflow-packs")
+def api_workflow_packs() -> dict[str, object]:
+    return workflow_pack_catalog()
 
 
 @app.post("/api/desired-state/plan")
