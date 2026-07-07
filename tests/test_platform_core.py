@@ -1071,6 +1071,55 @@ def test_runner_mode_device_credentials_rejected_before_queue_or_import(tmp_path
     assert "hunter2" not in json.dumps(client.get("/api/source-of-truth").json())
 
 
+def test_runner_inventory_import_installs_credentials_locally(tmp_path: Path, monkeypatch):
+    from types import SimpleNamespace
+
+    from netcode import runner_agent
+
+    source = tmp_path / "candidate_inventory.yaml"
+    destination = tmp_path / ".netcode-runner" / "inventory.yaml"
+    source.write_text(
+        """
+defaults:
+  username: admin
+  password: local-only
+devices:
+  - id: edge-1
+    hostname: edge-1
+    host: 10.0.0.9
+    platform: arista_eos
+    port: 22
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(runner_agent, "IDENTITY_DIR", destination.parent)
+    monkeypatch.setattr(runner_agent, "INVENTORY_FILE", destination)
+
+    rc = runner_agent.import_inventory(SimpleNamespace(file=str(source)))
+
+    assert rc == 0
+    assert destination.exists()
+    assert "local-only" in destination.read_text(encoding="utf-8")
+    assert oct(destination.stat().st_mode & 0o777) == "0o600"
+
+
+def test_runner_inventory_import_rejects_invalid_file(tmp_path: Path, monkeypatch):
+    from types import SimpleNamespace
+
+    from netcode import runner_agent
+
+    bad = tmp_path / "bad_inventory.yaml"
+    destination = tmp_path / ".netcode-runner" / "inventory.yaml"
+    bad.write_text("defaults: {}\n", encoding="utf-8")
+    monkeypatch.setattr(runner_agent, "IDENTITY_DIR", destination.parent)
+    monkeypatch.setattr(runner_agent, "INVENTORY_FILE", destination)
+
+    rc = runner_agent.import_inventory(SimpleNamespace(file=str(bad)))
+
+    assert rc == 1
+    assert not destination.exists()
+
+
 def test_read_job_payload_redaction_remains_defense_in_depth(tmp_path: Path):
     from netcode.store import record_to_dict, redact_secrets
 

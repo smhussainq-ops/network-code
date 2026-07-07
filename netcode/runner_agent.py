@@ -96,6 +96,32 @@ def _load_identity() -> dict[str, Any]:
     return json.loads(IDENTITY_FILE.read_text(encoding="utf-8"))
 
 
+def import_inventory(args: argparse.Namespace) -> int:
+    """Install a credentialed device inventory on the local runner only."""
+    from netcode.yamlio import read_yaml
+
+    source = Path(args.file).expanduser()
+    if not source.exists():
+        print(f"[runner] Inventory file not found: {source}", file=sys.stderr)
+        return 1
+    try:
+        data = read_yaml(source)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[runner] Failed to parse inventory YAML: {exc}", file=sys.stderr)
+        return 1
+    devices = data.get("devices") if isinstance(data, dict) else None
+    if not isinstance(devices, list) or not devices:
+        print("[runner] Inventory must contain a non-empty 'devices' list.", file=sys.stderr)
+        return 1
+
+    IDENTITY_DIR.mkdir(parents=True, exist_ok=True)
+    INVENTORY_FILE.write_text(source.read_text(encoding="utf-8"), encoding="utf-8")
+    INVENTORY_FILE.chmod(0o600)
+    print(f"[runner] Imported {len(devices)} device(s) into {INVENTORY_FILE}")
+    print("[runner] Credentials stay on this runner. They are not sent to the control plane.")
+    return 0
+
+
 def _execute_job(job: dict[str, Any]) -> dict[str, Any]:
     """Run one lab job locally: re-validate (fail-closed), resolve local creds, execute via the shared adapter."""
     # Imports are local so `enroll` works even without the full netcode package installed.
@@ -1385,6 +1411,9 @@ def main(argv: list[str] | None = None) -> int:
     p_enroll.add_argument("--join-token", required=True)
     p_enroll.add_argument("--name", default="runner")
     p_enroll.set_defaults(func=enroll)
+    p_import = sub.add_parser("inventory-import", help="Install credentialed device inventory on this runner.")
+    p_import.add_argument("file", help="Path to inventory YAML with local device credentials.")
+    p_import.set_defaults(func=import_inventory)
     p_run = sub.add_parser("run", help="Poll for and execute jobs.")
     p_run.set_defaults(func=run)
     args = parser.parse_args(argv)
