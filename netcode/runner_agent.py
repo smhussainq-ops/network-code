@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import hmac
+import ipaddress
 import json
 import os
 import re
@@ -473,6 +474,26 @@ def _probe_timeout_seconds(value: Any, *, default: float, maximum: float) -> int
     return max(1, min(int(requested), int(maximum)))
 
 
+def _safe_listener_probe_ip(value: str) -> str:
+    ip = ipaddress.ip_address(str(value).strip())
+    if ip.version != 4:
+        raise ValueError("only IPv4 listener probes are supported")
+    if ip.is_unspecified or ip.is_multicast or ip.is_loopback or ip.is_link_local:
+        raise ValueError("listener probe target must not be loopback, link-local, multicast, or unspecified")
+    if not ip.is_private:
+        raise ValueError("listener probe target must be an in-lab/private IPv4 address")
+    return str(ip)
+
+
+def _safe_http_probe_ip(value: str) -> str:
+    ip = ipaddress.ip_address(str(value).strip())
+    if ip.version != 4:
+        raise ValueError("only IPv4 HTTP flow probes are supported")
+    if ip.is_unspecified or ip.is_multicast or ip.is_loopback or ip.is_link_local:
+        raise ValueError("HTTP flow probe target must not be loopback, link-local, multicast, or unspecified")
+    return str(ip)
+
+
 def _execute_source_probe_command(
     *,
     source_device: str,
@@ -539,8 +560,12 @@ def _execute_rez_server_listener_probe(payload: dict[str, Any]) -> dict[str, Any
         dst_port = 0
     if not source_device or not dst_ip or dst_port < 1 or dst_port > 65535:
         return {"ok": False, "status": "fail", "error": "source_device, dst_ip, and dst_port are required"}
+    try:
+        safe_dst_ip = _safe_listener_probe_ip(dst_ip)
+    except ValueError as exc:
+        return {"ok": False, "status": "fail", "error": str(exc)}
     timeout_i = _probe_timeout_seconds(payload.get("timeout_seconds"), default=2.0, maximum=3.0)
-    command = f"bash timeout {timeout_i} nc -vz {dst_ip} {dst_port}"
+    command = f"bash timeout {timeout_i} nc -vz {safe_dst_ip} {dst_port}"
     device, output, error = _execute_source_probe_command(
         source_device=source_device,
         command=command,
@@ -554,7 +579,7 @@ def _execute_rez_server_listener_probe(payload: dict[str, Any]) -> dict[str, Any
             "probe_source": source_device,
             "source_matches_flow": True,
             "src_ip": src_ip,
-            "dst_ip": dst_ip,
+            "dst_ip": safe_dst_ip,
             "dst_port": dst_port,
             "protocol": "tcp",
             "fresh": True,
@@ -575,7 +600,7 @@ def _execute_rez_server_listener_probe(payload: dict[str, Any]) -> dict[str, Any
         "device": getattr(device, "id", source_device),
         "source_matches_flow": True,
         "src_ip": src_ip,
-        "dst_ip": dst_ip,
+        "dst_ip": safe_dst_ip,
         "dst_port": dst_port,
         "protocol": "tcp",
         "fresh": True,
@@ -607,8 +632,12 @@ def _execute_rez_http_flow_probe(payload: dict[str, Any]) -> dict[str, Any]:
         dst_port = 0
     if not source_device or not dst_ip or dst_port not in {80, 8080}:
         return {"ok": False, "status": "fail", "error": "source_device, dst_ip, and HTTP dst_port are required"}
+    try:
+        safe_dst_ip = _safe_http_probe_ip(dst_ip)
+    except ValueError as exc:
+        return {"ok": False, "status": "fail", "error": str(exc)}
     timeout_i = _probe_timeout_seconds(payload.get("timeout_seconds"), default=3.0, maximum=5.0)
-    url = f"http://{dst_ip}/" if dst_port == 80 else f"http://{dst_ip}:{dst_port}/"
+    url = f"http://{safe_dst_ip}/" if dst_port == 80 else f"http://{safe_dst_ip}:{dst_port}/"
     command = f"bash timeout {timeout_i} curl -v -m {timeout_i} {url} 2>&1 | head -120"
     device, output, error = _execute_source_probe_command(
         source_device=source_device,
@@ -623,7 +652,7 @@ def _execute_rez_http_flow_probe(payload: dict[str, Any]) -> dict[str, Any]:
             "probe_source": source_device,
             "source_matches_flow": True,
             "src_ip": src_ip,
-            "dst_ip": dst_ip,
+            "dst_ip": safe_dst_ip,
             "dst_port": dst_port,
             "protocol": "tcp",
             "fresh": True,
@@ -641,7 +670,7 @@ def _execute_rez_http_flow_probe(payload: dict[str, Any]) -> dict[str, Any]:
         "device": getattr(device, "id", source_device),
         "source_matches_flow": True,
         "src_ip": src_ip,
-        "dst_ip": dst_ip,
+        "dst_ip": safe_dst_ip,
         "dst_port": dst_port,
         "protocol": "tcp",
         "fresh": True,

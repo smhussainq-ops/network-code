@@ -914,6 +914,33 @@ devices:
         "bash timeout 3 curl -v -m 3 http://1.1.1.1/ 2>&1 | head -120",
     ]
 
+    before = list(commands)
+    listener_bad = runner_agent._execute_read_inner(
+        "rez_server_listener_probe",
+        {
+            "source_device": "arista-dc",
+            "src_ip": "10.10.0.10",
+            "dst_ip": "10.20.0.10; touch /tmp/rez-pwned",
+            "dst_port": 443,
+        },
+    )
+    http_bad = runner_agent._execute_read_inner(
+        "rez_http_flow_probe",
+        {
+            "source_device": "arista-dc",
+            "src_ip": "10.10.0.10",
+            "dst_ip": "1.1.1.1; touch /tmp/rez-pwned",
+            "dst_port": 80,
+        },
+    )
+    after = [entry["command"] for entry in captured if "command" in entry]
+
+    assert listener_bad["ok"] is False
+    assert http_bad["ok"] is False
+    assert "does not appear" in listener_bad["error"] or "Expected" in listener_bad["error"]
+    assert "does not appear" in http_bad["error"] or "Expected" in http_bad["error"]
+    assert after == before
+
 
 def test_runner_read_timeout_cancels_queued_job(tmp_path: Path, monkeypatch):
     init_workspace(WorkspacePaths(tmp_path))
