@@ -12,7 +12,7 @@ const EMPTY_CHANGE_TYPE = {
 };
 
 const appState = {
-  view: "shell",
+  view: "home",
   artifact: "overview",
   selectedChangeType: "add_vlan",
   formValues: {},
@@ -272,16 +272,16 @@ function setView(view) {
   const advancedNav = document.querySelector(".nav-advanced");
   if (advancedNav) advancedNav.open = ADVANCED_VIEWS.has(view);
   const titles = {
-    home: ["Learning map.", "A guided explanation of the pieces behind Network as Code. Daily work should happen in Shell."],
+    home: ["Closed-loop automation.", "Discover, plan, verify, diagnose, remediate, and apply through human approval. Netcode automates the work; engineers keep the trigger."],
     setup: ["Setup Wizard.", "Run once to connect Git, source of truth, runners, and proof mode. After that, Shell is the daily workspace."],
     inventory: ["Discover and trust devices.", "Use Rez read adapters to discover devices, then import reviewed records into source of truth."],
-    desired: ["Create desired state.", "Choose the network outcome, fill the intent fields, and let the platform create YAML and candidate config."],
+    desired: ["Workflow packs.", "Choose the network outcome, fill the intent fields, and let the platform create YAML and candidate config."],
     plan: ["Preview exact impact.", "Review the Terraform-style plan, generated commands, affected devices, risk, and apply gate."],
     validate: ["Validate before apply.", "Policy checks and lab dry-run proof must pass before apply is unlocked."],
     apply: ["Apply and verify.", "Commit only after validation and dry-run proof, then prove live state and keep rollback available."],
     fleet: ["Fleet operations.", "Roll one change across many devices as canary then batches with auto-halt on failure, and sweep the whole fleet for drift against the committed baseline."],
-    shell: ["Netcode Shell.", "The daily workspace for network engineers: direct SSH when you need speed, guarded SSH when you need governance, and evidence for every session."],
-    drift: ["Troubleshoot / investigate.", "Run read-only Rez checks, compare expected vs live state, detect drift, and attach findings to the change record."],
+    shell: ["Netcode Shell.", "A full SSH workspace for engineers, with session evidence and optional change guard when you need governance."],
+    drift: ["Rez Diagnostics / RCA.", "Run read-only Rez checks, compare expected vs live state, investigate drift or failed verification, and hand safe remediation back to Netcode."],
     evidence: ["Prove / audit.", "One package per change: request, intent, branch, commands, validation, dry-run, apply, verify, troubleshooting, rollback."],
   };
   $("view-title").textContent = titles[view][0];
@@ -3060,7 +3060,7 @@ async function boot() {
   const ready = await initAuth();
   if (!ready) return; // login overlay shown; boot resumes after successful login
   await checkWorkspace({ silent: true });
-  setView(appState.view || "shell");
+  setView(appState.view || "home");
 }
 
 $("login-form").addEventListener("submit", handleLogin);

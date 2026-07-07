@@ -26,26 +26,26 @@
             <div class="brand-mark">NC</div>
           <div>
             <h1>Netcode</h1>
-            <p>Network changes with plan, proof, and audit.</p>
+            <p>Closed-loop automation with diagnostics.</p>
           </div>
         </div>
 
         <nav class="nav-list">
           <p class="nav-section">Daily workspace</p>
-          <button class="nav-item active" type="button" data-view="shell">Shell</button>
+          <button class="nav-item active" type="button" data-view="home">Dashboard</button>
+          <button class="nav-item" type="button" data-view="shell">Shell</button>
           <button class="nav-item" type="button" data-view="fleet">Fleet</button>
+          <button class="nav-item" type="button" data-view="drift">Diagnostics</button>
           <button class="nav-item" type="button" data-view="evidence">Evidence</button>
           <p class="nav-section">One-time setup</p>
           <button class="nav-item" type="button" data-view="setup">Setup Wizard</button>
           <details class="nav-advanced">
             <summary>Advanced workflows</summary>
             <button class="nav-item compact" type="button" data-view="inventory">Inventory</button>
-            <button class="nav-item compact" type="button" data-view="desired">Desired State</button>
+            <button class="nav-item compact" type="button" data-view="desired">Workflow Packs</button>
             <button class="nav-item compact" type="button" data-view="plan">Plan</button>
             <button class="nav-item compact" type="button" data-view="validate">Validate</button>
             <button class="nav-item compact" type="button" data-view="apply">Apply</button>
-            <button class="nav-item compact" type="button" data-view="drift">Troubleshoot</button>
-            <button class="nav-item compact" type="button" data-view="home" aria-label="Home learning map">Learning Map</button>
           </details>
         </nav>
 
@@ -70,6 +70,55 @@
           </header>
 
           <section id="view-home" class="view">
+            <section class="closed-loop-hero" aria-label="Closed-loop automation overview">
+              <div class="closed-loop-copy">
+                <span class="hero-kicker">Netcode + Rez Diagnostics</span>
+                <h3>Self-verifying automation. Self-explaining failures. Human-approved changes.</h3>
+                <p>Other tools push config and hope. Netcode discovers live state, builds the plan, verifies the result, and when something fails, Rez investigates with read-only evidence and hands back a draft remediation.</p>
+                <div class="hero-actions">
+                  <button type="button" data-go="desired">Start a workflow pack</button>
+                  <button class="secondary" type="button" data-go="drift">Open Rez Diagnostics</button>
+                </div>
+              </div>
+              <div class="closed-loop-panel" aria-label="Closed loop workflow">
+                <div class="loop-line">
+                  <span>Discover</span>
+                  <span>Plan</span>
+                  <span>Verify</span>
+                  <span>Diagnose</span>
+                  <span>Remediate</span>
+                  <span>Approve</span>
+                </div>
+                <div class="loop-terminal">
+                  <div><b>CHG-4271</b> Region 3 edge remediation</div>
+                  <p>Generated route policy, firewall egress, NAT verification, rollback, and canary checks across 42 devices.</p>
+                  <p><b>Rez finding:</b> canary verification failed on Branch-EDGE-03; outbound NAT evidence missing for the scoped flow.</p>
+                  <p><b>Next safe action:</b> create a Netcode draft fix, validate, then wait for human approval before apply.</p>
+                </div>
+              </div>
+            </section>
+            <section class="trust-boundary-strip" aria-label="Platform trust boundaries">
+              <article>
+                <span>Shared</span>
+                <strong>Discovery spine</strong>
+                <p>One inventory and topology context feeds automation, drift, RCA, and packet investigation.</p>
+              </article>
+              <article>
+                <span>Local</span>
+                <strong>Runner-held credentials</strong>
+                <p>SSH/API credentials stay on the Windows or Linux runner next to the network.</p>
+              </article>
+              <article>
+                <span>Read-only</span>
+                <strong>Rez Diagnostics</strong>
+                <p>Rez can collect evidence and propose remediation, but it cannot apply configuration.</p>
+              </article>
+              <article>
+                <span>Gated</span>
+                <strong>Netcode writes</strong>
+                <p>Writes require plan, policy gates, canary, approval, apply, and verification.</p>
+              </article>
+            </section>
             <section class="value-strip" aria-label="Netcode business outcomes">
               <article>
                 <span>Outcome</span>
