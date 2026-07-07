@@ -1,0 +1,631 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Netcode × Rez — Unified UX Spec</title>
+<link rel="icon" href="../assets/netcode-mark.svg" type="image/svg+xml" />
+<link rel="stylesheet" href="../styles.css" />
+<link rel="stylesheet" href="spec.css" />
+</head>
+<body>
+
+<template id="__bundler_thumbnail">
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100">
+    <rect width="100" height="100" rx="16" fill="#102a43"/>
+    <circle cx="34" cy="40" r="7" fill="none" stroke="#58a6ff" stroke-width="3"/>
+    <circle cx="66" cy="40" r="7" fill="none" stroke="#58a6ff" stroke-width="3"/>
+    <line x1="41" y1="40" x2="59" y2="40" stroke="#58a6ff" stroke-width="3"/>
+    <path d="M30 62 l8 8 l16 -18" fill="none" stroke="#32d583" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/>
+    <text x="50" y="88" font-family="monospace" font-size="11" fill="#9db8dd" text-anchor="middle">NC×Rez</text>
+  </svg>
+</template>
+
+<header class="mast">
+  <p class="kicker">Design spec &amp; wireframes · for review before implementation</p>
+  <h1>Netcode × Rez — Unified Network Operations UX</h1>
+  <p>One console to <strong style="color:#fff">discover, automate, verify, diagnose, and remediate</strong> network changes. Netcode is the shell and the only writer; Rez RCA lives inside it as a native, read-only Diagnostics workspace. Discovery, inventory and device state are shared; credentials stay runner-local.</p>
+  <div class="meta">
+    <span>v1 · 2026-07-07</span>
+    <span>tag: checkpoint-2026-07-07-before-unified-ui-redesign</span>
+    <span>repos: network-code · resonance-core</span>
+    <span>status: spec — not code</span>
+  </div>
+</header>
+
+<div class="doc">
+
+  <!-- boundary legend -->
+  <div class="legend">
+    <span class="chip write"><span class="dot"></span>Netcode · gated write</span>
+    <span class="chip read"><span class="dot"></span>Rez · read-only</span>
+    <span class="chip shared"><span class="dot"></span>Shared service</span>
+    <span class="chip runner"><span class="dot"></span>Runner-local (credentials)</span>
+    <span class="chip verified"><span class="dot"></span>Verified / proof</span>
+  </div>
+
+  <!-- TOC -->
+  <nav class="toc">
+    <a href="#principles"><span class="n">0</span><span><b>Principles &amp; boundaries</b><small>What's fixed before we design</small></span></a>
+    <a href="#ia"><span class="n">1</span><span><b>IA &amp; navigation model</b><small>Shell regions + nav tree</small></span></a>
+    <a href="#flow"><span class="n">2</span><span><b>Unified workflow</b><small>Discover → … → Remediate</small></span></a>
+    <a href="#wires"><span class="n">3</span><span><b>Wireframes ×8</b><small>Shell + 7 screens, annotated</small></span></a>
+    <a href="#contracts"><span class="n">4</span><span><b>Data contracts</b><small>Netcode ↔ Rez ↔ runner</small></span></a>
+    <a href="#migration"><span class="n">5</span><span><b>Migration plan</b><small>What moves, what to delete</small></span></a>
+  </nav>
+
+  <!-- ============ 0 · PRINCIPLES ============ -->
+  <section class="section" id="principles">
+    <div class="head"><span class="num">00</span><h2>Principles &amp; boundaries</h2></div>
+    <p class="lead">These are decided, not open. Every screen downstream obeys them, so review here first — a change to any of these ripples through the whole spec.</p>
+    <div class="tiles c3" style="margin-bottom:12px">
+      <div class="card" style="padding:16px">
+        <div class="sp write" style="margin-bottom:9px">Netcode = shell + writer</div>
+        <p class="phn">Netcode owns the frame: identity, navigation, environments, and the <b>only</b> path that writes to devices. Every write goes through a gated workflow (plan → validate → apply → verify → rollback). There is no ad-hoc "run this command" button anywhere.</p>
+      </div>
+      <div class="card" style="padding:16px">
+        <div class="sp blue" style="margin-bottom:9px">Rez = read-only diagnostics</div>
+        <p class="phn">Rez becomes a native <b>Diagnostics</b> workspace inside the shell. It observes, correlates, and recommends — RCA, forensics, digital twin. It <b>never</b> writes to a device. Its output can seed a Netcode change, but only as a proposal that re-enters the gated path.</p>
+      </div>
+      <div class="card" style="padding:16px">
+        <div class="sp violet" style="margin-bottom:9px">Shared source of truth</div>
+        <p class="phn">Discovery, inventory and device/topology state are <b>one</b> dataset, produced once and read by both sides. No duplicate device lists, no divergent topologies. Diagnose and Automate reason over the same graph.</p>
+      </div>
+    </div>
+    <div class="callout warn">
+      <span class="mk">🔐</span>
+      <div><b>Credentials are runner-local — always.</b>
+        <p>Neither the shell nor Rez ever stores or sees device credentials. A local <b>runner</b> holds them and performs all device I/O (discovery reads, dry-runs, applies, rollbacks). The UI calls the runner and receives <em>results and evidence</em>, never secrets. This is the trust boundary that makes production adoption defensible.</p>
+      </div>
+    </div>
+    <div class="callout key">
+      <span class="mk">🔁</span>
+      <div><b>The integration seam: Diagnose → Remediate.</b>
+        <p>The single most important new interaction. When Rez identifies a root cause, the engineer clicks <em>"Create fix in Netcode"</em>. Rez emits a <code>RemediationProposal</code>; Netcode ingests it as a <b>draft change</b> that still must pass every gate. Read-only insight becomes gated action without Rez ever touching a device.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ 1 · IA / NAV ============ -->
+  <section class="section" id="ia">
+    <div class="head"><span class="num">01</span><h2>Information architecture &amp; navigation</h2></div>
+    <p class="lead">A single left rail organized by intent — <b>Operate</b> (write), <b>Diagnose</b> (read), and the shared spine that feeds both. The mode is always legible: you can see whether where you are can change a device.</p>
+
+    <div class="wire-annot">
+      <div class="wf">
+        <div class="wf-cap"><span class="t"><span class="id">IA</span> Shell navigation tree</span><span class="tag">left rail · persistent</span></div>
+        <div class="wf-body">
+          <div style="display:grid;grid-template-columns:230px 1fr;gap:16px;align-items:start">
+            <!-- nav rail -->
+            <div class="rg" style="background:var(--nc-surface-raise)">
+              <div style="display:flex;align-items:center;gap:9px;padding:2px 6px 10px">
+                <div style="width:26px;height:26px;border-radius:6px;background:var(--nc-navy);color:#fff;display:grid;place-items:center;font-weight:700;font-size:12px">NC</div>
+                <div style="font-weight:700;font-size:13px">Netcode</div>
+              </div>
+              <div class="nav-grp">Overview</div>
+              <div class="nav-i on"><span class="ic"></span>Dashboard</div>
+              <div class="nav-grp">Operate · writes</div>
+              <div class="nav-i"><span class="ic"></span>Discovery</div>
+              <div class="nav-i"><span class="ic"></span>Inventory</div>
+              <div class="nav-i"><span class="ic"></span>Workflow Packs</div>
+              <div class="nav-i"><span class="ic"></span>Changes</div>
+              <div class="nav-grp">Diagnose · read-only</div>
+              <div class="nav-i"><span class="ic"></span>Diagnostics / RCA</div>
+              <div class="nav-i"><span class="ic"></span>Digital Twin</div>
+              <div class="nav-grp">Records</div>
+              <div class="nav-i"><span class="ic"></span>Evidence &amp; Audit</div>
+              <div style="margin-top:12px;border-top:1px solid var(--nc-border);padding-top:9px">
+                <div class="nav-i"><span class="ic" style="background:var(--u-verified)"></span>Runner: connected</div>
+                <div class="phn" style="padding:0 8px">lab · 172.100.1.0/24</div>
+              </div>
+            </div>
+            <!-- explanation of grouping -->
+            <div class="stack" style="gap:12px">
+              <div class="rg write"><span class="lab">Operate</span>
+                <p class="phn" style="margin:2px 0 0"><b>The write path.</b> Discovery &amp; Inventory (shared) → Workflow Packs (reusable automations) → Changes (the gated plan/validate/apply/verify/rollback pipeline). Everything here can lead to a device write, and every write is gated.</p>
+              </div>
+              <div class="rg read"><span class="lab">Diagnose</span>
+                <p class="phn" style="margin:2px 0 0"><b>Read-only.</b> Diagnostics/RCA (incidents, pcap forensics, the Rez copilot) and the Digital Twin (topology, route tracing, conflicts). Rez's old top-level modes — <code>console · pcap · twin</code> — collapse into these two sections. Nothing here writes.</p>
+              </div>
+              <div class="rg shared"><span class="lab">Shared spine</span>
+                <p class="phn" style="margin:2px 0 0"><b>One dataset.</b> Discovery + Inventory + device/topology state sit under Operate for editing intent, but are <em>read by</em> Diagnose. Evidence &amp; Audit unifies incidents (Rez) and changes (Netcode) into one timeline.</p>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div class="notes">
+        <div class="grp-t">Why this structure</div>
+        <div class="n"><span class="pin">1</span><div class="bd"><b>Grouped by intent, not by product.</b> The engineer thinks "am I changing something or investigating something?" — not "am I in Netcode or Rez?" Operate vs Diagnose makes the read/write boundary the primary organizing line.</div></div>
+        <div class="n"><span class="pin">2</span><div class="bd"><b>Mode is always visible.</b> Operate items carry the amber write accent; Diagnose items the blue read accent. You always know if the current screen can touch a device.</div></div>
+        <div class="n"><span class="pin">3</span><div class="bd"><b>Runner status is permanent chrome.</b> Bottom of the rail shows runner connection + active environment. If the runner is down, every write action is visibly disabled — creds live there, not here.</div></div>
+        <div class="n"><span class="pin">4</span><div class="bd"><b>Top bar (not shown): environment switcher (lab/prod), global search, and the primary <span class="btn pri" style="padding:2px 8px">New change</span> action.</b> Prod is gated behind lab proof.</div></div>
+        <div class="n"><span class="pin">5</span><div class="bd"><b>Right context panel persists</b> across screens (the Outcome panel): current object status, what's expected, next safe action, and the read/write boundary for what you're looking at.</div></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ 2 · WORKFLOW ============ -->
+  <section class="section" id="flow">
+    <div class="head"><span class="num">02</span><h2>Unified workflow</h2></div>
+    <p class="lead">One operational loop spanning both products. Each stage names its owner and whether it can write. Diagnose is read-only and normally runs <em>after</em> Verify (post-change) or on demand (incident) — and it feeds Remediate, which re-enters the gated write path.</p>
+
+    <div class="pipe" style="margin-bottom:16px">
+      <div class="st shared"><span class="ph-arrow">›</span><div class="k">01</div><div class="nm">Discover</div><div class="who shared">Shared · read</div><div class="desc">Scan subnet, auto-detect vendor, import devices + topology into the one source of truth. Runner does the reads.</div></div>
+      <div class="st write"><span class="ph-arrow">›</span><div class="k">02</div><div class="nm">Automate</div><div class="who write">Netcode · intent</div><div class="desc">Pick a Workflow Pack, define desired state, generate a Change Plan (diff + exact commands + risk). No device writes yet.</div></div>
+      <div class="st write"><span class="ph-arrow">›</span><div class="k">03</div><div class="nm">Verify</div><div class="who write">Netcode · gated</div><div class="desc">Policy + vendor syntax + lab dry-run must pass. Apply unlocks only on green. Post-apply, read back intended vs actual.</div></div>
+      <div class="st read"><span class="ph-arrow">›</span><div class="k">04</div><div class="nm">Diagnose</div><div class="who read">Rez · read-only</div><div class="desc">If something looks wrong (pre or post), open Diagnostics: RCA from telemetry/pcap, twin route trace, conflicts. Recommends only.</div></div>
+      <div class="st write"><div class="k">05</div><div class="nm">Remediate / Rollback</div><div class="who write">Netcode · gated</div><div class="desc">Rez's finding becomes a draft change, or roll back the last apply. Re-enters Verify. Loop closes with evidence.</div></div>
+    </div>
+    <div class="callout key">
+      <span class="mk">↩︎</span>
+      <div><b>It's a loop, not a line.</b>
+        <p><b>Diagnose → Remediate</b> hands a <code>RemediationProposal</code> back into <b>Automate/Verify</b> as a gated change — so a read-only diagnosis can never directly mutate a device, but it can <em>propose</em> a fix that follows the full safety path. <b>Verify → Diagnose</b> also runs automatically after every apply, correlating the change against live state to catch drift early.</p>
+      </div>
+    </div>
+    <div class="tbl-wrap">
+      <table class="tbl">
+        <thead><tr><th style="width:130px">Stage</th><th style="width:120px">Owner</th><th style="width:90px">Writes?</th><th>Primary screens</th><th>Runner role</th></tr></thead>
+        <tbody>
+          <tr><td><b>Discover</b></td><td><span class="sp violet">Shared</span></td><td>Read</td><td>Discovery, Inventory</td><td class="mono">reads device facts + topology</td></tr>
+          <tr><td><b>Automate</b></td><td><span class="sp amber">Netcode</span></td><td>No (intent)</td><td>Workflow Packs, Change Plan</td><td class="mono">renders candidate; no I/O</td></tr>
+          <tr><td><b>Verify</b></td><td><span class="sp amber">Netcode</span></td><td>Gated</td><td>Verification (gates + dry-run)</td><td class="mono">dry-run (session…abort)</td></tr>
+          <tr><td><b>Diagnose</b></td><td><span class="sp blue">Rez</span></td><td>Never</td><td>Diagnostics/RCA, Digital Twin</td><td class="mono">reads telemetry / pcap / state</td></tr>
+          <tr><td><b>Remediate</b></td><td><span class="sp amber">Netcode</span></td><td>Gated</td><td>Change Plan → Verify → Apply</td><td class="mono">apply (commit) · rollback (no…)</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- ============ 3 · WIREFRAMES ============ -->
+  <section class="section" id="wires">
+    <div class="head"><span class="num">03</span><h2>Wireframes</h2></div>
+    <p class="lead">Eight annotated, schematic layouts — structure and behavior, not final pixels. Each carries its read/write boundary, its data source, and numbered notes for implementation. They reuse the Netcode design system (type, color, spacing) so hi-fi is a short step from here.</p>
+
+    <!-- WF1 · SHELL -->
+    <div class="sub"><span class="inpin">1</span> Shell — the application frame</div>
+    <div class="wire-annot">
+      <div class="wf">
+        <div class="wf-cap"><span class="t"><span class="id">WF-1</span> Shell layout</span><span class="tag">nav · topbar · main · context panel</span></div>
+        <div class="wf-body">
+          <div class="stack" style="gap:8px">
+            <div class="rg" style="padding:7px 10px"><div style="display:flex;align-items:center;justify-content:space-between;gap:10px">
+              <div style="display:flex;align-items:center;gap:8px"><div style="width:18px;height:18px;border-radius:5px;background:var(--nc-navy)"></div><span class="pht">Netcode</span><span class="sp gray">env: lab ▾</span></div>
+              <div style="display:flex;align-items:center;gap:8px"><span class="ph w40" style="width:120px"></span><span class="sp green">runner ✓</span><span class="btn pri">＋ New change</span></div>
+            </div></div>
+            <div class="frame shell">
+              <div class="rg" style="min-height:220px"><span class="lab">Nav rail</span>
+                <div class="nav-i on" style="margin-top:4px"><span class="ic"></span>Dashboard</div>
+                <div class="nav-grp">Operate</div>
+                <div class="nav-i"><span class="ic"></span>Discovery</div>
+                <div class="nav-i"><span class="ic"></span>Inventory</div>
+                <div class="nav-i"><span class="ic"></span>Packs</div>
+                <div class="nav-i"><span class="ic"></span>Changes</div>
+                <div class="nav-grp">Diagnose</div>
+                <div class="nav-i"><span class="ic"></span>RCA</div>
+                <div class="nav-i"><span class="ic"></span>Twin</div>
+              </div>
+              <div class="rg" style="min-height:220px"><span class="lab">Main workspace</span>
+                <div class="stack" style="margin-top:6px">
+                  <span class="ph lg w40"></span><span class="ph w85"></span>
+                  <div class="tiles c3" style="margin-top:4px"><div class="tile"><span class="ph t w70"></span><span class="ph w50"></span></div><div class="tile"><span class="ph t w70"></span><span class="ph w50"></span></div><div class="tile"><span class="ph t w70"></span><span class="ph w50"></span></div></div>
+                  <span class="ph w70" style="margin-top:4px"></span><span class="ph w60"></span>
+                </div>
+              </div>
+              <div class="rg read" style="min-height:220px"><span class="lab">Context panel</span>
+                <div class="stack" style="margin-top:6px">
+                  <span class="pht">Outcome</span><span class="ph w70"></span>
+                  <span class="sp blue">status</span>
+                  <div style="border-top:1px dashed var(--nc-border);margin:4px 0"></div>
+                  <span class="phn">Expected →</span><span class="ph t w85"></span>
+                  <span class="phn">Happened →</span><span class="ph t w70"></span>
+                  <span class="phn">Changed device? →</span><span class="sp green">no</span>
+                  <div style="margin-top:6px"><span class="btn pri">Next safe action ›</span></div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div class="notes">
+        <div class="grp-t">Regions</div>
+        <div class="n"><span class="pin">1</span><div class="bd"><b>Top bar:</b> environment switcher (lab/prod), global search, and the single primary <b>New change</b> action. Runner health sits here and in the rail.</div></div>
+        <div class="n"><span class="pin">2</span><div class="bd"><b>Nav rail:</b> the IA from §1. Operate (amber) vs Diagnose (blue) keeps the write boundary visible at all times.</div></div>
+        <div class="n"><span class="pin">3</span><div class="bd"><b>Main workspace:</b> the active screen (WF-2…8 render here). Scrolls independently.</div></div>
+        <div class="n"><span class="pin">4</span><div class="bd"><b>Context panel (persistent):</b> the Netcode Outcome panel — status, expected vs happened, "device changed?" and the next safe action. On Diagnose screens it turns blue and shows read-only + "Create fix in Netcode".</div></div>
+        <div class="grp-t">Boundary</div>
+        <div class="n"><span class="pin ghost">✓</span><div class="bd">The frame is Netcode. Diagnose screens mount inside the same frame but render the read-only panel treatment.</div></div>
+      </div>
+    </div>
+
+    <!-- WF2 · DASHBOARD -->
+    <div class="sub"><span class="inpin">2</span> Dashboard — unified home</div>
+    <div class="wire-annot">
+      <div class="wf">
+        <div class="wf-cap"><span class="t"><span class="id">WF-2</span> Dashboard</span><span class="tag">bridges Operate + Diagnose</span></div>
+        <div class="wf-body">
+          <div class="stack">
+            <div style="display:flex;justify-content:space-between;align-items:center"><span class="ph lg" style="width:220px"></span><div style="display:flex;gap:6px"><span class="btn gho">Investigate</span><span class="btn pri">＋ New change</span></div></div>
+            <div class="tiles c4">
+              <div class="tile"><span class="cap">Network health</span><span class="val" style="color:var(--nc-pass)">Healthy</span><span class="sp green">3 sites</span></div>
+              <div class="tile"><span class="cap">Open changes</span><span class="val">2</span><span class="sp amber">1 awaiting apply</span></div>
+              <div class="tile"><span class="cap">Open incidents</span><span class="val" style="color:var(--nc-fail)">1</span><span class="sp blue">Rez · read</span></div>
+              <div class="tile"><span class="cap">Drift</span><span class="val" style="color:var(--nc-warn)">1 device</span><span class="sp amber">v2-store3</span></div>
+            </div>
+            <div class="tiles c2">
+              <div class="rg write" style="min-height:120px"><span class="lab">Operate · changes</span>
+                <div class="stack" style="margin-top:6px">
+                  <div style="display:flex;justify-content:space-between"><span class="phn">Add VLAN 90 · v2-store1</span><span class="sp amber">ready to apply</span></div>
+                  <div style="display:flex;justify-content:space-between"><span class="phn">BGP peer · edge-2</span><span class="sp blue">planned</span></div>
+                  <div style="display:flex;justify-content:space-between"><span class="phn">MTU fix · core-1</span><span class="sp green">verified</span></div>
+                </div>
+              </div>
+              <div class="rg read" style="min-height:120px"><span class="lab">Diagnose · incidents (Rez)</span>
+                <div class="stack" style="margin-top:6px">
+                  <div style="display:flex;justify-content:space-between"><span class="phn">High retrans · store-1844</span><span class="sp red">RCA 82%</span></div>
+                  <div style="display:flex;justify-content:space-between"><span class="phn">BGP flap · edge-2</span><span class="sp blue">investigating</span></div>
+                  <div style="margin-top:4px"><span class="btn gho">Open Diagnostics ›</span></div>
+                </div>
+              </div>
+            </div>
+            <div class="rg runner" style="padding:9px 11px"><div style="display:flex;justify-content:space-between;align-items:center"><span class="phn"><b>Runner</b> · lab · 172.100.1.0/24 · creds held locally</span><span class="sp green">connected</span></div></div>
+          </div>
+        </div>
+      </div>
+      <div class="notes">
+        <div class="grp-t">Intent</div>
+        <div class="n"><span class="pin">1</span><div class="bd"><b>One health line across both worlds.</b> KPI row mixes change state (amber) and incident state (blue) so the operator sees "what's changing" and "what's wrong" together.</div></div>
+        <div class="n"><span class="pin">2</span><div class="bd"><b>Two doorways.</b> Left column → the write path (open changes); right column → read-only diagnostics. Colors encode the boundary.</div></div>
+        <div class="n"><span class="pin">3</span><div class="bd"><b>Drift tile is the bridge.</b> Drift is detected by Rez (read) but resolved by Netcode (gated) — clicking it can start a remediation change.</div></div>
+        <div class="n"><span class="pin">4</span><div class="bd"><b>Runner banner</b> reinforces the credential boundary and gates all write CTAs when disconnected.</div></div>
+        <div class="grp-t">Data</div>
+        <div class="n"><span class="pin ghost">↔</span><div class="bd">Reads <code>/api/changes</code>, <code>/api/incidents</code>, <code>/api/topology</code> health, <code>/api/runner/status</code>.</div></div>
+      </div>
+    </div>
+
+    <!-- WF3 · DISCOVERY -->
+    <div class="sub"><span class="inpin">3</span> Discovery — shared scan &amp; import</div>
+    <div class="wire-annot">
+      <div class="wf">
+        <div class="wf-cap"><span class="t"><span class="id">WF-3</span> Discovery</span><span class="tag">shared · read → writes source of truth</span></div>
+        <div class="wf-body">
+          <div class="stack">
+            <span class="ph lg" style="width:200px"></span>
+            <div class="rg shared" style="padding:10px"><span class="lab">Scan setup</span>
+              <div style="display:flex;gap:8px;align-items:end;margin-top:6px;flex-wrap:wrap">
+                <div class="stack" style="gap:3px"><span class="phn">Subnet / seed</span><span class="ph" style="width:150px;height:24px"></span></div>
+                <div class="stack" style="gap:3px"><span class="phn">Depth</span><span class="ph" style="width:60px;height:24px"></span></div>
+                <div class="stack" style="gap:3px"><span class="phn">Engine</span><span class="sp gray">v2 ▾</span></div>
+                <div class="stack" style="gap:3px"><span class="phn">Vendor</span><span class="sp violet">auto-detect</span></div>
+                <span class="btn pri">◎ Discover</span>
+              </div>
+            </div>
+            <div class="tbl-wrap" style="background:var(--nc-surface)">
+              <table class="tbl"><thead><tr><th>Device</th><th>Address</th><th>Vendor</th><th>Site</th><th>State</th></tr></thead>
+              <tbody>
+                <tr><td class="mono">v2-store1</td><td class="mono">172.100.1.41</td><td>Arista EOS</td><td class="mono">store-1842</td><td><span class="sp green">imported</span></td></tr>
+                <tr><td class="mono">v2-store2</td><td class="mono">172.100.1.42</td><td>Arista EOS</td><td class="mono">store-1843</td><td><span class="sp gray">new</span></td></tr>
+                <tr><td class="mono">v2-store3</td><td class="mono">172.100.1.43</td><td>Arista EOS</td><td class="mono">store-1844</td><td><span class="sp amber">drift</span></td></tr>
+              </tbody></table>
+            </div>
+            <div style="display:flex;justify-content:space-between;align-items:center"><span class="phn">3 found · vendor auto-detected · read-only scan</span><span class="btn pri">⤓ Import to source of truth</span></div>
+          </div>
+        </div>
+      </div>
+      <div class="notes">
+        <div class="grp-t">Shared service</div>
+        <div class="n"><span class="pin">1</span><div class="bd"><b>Produced once, read by both.</b> This is the merge of Netcode's Inventory discovery and Rez's <code>/api/discovery</code> crawl. One scan populates the inventory <em>and</em> the twin.</div></div>
+        <div class="n"><span class="pin">2</span><div class="bd"><b>Discovery reads, never writes to devices.</b> The only write is to the shared store on <b>Import</b>. Runner performs the crawl with local creds.</div></div>
+        <div class="n"><span class="pin">3</span><div class="bd"><b>Engine v1/v2 &amp; depth</b> carried over from Rez's discovery controls; seed/intent preserved as <code>DiscoveryItem</code> fields.</div></div>
+        <div class="n"><span class="pin">4</span><div class="bd"><b>Drift flag</b> surfaces here and on the Dashboard — computed by comparing live state to the last imported snapshot.</div></div>
+        <div class="grp-t">Data</div>
+        <div class="n"><span class="pin ghost">→</span><div class="bd">Writes <code>Device[]</code> + <code>TopologySnapshot</code>; emits <code>incident_id</code> for the twin env.</div></div>
+      </div>
+    </div>
+
+    <!-- WF4 · WORKFLOW PACKS -->
+    <div class="sub"><span class="inpin">4</span> Workflow Packs — reusable automations</div>
+    <div class="wire-annot">
+      <div class="wf">
+        <div class="wf-cap"><span class="t"><span class="id">WF-4</span> Workflow Packs</span><span class="tag">Netcode · entry to the write path</span></div>
+        <div class="wf-body">
+          <div class="stack">
+            <div style="display:flex;justify-content:space-between;align-items:center"><span class="ph lg" style="width:180px"></span><span class="ph w30" style="width:150px;height:24px"></span></div>
+            <div class="tiles c3">
+              <div class="tile" style="border-color:var(--nc-current-border);background:var(--nc-blue-50)"><div style="display:flex;justify-content:space-between"><span class="val" style="font-size:13px">Add VLAN</span><span class="sp blue">L2</span></div><span class="phn">Create a VLAN + name on access switches. SVI optional.</span><span class="phn" style="color:var(--nc-current)">▷ 7 policy checks</span></div>
+              <div class="tile"><div style="display:flex;justify-content:space-between"><span class="val" style="font-size:13px">Add BGP peer</span><span class="sp gray">L3</span></div><span class="phn">Configure an eBGP/iBGP neighbor with guardrails.</span><span class="phn">▷ 9 checks</span></div>
+              <div class="tile"><div style="display:flex;justify-content:space-between"><span class="val" style="font-size:13px">Interface change</span><span class="sp gray">L1/L2</span></div><span class="phn">Description, MTU, admin state, access/trunk.</span><span class="phn">▷ 6 checks</span></div>
+              <div class="tile"><div style="display:flex;justify-content:space-between"><span class="val" style="font-size:13px">ACL / prefix-list</span><span class="sp gray">policy</span></div><span class="phn">Edit filtering with segmentation guardrails.</span><span class="phn">▷ 8 checks</span></div>
+              <div class="tile"><div style="display:flex;justify-content:space-between"><span class="val" style="font-size:13px">Site intent</span><span class="sp gray">bulk</span></div><span class="phn">Apply a site-wide desired-state template.</span><span class="phn">▷ blast-radius aware</span></div>
+              <div class="tile" style="border-style:dashed;align-content:center;justify-items:center"><span class="phn" style="text-align:center">＋ From a Rez remediation<br/>proposal</span></div>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div class="notes">
+        <div class="grp-t">Concept</div>
+        <div class="n"><span class="pin">1</span><div class="bd"><b>A Pack = a parameterized gated workflow.</b> It bundles the intent schema (form), the Jinja template, and the policy checks for one change type. Selecting one starts a Change (WF-5).</div></div>
+        <div class="n"><span class="pin">2</span><div class="bd"><b>Generalizes Netcode's add_vlan slice</b> into a library. Each pack declares its own check count and risk profile up front.</div></div>
+        <div class="n"><span class="pin">3</span><div class="bd"><b>The dashed tile is the seam:</b> a Rez <code>RemediationProposal</code> arrives as a pre-filled pack instance — the one place diagnosis becomes action.</div></div>
+        <div class="n"><span class="pin">4</span><div class="bd"><b>Packs are versioned artifacts</b> in Git; adding/editing a pack is itself reviewable.</div></div>
+        <div class="grp-t">Boundary</div>
+        <div class="n"><span class="pin ghost">⚠</span><div class="bd">Choosing a pack writes nothing yet — it only drafts intent. Writes begin (gated) at Apply in WF-6.</div></div>
+      </div>
+    </div>
+
+    <!-- WF5 · CHANGE PLAN -->
+    <div class="sub"><span class="inpin">5</span> Change Plan — desired state, diff, risk</div>
+    <div class="wire-annot">
+      <div class="wf">
+        <div class="wf-cap"><span class="t"><span class="id">WF-5</span> Change Plan</span><span class="tag">Netcode · preview, no writes</span></div>
+        <div class="wf-body">
+          <div class="stack">
+            <div style="display:flex;justify-content:space-between;align-items:center"><span class="ph lg" style="width:230px"></span><span class="sp blue">planned</span></div>
+            <div class="tiles c3">
+              <div class="tile"><span class="cap">Affected</span><span class="val">1 device</span></div>
+              <div class="tile"><span class="cap">Changes</span><span class="val" style="color:var(--nc-current)">+1 add</span></div>
+              <div class="tile"><span class="cap">Risk</span><span class="val" style="color:var(--nc-pass)">Low</span></div>
+            </div>
+            <div class="tiles c2">
+              <div class="rg" style="padding:0;overflow:hidden"><span class="lab" style="margin:8px 0 0 10px;position:static;display:block">Before → after</span>
+                <div class="diff" style="padding:8px 12px">
+                  <div class="ctx">&nbsp;vlan 10&nbsp;&nbsp;name CORP</div>
+                  <div class="ctx">&nbsp;vlan 20&nbsp;&nbsp;name VOICE</div>
+                  <div class="add">+vlan 90</div>
+                  <div class="add">+&nbsp;&nbsp;&nbsp;name GUEST_WIFI</div>
+                </div>
+              </div>
+              <div class="rg" style="padding:0;overflow:hidden"><span class="lab" style="margin:8px 0 0 10px;position:static;display:block">Exact commands</span>
+                <div class="codebox" style="border-radius:0"><span class="c"># preview only — not sent</span><br/><span class="a">v2-store1#</span> configure session nc-9f2a<br/><span class="a">v2-store1#</span> vlan 90<br/><span class="a">v2-store1#</span> &nbsp;&nbsp;name GUEST_WIFI</div>
+              </div>
+            </div>
+            <div class="rg" style="padding:10px"><span class="lab">Blast radius &amp; risk</span>
+              <div class="stack" style="margin-top:6px">
+                <span class="phn">✓ 1 device · layer-2 only · no SVI/routing</span>
+                <span class="phn">✓ guest segment isolated from PCI</span>
+                <span class="phn">✓ reversible with a single <code>no vlan 90</code></span>
+              </div>
+            </div>
+            <div style="display:flex;gap:8px"><span class="btn pri">Run validation ›</span><span class="btn gho">↺ Re-plan</span></div>
+          </div>
+        </div>
+      </div>
+      <div class="notes">
+        <div class="grp-t">Terraform-for-networks</div>
+        <div class="n"><span class="pin">1</span><div class="bd"><b>Plan = preview, always.</b> Diff + exact commands + affected devices + risk, generated from desired-state YAML. Reads devices for the "before", writes nothing.</div></div>
+        <div class="n"><span class="pin">2</span><div class="bd"><b>Diff and command transcript sit side by side</b> — the engineer sees both the intent-level change and the literal CLI that would run.</div></div>
+        <div class="n"><span class="pin">3</span><div class="bd"><b>Risk/blast-radius is explicit</b> and can be enriched by the shared topology (how many neighbors touch this node).</div></div>
+        <div class="n"><span class="pin">4</span><div class="bd"><b>"Run validation" is the only forward action</b> — no apply button exists here. That keeps the gate order honest.</div></div>
+        <div class="grp-t">Data</div>
+        <div class="n"><span class="pin ghost">→</span><div class="bd">Produces a <code>Plan</code> (diff, commands, affected[], risk) on the <code>Change</code>.</div></div>
+      </div>
+    </div>
+
+    <!-- WF6 · VERIFICATION -->
+    <div class="sub"><span class="inpin">6</span> Verification — gates &amp; proof</div>
+    <div class="wire-annot">
+      <div class="wf">
+        <div class="wf-cap"><span class="t"><span class="id">WF-6</span> Verification</span><span class="tag">Netcode · gated · unlocks apply</span></div>
+        <div class="wf-body">
+          <div class="stack">
+            <div class="rg verified-x" style="padding:9px 11px;border-color:var(--nc-pass-border);background:var(--nc-pass-bg)"><div style="display:flex;justify-content:space-between;align-items:center"><span class="phn" style="color:var(--nc-pass);font-weight:700">9 / 9 checks passed — apply unlocked</span><span class="sp green">validated</span></div></div>
+            <div class="tiles c3">
+              <div class="rg" style="padding:10px"><span class="lab">Policy</span><div class="stack" style="margin-top:6px"><span class="phn">✓ VLAN in range</span><span class="phn">✓ not reserved</span><span class="phn">✓ name pattern</span><span class="phn">✓ subnet unique</span><span class="phn">✓ PCI isolation</span></div></div>
+              <div class="rg" style="padding:10px"><span class="lab">Vendor syntax</span><div class="stack" style="margin-top:6px"><span class="phn">✓ EOS parser accepts</span><span class="phn">✓ render scope safe</span></div></div>
+              <div class="rg" style="padding:10px"><span class="lab">Lab dry-run</span><div class="stack" style="margin-top:6px"><span class="phn">✓ session accepted</span><span class="phn">✓ aborted, no commit</span></div></div>
+            </div>
+            <div class="rg" style="padding:0;overflow:hidden"><span class="lab" style="margin:8px 0 0 10px;position:static;display:block">Dry-run transcript (runner)</span>
+              <div class="codebox" style="border-radius:0"><span class="a">v2-store1#</span> configure session nc-9f2a<br/><span class="a">v2-store1#</span> vlan 90 / name GUEST_WIFI<br/><span class="a">v2-store1#</span> show session-config diffs<br/><span class="g">+vlan 90  +  name GUEST_WIFI</span><br/><span class="c"># abort — no changes written</span></div>
+            </div>
+            <div style="display:flex;gap:8px;align-items:center"><span class="btn dngr">⚡ Apply in lab</span><span class="phn">requires explicit confirm · post-apply reads back intended vs actual</span></div>
+          </div>
+        </div>
+      </div>
+      <div class="notes">
+        <div class="grp-t">Gates</div>
+        <div class="n"><span class="pin">1</span><div class="bd"><b>Three gates in order:</b> policy → vendor syntax → lab dry-run. Apply is disabled until all are green. This is Netcode's core safety promise, made explicit.</div></div>
+        <div class="n"><span class="pin">2</span><div class="bd"><b>Dry-run is the only device contact so far</b> — an abortable EOS session run by the runner. The transcript is captured as evidence.</div></div>
+        <div class="n"><span class="pin">3</span><div class="bd"><b>Apply is destructive &amp; explicit:</b> red, behind a confirm. Post-apply, the screen reads the device back (intended vs actual) — the "Verify" half of the stage.</div></div>
+        <div class="n"><span class="pin">4</span><div class="bd"><b>After apply, Diagnose auto-runs</b> a correlation pass so any regression shows up immediately (Verify → Diagnose edge).</div></div>
+        <div class="grp-t">Data</div>
+        <div class="n"><span class="pin ghost">→</span><div class="bd">Produces <code>Validation</code> + <code>ApplyJob</code> + <code>Verification</code> records; all land in Evidence.</div></div>
+      </div>
+    </div>
+
+    <!-- WF7 · DIAGNOSTICS / RCA -->
+    <div class="sub"><span class="inpin">7</span> Diagnostics / RCA — Rez, read-only</div>
+    <div class="wire-annot">
+      <div class="wf">
+        <div class="wf-cap"><span class="t"><span class="id">WF-7</span> Diagnostics / RCA</span><span class="tag">Rez · read-only · recommends</span></div>
+        <div class="wf-body">
+          <div style="display:grid;grid-template-columns:150px 1fr 220px;gap:10px">
+            <div class="rg read" style="min-height:250px"><span class="lab">Incidents</span>
+              <div class="stack" style="margin-top:6px">
+                <div class="tile" style="padding:7px;border-color:var(--nc-current-border)"><span class="phn" style="font-weight:700">store-1844 retrans</span><span class="sp red">82%</span></div>
+                <div class="tile" style="padding:7px"><span class="phn">edge-2 BGP flap</span></div>
+                <div class="tile" style="padding:7px"><span class="phn">core-1 latency</span></div>
+                <div style="border-top:1px dashed var(--nc-border);margin-top:4px;padding-top:6px"><span class="phn">＋ Upload pcap</span></div>
+              </div>
+            </div>
+            <div class="rg" style="min-height:250px"><span class="lab">Root-cause analysis</span>
+              <div class="stack" style="margin-top:6px">
+                <div style="display:flex;justify-content:space-between;align-items:center"><span class="pht">Primary RCA</span><span class="sp violet">RezScore 82</span></div>
+                <span class="ph w85"></span>
+                <div class="rg" style="padding:8px;border-color:var(--nc-red-300);background:var(--nc-red-50)"><span class="phn" style="color:var(--nc-fail);font-weight:700">Suspect: leaf-3 uplink · retrans 4.2% · dup-ack ×318</span></div>
+                <span class="pht" style="margin-top:4px">Candidate RCAs</span>
+                <div style="display:flex;justify-content:space-between"><span class="phn">1 · MTU mismatch leaf-3↔spine-1</span><span class="sp red">0.82</span></div>
+                <div style="display:flex;justify-content:space-between"><span class="phn">2 · congestion on uplink</span><span class="sp amber">0.44</span></div>
+                <span class="pht" style="margin-top:4px">TCP ladder</span>
+                <div class="rg" style="padding:8px"><div style="display:flex;justify-content:space-between"><span class="phn">client</span><span class="phn">server</span></div><span class="ph t w70" style="margin-top:4px"></span><span class="ph t w50"></span><span class="phn" style="color:var(--nc-warn)">retrans ×212 · RST ×3</span></div>
+              </div>
+            </div>
+            <div class="rg read" style="min-height:250px"><span class="lab">Rez copilot</span>
+              <div class="stack" style="margin-top:6px">
+                <div class="rg" style="padding:7px;background:var(--nc-surface)"><span class="phn">"Why is store-1844 slow?"</span></div>
+                <div class="rg" style="padding:7px;background:var(--nc-blue-50);border-color:var(--nc-current-border)"><span class="phn">MTU mismatch on leaf-3 uplink. DNA match to INC-0412.</span></div>
+                <span class="phn" style="color:var(--nc-text-muted)">tool: read topology · read counters</span>
+                <div style="margin-top:auto;border-top:1px solid var(--nc-border);padding-top:8px"><span class="btn pri" style="background:var(--nc-warn);border-color:var(--nc-amber-700)">→ Create fix in Netcode</span></div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div class="notes">
+        <div class="grp-t">Rez, embedded</div>
+        <div class="n"><span class="pin">1</span><div class="bd"><b>Rez's 3 modes collapse here.</b> Incident list (left), RCA + pcap forensics (center: suspects, candidate RCAs, TCP ladder, RezScore, DNA), copilot chat (right). All read-only.</div></div>
+        <div class="n"><span class="pin">2</span><div class="bd"><b>RezScore &amp; DNA matches</b> surface as confidence signals — "how sure" and "have we seen this before" — carried straight from <code>computeRezScore</code> / <code>dna_matches</code>.</div></div>
+        <div class="n"><span class="pin">3</span><div class="bd"><b>The copilot never runs commands.</b> Its tools are read-only (topology, counters, pcap). It explains and correlates.</div></div>
+        <div class="n"><span class="pin">4</span><div class="bd"><b>"Create fix in Netcode" is THE seam.</b> It emits a <code>RemediationProposal</code> → a pre-filled Workflow Pack (WF-4) → full gated path. This button is the only exit from read-only into (gated) write.</div></div>
+        <div class="grp-t">Boundary</div>
+        <div class="n"><span class="pin ghost">👁</span><div class="bd">Entire screen is blue/read. It reasons over the <em>shared</em> topology + telemetry; it cannot mutate them.</div></div>
+      </div>
+    </div>
+
+    <!-- WF8 · DIGITAL TWIN -->
+    <div class="sub"><span class="inpin">8</span> Digital Twin — topology, routes, conflicts</div>
+    <div class="wire-annot">
+      <div class="wf">
+        <div class="wf-cap"><span class="t"><span class="id">WF-8</span> Digital Twin</span><span class="tag">Rez · read-only · simulate = lab only</span></div>
+        <div class="wf-body">
+          <div style="display:grid;grid-template-columns:1fr 220px;gap:10px">
+            <div class="rg" style="padding:8px"><span class="lab">Topology graph</span>
+              <div class="twin" style="margin-top:6px">
+                <div class="node path" style="left:18%;top:30%">spine1</div>
+                <div class="node" style="left:50%;top:18%">spine2</div>
+                <div class="node path hot" style="left:40%;top:62%">leaf3</div>
+                <div class="node" style="left:74%;top:40%">leaf1</div>
+                <div class="node" style="left:80%;top:74%">leaf2</div>
+                <svg style="position:absolute;inset:0;width:100%;height:100%" aria-hidden="true">
+                  <line x1="18%" y1="30%" x2="40%" y2="62%" stroke="#58a6ff" stroke-width="3"/>
+                  <line x1="18%" y1="30%" x2="50%" y2="18%" stroke="#475569" stroke-width="2"/>
+                  <line x1="50%" y1="18%" x2="74%" y2="40%" stroke="#475569" stroke-width="2"/>
+                  <line x1="40%" y1="62%" x2="74%" y2="40%" stroke="#ef4444" stroke-width="3" stroke-dasharray="5 3"/>
+                  <line x1="74%" y1="40%" x2="80%" y2="74%" stroke="#f59e0b" stroke-width="2" stroke-dasharray="6 3"/>
+                </svg>
+              </div>
+              <div style="display:flex;gap:12px;margin-top:6px"><span class="phn">— physical</span><span class="phn" style="color:var(--nc-warn)">-- BGP</span><span class="phn" style="color:var(--nc-fail)">-- conflict</span><span class="phn" style="color:var(--nc-current)">— route path</span></div>
+            </div>
+            <div class="stack">
+              <div class="rg" style="padding:9px"><span class="lab">Route trace</span><div class="stack" style="margin-top:6px"><span class="phn">src spine1 → dst 10.42.90.5</span><span class="ph t w85"></span><span class="phn" style="color:var(--nc-fail)">✗ blocked at leaf3 (MTU)</span></div></div>
+              <div class="rg" style="padding:9px"><span class="lab">Node: leaf3</span><div class="stack" style="margin-top:6px"><span class="phn">EOS 4.31 · 24 intf</span><span class="phn" style="color:var(--nc-fail)">eth3 oper down</span><span class="phn">BGP: 2 est · 1 idle</span></div></div>
+              <div class="rg read" style="padding:9px"><span class="lab">Simulate</span><div class="stack" style="margin-top:6px"><span class="phn">Chaos inject (lab only)</span><span class="sp gray">disabled in prod</span></div></div>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div class="notes">
+        <div class="grp-t">The twin</div>
+        <div class="n"><span class="pin">1</span><div class="bd"><b>Cytoscape graph, restyled.</b> Physical + BGP layers, admin/oper-down edges in red, conflict overlays from <code>state_atoms</code>, selectable nodes — all from Rez's <code>TwinGraph</code> and <code>/context</code>.</div></div>
+        <div class="n"><span class="pin">2</span><div class="bd"><b>Route tracing</b> (<code>/route_path</code>) highlights the path and shows where/why it breaks — the visual companion to RCA.</div></div>
+        <div class="n"><span class="pin">3</span><div class="bd"><b>Node inspector</b> reads device_states (interfaces, BGP neighbors). Read-only — selecting a node in RCA cross-highlights here.</div></div>
+        <div class="n"><span class="pin">4</span><div class="bd"><b>Chaos/simulate is lab-gated.</b> Fault injection exists only against the lab environment and is hidden/disabled in prod — it's the one Rez feature that "acts", so it's fenced to the twin/lab.</div></div>
+        <div class="grp-t">Boundary</div>
+        <div class="n"><span class="pin ghost">👁</span><div class="bd">Read-only view of the shared topology. Findings route to Netcode via the same <code>RemediationProposal</code> seam.</div></div>
+      </div>
+    </div>
+
+  </section>
+
+  <!-- ============ 4 · DATA CONTRACTS ============ -->
+  <section class="section" id="contracts">
+    <div class="head"><span class="num">04</span><h2>Data contracts — Netcode ↔ Rez ↔ runner</h2></div>
+    <p class="lead">Five shared objects and one handoff. The rule that keeps it safe: <b>Discovery writes the shared store; Rez only reads and produces analysis; Netcode is the only writer of changes; the runner is the only holder of credentials.</b></p>
+
+    <div class="sub">Shared objects &amp; ownership</div>
+    <div class="tbl-wrap" style="margin-bottom:20px">
+      <table class="tbl">
+        <thead><tr><th style="width:150px">Object</th><th style="width:140px">Produced by</th><th style="width:150px">Consumed by</th><th>Shape (key fields)</th></tr></thead>
+        <tbody>
+          <tr><td><b>Device</b></td><td><span class="sp violet">Discovery</span></td><td>Netcode + Rez</td><td class="mono">id, mgmt_ip, vendor, model, os, site, groups[], role</td></tr>
+          <tr><td><b>TopologySnapshot</b><br/><span class="phn">(a.k.a. NSG context)</span></td><td><span class="sp violet">Discovery</span></td><td>Netcode (blast-radius) · Rez (twin)</td><td class="mono">env_id, nodes[], links[{src,dst,src_if,dst_if,type:physical|bgp,status}], sites, device_states, state_atoms[], metadata{seed,depth,intent}</td></tr>
+          <tr><td><b>Incident / Analysis</b></td><td><span class="sp blue">Rez (read-only)</span></td><td>Netcode (seed remediation)</td><td class="mono">incident_id, summary, primary_bottleneck, candidate_rcas[], suspects[], domain_risk, dna_matches[], rez_score</td></tr>
+          <tr><td><b>Change</b></td><td><span class="sp amber">Netcode (only)</span></td><td>Rez (correlate)</td><td class="mono">change_id, pack, targets[], desired_state(yaml), plan{diff,commands,affected[],risk}, validation, apply_job, verification, rollback</td></tr>
+          <tr><td><b>EvidenceRecord</b></td><td>Netcode + Rez</td><td>Audit</td><td class="mono">links incident_id ↔ change_id ↔ apply_job ↔ verification; artifacts[], report</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="tiles c2" style="margin-bottom:20px">
+      <div class="rg read" style="padding:0;overflow:hidden">
+        <div class="codebox" style="border-radius:0"><span class="c">// THE SEAM — Rez → Netcode (read-only → gated write)</span><br/><span class="c">// Rez emits; Netcode ingests as a DRAFT change.</span><br/>RemediationProposal {<br/>&nbsp;&nbsp;<span class="a">source</span>: <span class="g">"rez"</span>,<br/>&nbsp;&nbsp;incident_id: <span class="g">"INC-0517"</span>,<br/>&nbsp;&nbsp;target_device: <span class="g">"leaf-3"</span>,<br/>&nbsp;&nbsp;suggested_pack: <span class="g">"interface_change"</span>,<br/>&nbsp;&nbsp;proposed_intent: { mtu: <span class="g">9214</span>, intf: <span class="g">"eth3"</span> },<br/>&nbsp;&nbsp;rationale: <span class="g">"MTU mismatch leaf-3↔spine-1"</span>,<br/>&nbsp;&nbsp;confidence: <span class="g">0.82</span>,<br/>&nbsp;&nbsp;evidence_refs: [<span class="g">"pcap:…"</span>, <span class="g">"twin:route_path"</span>]<br/>}<br/><span class="r">// NOT a device write — must pass all gates.</span></div>
+      </div>
+      <div class="stack" style="gap:12px">
+        <div class="rg runner" style="padding:12px"><span class="lab">Runner boundary</span>
+          <p class="phn" style="margin:4px 0 0"><b>The runner is the only process with credentials.</b> Both shells call it; it returns results + transcripts, never secrets.</p>
+          <div class="codebox" style="margin-top:8px"><span class="a">POST</span> /api/runner/exec <span class="c">// gated ops only</span><br/>&nbsp;&nbsp;{ op: <span class="g">"dry_run|apply|rollback|read"</span>,<br/>&nbsp;&nbsp;&nbsp;&nbsp;change_id, targets[] }<br/><span class="g">→ { transcript[], result, evidence_id }</span><br/><span class="c">// creds resolved locally; never in payload/response</span></div>
+        </div>
+        <div class="callout warn" style="margin:0"><span class="mk">🚦</span><div><b>Write authority is singular.</b><p>Only Netcode may call the runner with <code>apply</code>/<code>rollback</code>. Rez may call only <code>read</code>. The runner enforces this by op-type, so read-only is guaranteed server-side, not just in the UI.</p></div></div>
+      </div>
+    </div>
+
+    <div class="sub">API surface (unify Rez's <code>:8000</code> under one gateway)</div>
+    <div class="tbl-wrap">
+      <table class="tbl">
+        <thead><tr><th style="width:120px">Domain</th><th>Endpoints</th><th style="width:130px">Auth to write</th></tr></thead>
+        <tbody>
+          <tr><td><span class="sp violet">Shared</span></td><td class="mono">/api/discovery · /api/devices · /api/topology/{env}/context · /api/topology/{env}/route_path</td><td>runner (read)</td></tr>
+          <tr><td><span class="sp blue">Rez</span></td><td class="mono">/api/incidents · /api/analysis/* · /api/scan (pcap) · /api/lab/status · /api/remediation-proposals (POST → draft)</td><td>none (read-only)</td></tr>
+          <tr><td><span class="sp amber">Netcode</span></td><td class="mono">/api/packs · /api/changes · /api/plan · /api/validate · /api/apply · /api/rollback · /api/verify · /api/evidence</td><td>runner (gated)</td></tr>
+          <tr><td><span class="sp gray">Runner</span></td><td class="mono">/api/runner/status · /api/runner/exec</td><td>local creds</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- ============ 5 · MIGRATION ============ -->
+  <section class="section" id="migration">
+    <div class="head"><span class="num">05</span><h2>Migration plan</h2></div>
+    <p class="lead">Shell decision first, then move views by risk — shared spine before write path before diagnostics — so each phase ships something usable and reversible. Implemented surgically (per the checkpoint tag), slice by slice.</p>
+
+    <div class="callout key">
+      <span class="mk">🏛️</span>
+      <div><b>Which shell hosts?</b>
+        <p>Netcode is the shell <em>conceptually</em>, but Rez's <b>React/Vite</b> stack (Cytoscape, rich state) is the stronger technical host. <b>Recommendation: build the unified shell as a React app that consumes this design system.</b> Netcode's workflow screens are simple and get re-implemented in React; Rez's Diagnostics/Twin move in largely intact, restyled read-only. The current static Netcode <code>app.js</code> becomes reference, not runtime.</p>
+      </div>
+    </div>
+
+    <div class="card" style="padding:18px 20px;margin-bottom:18px">
+      <div class="phase"><div class="rail"><div class="dot">0</div><div class="line"></div></div><div class="bd"><h4>Phase 0 · Foundation</h4><p class="goal">Adopt the design system in both repos; freeze at <code>checkpoint-2026-07-07-before-unified-ui-redesign</code>. Stand up the React shell skeleton (nav rail, top bar, context panel) with tokens + components. No behavior moved yet.</p></div></div>
+      <div class="phase"><div class="rail"><div class="dot">1</div><div class="line"></div></div><div class="bd"><h4>Phase 1 · Shared spine</h4><p class="goal">Move <b>Discovery + Inventory</b> first — lowest risk, read-mostly, and it's the single source of truth everything else needs. Collapse the two separate discovery UIs into one.</p></div></div>
+      <div class="phase"><div class="rail"><div class="dot">2</div><div class="line"></div></div><div class="bd"><h4>Phase 2 · Write path</h4><p class="goal">Port the gated workflow: <b>Workflow Packs → Change Plan → Verification → Apply → Evidence</b>, preserving the runner boundary. Generalize <code>add_vlan</code> into the Pack model.</p></div></div>
+      <div class="phase"><div class="rail"><div class="dot">3</div><div class="line"></div></div><div class="bd"><h4>Phase 3 · Diagnostics</h4><p class="goal">Embed Rez as read-only <b>Diagnostics/RCA + Digital Twin</b>, restyled. Collapse <code>console·pcap·twin</code> modes into the two nav sections. Gate chaos/lab tools behind the lab environment.</p></div></div>
+      <div class="phase"><div class="rail"><div class="dot">4</div><div class="line"></div></div><div class="bd"><h4>Phase 4 · The seam</h4><p class="goal">Wire <b>Diagnose → Remediate</b>: <code>RemediationProposal</code> → pre-filled Pack → gated change. Auto-run a Diagnose correlation pass after each Apply. Unify Evidence across incident + change.</p></div></div>
+      <div class="phase"><div class="rail"><div class="dot" style="background:var(--nc-pass)">5</div></div><div class="bd"><h4>Phase 5 · Cleanup</h4><p class="goal">Consolidate APIs behind one gateway; make read-only enforcement server-side in the runner. Retire Rez's localStorage-scoped incident tabs for the shared store. Delete dead code.</p></div></div>
+    </div>
+
+    <div class="sub">What moves, what simplifies, what's deleted</div>
+    <div class="movecols">
+      <div class="col mv"><h5>✓ Move in (keep)</h5><ul>
+        <li>Rez <code>TwinGraph</code> (Cytoscape) — the twin</li>
+        <li>Rez RCA/pcap analysis + <code>Visualizers</code> (TCP ladder, minimap)</li>
+        <li>Rez copilot chat (read-only tools)</li>
+        <li>Netcode gated pipeline (plan→verify→apply→rollback→evidence)</li>
+        <li>Shared discovery crawl (v1/v2 engines)</li>
+      </ul></div>
+      <div class="col simp"><h5>◑ Simplify</h5><ul>
+        <li>Rez <code>console·pcap·twin</code> modes → 2 nav sections</li>
+        <li>Per-incident <code>localStorage</code> tabs → shared incident store</li>
+        <li>Chaos/lab tools → gated to lab env only</li>
+        <li>RezScore / DNA → read-only insight cards</li>
+        <li>Two discovery UIs → one shared screen</li>
+      </ul></div>
+      <div class="col del"><h5>✕ Delete</h5><ul>
+        <li>Netcode static <code>app.js</code> shell + standalone <code>index.html</code></li>
+        <li>Rez's standalone top-level mode switcher</li>
+        <li>Duplicate device/topology models across the two apps</li>
+        <li>Any direct "run command" affordance outside gated packs</li>
+        <li>Rez Vite boilerplate (<code>App.css</code> logo/spin)</li>
+      </ul></div>
+    </div>
+
+    <div class="callout warn" style="margin-top:22px"><span class="mk">🧭</span><div><b>Sequencing rule.</b><p>Never move the write path before the shared spine, and never wire the seam before Diagnostics is read-only-clean. Each phase must leave the app shippable — if a phase can't ship, split it. Codex implements one slice per PR against the checkpoint tag.</p></div></div>
+
+    <div style="margin-top:30px;padding-top:18px;border-top:1px solid var(--nc-border);display:flex;justify-content:space-between;flex-wrap:wrap;gap:10px">
+      <span class="phn">Netcode × Rez — Unified UX Spec · v1 · 2026-07-07 · design for review, not implementation</span>
+      <span class="phn mono">next: sign off IA + seam → Codex builds Phase 0–1</span>
+    </div>
+  </section>
+
+</div>
+</body>
+</html>
