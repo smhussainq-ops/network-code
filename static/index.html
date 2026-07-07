@@ -72,15 +72,15 @@
           <section id="view-home" class="view">
             <section class="closed-loop-hero" aria-label="Closed-loop automation overview">
               <div class="closed-loop-copy">
-                <span class="hero-kicker">Netcode + Rez Diagnostics</span>
-                <h3>Self-verifying automation. Self-explaining failures. Human-approved changes.</h3>
-                <p>Other tools push config and hope. Netcode discovers live state, builds the plan, verifies the result, and when something fails, Rez investigates with read-only evidence and hands back a draft remediation.</p>
+                <span class="hero-kicker">Operations queue</span>
+                <h3>Automation, diagnostics, and approvals in one workflow.</h3>
+                <p>Use this screen to see what is ready to plan, what is blocked by verification, which Rez incidents have draft fixes, and which changes are waiting for human approval.</p>
                 <div class="hero-actions">
                   <button type="button" data-go="desired">Start a workflow pack</button>
                   <button class="secondary" type="button" data-go="drift">Open Rez Diagnostics</button>
                 </div>
               </div>
-              <div class="closed-loop-panel" aria-label="Closed loop workflow">
+              <div class="closed-loop-panel" aria-label="Operational workflow state">
                 <div class="loop-line">
                   <span>Discover</span>
                   <span>Plan</span>
@@ -90,10 +90,10 @@
                   <span>Approve</span>
                 </div>
                 <div class="loop-terminal">
-                  <div><b>CHG-4271</b> Region 3 edge remediation</div>
-                  <p>Generated route policy, firewall egress, NAT verification, rollback, and canary checks across 42 devices.</p>
-                  <p><b>Rez finding:</b> canary verification failed on Branch-EDGE-03; outbound NAT evidence missing for the scoped flow.</p>
-                  <p><b>Next safe action:</b> create a Netcode draft fix, validate, then wait for human approval before apply.</p>
+                  <div><b>CHG-4271</b> waiting for approval</div>
+                  <p>Region 3 edge remediation: 7 sites, 42 devices, rollback generated, canary ready.</p>
+                  <p><b>INC-2048</b> Rez RCA found missing outbound NAT evidence for the scoped flow.</p>
+                  <p><b>Next:</b> review generated commands, approve canary, apply, then verify live state.</p>
                 </div>
               </div>
             </section>
