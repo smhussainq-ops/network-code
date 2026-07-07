@@ -1541,6 +1541,37 @@ def test_ansible_pack_plan_endpoint(tmp_path: Path, monkeypatch):
     assert data["execution"]["credentials_leave_runner"] is False
 
 
+def test_shell_desktop_profile_is_native_and_secret_free():
+    from netcode.shell_desktop import build_desktop_shell_profile
+
+    profile = build_desktop_shell_profile("https://netcode.example.com", runner_pool="pilot")
+    serialized = json.dumps(profile).lower()
+
+    assert profile["client"]["kind"] == "native-desktop"
+    assert profile["client"]["browser_based"] is False
+    assert profile["transport"]["shell_websocket_base_url"] == "wss://netcode.example.com"
+    assert profile["capabilities"]["full_human_cli"] is True
+    assert profile["boundaries"]["rez_diagnostics"] == "read-only runner actions only"
+    assert profile["control_plane"]["device_credentials"] == "never_stored"
+    assert "password" not in serialized
+    assert "runner_token" not in serialized
+    assert "private_key" not in serialized
+
+
+def test_shell_desktop_profile_endpoint(tmp_path: Path, monkeypatch):
+    init_workspace(WorkspacePaths(tmp_path))
+    monkeypatch.chdir(tmp_path)
+
+    response = TestClient(api.app).get("/api/shell/desktop/profile")
+    data = response.json()
+
+    assert response.status_code == 200
+    assert data["profile_version"] == "netcode-shell-desktop.v1"
+    assert data["client"]["browser_based"] is False
+    assert data["transport"]["open_session"].endswith("/api/shell/open")
+    assert data["boundaries"]["credentials"] == "runner-local inventory only"
+
+
 def test_ui_config_persists_editable_options_and_catalog(tmp_path: Path, monkeypatch):
     init_workspace(WorkspacePaths(tmp_path))
     monkeypatch.chdir(tmp_path)

@@ -78,6 +78,7 @@ from netcode.orchestrator import create_add_vlan_intent, create_desired_state_in
 from netcode.paths import paths
 from netcode.platform import platform_capabilities
 from netcode.scale import rollout_plan
+from netcode.shell_desktop import build_desktop_shell_profile
 from netcode.source_of_truth import netbox_sync, netbox_test, provider_catalog, source_of_truth
 from netcode.store import DEFAULT_ORG_ID, PlatformStore, record_to_dict
 from netcode.troubleshooting import troubleshoot_state
@@ -1233,6 +1234,11 @@ def api_diagnostics_verification_handoff(request: VerificationHandoffRequest) ->
 # evidence artifact. The GUARD runs on the runner (trust boundary); the control
 # plane only orchestrates and records.
 _SHELL_SESSIONS: dict[str, dict[str, object]] = {}
+
+
+@app.get("/api/shell/desktop/profile")
+def api_shell_desktop_profile(request: Request) -> dict[str, object]:
+    return build_desktop_shell_profile(str(request.base_url).rstrip("/"), runner_pool=runner_pool())
 
 
 def _shell_transcript_path(p, session_id: str) -> Path:

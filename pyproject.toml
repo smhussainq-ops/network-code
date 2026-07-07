@@ -31,6 +31,7 @@ postgres = [
 [project.scripts]
 netcode = "netcode.cli:app"
 netcode-runner = "netcode.runner_agent:main"
+netcode-shell-desktop = "netcode.shell_desktop:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
