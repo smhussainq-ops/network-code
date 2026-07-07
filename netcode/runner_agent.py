@@ -178,47 +178,25 @@ def _collapse_command(command: str) -> str:
     return " ".join(str(command or "").strip().split())
 
 
-_POST_PIPE_BLOCKED = (
-    "bash",
-    "system",
-    "redirect",
-    "append",
-    "tee",
-    "save",
-    "request",
-    "exec",
-    "python",
-    "perl",
-    "sh",
-)
-
-_POST_PIPE_BLOCKED_PREFIXES = (
-    "conf",
-    "write",
-    "reload",
-    "erase",
-    "delete",
-    "format",
-    "shutdown",
-    "copy ",
-    "clear",
-    "debug",
-    "set ",
-    "commit",
-    "rollback",
-    "load ",
-    "edit ",
-    "activate",
-    "deactivate",
-    "move ",
-    "rename ",
-    "mkdir ",
-    "rmdir ",
-    "boot ",
-    "upgrade ",
-    "install ",
-    "execute ",
-    "tools ",
+_POST_PIPE_ALLOWED_FILTERS = frozenset(
+    (
+        # Arista EOS/Cisco-style read filters.
+        "include",
+        "exclude",
+        "section",
+        "begin",
+        "count",
+        "json",
+        "no-more",
+        "nz",
+        "last",
+        "natural",
+        # Junos-style read filters.
+        "match",
+        "except",
+        "display",
+        "trim",
+    )
 )
 
 
@@ -228,13 +206,10 @@ def _pipe_segments_allowed(command: str) -> tuple[bool, str]:
     for segment in command.split("|")[1:]:
         lowered = segment.strip().lower()
         if not lowered:
-            continue
-        for blocked in _POST_PIPE_BLOCKED:
-            if lowered == blocked or lowered.startswith(blocked + " "):
-                return False, f"blocked post-pipe command '| {blocked}'"
-        for prefix in _POST_PIPE_BLOCKED_PREFIXES:
-            if lowered.startswith(prefix):
-                return False, f"blocked post-pipe pattern '| {prefix}'"
+            return False, "blocked empty post-pipe segment"
+        keyword = lowered.split(None, 1)[0]
+        if keyword not in _POST_PIPE_ALLOWED_FILTERS:
+            return False, f"blocked post-pipe command '| {keyword}'"
     return True, "allowed"
 
 
