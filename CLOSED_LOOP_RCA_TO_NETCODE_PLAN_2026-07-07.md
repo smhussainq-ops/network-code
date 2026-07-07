@@ -6,6 +6,26 @@
 ## The one rule that fixes this
 > **No static mockups. Every card/row/panel renders a REAL object from a REAL endpoint. Definition of done for the whole loop = a single automated E2E test that: opens an incident → Rez produces a read-only RCA proposal → Netcode creates a DRAFT change with real generated commands + rollback → a (different) human approves → it applies to a lab device → verification passes → signed evidence links back to the incident. If you can't click it and get a real `change_id`, it isn't done.**
 
+## Grounded status (validated against both repos, 2026-07-07)
+The founder's end-to-end flow is **discover → Shell → automate → RCA → push remediation**. Validated hop by hop in code:
+
+| Hop | Status | Anchor |
+|---|---|---|
+| 1. Discover devices (Rez UI over Netcode backend) | ✅ real | `discovery.py:86`; runner strips cloud creds `api.py:887` (HTTP 400), resolves from `~/.netcode-runner/inventory.yaml` |
+| 2. Governed Shell writes | ✅ keep as-is (see decision) | `shell_guard.py:313` (immediate write on attach); creds never leave runner `shell_pty.py:55`; durable transcript `api.py:1244` |
+| 3. Scripted automation (plan→gate→canary→apply→verify) | ✅ real | approve gate `api.py:1756`, requester≠approver `api.py:1736`; fleet canary/auto-halt `fleet.py:280` |
+| 4. RCA read-only investigation | ✅ real | bridge read-only `api.py:906`, `store.py:810/819`, read jobs never advance a change `runner_hub.py:117` |
+| 4b. verify-fail → Diagnostics handoff | ⚠️ partial | builder exists `diagnostics_handoff.py`, but **nothing auto-invokes it** on a failed verify |
+| 5. chat-v2 RCA → push to Netcode | ❌ **the gap** | `/api/chat` returns free-text `server.py:9840`; RCA card has no push button `ChatInterface.tsx:430`; Netcode `/api/changes` is **GET-only** — `POST /api/changes/from-rca` is genuinely NEW |
+
+## The approval decision (from the founder — this is law)
+Two write-origin classes, two rules. **Do not blur them.**
+
+1. **Human-initiated writes (Shell + engineer-authored automation): the engineer IS the approval.** A human typing a governed, credential-safe, fully-recorded command is the human-in-the-loop. **Keep the Shell exactly as it is** — governed immediate-execution (config locked until a change is attached, creds resolved at runner, dangerous commands re-confirm, pastes staged, durable transcript folded into the change record). **Do NOT** add a requester≠approver gate to the Shell, and do NOT build the "attach-to-an-already-approved-change" tiering. *Don't complicate things.*
+2. **Machine-initiated writes (Rez RCA): STRICT — a human must always approve.** Rez RCA may only emit a **proposal (data)**. The draft change it creates **must never auto-apply and must never be machine-approvable.** A human engineer must review the exact commands + rollback and explicitly push it. Because the requester is Rez-the-machine, any human approver satisfies requester≠approver by construction — but the load-bearing rule is simply: **Rez never turns its own recommendation into a write. A human does.**
+
+This is the whole safety story in one line: **humans are trusted to change the network; the machine is only trusted to recommend.**
+
 ## You already built 80% of this — do NOT rebuild it
 The drift closed loop is **already live-proven** this session:
 `drift detected → fleet.create_remediation_rollouts() → per-device draft change → approval gate (requester≠approver) → canary → apply → verify → signed evidence.`
@@ -21,7 +41,11 @@ Existing pieces to REUSE (validated this session — do not reimplement):
 
 ## The non-negotiable guardrail (enforce in code + prove with a test)
 > **Diagnostics has NO apply path. Rez can produce a *proposal* (data). Only an approved Netcode change writes. The RCA→change handoff is a DATA object, never a command execution.**
-This is already enforced at the runner (the bridge only mints `read_` jobs; the write path `create_job` is reachable only from the change pipeline). The plan must ADD a test that asserts: a Rez RCA proposal can *create a draft change* but can *never* cause a device write except through `/api/change/{id}/approve` + the gated apply path.
+This is already enforced at the runner (the bridge only mints `read_` jobs; the write path `create_job` is reachable only from the change pipeline). The plan must ADD a test that asserts: a Rez RCA proposal can *create a draft change* but can *never* cause a device write except through `/api/change/{id}/approve` + the gated apply path. **Scope note:** this guardrail is about the *machine* path only. The interactive Shell is a *human* path and is explicitly out of scope — it stays as-is per the approval decision above.
+
+### Two more grounded gaps to close (found in validation)
+- **Auto-wire the verify-fail → Diagnostics handoff.** The builder exists (`diagnostics_handoff.py`) but nothing calls it. Have the apply→verify path (`fleet.py` verify-fail branch + the `/api/verify` endpoints) POST to `/api/diagnostics/verification-handoff` on `failed=True`, so RCA is *offered automatically* on a failed change — this is what makes hop 4 continuous instead of manual.
+- **Build the RCA → `change_type` mapping layer.** Today an RCA conclusion is free-text prose (`server.py:9840`). `POST /api/changes/from-rca` needs a *structured* proposal, so add the layer that maps a root cause (missing ACL entry, wrong BGP metric, stale route, missing VLAN…) to a real `ChangeTypeSpec` key + params + rollback. Without it, `from-rca` has nothing valid to consume. Start with a small, safe set of change types (the ones already in the registry) and refuse to draft when confidence is low.
 
 ---
 
