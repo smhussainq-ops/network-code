@@ -10,7 +10,7 @@ from netcode.store import PlatformStore
 from netcode.yamlio import read_yaml
 
 
-def test_rca_remediation_creates_draft_custom_change_without_jobs(tmp_path: Path, monkeypatch):
+def test_rca_remediation_runs_static_validation_without_jobs(tmp_path: Path, monkeypatch):
     init_workspace(WorkspacePaths(tmp_path))
     monkeypatch.chdir(tmp_path)
     client = TestClient(api.app)
@@ -48,14 +48,15 @@ def test_rca_remediation_creates_draft_custom_change_without_jobs(tmp_path: Path
 
     store = PlatformStore(WorkspacePaths(tmp_path.resolve()))
     change = store.get_change(body["change_id"])
-    assert change.status == "draft"
-    assert change.workflow_state == "draft"
+    assert change.status == "blocked"
+    assert change.workflow_state == "blocked"
     assert change.device_id == "Branch-EDGE-03"
     assert change.last_job_id is None
     assert store.list_jobs() == []
     assert change.result["plan"]["commands"]
     assert change.result["pipeline"]["render"]["config"]
     assert change.result["pipeline"]["artifacts"]["report_json_path"]
+    assert any(check["status"] == "fail" for check in change.result["pipeline"]["validation"]["checks"])
 
     intent = read_yaml(Path(change.intent_path))
     assert intent["change_type"] == "custom_config"
@@ -68,6 +69,7 @@ def test_rca_remediation_creates_draft_custom_change_without_jobs(tmp_path: Path
     events = store.list_workflow_events(change.id)
     assert len(events) == 1
     assert events[0].action == "rca_proposal"
+    assert events[0].to_state == "blocked"
 
 
 def test_rca_remediation_preserves_known_typed_intent(tmp_path: Path, monkeypatch):
@@ -105,7 +107,51 @@ def test_rca_remediation_preserves_known_typed_intent(tmp_path: Path, monkeypatc
     assert intent["change_type"] == "acl_rule"
     assert intent["targets"] == {"device_ids": ["Edge-FW-01"]}
     assert intent["metadata"]["ticket_id"] == "INC-ACL-01"
-    assert body["change"]["workflow_state"] == "draft"
+    assert body["change"]["workflow_state"] == "blocked"
+
+
+def test_rez_rca_validated_draft_can_enter_dry_run_queue(tmp_path: Path, monkeypatch):
+    init_workspace(WorkspacePaths(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("NETCODE_EXECUTION", "runner")
+    client = TestClient(api.app)
+
+    response = client.post(
+        "/api/changes/from-rca",
+        json={
+            "source": "rez",
+            "incident_id": "INC-DRYRUN",
+            "target_device": "v2-store1",
+            "suggested_pack": "custom_config",
+            "rationale": "Rez proposed a reviewed config draft.",
+            "proposed_intent": {
+                "site": "store-1842",
+                "config_lines": "vlan 992\n   name RCA_DRYRUN\n",
+                "rollback_lines": "no vlan 992\n",
+            },
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["change"]["workflow_state"] == "validated"
+    assert body["draft_only"] is True
+    assert body["human_approval_required"] is True
+
+    from netcode.jobs import JobRunner
+
+    store = PlatformStore(WorkspacePaths(tmp_path.resolve()))
+    dry_run = JobRunner(WorkspacePaths(tmp_path.resolve()), store=store).run_lab_action(
+        Path(body["intent_path"]),
+        "dry-run",
+        "v2-store1",
+        body["change_id"],
+    )
+
+    assert dry_run["ok"] is True
+    assert dry_run["queued"] is True
+    assert dry_run["job"]["action"] == "lab_dry-run"
+    assert dry_run["change"]["workflow_state"] == "validated"
 
 
 def test_rca_remediation_strips_credential_shaped_fields(tmp_path: Path, monkeypatch):

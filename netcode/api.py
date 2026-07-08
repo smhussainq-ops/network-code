@@ -2220,13 +2220,19 @@ def api_change_from_rca(request: RcaRemediationProposalRequest, http_request: Re
             "artifacts": pipeline.artifacts.model_dump() if pipeline.artifacts else None,
         },
     }
-    store.update_change(change.id, "draft", evidence, workflow_state="draft")
+    workflow = state_after_static_validation(pipeline.status == "pass")
+    store.update_change(
+        change.id,
+        "validated" if pipeline.status == "pass" else "blocked",
+        evidence,
+        workflow_state=workflow.state,
+    )
     store.record_workflow_event(
         change.id,
         "rca_proposal",
         "draft",
-        "draft",
-        f"Created draft from Rez RCA proposal: {title}",
+        workflow.state,
+        f"Created Rez RCA remediation draft and ran static validation: {title}. {workflow.message}",
         evidence,
     )
     change = store.get_change(change.id)
