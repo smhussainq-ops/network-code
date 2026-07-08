@@ -420,3 +420,41 @@ Rez:
 - `41a89ab ui: wire Netcode module to Rez RCA drafts`
 
 Known dirty/generated Netcode files are intentionally excluded from this plan and should not be mixed into feature implementation commits.
+
+---
+
+## 9. Claude Code Review (2026-07-07)
+
+**Overall: the plan is honest and well-structured — approve it with two changes: re-order to reach the demo before full parity, and answer the 5 questions below.** The "every card backed by a real object" rule and the stop conditions are exactly right; keep them.
+
+### 9.1 Validation of current commits — GO
+Grounded in source (not the deployed copy):
+- **`0178681` `from-rca` is genuinely draft-only.** `api.py:1953-2021` calls only `create_change` + `update_change(workflow_state="draft")` + `record_workflow_event`. **No `create_job`, no `run_lab_action`, no apply. Lands in `draft`, NOT `dry_run_passed`** — the one safety-critical detail, correct. Change-type allowlist + `custom_config` fallback + required target (`api.py:419-423`). Structure-validated via `load_intent_data`.
+- **`41a89ab` Rez proxy is correctly scoped.** Only `GET /api/netcode/changes` + `POST /api/netcode/changes/from-rca` (`server.py:1327,1332`). **No approve/apply/dry-run proxied.** Control-plane URL/token from env, server-side.
+- **Tests:** bridge `3 passed`; full suite `122 passed, 1 failed`. The one failure is `test_app_route_serves_ui` — a stale assertion for the old static Netcode root route, expected to break now that Netcode is a Rez module. **Update or delete that test in Slice 2; it is not a regression.**
+
+**Three minor conditions (none block; fold into the slices):**
+- **P1 — service auth for the proxy under `NETCODE_AUTH=1`.** `from-rca` inherits standard RBAC (not specially open — good), but with auth ON the Rez→Netcode `from-rca` call needs a defined service credential (scoped token). Define it in Slice 11 before AWS. Local demo (auth off) is fine today.
+- **P2 — confidence is captured but not gated.** Add "refuse `low` confidence → 422" when you do Slice 5.
+- **P2 — `custom_config` auto-acks a missing rollback** (`acknowledge_no_rollback: not bool(rollback)`, `api.py:457`). For RCA drafts, don't auto-ack — surface "no rollback: engineer must supply" so the human sees it before approving.
+
+### 9.2 Answers to the 5 review questions
+1. **Is Slice 1 (discover-once) the next blocker for full parity?** For *parity*, yes it's foundational; for the *fastest credible POC*, no. It's a pilot-onboarding smoothness gap, not a demo blocker (pre-import the lab devices once). It's a different repo/owner (Netcode backend) than the demo spine (Rez UI) — **run Slice 1 in parallel, don't let it gate the demo.**
+2. **Should `from-rca` run the static pipeline immediately, or stay draft-only until the human opens it?** **Run `run_static_pipeline` immediately AND stay in `draft`.** Static pipeline = render + validate + policy + blast-radius — it touches **no device and creates no job** (that's dry-run, which is separate). Running it at draft time means the human opens a draft that *already shows real commands + rollback + validation* — which is what makes the review real and anti-static. It does **not** advance workflow state. Today the endpoint runs `load_intent_data` (structure only), not `run_static_pipeline` — **add it.** This is the single highest-value upgrade to the current slice.
+3. **Which first RCA mapping to certify?** **NTP first, then ACL.** NTP is lowest blast radius, deterministic, has a dedicated `ntp_standardize` type + pack, and is trivially verifiable (server list matches or not) — the safest way to prove the loop. Then **ACL** (`acl_rule`, high value, clean structured mapping, moderate risk). Then VLAN/trunk. **NAT/firewall `custom_config` LAST** — least structured, hardest to verify, don't lead with it.
+4. **Windows runner before AWS, or AWS with ORB/Linux first?** **AWS with ORB/Linux first.** The runner is already proven on Linux/ORB; the load-bearing pilot risk is the SaaS split over the public internet (runner dials out 443, backend has no device route) — prove that with the runner you have. Windows packaging is customer-onboarding convenience; do it when a pilot actually needs Windows, not before. (Note for Slice 11: Netcode CP holds session/WS state in memory → **single-worker** on AWS.)
+5. **Any hidden write path from Rez to runner besides the Netcode change workflow?** **No — validated.** The Rez bridge mints only `read_` jobs (`create_read_job` hard-prefixes `read_` + `__read__` sentinel; `runner_hub` never advances a change on `read_`). `from-rca` creates **no job**. The write path (`create_job`) is reachable only from the change pipeline behind dry-run→approve→apply. The one standing rule: **every new Rez `/api/netcode/*` proxy route must be read or draft only** — re-audit on each addition (today's two are clean).
+
+### 9.3 Re-sequencing — reach the demo, then fill parity
+Codex's §5 reasoning is right ("credible closed-loop demo, not every advanced feature first") but its order leads with Slice 1. Sharpen to a **demo spine** vs **parallel tracks**:
+
+**Demo spine (serialize, this is the money path):**
+`Slice 2 (live change workspace)` → `Slice 4 (human-gated execution UI)` → `Slice 5 (structured RemediationProposal)` → `Slice 6 (verify-fail → diagnostics)` → `Slice 7 (evidence chain)` → `Slice 12 (E2E demo)`. Fold the minimum of `Slice 3 (one workflow pack + custom_config)` into where Slice 4 needs a change to operate on.
+
+**Parallel track A (Netcode backend, off the demo critical path):** `Slice 1 (discover-once)` — pilot prerequisite, do alongside the UI work.
+**Parallel track B (after the demo is green):** `Slice 11 (AWS)` → then `Slice 10 (Windows)` → then `Slice 8 (git rollback UX)` → `Slice 9 (Ansible execution)`.
+
+Rationale: the demo spine is one repo-crossing thread (Rez UI + existing Netcode endpoints) and proves the whole value prop. Discovery-auto-import and productization don't block it and shouldn't serialize in front of it.
+
+### 9.4 One addition to §3 guardrails
+Add: **the `from-rca` draft carries rendered plan artifacts (commands, rollback, policy, blast radius) at creation time via the static pipeline — but never a job and never an advanced workflow state.** This is what lets Slice 2's detail drawer be real without any device contact.
