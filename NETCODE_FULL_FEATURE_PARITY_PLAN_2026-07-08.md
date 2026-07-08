@@ -427,16 +427,24 @@ Known dirty/generated Netcode files are intentionally excluded from this plan an
 
 **Overall: the plan is honest and well-structured — approve it with two changes: re-order to reach the demo before full parity, and answer the 5 questions below.** The "every card backed by a real object" rule and the stop conditions are exactly right; keep them.
 
-### 9.1 Validation of current commits — GO
-Grounded in source (not the deployed copy):
-- **`0178681` `from-rca` is genuinely draft-only.** `api.py:1953-2021` calls only `create_change` + `update_change(workflow_state="draft")` + `record_workflow_event`. **No `create_job`, no `run_lab_action`, no apply. Lands in `draft`, NOT `dry_run_passed`** — the one safety-critical detail, correct. Change-type allowlist + `custom_config` fallback + required target (`api.py:419-423`). Structure-validated via `load_intent_data`.
-- **`41a89ab` Rez proxy is correctly scoped.** Only `GET /api/netcode/changes` + `POST /api/netcode/changes/from-rca` (`server.py:1327,1332`). **No approve/apply/dry-run proxied.** Control-plane URL/token from env, server-side.
-- **Tests:** bridge `3 passed`; full suite `122 passed, 1 failed`. The one failure is `test_app_route_serves_ui` — a stale assertion for the old static Netcode root route, expected to break now that Netcode is a Rez module. **Update or delete that test in Slice 2; it is not a regression.**
+### 9.1 Validation of current commits — GO-WITH-CONDITIONS (2 deployment-gating P0s)
+A 5-audit adversarial pass (source, tests, proxy, UI, live gate-proof) confirms the **core invariants all HOLD** but found **two P0 holes that must be closed before `from-rca` deploys** — it is safe today *only because the endpoint is not yet live* (`:8095` returns 404 for it — the running CP predates commit `0178681`).
 
-**Three minor conditions (none block; fold into the slices):**
-- **P1 — service auth for the proxy under `NETCODE_AUTH=1`.** `from-rca` inherits standard RBAC (not specially open — good), but with auth ON the Rez→Netcode `from-rca` call needs a defined service credential (scoped token). Define it in Slice 11 before AWS. Local demo (auth off) is fine today.
-- **P2 — confidence is captured but not gated.** Add "refuse `low` confidence → 422" when you do Slice 5.
-- **P2 — `custom_config` auto-acks a missing rollback** (`acknowledge_no_rollback: not bool(rollback)`, `api.py:457`). For RCA drafts, don't auto-ack — surface "no rollback: engineer must supply" so the human sees it before approving.
+**What holds (independently re-verified):**
+- **Draft-only.** `from-rca` (`api.py:1953-2021`) makes **zero** `create_job` / `run_lab_action` / `run_static_pipeline` calls; the change is born in `draft` (`api.py:2002`), never `dry_run_passed`. Machine self-approve is rejected (requester≠approver, proven in gate-proof).
+- **Proxy clean.** Rez `_netcode_proxy` (`server.py:1328-1355`) exposes only reads + the draft-create POST, token attached **server-side** from env — never reaches the browser.
+- **UI anti-static.** Hardcoded mock cards (CHG-4271 etc.) removed; renders live `change_id`s.
+- **Tests:** bridge `3 passed`; full suite `122 passed, 1 failed` (the failure is the stale `test_app_route_serves_ui` root-route assertion — update/delete in Slice 2, not a regression).
+
+**🔴 P0 (block deploy — fix before `from-rca` goes live):**
+1. **Human approval is environmental, not intrinsic.** `approval_required()` (`jobs.py:29-39`) falls back to `auth_enabled()`, `workflow.py:42` permits apply from `dry_run_passed`, and the `human_approval_required` marker `from-rca` writes has **zero consumers** (write-only). Net: on an auth-off CP, once `from-rca` deploys, a dry-run-passed RCA draft could apply with **no approve step** — a direct breach of the founder's #1 law in the default posture. It works today only because the live env sets `NETCODE_REQUIRE_APPROVAL=1`; a redeploy without that flag loses the guarantee. **Fix:** make approval intrinsic for machine-sourced (`source=rez_rca`) changes — block apply in `JobRunner.run_lab_action` unless `workflow_state=='approved'`, independent of global auth/approval config.
+2. **Credential pass-through on the typed-intent path.** `_intent_from_rca_proposal` builds `intent = {**proposed, ...}` (spread of the raw Rez dict, no `extra="forbid"`) and `write_yaml` persists it — so credential-shaped extra keys from Rez would be silently written to control-plane YAML (Invariant-3 exposure, though no transit demonstrated). **Fix:** whitelist the accepted fields / `extra="forbid"` / strip credential-shaped keys before persist.
+
+**P1 (before pilot):** wire `run_static_pipeline` at draft time so drafts carry real rendered commands (see Q2 — high value); add confidence gating `Field(ge=0, le=1)` + refuse low; add approve-path test coverage (currently **zero** tests hit `/api/change/{id}/approve` — guardrails b/c/d untested); redeploy the CP **after** both P0s land (deployment lag: `:8095` 404s `from-rca` today).
+
+**P2:** validate `target_device` against inventory (any string accepted today); registry-validate typed proposals via `spec_for(change_type).build()` for non-`custom_config`; stop rejected apply probes from mutating `validated→blocked`; add a "Review in Netcode" affordance to the UI success toast.
+
+> **Correction note:** my initial quick read graded this "GO, 3 minor conditions." The full adversarial pass upgraded it to **GO-WITH-CONDITIONS with 2 P0s** — I had under-weighted the approval-is-environmental hole (touches Invariant 1) and the `{**proposed}` credential pass-through. Grade corrected here; the Q&A below stands unchanged (the audit independently confirmed Q2 and Q5).
 
 ### 9.2 Answers to the 5 review questions
 1. **Is Slice 1 (discover-once) the next blocker for full parity?** For *parity*, yes it's foundational; for the *fastest credible POC*, no. It's a pilot-onboarding smoothness gap, not a demo blocker (pre-import the lab devices once). It's a different repo/owner (Netcode backend) than the demo spine (Rez UI) — **run Slice 1 in parallel, don't let it gate the demo.**
