@@ -1,5 +1,7 @@
 import json
 import subprocess
+import zipfile
+from io import BytesIO
 from pathlib import Path
 
 from fastapi.testclient import TestClient
@@ -1849,6 +1851,48 @@ def test_shell_desktop_profile_endpoint(tmp_path: Path, monkeypatch):
     assert data["client"]["browser_based"] is False
     assert data["transport"]["open_session"].endswith("/api/shell/open")
     assert data["boundaries"]["credentials"] == "runner-local inventory only"
+
+
+def test_windows_runner_package_contains_install_scripts_and_no_secrets():
+    from netcode.windows_runner_package import build_windows_runner_package
+
+    package = build_windows_runner_package("https://netcode.example.com", runner_pool="pilot")
+    with zipfile.ZipFile(BytesIO(package), "r") as archive:
+        names = set(archive.namelist())
+        combined = "\n".join(archive.read(name).decode("utf-8") for name in names)
+
+    assert {
+        "README.md",
+        "install-runner.ps1",
+        "start-runner.ps1",
+        "import-inventory.ps1",
+        "sample-inventory.yaml",
+        "netcode-shell-profile.json",
+    }.issubset(names)
+    assert "https://netcode.example.com" in combined
+    assert "wss://netcode.example.com" in combined
+    assert "runner_token" not in combined
+    assert "hmac_secret" not in combined
+    assert "<single-use-token>" in combined
+    assert "replace-me" in combined
+
+
+def test_windows_runner_download_endpoint_returns_zip(tmp_path: Path, monkeypatch):
+    init_workspace(WorkspacePaths(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("NETCODE_RUNNER_POOL", "pilot")
+
+    client = TestClient(api.app)
+    manifest = client.get("/api/runner/download/windows/manifest").json()
+    response = client.get("/api/runner/download/windows")
+
+    assert manifest["ok"] is True
+    assert manifest["platform"] == "windows"
+    assert manifest["runner_pool"] == "pilot"
+    assert response.status_code == 200
+    assert response.headers["content-type"] == "application/zip"
+    with zipfile.ZipFile(BytesIO(response.content), "r") as archive:
+        assert "install-runner.ps1" in archive.namelist()
 
 
 def test_ui_config_persists_editable_options_and_catalog(tmp_path: Path, monkeypatch):

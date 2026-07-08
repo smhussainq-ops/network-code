@@ -93,6 +93,7 @@ from netcode.ui_config import (
     write_ui_config,
 )
 from netcode.verification import verify_state, verify_vlan_state
+from netcode.windows_runner_package import build_windows_runner_package, package_manifest
 from netcode.workflow import state_after_lab_action, state_after_static_validation, workflow_snapshot
 from netcode.workflow_packs import workflow_pack_catalog
 from netcode.yamlio import write_yaml
@@ -1544,6 +1545,21 @@ _SHELL_SESSIONS: dict[str, dict[str, object]] = {}
 @app.get("/api/shell/desktop/profile")
 def api_shell_desktop_profile(request: Request) -> dict[str, object]:
     return build_desktop_shell_profile(str(request.base_url).rstrip("/"), runner_pool=runner_pool())
+
+
+@app.get("/api/runner/download/windows/manifest")
+def api_windows_runner_manifest(request: Request) -> dict[str, object]:
+    return package_manifest(str(request.base_url).rstrip("/"), runner_pool=runner_pool())
+
+
+@app.get("/api/runner/download/windows")
+def api_windows_runner_download(request: Request) -> Response:
+    package = build_windows_runner_package(str(request.base_url).rstrip("/"), runner_pool=runner_pool())
+    return Response(
+        content=package,
+        media_type="application/zip",
+        headers={"Content-Disposition": 'attachment; filename="netcode-windows-runner.zip"'},
+    )
 
 
 def _shell_transcript_path(p, session_id: str) -> Path:
