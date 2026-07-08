@@ -65,7 +65,7 @@ from netcode.auth import (
     token_hash,
     verify_password,
 )
-from netcode.models import load_intent
+from netcode.models import load_intent, load_intent_data
 from netcode.runner_hub import (
     authenticate_runner,
     enroll_runner,
@@ -95,6 +95,7 @@ from netcode.ui_config import (
 from netcode.verification import verify_state, verify_vlan_state
 from netcode.workflow import state_after_lab_action, state_after_static_validation, workflow_snapshot
 from netcode.workflow_packs import workflow_pack_catalog
+from netcode.yamlio import write_yaml
 
 
 class AddVlanRequest(BaseModel):
@@ -297,6 +298,19 @@ class RunnerReadRequest(BaseModel):
     timeout: float = 60.0
 
 
+class RcaRemediationProposalRequest(BaseModel):
+    source: str = "rez"
+    incident_id: str
+    target_device: str = ""
+    suggested_pack: str = "custom_config"
+    proposed_intent: dict[str, object] = {}
+    rationale: str = ""
+    confidence: float = 0.0
+    evidence_refs: list[str] = []
+    requested_by: str = "rez-rca"
+    title: str = ""
+
+
 class LoginRequest(BaseModel):
     email: str
     password: str
@@ -360,6 +374,101 @@ def _is_rez_bridge_request(path: str, authorization: str | None) -> bool:
 
 def _request_principal(request: Request) -> Principal:
     return getattr(request.state, "principal", SYSTEM_PRINCIPAL)
+
+
+_RCA_ALLOWED_CHANGE_TYPES = {
+    "add_vlan",
+    "interface_config",
+    "bgp_neighbor",
+    "acl_rule",
+    "site_device_intent",
+    "custom_config",
+    "ntp_standardize",
+}
+
+
+def _safe_slug(value: str, default: str = "rca-remediation") -> str:
+    slug = re.sub(r"[^a-zA-Z0-9_.-]+", "-", value.strip()).strip("-._").lower()
+    return slug[:80] or default
+
+
+def _proposal_targets(request: RcaRemediationProposalRequest) -> dict[str, object]:
+    raw_targets = request.proposed_intent.get("targets")
+    if isinstance(raw_targets, dict):
+        device_ids = raw_targets.get("device_ids")
+        device_group = raw_targets.get("device_group")
+        if isinstance(device_ids, list) and any(str(item).strip() for item in device_ids):
+            return {"device_ids": [str(item).strip() for item in device_ids if str(item).strip()]}
+        if str(device_group or "").strip():
+            return {"device_group": str(device_group).strip()}
+    target_device = request.target_device.strip()
+    if target_device:
+        return {"device_ids": [target_device]}
+    raise HTTPException(
+        status_code=400,
+        detail="RCA remediation proposals must include target_device or proposed_intent.targets.",
+    )
+
+
+def _proposal_lines(value: object) -> str:
+    if isinstance(value, list):
+        return "\n".join(str(item) for item in value if str(item).strip()).strip()
+    return str(value or "").strip()
+
+
+def _intent_from_rca_proposal(request: RcaRemediationProposalRequest) -> dict[str, object]:
+    proposed = dict(request.proposed_intent or {})
+    requested_type = str(proposed.get("change_type") or request.suggested_pack or "custom_config").strip()
+    change_type = requested_type if requested_type in _RCA_ALLOWED_CHANGE_TYPES else "custom_config"
+    targets = _proposal_targets(request)
+    site = str(proposed.get("site") or proposed.get("scope") or "rca-remediation").strip() or "rca-remediation"
+    policy = proposed.get("policy") if isinstance(proposed.get("policy"), dict) else {}
+    metadata = proposed.get("metadata") if isinstance(proposed.get("metadata"), dict) else {}
+    metadata = {
+        **metadata,
+        "requested_by": request.requested_by.strip() or "rez-rca",
+        "ticket_id": request.incident_id.strip(),
+        "learning_mode": True,
+        "source": "rez_rca",
+        "draft_only": True,
+        "human_approval_required": True,
+        "rationale": request.rationale,
+        "evidence_refs": request.evidence_refs,
+        "confidence": request.confidence,
+    }
+
+    if change_type == "custom_config":
+        config_lines = (
+            _proposal_lines(proposed.get("config_lines"))
+            or _proposal_lines(proposed.get("commands"))
+            or _proposal_lines(proposed.get("config"))
+            or "! Rez RCA draft requires engineer command review before apply"
+        )
+        rollback_lines = _proposal_lines(proposed.get("rollback_lines") or proposed.get("rollback"))
+        return {
+            "change_type": "custom_config",
+            "site": site,
+            "targets": targets,
+            "custom": {
+                "config_lines": config_lines,
+                "rollback_lines": rollback_lines,
+                "verify_contains": str(proposed.get("verify_contains") or "").strip(),
+                "description": request.rationale.strip() or request.title.strip() or "Draft created from Rez RCA.",
+                "acknowledge_no_rollback": not bool(rollback_lines.strip()),
+            },
+            "policy": policy,
+            "metadata": metadata,
+        }
+
+    intent = {
+        **proposed,
+        "change_type": change_type,
+        "site": site,
+        "targets": targets,
+        "policy": policy,
+        "metadata": metadata,
+    }
+    return intent
 
 
 @app.middleware("http")
@@ -1839,6 +1948,77 @@ def api_changes(request: Request) -> dict[str, object]:
     store = PlatformStore(paths())
     org = _request_principal(request).org_id
     return {"changes": [record_to_dict(record) for record in store.list_changes(org_id=org)]}
+
+
+@app.post("/api/changes/from-rca")
+def api_change_from_rca(request: RcaRemediationProposalRequest, http_request: Request) -> dict[str, object]:
+    """Create a Netcode draft change from a Rez RCA remediation proposal.
+
+    This is intentionally draft-only: it writes an intent artifact and change
+    record, but never queues a job or unlocks apply. Human review, dry-run, and
+    approval remain the write boundary.
+    """
+    if request.source.strip().lower() != "rez":
+        raise HTTPException(status_code=400, detail="Only Rez RCA proposals are accepted.")
+    if not request.incident_id.strip():
+        raise HTTPException(status_code=400, detail="incident_id is required.")
+
+    p = paths()
+    principal = _request_principal(http_request)
+    store = PlatformStore(p)
+    intent = _intent_from_rca_proposal(request)
+    try:
+        load_intent_data(intent)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid remediation intent: {exc}") from exc
+
+    incident_slug = _safe_slug(request.incident_id)
+    intent_path = p.intents / "rca" / f"{incident_slug}-{uuid.uuid4().hex[:8]}.yaml"
+    write_yaml(intent_path, intent)
+
+    title = request.title.strip() or f"Rez RCA remediation for {request.incident_id.strip()}"
+    target_device = request.target_device.strip() or None
+    requested_by = request.requested_by.strip() or "rez-rca"
+    change = store.create_change(
+        intent_path,
+        target_device,
+        requested_by=requested_by,
+        org_id=principal.org_id,
+        created_by_user_id=principal.user_id,
+    )
+    evidence = {
+        "source": "rez_rca",
+        "draft_only": True,
+        "human_approval_required": True,
+        "incident_id": request.incident_id.strip(),
+        "title": title,
+        "target_device": target_device,
+        "suggested_pack": request.suggested_pack,
+        "change_type": intent.get("change_type"),
+        "rationale": request.rationale,
+        "confidence": request.confidence,
+        "evidence_refs": request.evidence_refs,
+    }
+    store.update_change(change.id, "draft", evidence, workflow_state="draft")
+    store.record_workflow_event(
+        change.id,
+        "rca_proposal",
+        "draft",
+        "draft",
+        f"Created draft from Rez RCA proposal: {title}",
+        evidence,
+    )
+    change = store.get_change(change.id)
+    return {
+        "ok": True,
+        "draft_only": True,
+        "human_approval_required": True,
+        "change_id": change.id,
+        "change": record_to_dict(change),
+        "intent_path": str(intent_path),
+        "intent": intent,
+        "workflow": workflow_snapshot(change.workflow_state).as_dict(),
+    }
 
 
 @app.get("/api/jobs")
