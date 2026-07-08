@@ -1051,6 +1051,39 @@ def _collect_rez_state_for_troubleshooting(device) -> dict[str, object]:  # noqa
         executor.shutdown(wait=False, cancel_futures=True)
 
 
+def _import_runner_discovery_candidate(p: WorkspacePaths, discovery_result: dict[str, object]) -> dict[str, object]:
+    """Persist public discovery facts returned by the local runner.
+
+    Runner discovery owns device access and credentials. The control plane only
+    receives/imports the sanitized source_of_truth_candidate shape, using the
+    same import path as the manual review button.
+    """
+    result = dict(discovery_result)
+    if not result.get("ok"):
+        return result
+    candidate = result.get("source_of_truth_candidate")
+    if not isinstance(candidate, dict):
+        result["source_of_truth"] = {
+            "ok": False,
+            "source_of_truth_written": False,
+            "error": "Runner discovery did not return a source_of_truth_candidate.",
+        }
+        return result
+
+    source_result = DiscoveryService(p).import_candidate(candidate)
+    result["source_of_truth"] = source_result
+    safety = dict(result.get("safety") or {})
+    safety["source_of_truth_written"] = bool(source_result.get("ok"))
+    if source_result.get("ok"):
+        safety["message"] = "Discovery used runner-local collection and imported public facts into the control-plane source of truth."
+        result["device"] = source_result.get("device")
+    else:
+        safety["message"] = source_result.get("error") or "Source-of-truth import failed."
+        result["ok"] = False
+    result["safety"] = safety
+    return result
+
+
 @app.post("/api/readiness/devices")
 def api_readiness_devices(request: Request) -> dict[str, object]:
     """Live read test: can the platform actually read the trusted devices right now?"""
@@ -1097,7 +1130,8 @@ def api_discovery_scan(request: DiscoveryScanRequest, http_request: Request) -> 
         payload = {"host": request.host,
                    "platform": request.platform, "port": request.port, "device_id": request.device_id,
                    "site": request.site, "groups": request.groups}
-        return _runner_read(p, "discovery", payload, _request_principal(http_request).org_id)
+        discovery_result = _runner_read(p, "discovery", payload, _request_principal(http_request).org_id)
+        return _import_runner_discovery_candidate(p, discovery_result)
     return DiscoveryService(p).scan(
         host=request.host,
         username=request.username,

@@ -1071,6 +1071,89 @@ def test_runner_mode_device_credentials_rejected_before_queue_or_import(tmp_path
     assert "hunter2" not in json.dumps(client.get("/api/source-of-truth").json())
 
 
+def test_runner_discovery_auto_imports_public_source_of_truth_and_unblocks_planning(tmp_path: Path, monkeypatch):
+    """One runner discovery should make the device usable by Automation and Rez.
+
+    The runner may know credentials locally, but the control plane imports only
+    the public source_of_truth_candidate returned by the runner.
+    """
+    init_workspace(WorkspacePaths(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("NETCODE_EXECUTION", "runner")
+    monkeypatch.setenv("NETCODE_RUNNER_POOL", "store-lab")
+    calls: list[dict[str, object]] = []
+
+    def fake_runner_read(p, action, payload, org_id, timeout=60.0):  # noqa: ANN001
+        calls.append({"action": action, "payload": dict(payload), "org_id": org_id, "timeout": timeout})
+        if action == "discovery":
+            return {
+                "ok": True,
+                "provider": "rez-runner",
+                "source_of_truth_candidate": {
+                    "id": "edge-1",
+                    "hostname": "edge-1",
+                    "host": "192.0.2.10",
+                    "platform": "arista_eos",
+                    "site": "site-101",
+                    "groups": ["edge", "discovered"],
+                    "port": 2222,
+                    "username": "runner-admin",
+                    "password": "runner-secret",
+                },
+                "runner_inventory": {"action": "added"},
+                "safety": {"device_writes": "none", "source_of_truth_written": False},
+            }
+        if action == "rez_ssh_command":
+            return {"ok": True, "device": payload.get("device"), "stdout": "edge-1 uptime is 1 day", "status": "pass"}
+        raise AssertionError(f"unexpected runner action {action}")
+
+    monkeypatch.setattr(api, "_runner_read", fake_runner_read)
+    client = TestClient(api.app)
+
+    discovery = client.post(
+        "/api/discovery/scan",
+        json={"host": "192.0.2.10", "platform": "arista_eos", "device_id": "edge-1", "site": "site-101", "groups": ["edge"]},
+    )
+    discovery_body = discovery.json()
+
+    assert discovery.status_code == 200
+    assert discovery_body["ok"] is True
+    assert discovery_body["source_of_truth"]["ok"] is True
+    assert discovery_body["safety"]["source_of_truth_written"] is True
+    assert discovery_body["device"]["id"] == "edge-1"
+
+    source = client.get("/api/source-of-truth").json()
+    serialized_source = json.dumps(source)
+    assert "edge-1" in serialized_source
+    assert "192.0.2.10" in serialized_source
+    assert "runner-secret" not in serialized_source
+    assert "runner-admin" not in serialized_source
+
+    plan = client.post(
+        "/api/desired-state/plan",
+        json={
+            "change_type": "add_vlan",
+            "site": "site-101",
+            "device_id": "edge-1",
+            "requested_by": "unit",
+            "values": {"vlan_id": 210, "name": "APP_210", "subnet": "10.210.0.0/24"},
+        },
+    )
+    assert plan.status_code == 200
+    assert plan.json()["change"]["device_id"] == "edge-1"
+    assert "vlan 210" in plan.json()["pipeline"]["render"]["config"]
+
+    rez = client.post(
+        "/api/rez/runner-read",
+        json={"action": "rez_ssh_command", "payload": {"device": "edge-1", "command": "show version"}, "timeout": 10},
+    )
+    assert rez.status_code == 200
+    assert rez.json()["ok"] is True
+    assert rez.json()["device"] == "edge-1"
+    assert calls[-1]["action"] == "rez_ssh_command"
+    assert calls[-1]["payload"]["device"] == "edge-1"
+
+
 def test_runner_inventory_import_installs_credentials_locally(tmp_path: Path, monkeypatch):
     from types import SimpleNamespace
 
