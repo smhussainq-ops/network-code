@@ -1624,6 +1624,202 @@ def test_ansible_pack_plan_endpoint(tmp_path: Path, monkeypatch):
     assert data["execution"]["credentials_leave_runner"] is False
 
 
+def test_ansible_pack_run_blocks_without_runner_before_creating_change(tmp_path: Path, monkeypatch):
+    init_workspace(WorkspacePaths(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("NETCODE_EXECUTION", "local")
+    playbook = tmp_path / "playbooks" / "ntp.yml"
+    playbook.parent.mkdir(parents=True, exist_ok=True)
+    playbook.write_text(
+        """
+- hosts: all
+  tasks:
+    - name: Preview approved NTP
+      debug:
+        msg: ntp server 10.10.10.20
+""",
+        encoding="utf-8",
+    )
+
+    response = TestClient(api.app).post(
+        "/api/workflow-packs/ansible/run",
+        json={"playbook_path": "playbooks/ntp.yml", "targets": ["Access-SW-01"], "mode": "check"},
+    )
+    data = response.json()
+
+    assert response.status_code == 200
+    assert data["ok"] is False
+    assert data["queued"] is False
+    assert "runner-only" in data["message"]
+    assert PlatformStore(WorkspacePaths(tmp_path)).list_changes() == []
+
+
+def test_ansible_pack_run_queues_check_on_runner_without_credentials(tmp_path: Path, monkeypatch):
+    init_workspace(WorkspacePaths(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("NETCODE_EXECUTION", "runner")
+    monkeypatch.setenv("NETCODE_RUNNER_POOL", "pilot")
+    playbook = tmp_path / "playbooks" / "ntp.yml"
+    playbook.parent.mkdir(parents=True, exist_ok=True)
+    playbook.write_text(
+        """
+- hosts: all
+  tasks:
+    - name: Preview approved NTP
+      debug:
+        msg: ntp server 10.10.10.20
+""",
+        encoding="utf-8",
+    )
+
+    response = TestClient(api.app).post(
+        "/api/workflow-packs/ansible/run",
+        json={"playbook_path": "playbooks/ntp.yml", "targets": ["Access-SW-01"], "mode": "check"},
+    )
+    data = response.json()
+
+    assert response.status_code == 200
+    assert data["ok"] is True
+    assert data["queued"] is True
+    assert data["job"]["action"] == "ansible_check"
+    assert data["job"]["pool"] == "pilot"
+    payload = data["job"]["payload"]
+    assert payload["action"] == "ansible_pack"
+    assert payload["mode"] == "check"
+    assert payload["targets"] == ["Access-SW-01"]
+    serialized = json.dumps(payload).lower()
+    assert "password" not in serialized
+    assert "secret" not in serialized
+    assert data["change"]["workflow_state"] == "validated"
+
+
+def test_ansible_pack_run_apply_requires_approved_change(tmp_path: Path, monkeypatch):
+    paths = WorkspacePaths(tmp_path)
+    init_workspace(paths)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("NETCODE_EXECUTION", "runner")
+    playbook = tmp_path / "playbooks" / "ntp.yml"
+    rollback = tmp_path / "playbooks" / "rollback.yml"
+    playbook.parent.mkdir(parents=True, exist_ok=True)
+    playbook.write_text(
+        """
+- hosts: all
+  tasks:
+    - name: Configure NTP
+      debug:
+        msg: ntp server 10.10.10.20
+""",
+        encoding="utf-8",
+    )
+    rollback.write_text(
+        """
+- hosts: all
+  tasks:
+    - name: Roll back NTP
+      debug:
+        msg: rollback reviewed
+""",
+        encoding="utf-8",
+    )
+    change = PlatformStore(paths).create_change(playbook, "Access-SW-01")
+
+    response = TestClient(api.app).post(
+        "/api/workflow-packs/ansible/run",
+        json={
+            "playbook_path": "playbooks/ntp.yml",
+            "rollback_playbook_path": "playbooks/rollback.yml",
+            "targets": ["Access-SW-01"],
+            "mode": "apply",
+            "change_id": change.id,
+        },
+    )
+    data = response.json()
+
+    assert response.status_code == 200
+    assert data["ok"] is False
+    assert data["queued"] is False
+    assert "Approval required" in data["message"]
+    assert PlatformStore(paths).get_change(change.id).workflow_state == "draft"
+
+
+def test_runner_ansible_pack_reaudits_locally_and_uses_generated_inventory(tmp_path: Path, monkeypatch):
+    from netcode import runner_agent
+    from netcode.yamlio import read_yaml
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    playbook = workspace / "playbooks" / "ntp.yml"
+    playbook.parent.mkdir(parents=True)
+    playbook.write_text(
+        """
+- hosts: all
+  tasks:
+    - name: Preview approved NTP
+      debug:
+        msg: ntp server 10.10.10.20
+""",
+        encoding="utf-8",
+    )
+    inventory_file = tmp_path / "runner-inventory.yaml"
+    write_yaml(
+        inventory_file,
+        {
+            "devices": [
+                {
+                    "id": "Access-SW-01",
+                    "hostname": "Access-SW-01",
+                    "host": "192.0.2.10",
+                    "platform": "arista_eos",
+                    "username": "admin",
+                    "password": "local-only",
+                    "port": 22,
+                }
+            ]
+        },
+    )
+    monkeypatch.setenv("NETCODE_RUNNER_WORKSPACE", str(workspace))
+    monkeypatch.setattr(runner_agent, "INVENTORY_FILE", inventory_file)
+    monkeypatch.setattr("shutil.which", lambda binary: "/usr/bin/ansible-playbook" if binary == "ansible-playbook" else None)
+    captured: dict[str, object] = {}
+
+    class Completed:
+        returncode = 0
+        stdout = "PLAY RECAP ok=1"
+        stderr = ""
+
+    def fake_run(command, **kwargs):
+        captured["command"] = command
+        captured["kwargs"] = kwargs
+        inventory_path = Path(command[command.index("--inventory") + 1])
+        captured["inventory"] = read_yaml(inventory_path)
+        return Completed()
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    result = runner_agent._execute_ansible_pack(
+        {
+            "mode": "check",
+            "playbook_path": "playbooks/ntp.yml",
+            "targets": ["Access-SW-01"],
+        }
+    )
+
+    assert result["ok"] is True
+    assert result["status"] == "pass"
+    command = captured["command"]
+    assert isinstance(command, list)
+    assert "--check" in command
+    assert "--diff" in command
+    assert captured["kwargs"]["cwd"] == workspace
+    assert captured["kwargs"].get("shell") is not True
+    generated_inventory = captured["inventory"]
+    assert generated_inventory["all"]["hosts"]["Access-SW-01"]["ansible_host"] == "192.0.2.10"
+    assert generated_inventory["all"]["hosts"]["Access-SW-01"]["ansible_password"] == "local-only"
+    serialized_result = json.dumps(result).lower()
+    assert "local-only" not in serialized_result
+    assert result["evidence"]["credentials_leave_runner"] is False
+
+
 def test_shell_desktop_profile_is_native_and_secret_free():
     from netcode.shell_desktop import build_desktop_shell_profile
 

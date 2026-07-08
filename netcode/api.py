@@ -123,6 +123,7 @@ class AnsiblePackPlanRequest(BaseModel):
     targets: list[str] = []
     mode: str = "check"
     requested_by: str = "operator"
+    change_id: str = ""
 
 
 class IntentPathRequest(BaseModel):
@@ -717,6 +718,110 @@ def api_ansible_pack_plan(request: AnsiblePackPlanRequest) -> dict[str, object]:
         )
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/workflow-packs/ansible/run")
+def api_ansible_pack_run(request: AnsiblePackPlanRequest, http_request: Request) -> dict[str, object]:
+    p = paths()
+    try:
+        plan = build_ansible_pack_plan(
+            p.root,
+            playbook_path=request.playbook_path,
+            rollback_playbook_path=request.rollback_playbook_path,
+            targets=request.targets,
+            mode=request.mode,
+            requested_by=request.requested_by,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if not plan.get("ok"):
+        return {"ok": False, "queued": False, "status": "blocked", "plan": plan, "message": "Ansible plan is blocked."}
+    mode = str(plan.get("mode") or "check")
+    if not request.targets:
+        return {
+            "ok": False,
+            "queued": False,
+            "status": "blocked",
+            "plan": plan,
+            "message": "Ansible execution requires explicit target device IDs.",
+        }
+    if execution_mode() != "runner":
+        return {
+            "ok": False,
+            "queued": False,
+            "status": "blocked",
+            "plan": plan,
+            "message": "Ansible execution is runner-only because device credentials stay local.",
+        }
+    store = PlatformStore(p)
+    principal = _request_principal(http_request)
+    change = None
+    if request.change_id:
+        try:
+            change = store.get_change(request.change_id)
+        except Exception as exc:
+            raise HTTPException(status_code=404, detail=f"Unknown change {request.change_id}") from exc
+        if change.org_id != principal.org_id:
+            raise HTTPException(status_code=404, detail=f"Unknown change {request.change_id}")
+    if mode in {"canary", "apply"}:
+        if not change:
+            return {
+                "ok": False,
+                "queued": False,
+                "status": "blocked",
+                "plan": plan,
+                "message": "Canary/apply Ansible execution requires an approved Netcode change.",
+            }
+        if change.workflow_state != "approved":
+            return {
+                "ok": False,
+                "queued": False,
+                "status": "blocked",
+                "plan": plan,
+                "message": f"Approval required before Ansible {mode} (state: {change.workflow_state}).",
+            }
+    if not change:
+        marker = p.intents / "ansible" / f"ansible-{uuid.uuid4().hex[:8]}.yaml"
+        write_yaml(marker, {
+            "kind": "ansible_pack",
+            "playbook_path": request.playbook_path,
+            "rollback_playbook_path": request.rollback_playbook_path,
+            "targets": request.targets,
+            "mode": mode,
+            "metadata": {"requested_by": request.requested_by, "source": "netcode_ansible"},
+        })
+        change = store.create_change(
+            marker,
+            request.targets[0] if request.targets else None,
+            requested_by=request.requested_by,
+            org_id=principal.org_id,
+            created_by_user_id=principal.user_id,
+        )
+        change = store.update_change(change.id, "validated", {"source": "ansible", "plan": plan}, workflow_state="validated")
+    payload = {
+        "action": "ansible_pack",
+        "mode": mode,
+        "playbook_path": request.playbook_path,
+        "rollback_playbook_path": request.rollback_playbook_path,
+        "targets": request.targets,
+        "plan": plan,
+    }
+    job = store.queue_job(change.id, f"ansible_{mode}", runner_pool(), payload)
+    store.record_workflow_event(
+        change.id,
+        f"ansible_{mode}",
+        change.workflow_state,
+        change.workflow_state,
+        f"Queued Ansible {mode} for runner pool '{runner_pool()}'.",
+        {"job_id": job.id, "mode": mode, "runner_only": True},
+    )
+    return {
+        "ok": True,
+        "queued": True,
+        "change": record_to_dict(store.get_change(change.id)),
+        "job": record_to_dict(job),
+        "plan": plan,
+    }
 
 
 @app.post("/api/desired-state/plan")

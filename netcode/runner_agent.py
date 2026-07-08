@@ -137,6 +137,8 @@ def _execute_job(job: dict[str, Any]) -> dict[str, Any]:
     if job_action.startswith("read_"):
         return _execute_read(job_action[len("read_"):], payload)
     action = payload.get("action")
+    if action == "ansible_pack":
+        return _execute_ansible_pack(payload)
     device_spec = payload.get("device") or {}
     device_id = device_spec.get("id")
 
@@ -193,6 +195,160 @@ def _execute_job(job: dict[str, Any]) -> dict[str, Any]:
 
 def _runner_ws():
     return _RunnerPaths(Path(os.environ.get("NETCODE_RUNNER_WORKSPACE", "") or Path.cwd()).resolve())
+
+
+def _ansible_network_vars(platform: str) -> dict[str, Any]:
+    normalized = _netmiko_device_type(platform)
+    mapping = {
+        "arista_eos": {"ansible_connection": "network_cli", "ansible_network_os": "arista.eos.eos"},
+        "cisco_ios": {"ansible_connection": "network_cli", "ansible_network_os": "cisco.ios.ios"},
+        "cisco_xe": {"ansible_connection": "network_cli", "ansible_network_os": "cisco.ios.ios"},
+        "cisco_nxos": {"ansible_connection": "network_cli", "ansible_network_os": "cisco.nxos.nxos"},
+        "juniper_junos": {"ansible_connection": "netconf", "ansible_network_os": "junipernetworks.junos.junos"},
+        "fortinet": {"ansible_connection": "httpapi", "ansible_network_os": "fortinet.fortios.fortios"},
+        "paloalto_panos": {"ansible_connection": "local"},
+    }
+    return mapping.get(normalized, {"ansible_connection": "network_cli", "ansible_network_os": normalized})
+
+
+def _write_ansible_inventory(devices: list[Any], destination: Path) -> None:
+    from netcode.yamlio import write_yaml
+
+    hosts: dict[str, dict[str, Any]] = {}
+    for device in devices:
+        host_vars = {
+            "ansible_host": device.host,
+            "ansible_port": int(device.port),
+            "ansible_user": device.username,
+            "ansible_password": device.password,
+            **_ansible_network_vars(device.platform),
+        }
+        hosts[device.id] = {key: value for key, value in host_vars.items() if value not in (None, "")}
+    write_yaml(destination, {"all": {"hosts": hosts}})
+    destination.chmod(0o600)
+
+
+def _execute_ansible_pack(payload: dict[str, Any]) -> dict[str, Any]:
+    """Execute a reviewed Ansible pack on the local runner only.
+
+    The runner re-audits the playbook against its own workspace and generates a
+    temporary Ansible inventory from runner-local credentials. The control plane
+    can request a pack, but cannot provide or override device credentials.
+    """
+    import subprocess
+    import tempfile
+    import shutil
+
+    from netcode.ansible_backend import build_ansible_pack_plan
+    from netcode.inventory import Inventory
+
+    mode = str(payload.get("mode") or "check").strip().lower() or "check"
+    targets = [str(item).strip() for item in (payload.get("targets") or []) if str(item).strip()]
+    playbook_path = str(payload.get("playbook_path") or "").strip()
+    rollback_playbook_path = str(payload.get("rollback_playbook_path") or "").strip()
+    if not targets:
+        return {"ok": False, "status": "fail", "action": "ansible_pack", "mode": mode, "message": "Explicit target device IDs are required."}
+    if not INVENTORY_FILE.exists():
+        return {"ok": False, "status": "fail", "action": "ansible_pack", "mode": mode, "message": f"No local inventory at {INVENTORY_FILE}."}
+
+    ws_root = Path(os.environ.get("NETCODE_RUNNER_WORKSPACE", "") or Path.cwd()).resolve()
+    try:
+        local_plan = build_ansible_pack_plan(
+            ws_root,
+            playbook_path=playbook_path,
+            rollback_playbook_path=rollback_playbook_path,
+            targets=targets,
+            mode=mode,
+            requested_by=str(payload.get("requested_by") or "runner"),
+        )
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "status": "fail", "action": "ansible_pack", "mode": mode, "message": f"Local runner Ansible audit failed: {exc}"}
+    if not local_plan.get("ok"):
+        return {"ok": False, "status": "fail", "action": "ansible_pack", "mode": mode, "message": "Local runner Ansible audit blocked execution.", "evidence": {"plan": local_plan}}
+
+    inventory = Inventory(INVENTORY_FILE)
+    devices = []
+    missing = []
+    for target in targets:
+        device = inventory.find_device(target)
+        if device is None:
+            missing.append(target)
+        else:
+            devices.append(device)
+    if missing:
+        return {
+            "ok": False,
+            "status": "fail",
+            "action": "ansible_pack",
+            "mode": mode,
+            "message": f"Target device(s) not in local runner inventory: {', '.join(missing)}",
+            "evidence": {"plan": local_plan, "missing_targets": missing},
+        }
+
+    ansible_playbook = shutil.which("ansible-playbook")
+    if not ansible_playbook:
+        return {
+            "ok": False,
+            "status": "fail",
+            "action": "ansible_pack",
+            "mode": mode,
+            "message": "ansible-playbook is not installed on this runner.",
+            "evidence": {"plan": local_plan, "required_binary": "ansible-playbook"},
+        }
+
+    with tempfile.TemporaryDirectory(prefix="netcode-ansible-") as tempdir:
+        generated_inventory = Path(tempdir) / "inventory.yaml"
+        _write_ansible_inventory(devices, generated_inventory)
+        command = [
+            ansible_playbook,
+            str(local_plan["playbook"]["path"]),
+            "--inventory",
+            str(generated_inventory),
+            "--limit",
+            ",".join(device.id for device in devices),
+        ]
+        if mode == "check":
+            command.extend(["--check", "--diff"])
+        started = time.monotonic()
+        try:
+            completed = subprocess.run(
+                command,
+                cwd=ws_root,
+                capture_output=True,
+                text=True,
+                timeout=600,
+                check=False,
+            )
+        except subprocess.TimeoutExpired as exc:
+            return {
+                "ok": False,
+                "status": "fail",
+                "action": "ansible_pack",
+                "mode": mode,
+                "message": "ansible-playbook timed out after 600s.",
+                "duration_ms": int((time.monotonic() - started) * 1000),
+                "evidence": {"plan": local_plan, "stdout": str(exc.stdout or "")[-4000:], "stderr": str(exc.stderr or "")[-4000:]},
+            }
+    ok = completed.returncode == 0
+    return {
+        "ok": ok,
+        "status": "pass" if ok else "fail",
+        "action": "ansible_pack",
+        "mode": mode,
+        "targets": [device.id for device in devices],
+        "message": "Ansible pack completed on the local runner." if ok else "Ansible pack failed on the local runner.",
+        "duration_ms": int((time.monotonic() - started) * 1000),
+        "runner_version": VERSION,
+        "evidence": {
+            "plan": local_plan,
+            "runner_local_inventory": True,
+            "credentials_leave_runner": False,
+            "command": [command[0], "<playbook>", "--inventory", "<runner-generated-inventory>", "--limit", ",".join(device.id for device in devices), *(["--check", "--diff"] if mode == "check" else [])],
+            "stdout": str(completed.stdout or "")[-8000:],
+            "stderr": str(completed.stderr or "")[-8000:],
+            "returncode": completed.returncode,
+        },
+    }
 
 
 READ_TIMEOUT_SECONDS = 30
