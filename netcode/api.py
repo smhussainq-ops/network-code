@@ -386,6 +386,29 @@ _RCA_ALLOWED_CHANGE_TYPES = {
     "ntp_standardize",
 }
 
+_RCA_TOP_LEVEL_SECTIONS = {
+    "add_vlan": "vlan",
+    "interface_config": "interface",
+    "bgp_neighbor": "bgp",
+    "acl_rule": "acl",
+    "site_device_intent": "device",
+    "ntp_standardize": "ntp",
+}
+
+_RCA_SENSITIVE_KEY_PARTS = (
+    "password",
+    "passwd",
+    "pwd",
+    "secret",
+    "token",
+    "credential",
+    "api_key",
+    "apikey",
+    "private_key",
+    "privatekey",
+    "passphrase",
+)
+
 
 def _safe_slug(value: str, default: str = "rca-remediation") -> str:
     slug = re.sub(r"[^a-zA-Z0-9_.-]+", "-", value.strip()).strip("-._").lower()
@@ -416,16 +439,50 @@ def _proposal_lines(value: object) -> str:
     return str(value or "").strip()
 
 
+def _strip_sensitive_proposal_fields(value: object) -> object:
+    """Drop credential-shaped keys before any Rez proposal becomes CP intent YAML."""
+    if isinstance(value, dict):
+        cleaned: dict[str, object] = {}
+        for key, item in value.items():
+            key_text = str(key).lower()
+            if any(part in key_text for part in _RCA_SENSITIVE_KEY_PARTS):
+                continue
+            cleaned[str(key)] = _strip_sensitive_proposal_fields(item)
+        return cleaned
+    if isinstance(value, list):
+        return [_strip_sensitive_proposal_fields(item) for item in value]
+    return value
+
+
+def _safe_proposal_dict(value: object) -> dict[str, object]:
+    cleaned = _strip_sensitive_proposal_fields(value)
+    return cleaned if isinstance(cleaned, dict) else {}
+
+
+def _typed_proposal_section(change_type: str, proposed: dict[str, object]) -> dict[str, object]:
+    section = _RCA_TOP_LEVEL_SECTIONS.get(change_type)
+    if section and isinstance(proposed.get(section), dict):
+        return {section: _safe_proposal_dict(proposed.get(section))}
+    # Some callers may send the same field values used by desired-state plans.
+    # Use the registry builder to produce a typed section without copying extra keys.
+    values = proposed.get("values") if isinstance(proposed.get("values"), dict) else None
+    if isinstance(values, dict):
+        from netcode.change_types import spec_for
+
+        built: dict[str, object] = {}
+        spec_for(change_type).build(built, _safe_proposal_dict(values), "")
+        return {key: value for key, value in built.items() if key in _RCA_TOP_LEVEL_SECTIONS.values()}
+    return {}
+
+
 def _intent_from_rca_proposal(request: RcaRemediationProposalRequest) -> dict[str, object]:
-    proposed = dict(request.proposed_intent or {})
+    proposed = _safe_proposal_dict(request.proposed_intent or {})
     requested_type = str(proposed.get("change_type") or request.suggested_pack or "custom_config").strip()
     change_type = requested_type if requested_type in _RCA_ALLOWED_CHANGE_TYPES else "custom_config"
     targets = _proposal_targets(request)
     site = str(proposed.get("site") or proposed.get("scope") or "rca-remediation").strip() or "rca-remediation"
-    policy = proposed.get("policy") if isinstance(proposed.get("policy"), dict) else {}
-    metadata = proposed.get("metadata") if isinstance(proposed.get("metadata"), dict) else {}
+    policy = _safe_proposal_dict(proposed.get("policy")) if isinstance(proposed.get("policy"), dict) else {}
     metadata = {
-        **metadata,
         "requested_by": request.requested_by.strip() or "rez-rca",
         "ticket_id": request.incident_id.strip(),
         "learning_mode": True,
@@ -460,14 +517,14 @@ def _intent_from_rca_proposal(request: RcaRemediationProposalRequest) -> dict[st
             "metadata": metadata,
         }
 
-    intent = {
-        **proposed,
+    intent: dict[str, object] = {
         "change_type": change_type,
         "site": site,
         "targets": targets,
         "policy": policy,
         "metadata": metadata,
     }
+    intent.update(_typed_proposal_section(change_type, proposed))
     return intent
 
 
@@ -2009,6 +2066,7 @@ def api_change_from_rca(request: RcaRemediationProposalRequest, http_request: Re
     incident_slug = _safe_slug(request.incident_id)
     intent_path = p.intents / "rca" / f"{incident_slug}-{uuid.uuid4().hex[:8]}.yaml"
     write_yaml(intent_path, intent)
+    pipeline = run_static_pipeline(p, intent_path)
 
     title = request.title.strip() or f"Rez RCA remediation for {request.incident_id.strip()}"
     target_device = request.target_device.strip() or None
@@ -2032,6 +2090,14 @@ def api_change_from_rca(request: RcaRemediationProposalRequest, http_request: Re
         "rationale": request.rationale,
         "confidence": request.confidence,
         "evidence_refs": request.evidence_refs,
+        "pipeline": pipeline.model_dump(),
+        "plan": {
+            "commands": pipeline.render.config,
+            "rollback": intent.get("custom", {}).get("rollback_lines", "") if isinstance(intent.get("custom"), dict) else "",
+            "validation_status": pipeline.status,
+            "checks": [check.model_dump() for check in pipeline.validation.checks],
+            "artifacts": pipeline.artifacts.model_dump() if pipeline.artifacts else None,
+        },
     }
     store.update_change(change.id, "draft", evidence, workflow_state="draft")
     store.record_workflow_event(

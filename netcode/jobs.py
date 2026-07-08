@@ -19,6 +19,7 @@ from netcode.rendering import render_intent
 from netcode.store import PlatformStore, record_to_dict
 from netcode.ui_config import configured_inventory_path, configured_policy_path
 from netcode.workflow import require_action_allowed, state_after_lab_action
+from netcode.yamlio import read_yaml
 
 
 def execution_mode() -> str:
@@ -37,6 +38,18 @@ def approval_required() -> bool:
         return False
     from netcode.auth import auth_enabled
     return auth_enabled()
+
+
+def intrinsic_approval_required(intent_path: Path) -> bool:
+    """Machine-sourced drafts carry their own approval gate, independent of env."""
+    try:
+        intent = read_yaml(intent_path)
+    except Exception:
+        return False
+    metadata = intent.get("metadata") if isinstance(intent, dict) else {}
+    if not isinstance(metadata, dict):
+        return False
+    return bool(metadata.get("human_approval_required")) or str(metadata.get("source") or "").strip().lower() == "rez_rca"
 
 
 def runner_pool() -> str:
@@ -77,11 +90,13 @@ class JobRunner:
 
     def run_lab_action(self, intent_path: Path, action: str, device_id: str | None, change_id: str | None = None) -> dict[str, object]:
         change = self.store.get_change(change_id) if change_id else self.store.get_or_create_change(intent_path, device_id)
-        if action == "apply" and approval_required() and change.workflow_state != "approved":
+        intrinsic_gate = intrinsic_approval_required(intent_path)
+        needs_approval = approval_required() or intrinsic_gate
+        if action == "apply" and needs_approval and change.workflow_state != "approved":
             message = ("Approval gate: a second engineer must approve this change before apply. "
                        "The requester cannot approve their own change.")
             self.store.record_workflow_event(change.id, "apply", change.workflow_state, change.workflow_state,
-                                             message, {"blocked": True, "approval_required": True})
+                                             message, {"blocked": True, "approval_required": True, "intrinsic_approval_required": intrinsic_gate})
             return {
                 "ok": False,
                 "change": record_to_dict(self.store.get_change(change.id)),

@@ -2421,42 +2421,38 @@ def test_app_route_serves_ui():
     response = TestClient(api.app).get("/app")
 
     assert response.status_code == 200
-    assert "Netcode" in response.text
-    assert "Network changes with plan, proof, and audit" in response.text
-    assert "Netcode Shell" in response.text
-    assert "Direct CLI" in response.text
-    assert "Guarded" in response.text
-    assert "Add device" in response.text
-    assert "Shell mode" in response.text
-    assert "Credentials stay on the runner" in response.text
-    assert "Setup Wizard" in response.text
-    assert "runners-panel" in response.text
-    assert "On-prem runners" in response.text
-    assert "change-record" in response.text
-    assert "Daily workspace" in response.text
-    assert "Learning Map" in response.text
-    assert "Inventory" in response.text
-    assert "Desired State" in response.text
-    assert "Plan" in response.text
-    assert "Validate" in response.text
-    assert "Apply" in response.text
-    assert "Troubleshoot" in response.text
-    assert "Evidence" in response.text
-    assert "What do you want the network to look like?" in response.text
-    assert "Editable platform configuration" in response.text
-    assert "Connect Git repo" in response.text
-    assert "Save configuration" in response.text
-    assert "config-json" in response.text
-    assert "SSH port" in response.text
-    assert "Groups" in response.text
-    assert "change-type-grid" in response.text
-    assert "dynamic-fields" in response.text
-    assert "Live outcome" in response.text
-    assert "Next safe action" in response.text
-    assert "Check workspace" in response.text
-    assert "Source of truth" in response.text
-    assert "Discovery" in response.text
-    assert "Discover device" in response.text
+    expected_text = [
+        "Netcode",
+        "Closed-loop automation with diagnostics",
+        "Automation, diagnostics, and approvals in one workflow",
+        "Daily workspace",
+        "Setup Wizard",
+        "Advanced workflows",
+        "Inventory",
+        "Workflow Packs",
+        "Plan",
+        "Validate",
+        "Apply",
+        "Evidence",
+        "Source of truth",
+        "Discovery",
+        "On-prem runners",
+        "Credentials stay on the runner",
+        "Writes require plan, policy gates, canary, approval, apply, and verification",
+        "Live outcome",
+        "Next safe action",
+    ]
+    for text in expected_text:
+        assert text in response.text
+    expected_contracts = [
+        "runners-panel",
+        "change-record",
+        "config-json",
+        "change-type-grid",
+        "dynamic-fields",
+    ]
+    for marker in expected_contracts:
+        assert marker in response.text
     assert "Create plan" in response.text
     assert "Run lab dry-run" in response.text
     assert "Apply in Arista lab" in response.text

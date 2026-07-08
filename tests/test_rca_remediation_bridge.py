@@ -1,4 +1,5 @@
 from pathlib import Path
+import json
 
 from fastapi.testclient import TestClient
 
@@ -52,6 +53,9 @@ def test_rca_remediation_creates_draft_custom_change_without_jobs(tmp_path: Path
     assert change.device_id == "Branch-EDGE-03"
     assert change.last_job_id is None
     assert store.list_jobs() == []
+    assert change.result["plan"]["commands"]
+    assert change.result["pipeline"]["render"]["config"]
+    assert change.result["pipeline"]["artifacts"]["report_json_path"]
 
     intent = read_yaml(Path(change.intent_path))
     assert intent["change_type"] == "custom_config"
@@ -102,6 +106,95 @@ def test_rca_remediation_preserves_known_typed_intent(tmp_path: Path, monkeypatc
     assert intent["targets"] == {"device_ids": ["Edge-FW-01"]}
     assert intent["metadata"]["ticket_id"] == "INC-ACL-01"
     assert body["change"]["workflow_state"] == "draft"
+
+
+def test_rca_remediation_strips_credential_shaped_fields(tmp_path: Path, monkeypatch):
+    init_workspace(WorkspacePaths(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    client = TestClient(api.app)
+
+    response = client.post(
+        "/api/changes/from-rca",
+        json={
+            "source": "rez",
+            "incident_id": "INC-CREDS",
+            "target_device": "Edge-FW-01",
+            "suggested_pack": "acl_rule",
+            "rationale": "Scoped flow needs an explicit HTTPS permit.",
+            "proposed_intent": {
+                "change_type": "acl_rule",
+                "site": "Site-101",
+                "password": "hunter2",
+                "metadata": {"api_token": "token-should-not-persist", "operator_note": "safe"},
+                "policy": {"pci_reachable": False, "private_key": "key-should-not-persist"},
+                "acl": {
+                    "name": "EDGE-IN",
+                    "sequence": 40,
+                    "action": "permit",
+                    "protocol": "tcp",
+                    "source": "10.10.0.0/24",
+                    "destination": "203.0.113.10/32",
+                    "destination_port": "443",
+                    "enable_secret": "secret-should-not-persist",
+                },
+            },
+        },
+    )
+
+    assert response.status_code == 200
+    intent_path = Path(response.json()["intent_path"])
+    serialized = json.dumps(read_yaml(intent_path), sort_keys=True)
+    assert "hunter2" not in serialized
+    assert "token-should-not-persist" not in serialized
+    assert "key-should-not-persist" not in serialized
+    assert "secret-should-not-persist" not in serialized
+    assert "password" not in serialized.lower()
+    assert "api_token" not in serialized.lower()
+    assert "private_key" not in serialized.lower()
+    assert "enable_secret" not in serialized.lower()
+
+
+def test_rez_rca_draft_requires_approval_even_when_global_gate_off(tmp_path: Path, monkeypatch):
+    init_workspace(WorkspacePaths(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("NETCODE_REQUIRE_APPROVAL", "0")
+    monkeypatch.setenv("NETCODE_EXECUTION", "runner")
+    client = TestClient(api.app)
+
+    response = client.post(
+        "/api/changes/from-rca",
+        json={
+            "source": "rez",
+            "incident_id": "INC-APPROVAL",
+            "target_device": "v2-store1",
+            "suggested_pack": "custom_config",
+            "rationale": "Rez proposed a reviewed config draft.",
+            "proposed_intent": {
+                "site": "store-1842",
+                "config_lines": "vlan 991\n   name RCA_REVIEWED\n",
+                "rollback_lines": "no vlan 991\n",
+            },
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    store = PlatformStore(WorkspacePaths(tmp_path.resolve()))
+    change = store.get_change(body["change_id"])
+    store.record_workflow_event(change.id, "dry-run", change.workflow_state, "dry_run_passed", "dry-run proof", {})
+
+    from netcode.jobs import JobRunner
+
+    blocked = JobRunner(WorkspacePaths(tmp_path.resolve()), store=store).run_lab_action(
+        Path(body["intent_path"]),
+        "apply",
+        "v2-store1",
+        change.id,
+    )
+
+    assert blocked["ok"] is False
+    assert blocked["result"]["approval_required"] is True
+    assert blocked["result"]["workflow_state"] == "dry_run_passed"
 
 
 def test_rca_remediation_requires_target_scope(tmp_path: Path, monkeypatch):
