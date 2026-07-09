@@ -25,6 +25,7 @@ import os
 import re
 import signal
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -39,12 +40,70 @@ POLICY_FILE = IDENTITY_DIR / "policy.yaml"
 VERSION = "0.1.0-phase0"
 
 _stop = False
+_SHELL_ADAPTERS: dict[str, dict[str, Any]] = {}
+_SHELL_ADAPTER_LOCK = threading.Lock()
+_SHELL_ADAPTER_IDLE_SECONDS = 300.0
 
 
 def _handle_sigterm(signum, frame):  # noqa: ANN001
     global _stop
     _stop = True
     print("\n[runner] SIGTERM received — will exit after the current job drains.", flush=True)
+
+
+def _shell_adapter_key(payload: dict[str, Any], device_id: str) -> str:
+    session_id = str(payload.get("session_id") or "").strip()
+    return session_id or f"device:{device_id}"
+
+
+def _shell_adapter_for(key: str, device):  # noqa: ANN001
+    """Return a persistent CLI adapter for one REST shell session.
+
+    The browser sends `/api/shell/input` one line at a time. Reusing the same
+    adapter is what preserves device CLI mode across `conf t`, `interface ...`,
+    and later lines while keeping concurrent sessions isolated by session id.
+    """
+    from netcode.lab import AristaEOSLabAdapter
+
+    now = time.monotonic()
+    with _SHELL_ADAPTER_LOCK:
+        for existing_key, entry in list(_SHELL_ADAPTERS.items()):
+            if now - float(entry.get("last_used") or 0.0) <= _SHELL_ADAPTER_IDLE_SECONDS:
+                continue
+            adapter = entry.get("adapter")
+            try:
+                if adapter is not None:
+                    adapter.disconnect()
+            except Exception:
+                pass
+            _SHELL_ADAPTERS.pop(existing_key, None)
+
+        entry = _SHELL_ADAPTERS.get(key)
+        if entry and str(entry.get("device_id")) == str(device.id):
+            entry["last_used"] = now
+            return entry["adapter"]
+
+        if entry:
+            try:
+                entry.get("adapter").disconnect()
+            except Exception:
+                pass
+
+        adapter = AristaEOSLabAdapter(device)
+        adapter.connect()
+        _SHELL_ADAPTERS[key] = {"adapter": adapter, "device_id": str(device.id), "last_used": now}
+        return adapter
+
+
+def _shell_adapter_drop(key: str) -> None:
+    with _SHELL_ADAPTER_LOCK:
+        entry = _SHELL_ADAPTERS.pop(key, None)
+    adapter = (entry or {}).get("adapter")
+    if adapter is not None:
+        try:
+            adapter.disconnect()
+        except Exception:
+            pass
 
 
 def _canonical(value: dict[str, Any]) -> str:
@@ -1348,7 +1407,6 @@ def _execute_read_inner(action: str, payload: dict[str, Any]) -> dict[str, Any]:
         # Human CLI: the audit/guard runs HERE (the trust boundary). Config is
         # allowed for the interactive engineer path; unattended changes still
         # use the plan/dry-run/approval/apply pipeline.
-        from netcode.lab import AristaEOSLabAdapter
         from netcode.shell_guard import ShellSessionState, guard_submit
         inv = Inventory(INVENTORY_FILE)
         device = inv.find_device(str(payload.get("device_id") or ""))
@@ -1386,15 +1444,14 @@ def _execute_read_inner(action: str, payload: dict[str, Any]) -> dict[str, Any]:
         executed = False
         cleared = decision["kind"] in ("run_reads", "run_live", "direct")
         if decision["kind"] in ("run_reads", "run_live", "direct"):
-            adapter = AristaEOSLabAdapter(device)
+            adapter_key = _shell_adapter_key(payload, device.id)
             try:
-                adapter.connect()
+                adapter = _shell_adapter_for(adapter_key, device)
                 output = "\n".join(adapter.show(line.strip()) for line in decision["lines"])
                 executed = True
             except Exception as exc:  # noqa: BLE001
+                _shell_adapter_drop(adapter_key)
                 output = f"[shell] device read failed: {exc}"
-            finally:
-                adapter.disconnect()
         return {"ok": True, "cleared": cleared, "executed": executed, "guard_kind": decision["kind"],
                 "output": output, "events": decision["events"], "state": decision["state"],
                 "device_touched": bool(decision["state"].get("device_touched")),

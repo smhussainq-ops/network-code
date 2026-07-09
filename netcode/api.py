@@ -1696,7 +1696,12 @@ def api_shell_input(request: ShellInputRequest, http_request: Request) -> dict[s
     p = paths()
     org = _request_principal(http_request).org_id
     session = _shell_session_or_404(request.session_id, org)
-    payload = {"device_id": session["device_id"], "input": request.input, "state": session["state"]}
+    payload = {
+        "device_id": session["device_id"],
+        "session_id": request.session_id,
+        "input": request.input,
+        "state": session["state"],
+    }
     if execution_mode() == "runner":
         result = _runner_read(p, "shell", payload, org)
     else:

@@ -506,6 +506,89 @@ devices:
     assert calls["disconnect"] is True
 
 
+def test_runner_rest_shell_persists_cli_mode_per_session(tmp_path: Path, monkeypatch):
+    from netcode import lab, runner_agent
+
+    inv = tmp_path / "inventory.yaml"
+    inv.write_text(
+        """
+defaults:
+  username: admin
+  password: admin
+devices:
+  - id: v2-store1
+    host: 127.0.0.1
+    platform: arista_eos
+    port: 2222
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(runner_agent, "INVENTORY_FILE", inv)
+    runner_agent._SHELL_ADAPTERS.clear()
+    created = []
+
+    class FakeShellAdapter:
+        def __init__(self, device):
+            self.device = device
+            self.connected = False
+            self.in_config = False
+            self.commands = []
+            self.disconnects = 0
+            created.append(self)
+
+        def connect(self):
+            self.connected = True
+
+        def disconnect(self):
+            self.disconnects += 1
+            self.connected = False
+
+        def show(self, command):
+            self.commands.append(command)
+            normalized = " ".join(command.lower().split())
+            if normalized in ("configure terminal", "conf t", "configure"):
+                self.in_config = True
+                return "config"
+            if normalized == "end":
+                self.in_config = False
+                return "end"
+            if normalized.startswith("interface "):
+                if not self.in_config:
+                    raise RuntimeError("not in config mode")
+                return "interface"
+            return "ok"
+
+    monkeypatch.setattr(lab, "AristaEOSLabAdapter", FakeShellAdapter)
+
+    base_payload = {
+        "device_id": "v2-store1",
+        "session_id": "session-a",
+        "state": {"mode": "direct", "guard_enabled": False},
+    }
+    first = runner_agent._execute_read_inner("shell", {**base_payload, "input": "configure terminal"})
+    second = runner_agent._execute_read_inner("shell", {**base_payload, "state": first["state"], "input": "interface Loopback101"})
+
+    assert first["executed"] is True
+    assert second["executed"] is True
+    assert len(created) == 1
+    assert created[0].commands == ["configure terminal", "interface Loopback101"]
+
+    isolated = runner_agent._execute_read_inner(
+        "shell",
+        {
+            "device_id": "v2-store1",
+            "session_id": "session-b",
+            "state": {"mode": "direct", "guard_enabled": False},
+            "input": "interface Loopback202",
+        },
+    )
+
+    assert isolated["executed"] is False
+    assert "not in config mode" in isolated["output"]
+    assert len(created) == 2
+    runner_agent._SHELL_ADAPTERS.clear()
+
+
 def test_rez_runner_read_endpoint_strips_credentials_and_queues_only_supported_action(tmp_path: Path, monkeypatch):
     init_workspace(WorkspacePaths(tmp_path))
     monkeypatch.chdir(tmp_path)
