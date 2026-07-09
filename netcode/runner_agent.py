@@ -127,7 +127,7 @@ def _execute_job(job: dict[str, Any]) -> dict[str, Any]:
     # Imports are local so `enroll` works even without the full netcode package installed.
     import tempfile
     from netcode.inventory import Inventory
-    from netcode.lab import AristaEOSLabAdapter
+    from netcode.lab import AristaEOSLabAdapter, run_lab_action_for_device
     from netcode.models import load_intent
     from netcode.rendering import render_intent
     from netcode.runner_checks import local_policy_gate
@@ -177,15 +177,9 @@ def _execute_job(job: dict[str, Any]) -> dict[str, Any]:
         return {"status": "fail", "action": action, "device_id": device_id,
                 "message": f"Device {device_id} not in local runner inventory."}
 
-    adapter = AristaEOSLabAdapter(device)
-    if action == "dry-run":
-        lab = adapter.dry_run(intent, render)
-    elif action == "apply":
-        lab = adapter.apply(intent, render)
-    elif action == "rollback":
-        lab = adapter.rollback(intent, render)
-    else:
+    if action not in {"dry-run", "apply", "rollback"}:
         return {"status": "fail", "action": action, "device_id": device_id, "message": f"Unknown action {action}."}
+    lab = run_lab_action_for_device(device, intent, render, action)
     result = lab.__dict__ if hasattr(lab, "__dict__") else dict(lab)
     result.setdefault("action", action)
     result.setdefault("device_id", device_id)
@@ -1351,9 +1345,9 @@ def _execute_read_inner(action: str, payload: dict[str, Any]) -> dict[str, Any]:
         )
 
     if action == "shell":
-        # Governed CLI: the guard runs HERE (the trust boundary), and only a
-        # cleared read-only line is executed on the device. Config execution is
-        # never done raw — it stays in the proven plan/dry-run/apply pipeline.
+        # Human CLI: the audit/guard runs HERE (the trust boundary). Config is
+        # allowed for the interactive engineer path; unattended changes still
+        # use the plan/dry-run/approval/apply pipeline.
         from netcode.lab import AristaEOSLabAdapter
         from netcode.shell_guard import ShellSessionState, guard_submit
         inv = Inventory(INVENTORY_FILE)
@@ -1367,11 +1361,21 @@ def _execute_read_inner(action: str, payload: dict[str, Any]) -> dict[str, Any]:
             in_config=bool(raw.get("in_config", False)),
             device_touched=bool(raw.get("device_touched", False)),
         )
-        decision = guard_submit(state, str(payload.get("input", "")))
+        guard_enabled = bool(raw.get("guard_enabled", False))
+        if guard_enabled:
+            decision = guard_submit(state, str(payload.get("input", "")))
+        else:
+            lines = [line for line in str(payload.get("input", "")).replace("\r", "\n").split("\n") if line.strip()]
+            decision = {
+                "kind": "direct",
+                "lines": lines,
+                "events": [{"type": "guard", "action": "direct_mode", "message": "Full live shell: command sent to device and recorded."}],
+                "state": state.as_dict(),
+            }
         output = ""
         executed = False
-        cleared = decision["kind"] in ("run_reads", "config_staged")
-        if decision["kind"] == "run_reads":
+        cleared = decision["kind"] in ("run_reads", "run_live", "direct")
+        if decision["kind"] in ("run_reads", "run_live", "direct"):
             adapter = AristaEOSLabAdapter(device)
             try:
                 adapter.connect()
@@ -1381,8 +1385,6 @@ def _execute_read_inner(action: str, payload: dict[str, Any]) -> dict[str, Any]:
                 output = f"[shell] device read failed: {exc}"
             finally:
                 adapter.disconnect()
-        elif decision["kind"] == "config_staged":
-            output = "[staged] config line captured — stage & apply through the change pipeline."
         return {"ok": True, "cleared": cleared, "executed": executed, "guard_kind": decision["kind"],
                 "output": output, "events": decision["events"], "state": decision["state"],
                 "device_touched": bool(decision["state"].get("device_touched")),
@@ -1493,7 +1495,7 @@ def _start_interactive_channel(server: str, token: str) -> None:
             raw = frame.get("state") or {}
             state = ShellSessionState(mode=str(raw.get("mode", "read_only")),
                                       change_id=raw.get("change_id"), in_config=bool(raw.get("in_config", False)))
-            guard_enabled = bool(raw.get("guard_enabled", True))
+            guard_enabled = bool(raw.get("guard_enabled", False))
             sess = InteractivePtySession(
                 device, state,
                 on_output=lambda data, s=sid: send_frame({"t": "out", "sid": s, "d": base64.b64encode(data).decode()}),

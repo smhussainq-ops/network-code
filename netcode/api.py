@@ -185,7 +185,7 @@ class VerificationHandoffRequest(BaseModel):
 
 class ShellOpenRequest(BaseModel):
     device_id: str
-    guard_enabled: bool = True
+    guard_enabled: bool = False
 
 
 class ShellManualDeviceRequest(BaseModel):
@@ -1613,7 +1613,7 @@ def api_shell_open(request: ShellOpenRequest, http_request: Request) -> dict[str
     if not device:
         raise HTTPException(status_code=404, detail=f"Unknown device {request.device_id}")
     session_id = uuid.uuid4().hex[:16]
-    mode = "read_only" if request.guard_enabled else "direct"
+    mode = "guarded" if request.guard_enabled else "direct"
     state = {
         "mode": mode,
         "change_id": None,
@@ -1625,9 +1625,9 @@ def api_shell_open(request: ShellOpenRequest, http_request: Request) -> dict[str
     _shell_append(p, session_id, {"event": "session_opened", "device_id": device.id, "org_id": org,
                                   "guard_enabled": bool(request.guard_enabled)})
     if request.guard_enabled:
-        message = f"Guarded session open on {device.id}. Config mode is guarded until a change is attached."
+        message = f"Live shell open on {device.id}. Safety prompts remain enabled; transcript logging is on."
     else:
-        message = f"Direct CLI session open on {device.id}. Governance blocking is disabled; transcript logging remains on."
+        message = f"Full live shell open on {device.id}. Commands run on the device; transcript logging remains on."
     return {"ok": True, "session_id": session_id, "device_id": device.id, "platform": device.platform,
             "state": state, "message": message}
 
@@ -1641,7 +1641,7 @@ def _shell_session_or_404(session_id: str, org: str) -> dict[str, object]:
 
 @app.post("/api/shell/attach")
 def api_shell_attach(request: ShellAttachRequest, http_request: Request) -> dict[str, object]:
-    """Attach a change record so config mode becomes permitted."""
+    """Attach a change record as optional audit metadata for this live session."""
     p = paths()
     org = _request_principal(http_request).org_id
     session = _shell_session_or_404(request.session_id, org)
@@ -1657,7 +1657,7 @@ def api_shell_attach(request: ShellAttachRequest, http_request: Request) -> dict
     session["state"] = state
     _shell_append(p, request.session_id, {"event": "change_attached", "change_id": request.change_id})
     return {"ok": True, "session_id": request.session_id, "state": state,
-            "message": f"Change {request.change_id} attached — config mode is now permitted under governance."}
+            "message": f"Change {request.change_id} attached as session metadata. The shell remains live."}
 
 
 @app.post("/api/shell/quick-change")
@@ -1691,8 +1691,8 @@ def api_shell_quick_change(request: ShellQuickChangeRequest, http_request: Reque
 
 @app.post("/api/shell/input")
 def api_shell_input(request: ShellInputRequest, http_request: Request) -> dict[str, object]:
-    """Submit a line (or paste) to the governed session. The guard runs on the
-    runner; only cleared read-only lines reach the device."""
+    """Submit a line (or paste) to the live shell session. Any optional guard
+    runs on the runner; unattended automation gates live outside this path."""
     p = paths()
     org = _request_principal(http_request).org_id
     session = _shell_session_or_404(request.session_id, org)

@@ -1928,6 +1928,20 @@ def test_shell_desktop_profile_is_native_and_secret_free():
     assert "private_key" not in serialized
 
 
+def test_shell_open_defaults_to_full_live_mode(tmp_path: Path, monkeypatch):
+    paths = WorkspacePaths(tmp_path)
+    init_workspace(paths)
+    monkeypatch.chdir(tmp_path)
+
+    response = TestClient(api.app).post("/api/shell/open", json={"device_id": "v2-store1"})
+    body = response.json()
+
+    assert response.status_code == 200
+    assert body["state"]["mode"] == "direct"
+    assert body["state"]["guard_enabled"] is False
+    assert "Full live shell open" in body["message"]
+
+
 def test_shell_desktop_profile_endpoint(tmp_path: Path, monkeypatch):
     init_workspace(WorkspacePaths(tmp_path))
     monkeypatch.chdir(tmp_path)

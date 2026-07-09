@@ -13,8 +13,9 @@ Interactive model (how real jump-host command filters work):
 - Multi-line pastes are intercepted whole, before any byte is forwarded.
 
 Fail-closed philosophy:
-- Sessions start read-only; entering configuration mode is blocked until a
-  change record is attached.
+- The human shell is a real SSH terminal: configuration mode is allowed without
+  an automation change record. Netcode records the session passively; unattended
+  automation remains governed elsewhere.
 - Credential/AAA lines are blocked unconditionally (same invariant as the
   custom_config policy): the shell is never a credential push path.
 - Dangerous lines (reload, write erase, ...) need an explicit re-Enter
@@ -73,7 +74,7 @@ _SAFE_CONTROL = {"\r", "\n", "\t", "\x7f", "\x08", "\x03", "\x15"}
 class ShellSessionState:
     """Guard-relevant state for one governed session."""
 
-    mode: str = "read_only"  # read_only | change_attached
+    mode: str = "direct"  # direct | guarded | change_attached
     change_id: str | None = None
     in_config: bool = False
     device_touched: bool = False
@@ -99,9 +100,9 @@ class GuardDecision:
 
 # Philosophy: this is a real SSH terminal for good-faith engineers, so it is
 # ALLOW-BY-DEFAULT — any command flows unless it's one of three things:
-#   1. entering configuration mode (gated behind a change record),
-#   2. a genuinely destructive/disruptive exec command (needs a confirm),
-#   3. a credential/AAA line (always blocked) or command chaining.
+#   1. a genuinely destructive/disruptive exec command (needs a confirm),
+#   2. a credential/AAA line (always blocked),
+#   3. command chaining/control characters that make the audited line ambiguous.
 # Everything else — show/enable/en/terminal/ping/traceroute/bash-less reads,
 # vendor abbreviations, pipes to filters — just works, like SecureCRT.
 
@@ -261,22 +262,12 @@ def _enter_decision(state: ShellSessionState, enter_byte: str) -> GuardDecision:
         }])
 
     if kind == "config_enter":
-        if state.mode != "change_attached":
-            return GuardDecision(forward=KILL_LINE, events=[{
-                "type": "guard", "action": "blocked_config_mode",
-                "message": (
-                    "Config mode is guarded. Attach a change record before this "
-                    "session can change device configuration. No device config "
-                    "was touched."
-                ),
-                "options": ["attach_change", "create_change", "cancel"],
-            }])
         state.in_config = True
         state.device_touched = True
         return GuardDecision(forward=enter_byte, events=[{
-            "type": "guard", "action": "config_mode_entered",
+            "type": "guard", "action": "config_mode_entered_live",
             "change_id": state.change_id,
-            "message": f"Config mode entered under change {state.change_id}.",
+            "message": "Config mode entered live. The session is being recorded.",
         }, {"type": "command", "line": line.strip(), "kind": "config_enter",
             "change_id": state.change_id}])
 
@@ -389,7 +380,7 @@ def guard_submit(state: ShellSessionState, text: str) -> dict[str, Any]:
 
     Returns a dict with `kind`:
       - "run_reads": `lines` are cleared read-only commands to execute
-      - "config_staged": a cleared config line (never raw-executed here)
+      - "run_live": `lines` are cleared live CLI/config commands to execute
       - "paste_intercept": a config-ish paste to stage as a change
       - "blocked": guard refused; see `events`
     """
@@ -400,29 +391,27 @@ def guard_submit(state: ShellSessionState, text: str) -> dict[str, Any]:
     lines = [l for l in text.replace("\r", "\n").split("\n") if l.strip()]
 
     if len(lines) > 1:
-        paste = submit_paste(state, text)
-        if paste is not None:
-            return {"kind": "paste_intercept", "lines": [], "events": paste["events"], "state": paste["state"]}
-        # Multi-line, not config-ish: allow ONLY if EVERY line is a plain read.
+        # Multi-line input in the human shell runs live as long as every line
+        # passes the same per-line safety floor. This supports real config
+        # blocks while still rejecting credentials, chaining, and destructive
+        # commands that need an explicit one-line confirmation.
+        live_events: list[dict[str, Any]] = []
         for line in lines:
-            verdict = classify_line(line, state.in_config)
-            if verdict["kind"] not in ("read", "empty"):
-                return {"kind": "blocked", "lines": [], "state": state.as_dict(), "events": [{
-                    "type": "guard", "action": "blocked_mixed_multiline",
-                    "message": (
-                        "Blocked: multi-line input mixes reads with non-read "
-                        "commands. Send read commands one per line, or stage a "
-                        "configuration change. Nothing was sent to the device."
-                    ),
-                }]}
-        return {"kind": "run_reads", "lines": lines, "events": [], "state": state.as_dict()}
+            result = submit_line(state, line)
+            live_events.extend(result["events"])
+            if not result["cleared"] or result["kind"] in ("dangerous", "always_blocked", "blocked_chain"):
+                return {"kind": "blocked", "lines": [], "state": state.as_dict(), "events": live_events or result["events"]}
+        live_kind = "run_live" if state.device_touched or any(e.get("kind") in ("config_enter", "config_line") for e in live_events) else "run_reads"
+        return {"kind": live_kind, "lines": lines, "events": live_events, "state": state.as_dict()}
 
     single = lines[0] if lines else ""
     result = submit_line(state, single)
     if result["cleared"] and not state.in_config and result["kind"] in ("read", "config_exit", "empty"):
         return {"kind": "run_reads", "lines": [single], "events": result["events"], "state": result["state"]}
+    if result["cleared"] and result["kind"] in ("config_enter", "config_line"):
+        return {"kind": "run_live", "lines": [single], "events": result["events"], "state": result["state"]}
     if result["cleared"] and state.in_config:
-        return {"kind": "config_staged", "lines": [], "events": result["events"], "state": result["state"]}
+        return {"kind": "run_live", "lines": [single], "events": result["events"], "state": result["state"]}
     return {"kind": "blocked", "lines": [], "events": result["events"], "state": result["state"]}
 
 

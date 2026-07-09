@@ -6,9 +6,10 @@ import re
 import shutil
 import subprocess
 import time
+from difflib import unified_diff
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 from netcode.adapters.execution import ExecutionAdapter, ExecutionAdapterMetadata
 from netcode.adapters.registry import AdapterRegistry
@@ -33,6 +34,77 @@ class LabResult:
     message: str
     session_name: str = ""
     evidence: dict[str, object] = field(default_factory=dict)
+    dry_run_kind: str = ""
+
+
+DRY_RUN_CAPABILITIES: dict[str, dict[str, str]] = {
+    "arista_eos": {
+        "tier": "native",
+        "dry_run_kind": "native_session",
+        "mechanism": "EOS configure session + show session-config diffs + abort",
+    },
+    "cisco_ios": {
+        "tier": "offline",
+        "dry_run_kind": "offline_validation",
+        "mechanism": "read running-config + static validation + generated diff; canary before wider rollout",
+    },
+    "cisco_xe": {
+        "tier": "offline",
+        "dry_run_kind": "offline_validation",
+        "mechanism": "read running-config + static validation + generated diff; canary before wider rollout",
+    },
+    "cisco_nxos": {
+        "tier": "planned_native",
+        "dry_run_kind": "canary_only",
+        "mechanism": "native session support is planned; use canary verification until implemented",
+    },
+    "cisco_xr": {
+        "tier": "planned_native",
+        "dry_run_kind": "canary_only",
+        "mechanism": "commit check support is planned; use canary verification until implemented",
+    },
+    "juniper_junos": {
+        "tier": "planned_native",
+        "dry_run_kind": "canary_only",
+        "mechanism": "candidate commit-check support is planned; use canary verification until implemented",
+    },
+}
+
+
+def normalize_platform(platform: str) -> str:
+    normalized = str(platform or "").strip().lower().replace("-", "_").replace(" ", "_")
+    aliases = {
+        "arista": "arista_eos",
+        "eos": "arista_eos",
+        "arista_eos": "arista_eos",
+        "ios": "cisco_ios",
+        "cisco_ios": "cisco_ios",
+        "iosxe": "cisco_xe",
+        "cisco_iosxe": "cisco_xe",
+        "cisco_xe": "cisco_xe",
+        "nxos": "cisco_nxos",
+        "cisco_nxos": "cisco_nxos",
+        "iosxr": "cisco_xr",
+        "cisco_xr": "cisco_xr",
+        "junos": "juniper_junos",
+        "juniper_junos": "juniper_junos",
+    }
+    return aliases.get(normalized, normalized or "arista_eos")
+
+
+def dry_run_capability(platform: str) -> dict[str, str]:
+    normalized = normalize_platform(platform)
+    return {
+        "platform": normalized,
+        **DRY_RUN_CAPABILITIES.get(
+            normalized,
+            {
+                "tier": "canary",
+                "dry_run_kind": "canary_only",
+                "mechanism": "no native pre-commit or offline validator is implemented; prove on a canary before rollout",
+            },
+        ),
+    }
 
 
 class AristaEOSLabAdapter(ExecutionAdapter):
@@ -173,13 +245,15 @@ class AristaEOSLabAdapter(ExecutionAdapter):
             if action == "dry-run":
                 final = self._send_checked("abort")
                 transcript.append({"command": "abort", "output": final})
+                capability = dry_run_capability(self.device.platform)
                 return LabResult(
                     status="pass",
                     action=action,
                     device_id=self.device.id,
                     message="EOS accepted candidate config in a config session and the session was aborted.",
                     session_name=session_name,
-                    evidence={"diff": diff, "transcript": transcript},
+                    evidence={"diff": diff, "transcript": transcript, "dry_run_capability": capability},
+                    dry_run_kind="native_session",
                 )
             final = self._send_checked("commit")
             transcript.append({"command": "commit", "output": final})
@@ -402,6 +476,172 @@ class AristaEOSLabAdapter(ExecutionAdapter):
         )
 
 
+def _netmiko_device_type(platform: str) -> str:
+    normalized = normalize_platform(platform)
+    mapping = {
+        "arista_eos": "arista_eos",
+        "cisco_ios": "cisco_ios",
+        "cisco_xe": "cisco_xe",
+        "cisco_nxos": "cisco_nxos",
+        "juniper_junos": "juniper_junos",
+    }
+    return mapping.get(normalized, normalized)
+
+
+def _collect_running_config(device: Device, timeout: int = 45) -> str:
+    try:
+        from netmiko import ConnectHandler
+    except Exception as exc:
+        raise RuntimeError(f"netmiko is required for offline validation collection: {exc}") from exc
+
+    params = {
+        "device_type": _netmiko_device_type(device.platform),
+        "host": device.host,
+        "username": device.username,
+        "password": device.password,
+        "port": device.port,
+        "fast_cli": False,
+        "conn_timeout": timeout,
+        "auth_timeout": timeout,
+        "banner_timeout": timeout,
+    }
+    conn = ConnectHandler(**params)
+    try:
+        try:
+            conn.enable()
+        except Exception:
+            pass
+        return conn.send_command("show running-config", read_timeout=timeout)
+    finally:
+        conn.disconnect()
+
+
+def _offline_preconditions(rendered_config: str, running_config: str) -> list[dict[str, Any]]:
+    rendered_lines = [line.rstrip() for line in rendered_config.splitlines() if line.strip()]
+    checks: list[dict[str, Any]] = [
+        {
+            "id": "rendered_config_present",
+            "status": "pass" if bool(rendered_lines) else "fail",
+            "message": f"{len(rendered_lines)} rendered config line(s) available for offline validation.",
+        },
+        {
+            "id": "plain_cli_lines",
+            "status": "pass" if not any(("\x00" in line or "\r" in line) for line in rendered_lines) else "fail",
+            "message": "Rendered config uses plain CLI lines without control characters.",
+        },
+        {
+            "id": "current_config_collected",
+            "status": "pass" if bool(running_config.strip()) else "fail",
+            "message": "Current running-config was collected read-only from the device.",
+        },
+    ]
+    for line in rendered_lines:
+        stripped = line.strip()
+        if stripped.startswith("interface "):
+            interface = stripped.split(" ", 1)[1]
+            checks.append(
+                {
+                    "id": "interface_precondition",
+                    "status": "pass" if f"interface {interface}" in running_config else "warning",
+                    "message": (
+                        f"Interface {interface} exists in running-config."
+                        if f"interface {interface}" in running_config
+                        else f"Interface {interface} was not found in running-config; canary must prove this line."
+                    ),
+                }
+            )
+        if stripped.startswith("vlan "):
+            vlan = stripped.split(" ", 1)[1]
+            checks.append(
+                {
+                    "id": "vlan_precondition",
+                    "status": "pass" if f"vlan {vlan}" not in running_config else "warning",
+                    "message": (
+                        f"VLAN {vlan} is not already present."
+                        if f"vlan {vlan}" not in running_config
+                        else f"VLAN {vlan} already exists; rendered change may be idempotent."
+                    ),
+                }
+            )
+    return checks
+
+
+def offline_dry_run(device: Device, intent: Intent, render, running_config: str | None = None) -> LabResult:
+    capability = dry_run_capability(device.platform)
+    try:
+        current_config = running_config if running_config is not None else _collect_running_config(device)
+    except Exception as exc:
+        return LabResult(
+            status="fail",
+            action="dry-run",
+            device_id=device.id,
+            message=f"Offline validation could not collect running-config: {exc}",
+            evidence={"dry_run_capability": capability, "collection_error": str(exc)},
+            dry_run_kind="offline_validation",
+        )
+    checks = _offline_preconditions(render.config, current_config)
+    passed = all(check["status"] in {"pass", "warning"} for check in checks)
+    proposed = (current_config.rstrip() + "\n" + render.config.strip() + "\n") if current_config.strip() else render.config.strip() + "\n"
+    diff = "\n".join(
+        unified_diff(
+            current_config.splitlines(),
+            proposed.splitlines(),
+            fromfile=f"{device.id}:running-config",
+            tofile=f"{device.id}:candidate",
+            lineterm="",
+        )
+    )
+    return LabResult(
+        status="pass" if passed else "fail",
+        action="dry-run",
+        device_id=device.id,
+        message=(
+            f"No native pre-commit on {normalize_platform(device.platform)}; validated by static analysis "
+            "and read-only precondition checks. Change must still be proven on a canary before rollout."
+        ),
+        evidence={
+            "dry_run_capability": capability,
+            "preconditions": checks,
+            "diff": diff,
+            "rendered_config_lines": len([line for line in render.config.splitlines() if line.strip()]),
+            "current_config_collected": bool(current_config.strip()),
+        },
+        dry_run_kind="offline_validation",
+    )
+
+
+def run_lab_action_for_device(device: Device, intent: Intent, render, action: Literal["dry-run", "apply", "rollback"]) -> LabResult:
+    platform = normalize_platform(device.platform)
+    if action == "dry-run":
+        if platform == "arista_eos":
+            return AristaEOSLabAdapter(device).dry_run(intent, render)
+        capability = dry_run_capability(platform)
+        if capability["dry_run_kind"] == "offline_validation":
+            return offline_dry_run(device, intent, render)
+        return LabResult(
+            status="fail",
+            action=action,
+            device_id=device.id,
+            message=f"No native or offline dry-run validator is implemented for {platform}; use a human-approved canary.",
+            evidence={"dry_run_capability": capability},
+            dry_run_kind="canary_only",
+        )
+    if platform != "arista_eos":
+        return LabResult(
+            status="fail",
+            action=action,
+            device_id=device.id,
+            message=f"{action} is not implemented for {platform} in this runner yet.",
+            evidence={"platform": platform, "write_supported": False},
+        )
+    adapter = AristaEOSLabAdapter(device)
+    if action == "apply":
+        return adapter.apply(intent, render)
+    if action == "rollback":
+        return adapter.rollback(intent, render)
+    raise ValueError(f"Unsupported lab action {action}")
+
+
 def lab_status() -> dict[str, object]:
     if not shutil.which("clab"):
         return {"ok": False, "message": "clab is not on PATH"}
@@ -450,15 +690,7 @@ def run_lab_action(paths: WorkspacePaths, intent_path: Path, action: Literal["dr
         ).__dict__
 
     device = _device_for_intent(paths, intent, device_id)
-    adapter = AristaEOSLabAdapter(device)
-    if action == "dry-run":
-        result = adapter.dry_run(intent, render)
-    elif action == "apply":
-        result = adapter.apply(intent, render)
-    elif action == "rollback":
-        result = adapter.rollback(intent, render)
-    else:
-        raise ValueError(f"Unsupported lab action {action}")
+    result = run_lab_action_for_device(device, intent, render, action)
 
     payload = result.__dict__.copy()
     if result.status == "pass" and action in {"apply", "rollback"}:

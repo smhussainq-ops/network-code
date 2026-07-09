@@ -2,13 +2,10 @@
 
 Opens a real SSH shell channel (paramiko invoke_shell) and bridges it to an
 upstream message stream. When guard mode is enabled, every byte of engineer
-INPUT is run through the streaming shell guard (shell_guard.feed) before it can
-reach the device: config mode is blocked until a change is attached,
-credential/dangerous/unknown commands are killed at Enter, pastes are staged,
-history-recall taints the line. In direct mode, input is passed through as a
-normal SSH terminal while command lines are still emitted for the evidence
-transcript. Device OUTPUT streams back upstream in real time (the read
-direction).
+INPUT defaults to a direct live SSH terminal while command lines are still
+emitted for the evidence transcript. Optional guard mode can still prompt or
+block selected risky input at Enter. Device OUTPUT streams back upstream in real
+time (the read direction).
 
 The whole session — every guarded input decision and a size-bounded sample of
 output — is emitted as the evidence transcript. Credentials never leave the
@@ -38,7 +35,7 @@ class InteractivePtySession:
         on_output: OnOutput,
         on_event: OnEvent,
         *,
-        guard_enabled: bool = True,
+        guard_enabled: bool = False,
     ):
         self.device = device
         self.state = state
