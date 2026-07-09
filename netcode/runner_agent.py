@@ -1366,6 +1366,16 @@ def _execute_read_inner(action: str, payload: dict[str, Any]) -> dict[str, Any]:
             decision = guard_submit(state, str(payload.get("input", "")))
         else:
             lines = [line for line in str(payload.get("input", "")).replace("\r", "\n").split("\n") if line.strip()]
+            for line in lines:
+                normalized = " ".join(line.lower().split())
+                if normalized in ("configure terminal", "conf t", "configure"):
+                    state.in_config = True
+                elif normalized in ("end", "disable"):
+                    state.in_config = False
+                elif normalized == "exit" and state.in_config:
+                    continue
+                elif state.in_config and normalized and not normalized.startswith(("show ", "do show ")):
+                    state.device_touched = True
             decision = {
                 "kind": "direct",
                 "lines": lines,
