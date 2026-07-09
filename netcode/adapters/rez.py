@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib
+import inspect
 import os
 import sys
 import time
@@ -39,6 +40,20 @@ PLATFORM_ALIASES = {
     "nokia": "nokia_srl",
 }
 
+READ_TRANSPORTS: dict[str, tuple[str, ...]] = {
+    "arista_eos": ("ssh", "api"),
+    "cisco_ios": ("ssh",),
+    "cisco_nxos": ("ssh",),
+    "cisco_asa": ("ssh",),
+    "juniper_junos": ("ssh",),
+    "nokia_srl": ("ssh",),
+    "fortinet": ("ssh", "api"),
+    "palo_alto": ("ssh", "api"),
+    "aruba_aoscx": ("api",),
+    "cisco_sdwan": ("api",),
+    "meraki": ("api",),
+}
+
 
 class RezAdapterBridge:
     def __init__(self, root: str | Path | None = None):
@@ -49,14 +64,13 @@ class RezAdapterBridge:
     def _default_root(self) -> Path:
         candidates = [
             os.environ.get("NETCODE_REZ_ROOT"),
-            "/Users/syedhussain/Dev/Prod/resonance-core",
-            "/home/syedhussain/resonance-core",
-            "/Users/syedhussain/Dev/Prod/resonance-core/Claude/resonance-core",
             "/Users/syedhussain/Dev/Claude/resonance-core",
+            "/home/syedhussain/resonance-core",
+            "/Users/syedhussain/Dev/Prod/resonance-core",
             "/Users/syedhussain/resonance-core",
         ]
         for candidate in candidates:
-            if candidate and Path(candidate).exists():
+            if candidate and (Path(candidate) / "drivers" / "collector.py").is_file():
                 return Path(candidate)
         return Path("/Users/syedhussain/Dev/Claude/resonance-core")
 
@@ -140,11 +154,124 @@ class RezAdapterBridge:
                     "platform": platform,
                     "driver": f"{driver_cls.__module__}.{driver_cls.__name__}",
                     "capabilities": ["connect", "disconnect", "get_full_state"],
+                    "read_transports": list(READ_TRANSPORTS.get(platform, ("ssh",))),
                 }
                 for platform, driver_cls in sorted(driver_map.items())
             ],
             "error": self._error,
         }
+
+    @staticmethod
+    def _as_bool(value: Any, default: bool = False) -> bool:
+        if value is None:
+            return default
+        if isinstance(value, bool):
+            return value
+        return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+    @staticmethod
+    def _as_port(value: Any, default: int) -> int:
+        try:
+            port = int(value)
+        except (TypeError, ValueError):
+            return default
+        return port if 1 <= port <= 65535 else default
+
+    def _driver_kwargs(self, device: Device, platform: str) -> dict[str, Any]:
+        """Build the real constructor contract for one Rez vendor driver.
+
+        Netcode's legacy bridge passed ``device.port`` as the fourth positional
+        argument for every driver. That silently treated forwarded SSH ports as
+        HTTPS ports on FortiGate/PAN-OS and discarded API tokens/controller IDs.
+        The runner-local inventory now carries those fields explicitly.
+        """
+        options = dict(device.connection_options or {})
+        transport = str(options.get("transport") or "auto").strip().lower()
+        raw_port = self._as_port(device.port, 22)
+        explicit_api_port = options.get("api_port")
+        explicit_ssh_port = options.get("ssh_port")
+        api_port = self._as_port(
+            explicit_api_port,
+            raw_port if transport == "api" or (raw_port != 22 and raw_port in {443, 8443}) else 443,
+        )
+        ssh_port = self._as_port(
+            explicit_ssh_port,
+            raw_port if transport != "api" and raw_port not in {443, 8443} else 22,
+        )
+        common: dict[str, Any] = {
+            "hostname": device.host,
+            "username": device.username,
+            "password": device.password,
+        }
+
+        if platform == "fortinet":
+            api_hint = bool(options.get("api_token") or explicit_api_port is not None or raw_port in {443, 8443})
+            use_api = self._as_bool(options.get("use_api"), transport == "api" or (transport == "auto" and api_hint))
+            return {
+                **common,
+                "port": api_port,
+                "ssh_port": ssh_port,
+                "api_token": options.get("api_token"),
+                "use_api": use_api,
+                "verify_ssl": self._as_bool(options.get("verify_ssl"), False),
+                "vdom": str(options.get("vdom") or "root"),
+            }
+        if platform == "palo_alto":
+            api_hint = explicit_api_port is not None or raw_port in {443, 8443}
+            use_api = self._as_bool(options.get("use_api"), transport == "api" or (transport == "auto" and api_hint))
+            return {
+                **common,
+                "port": api_port,
+                "ssh_port": ssh_port,
+                "use_api": use_api,
+                "verify_ssl": self._as_bool(options.get("verify_ssl"), False),
+            }
+        if platform == "arista_eos":
+            return {
+                **common,
+                "port": ssh_port,
+                "eapi_port": self._as_port(options.get("eapi_port") or explicit_api_port, 443),
+                "use_eapi": self._as_bool(options.get("use_eapi"), transport == "api"),
+            }
+        if platform == "meraki":
+            return {
+                **common,
+                "port": api_port,
+                "api_key": options.get("api_key"),
+                "organization_id": options.get("organization_id"),
+                "network_id": options.get("network_id"),
+            }
+        if platform == "cisco_sdwan":
+            return {
+                **common,
+                "port": api_port,
+                "device_id": options.get("managed_device_id"),
+            }
+        if platform == "aruba_aoscx":
+            return {
+                **common,
+                "port": api_port,
+                "verify_ssl": self._as_bool(options.get("verify_ssl"), False),
+                "api_version": options.get("api_version"),
+            }
+        return {**common, "port": ssh_port}
+
+    def build_driver(self, device: Device) -> tuple[str, Any]:
+        """Instantiate the normalized Rez driver for a runner-local device."""
+        driver_map = self._load_driver_map()
+        platform = self.normalize_platform(device.platform)
+        driver_cls = driver_map.get(platform)
+        if not driver_cls:
+            raise ValueError(f"Rez has no driver for platform {device.platform}")
+        kwargs = self._driver_kwargs(device, platform)
+        signature = inspect.signature(driver_cls)
+        parameters = signature.parameters
+        accepts_any = any(parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in parameters.values())
+        if "hostname" not in parameters and "host" in parameters:
+            kwargs["host"] = kwargs.pop("hostname")
+        if not accepts_any:
+            kwargs = {key: value for key, value in kwargs.items() if key in parameters}
+        return platform, driver_cls(**kwargs)
 
     async def collect_device_state_async(self, device: Device) -> dict[str, object]:
         started = time.perf_counter()
@@ -161,7 +288,8 @@ class RezAdapterBridge:
                 "collection_time": round(time.perf_counter() - started, 3),
                 "error": self._error or "Rez drivers unavailable",
             }
-        driver_cls = driver_map.get(device.platform)
+        platform = self.normalize_platform(device.platform)
+        driver_cls = driver_map.get(platform)
         if not driver_cls:
             error = f"Rez has no driver for platform {device.platform}"
             return {
@@ -177,7 +305,7 @@ class RezAdapterBridge:
                 "supported_platforms": sorted(driver_map.keys()),
             }
 
-        driver = driver_cls(device.host, device.username, device.password, device.port)
+        _, driver = self.build_driver(device)
         try:
             await driver.connect()
             state = await driver.get_full_state()
@@ -195,9 +323,10 @@ class RezAdapterBridge:
             return {
                 "ok": True,
                 "device_id": device.id,
-                "platform": device.platform,
+                "platform": platform,
                 "driver": f"{driver_cls.__module__}.{driver_cls.__name__}",
-                "adapter": f"rez.{device.platform}",
+                "adapter": f"rez.{platform}",
+                "read_transports": list(READ_TRANSPORTS.get(platform, ("ssh",))),
                 "state": state_payload,
                 "warnings": warnings,
                 "errors": errors,
@@ -208,9 +337,9 @@ class RezAdapterBridge:
             return {
                 "ok": False,
                 "device_id": device.id,
-                "platform": device.platform,
+                "platform": platform,
                 "driver": f"{driver_cls.__module__}.{driver_cls.__name__}",
-                "adapter": f"rez.{device.platform}",
+                "adapter": f"rez.{platform}",
                 "state": None,
                 "warnings": [],
                 "errors": [error],

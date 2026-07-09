@@ -2572,7 +2572,19 @@ function fleetWaveClicks(event) {
 }
 
 function shellDevices() {
-  return (appState.source?.devices || []).map((d) => d.id).filter(Boolean);
+  const profiles = new Map((appState.rezPlatforms?.platforms || [])
+    .filter((item) => item && typeof item === "object")
+    .map((item) => [String(item.platform || ""), item]));
+  const apiOnly = new Set(["meraki", "cisco_sdwan"]);
+  return (appState.source?.devices || [])
+    .filter((device) => {
+      const platform = String(device.platform || "");
+      const profile = profiles.get(platform);
+      if (profile && Array.isArray(profile.read_transports)) return profile.read_transports.includes("ssh");
+      return !apiOnly.has(platform);
+    })
+    .map((device) => device.id)
+    .filter(Boolean);
 }
 
 function shellGuardEnabled() {
@@ -2905,9 +2917,12 @@ async function openShellEvidence() {
 function shellPlatformOptions() {
   const raw = appState.rezPlatforms?.platforms || appState.rezPlatforms || {};
   let platforms = [];
-  if (Array.isArray(raw)) platforms = raw.map((item) => typeof item === "string" ? item : item.platform || item.id).filter(Boolean);
+  if (Array.isArray(raw)) platforms = raw
+    .filter((item) => typeof item === "string" || !Array.isArray(item.read_transports) || item.read_transports.includes("ssh"))
+    .map((item) => typeof item === "string" ? item : item.platform || item.id)
+    .filter(Boolean);
   else if (raw && typeof raw === "object") platforms = Object.keys(raw);
-  if (!platforms.length) platforms = ["arista_eos", "cisco_ios", "cisco_nxos", "juniper_junos", "aruba_aoscx"];
+  if (!platforms.length) platforms = ["arista_eos", "cisco_ios", "cisco_nxos", "cisco_asa", "juniper_junos", "fortinet", "palo_alto", "nokia_srl"];
   return [...new Set(platforms)].sort();
 }
 

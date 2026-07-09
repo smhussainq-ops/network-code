@@ -97,6 +97,95 @@ DRIVER_MAP = {"fake_os": FakeDriver}
     assert bridge.platforms()["platforms"][0]["platform"] == "fake_os"
 
 
+def test_inventory_preserves_runner_local_vendor_api_options(tmp_path: Path):
+    inventory_path = tmp_path / "inventory.yaml"
+    inventory_path.write_text(
+        """
+defaults:
+  username: admin
+  password: local-only
+devices:
+  - id: fgt-hub
+    host: 127.0.0.1
+    platform: fortinet
+    port: 3122
+    connection:
+      transport: api
+      ssh_port: 3122
+      api_port: 3143
+      api_token: token-local-only
+      vdom: root
+""".strip(),
+        encoding="utf-8",
+    )
+
+    device = Inventory(inventory_path).by_id["fgt-hub"]
+
+    assert device.port == 3122
+    assert device.connection_options["transport"] == "api"
+    assert device.connection_options["ssh_port"] == 3122
+    assert device.connection_options["api_port"] == 3143
+    assert device.connection_options["api_token"] == "token-local-only"
+    assert "token-local-only" not in repr(device)
+
+
+def test_rez_bridge_builds_vendor_specific_ssh_and_api_driver_contracts():
+    captured: dict[str, dict] = {}
+
+    def fake_driver(platform):
+        class Driver:
+            def __init__(self, **kwargs):
+                captured[platform] = kwargs
+
+        return Driver
+
+    bridge = RezAdapterBridge(root="/missing")
+    bridge._driver_map = {
+        platform: fake_driver(platform)
+        for platform in ("cisco_ios", "fortinet", "palo_alto", "meraki", "cisco_sdwan")
+    }
+
+    def device(platform, options=None, port=22):
+        return Device(
+            id=platform,
+            host="192.0.2.10",
+            platform=platform,
+            username="operator",
+            password="local-password",
+            port=port,
+            hostname=platform,
+            site="lab",
+            groups=(),
+            connection_options=options or {},
+        )
+
+    bridge.build_driver(device("cisco_ios", {"ssh_port": 2222}))
+    bridge.build_driver(device("fortinet", {"ssh_port": 2223, "api_port": 8443, "api_token": "fgt-token"}))
+    bridge.build_driver(device("palo_alto", {"transport": "api", "ssh_port": 2224, "api_port": 9443}))
+    bridge.build_driver(device("meraki", {"api_key": "meraki-key", "organization_id": "org-1", "network_id": "net-1"}))
+    bridge.build_driver(device("cisco_sdwan", {"api_port": 8443, "managed_device_id": "10.0.0.1"}))
+
+    assert captured["cisco_ios"]["port"] == 2222
+    assert captured["fortinet"] | {"password": "redacted"} == {
+        "hostname": "192.0.2.10",
+        "username": "operator",
+        "password": "redacted",
+        "port": 8443,
+        "ssh_port": 2223,
+        "api_token": "fgt-token",
+        "use_api": True,
+        "verify_ssl": False,
+        "vdom": "root",
+    }
+    assert captured["palo_alto"]["use_api"] is True
+    assert captured["palo_alto"]["port"] == 9443
+    assert captured["palo_alto"]["ssh_port"] == 2224
+    assert captured["meraki"]["api_key"] == "meraki-key"
+    assert captured["meraki"]["organization_id"] == "org-1"
+    assert captured["cisco_sdwan"]["device_id"] == "10.0.0.1"
+    assert captured["cisco_sdwan"]["port"] == 8443
+
+
 def test_discovery_service_builds_source_of_truth_candidate(tmp_path: Path):
     paths = WorkspacePaths(tmp_path)
     init_workspace(paths)
@@ -506,8 +595,128 @@ devices:
     assert calls["disconnect"] is True
 
 
+def test_vendor_aware_shell_uses_runner_local_ssh_port(monkeypatch):
+    import sys
+    import types
+
+    from netcode.adapters.shell import NetmikoShellAdapter
+
+    calls = {}
+
+    class FakeConnection:
+        def __init__(self, **kwargs):
+            calls.update(kwargs)
+
+        def enable(self):
+            raise RuntimeError("no IOS enable mode")
+
+        def send_command_timing(self, command, **kwargs):  # noqa: ANN001
+            calls["command"] = command
+            return "FortiGate output"
+
+        def disconnect(self):
+            calls["disconnected"] = True
+
+    monkeypatch.setitem(sys.modules, "netmiko", types.SimpleNamespace(ConnectHandler=FakeConnection))
+    device = Device(
+        id="fgt-hub",
+        host="127.0.0.1",
+        platform="fortinet",
+        username="admin",
+        password="local-only",
+        port=8443,
+        hostname="fgt-hub",
+        site="lab",
+        groups=(),
+        connection_options={"ssh_port": 2222, "api_port": 8443, "api_token": "local-token"},
+    )
+
+    adapter = NetmikoShellAdapter(device)
+    adapter.connect()
+    output = adapter.show("get system status")
+    adapter.disconnect()
+
+    assert output == "FortiGate output"
+    assert calls["device_type"] == "fortinet"
+    assert calls["port"] == 2222
+    assert calls["command"] == "get system status"
+    assert calls["disconnected"] is True
+
+
+def test_vendor_aware_shell_rejects_api_only_controller():
+    from netcode.adapters.shell import netmiko_device_type
+
+    try:
+        netmiko_device_type("meraki")
+    except ValueError as exc:
+        assert "API-only" in str(exc)
+    else:  # pragma: no cover - explicit failure message
+        raise AssertionError("Meraki Dashboard must not be presented as an SSH Shell target")
+
+
+def test_interactive_pty_uses_ssh_port_not_vendor_api_port(monkeypatch):
+    import sys
+    import types
+
+    from netcode.shell_guard import ShellSessionState
+    from netcode.shell_pty import InteractivePtySession
+
+    calls = {}
+
+    class FakeChannel:
+        def settimeout(self, _timeout):
+            return None
+
+        def recv_ready(self):
+            return False
+
+        def close(self):
+            return None
+
+    class FakeClient:
+        def set_missing_host_key_policy(self, _policy):
+            return None
+
+        def connect(self, host, **kwargs):  # noqa: ANN001
+            calls.update({"host": host, **kwargs})
+
+        def invoke_shell(self, **_kwargs):
+            return FakeChannel()
+
+        def close(self):
+            return None
+
+    fake_paramiko = types.SimpleNamespace(SSHClient=FakeClient, AutoAddPolicy=lambda: object())
+    monkeypatch.setitem(sys.modules, "paramiko", fake_paramiko)
+    device = Device(
+        id="pan-edge",
+        host="192.0.2.20",
+        platform="palo_alto",
+        username="admin",
+        password="local-only",
+        port=9443,
+        hostname="pan-edge",
+        site="lab",
+        groups=(),
+        connection_options={"api_port": 9443, "ssh_port": 2222},
+    )
+    session = InteractivePtySession(
+        device,
+        ShellSessionState(mode="direct"),
+        on_output=lambda _data: None,
+        on_event=lambda _event: None,
+    )
+
+    session.open()
+    session.close()
+
+    assert calls["host"] == "192.0.2.20"
+    assert calls["port"] == 2222
+
+
 def test_runner_rest_shell_persists_cli_mode_per_session(tmp_path: Path, monkeypatch):
-    from netcode import lab, runner_agent
+    from netcode import runner_agent
+    from netcode.adapters import shell
 
     inv = tmp_path / "inventory.yaml"
     inv.write_text(
@@ -558,7 +767,7 @@ devices:
                 return "interface"
             return "ok"
 
-    monkeypatch.setattr(lab, "AristaEOSLabAdapter", FakeShellAdapter)
+    monkeypatch.setattr(shell, "NetmikoShellAdapter", FakeShellAdapter)
 
     base_payload = {
         "device_id": "v2-store1",
@@ -2045,7 +2254,11 @@ def test_windows_runner_package_contains_install_scripts_and_no_secrets():
     package = build_windows_runner_package("https://netcode.example.com", runner_pool="pilot")
     with zipfile.ZipFile(BytesIO(package), "r") as archive:
         names = set(archive.namelist())
-        combined = "\n".join(archive.read(name).decode("utf-8") for name in names)
+        combined = "\n".join(
+            archive.read(name).decode("utf-8")
+            for name in names
+            if not name.startswith(("runner-source/", "rez-runtime/"))
+        )
 
     assert {
         "README.md",
@@ -2054,6 +2267,10 @@ def test_windows_runner_package_contains_install_scripts_and_no_secrets():
         "import-inventory.ps1",
         "sample-inventory.yaml",
         "netcode-shell-profile.json",
+        "rez-runtime/drivers/collector.py",
+        "rez-runtime/device_state_model.py",
+        "runner-source/pyproject.toml",
+        "runner-source/netcode/runner_agent.py",
     }.issubset(names)
     assert "https://netcode.example.com" in combined
     assert "wss://netcode.example.com" in combined
@@ -2061,6 +2278,10 @@ def test_windows_runner_package_contains_install_scripts_and_no_secrets():
     assert "hmac_secret" not in combined
     assert "<single-use-token>" in combined
     assert "replace-me" in combined
+    assert "NETCODE_REZ_ROOT" in combined
+    assert "inventory-import $InventoryPath" in combined
+    assert "import-inventory --file" not in combined
+    assert 'Join-Path $PSScriptRoot "runner-source"' in combined
 
 
 def test_windows_runner_download_endpoint_returns_zip(tmp_path: Path, monkeypatch):
@@ -2075,6 +2296,8 @@ def test_windows_runner_download_endpoint_returns_zip(tmp_path: Path, monkeypatc
     assert manifest["ok"] is True
     assert manifest["platform"] == "windows"
     assert manifest["runner_pool"] == "pilot"
+    assert manifest["rez_adapter_bundle"]["included"] is True
+    assert manifest["runner_source_bundle"]["included"] is True
     assert response.status_code == 200
     assert response.headers["content-type"] == "application/zip"
     with zipfile.ZipFile(BytesIO(response.content), "r") as archive:

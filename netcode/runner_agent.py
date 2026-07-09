@@ -63,7 +63,7 @@ def _shell_adapter_for(key: str, device):  # noqa: ANN001
     adapter is what preserves device CLI mode across `conf t`, `interface ...`,
     and later lines while keeping concurrent sessions isolated by session id.
     """
-    from netcode.lab import AristaEOSLabAdapter
+    from netcode.adapters.shell import NetmikoShellAdapter
 
     now = time.monotonic()
     with _SHELL_ADAPTER_LOCK:
@@ -89,7 +89,7 @@ def _shell_adapter_for(key: str, device):  # noqa: ANN001
             except Exception:
                 pass
 
-        adapter = AristaEOSLabAdapter(device)
+        adapter = NetmikoShellAdapter(device)
         adapter.connect()
         _SHELL_ADAPTERS[key] = {"adapter": adapter, "device_id": str(device.id), "last_used": now}
         return adapter
@@ -482,28 +482,9 @@ def _rez_read_command_allowed(command: str) -> tuple[bool, str]:
 
 
 def _netmiko_device_type(platform: str) -> str:
-    normalized = str(platform or "").strip().lower().replace("-", "_").replace(" ", "_")
-    aliases = {
-        "arista": "arista_eos",
-        "arista_eos": "arista_eos",
-        "eos": "arista_eos",
-        "cisco_ios": "cisco_ios",
-        "ios": "cisco_ios",
-        "iosxe": "cisco_xe",
-        "cisco_iosxe": "cisco_xe",
-        "cisco_xe": "cisco_xe",
-        "nxos": "cisco_nxos",
-        "cisco_nxos": "cisco_nxos",
-        "fortigate": "fortinet",
-        "fortinet": "fortinet",
-        "fortios": "fortinet",
-        "palo_alto": "paloalto_panos",
-        "panos": "paloalto_panos",
-        "paloalto_panos": "paloalto_panos",
-        "junos": "juniper_junos",
-        "juniper_junos": "juniper_junos",
-    }
-    return aliases.get(normalized, normalized or "arista_eos")
+    from netcode.adapters.shell import netmiko_device_type
+
+    return netmiko_device_type(platform)
 
 
 def _execute_rez_ssh_command(payload: dict[str, Any]) -> dict[str, Any]:
@@ -536,12 +517,14 @@ def _execute_rez_ssh_command(payload: dict[str, Any]) -> dict[str, Any]:
 
     conn = None
     try:
+        from netcode.adapters.shell import ssh_port_for
+
         conn = ConnectHandler(
             device_type=_netmiko_device_type(device.platform),
             host=device.host,
             username=device.username,
             password=device.password,
-            port=device.port,
+            port=ssh_port_for(device),
             fast_cli=False,
             conn_timeout=20,
             auth_timeout=20,
@@ -775,12 +758,14 @@ def _execute_source_probe_command(
     conn = None
     started = time.monotonic()
     try:
+        from netcode.adapters.shell import ssh_port_for
+
         conn = ConnectHandler(
             device_type=_netmiko_device_type(device.platform),
             host=device.host,
             username=device.username,
             password=device.password,
-            port=device.port,
+            port=ssh_port_for(device),
             fast_cli=False,
             conn_timeout=max(5, int(timeout_seconds) + 5),
             auth_timeout=20,

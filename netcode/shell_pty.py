@@ -51,12 +51,13 @@ class InteractivePtySession:
 
     def open(self, term: str = "xterm", width: int = 120, height: int = 40, timeout: int = 20) -> None:
         import paramiko
+        from netcode.adapters.shell import ssh_port_for
 
         self._client = paramiko.SSHClient()
         self._client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
         self._client.connect(
             self.device.host,
-            port=int(getattr(self.device, "port", 22) or 22),
+            port=ssh_port_for(self.device),
             username=self.device.username,
             password=self.device.password,
             look_for_keys=False,

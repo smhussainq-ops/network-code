@@ -9,11 +9,49 @@ from __future__ import annotations
 
 import json
 from io import BytesIO
+from pathlib import Path
 from textwrap import dedent
 from typing import Any
 from zipfile import ZIP_DEFLATED, ZipFile
 
 from netcode.shell_desktop import build_desktop_shell_profile
+
+
+def _rez_runtime_files() -> dict[str, bytes]:
+    """Return the device-driver-only Rez runtime for the local runner."""
+    try:
+        from netcode.adapters.rez import RezAdapterBridge
+
+        root = RezAdapterBridge().root
+    except Exception:
+        return {}
+    required = [
+        root / "device_state_model.py",
+        root / "utils" / "__init__.py",
+        root / "utils" / "policy_matcher.py",
+    ]
+    driver_files = sorted((root / "drivers").glob("*.py")) if (root / "drivers").is_dir() else []
+    if not driver_files or any(not path.is_file() for path in required):
+        return {}
+    files: dict[str, bytes] = {}
+    for path in [*driver_files, *required]:
+        relative = path.relative_to(root)
+        files[f"rez-runtime/{relative.as_posix()}"] = path.read_bytes()
+    return files
+
+
+def _runner_source_files() -> dict[str, bytes]:
+    """Bundle the exact runner source so pilot installs do not depend on PyPI."""
+    package_dir = Path(__file__).resolve().parent
+    project_root = package_dir.parent
+    pyproject = project_root / "pyproject.toml"
+    if not pyproject.is_file():
+        return {}
+    files = {"runner-source/pyproject.toml": pyproject.read_bytes()}
+    for path in sorted(package_dir.rglob("*.py")):
+        relative = path.relative_to(project_root)
+        files[f"runner-source/{relative.as_posix()}"] = path.read_bytes()
+    return files
 
 
 def _install_runner_ps1(control_plane_url: str) -> str:
@@ -22,7 +60,7 @@ def _install_runner_ps1(control_plane_url: str) -> str:
         param(
           [Parameter(Mandatory=$true)][string]$JoinToken,
           [string]$RunnerName = $env:COMPUTERNAME,
-          [string]$PackageSpec = "netcode-platform",
+          [string]$PackageSpec = "",
           [switch]$RegisterStartupTask
         )
 
@@ -30,6 +68,8 @@ def _install_runner_ps1(control_plane_url: str) -> str:
         $Root = Join-Path $env:ProgramData "NetcodeRunner"
         $Venv = Join-Path $Root ".venv"
         $Python = Join-Path $Venv "Scripts\\python.exe"
+        $RezSource = Join-Path $PSScriptRoot "rez-runtime"
+        $RezRoot = Join-Path $Root "rez-runtime"
         New-Item -ItemType Directory -Force -Path $Root | Out-Null
 
         if (-not (Get-Command py -ErrorAction SilentlyContinue)) {{
@@ -41,7 +81,21 @@ def _install_runner_ps1(control_plane_url: str) -> str:
         }}
 
         & $Python -m pip install --upgrade pip
-        & $Python -m pip install --upgrade $PackageSpec
+        if ($PackageSpec) {{
+          & $Python -m pip install --upgrade $PackageSpec
+        }} else {{
+          $BundledSource = Join-Path $PSScriptRoot "runner-source"
+          if (-not (Test-Path (Join-Path $BundledSource "pyproject.toml"))) {{
+            throw "The bundled Netcode runner source is missing. Download a fresh runner package."
+          }}
+          & $Python -m pip install --upgrade $BundledSource
+        }}
+        if (-not (Test-Path (Join-Path $RezSource "drivers\\collector.py"))) {{
+          throw "The Rez multi-vendor adapter bundle is missing. Download a fresh runner package."
+        }}
+        New-Item -ItemType Directory -Force -Path $RezRoot | Out-Null
+        Copy-Item -Path (Join-Path $RezSource "*") -Destination $RezRoot -Recurse -Force
+        $env:NETCODE_REZ_ROOT = $RezRoot
         & $Python -m netcode.runner_agent enroll --server "{control_plane_url}" --join-token $JoinToken --name $RunnerName
 
         if ($RegisterStartupTask) {{
@@ -64,6 +118,7 @@ def _start_runner_ps1() -> str:
         $ErrorActionPreference = "Stop"
         $Root = Join-Path $env:ProgramData "NetcodeRunner"
         $Python = Join-Path $Root ".venv\\Scripts\\python.exe"
+        $env:NETCODE_REZ_ROOT = Join-Path $Root "rez-runtime"
         $LogDir = Join-Path $Root "logs"
         New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
         $LogFile = Join-Path $LogDir ("runner-" + (Get-Date -Format "yyyyMMdd") + ".log")
@@ -95,7 +150,7 @@ def _import_inventory_ps1() -> str:
           throw "Inventory file not found: $InventoryPath"
         }
 
-        & $Python -m netcode.runner_agent import-inventory --file $InventoryPath
+        & $Python -m netcode.runner_agent inventory-import $InventoryPath
         Write-Host "Inventory imported into the runner-local credential store."
         """
     ).strip() + "\n"
@@ -118,6 +173,21 @@ def _sample_inventory_yaml() -> str:
             groups:
               - lab
               - core
+
+        # Hybrid SSH + API example. These values remain on the local runner:
+        # - id: edge-fw-01
+        #   hostname: edge-fw-01
+        #   host: 192.0.2.20
+        #   platform: fortinet
+        #   username: admin
+        #   password: replace-me
+        #   port: 22
+        #   connection:
+        #     transport: api
+        #     ssh_port: 22
+        #     api_port: 443
+        #     api_token: replace-me
+        #     verify_ssl: false
         """
     ).strip() + "\n"
 
@@ -148,6 +218,11 @@ def _readme(control_plane_url: str) -> str:
         - Outbound HTTPS/WSS only from the runner to the control plane.
         - No inbound listener is opened by the runner.
         - Device credentials are stored in the runner-local inventory.
+        - The package includes the lightweight Rez driver runtime for 11 active
+          platforms; no LLM, MCP server, Chat-v2 backend, or math engine runs on
+          the customer runner.
+        - SSH-capable devices can use Netcode Shell. API-only controllers use
+          discovery, live state, diagnostics, and verification without a Shell.
         - Rez Diagnostics uses read-only runner jobs.
         - Netcode writes require plan, dry-run/canary, human approval, apply,
           and verification gates.
@@ -166,7 +241,7 @@ def _readme(control_plane_url: str) -> str:
 def build_windows_runner_package(control_plane_url: str, *, runner_pool: str = "default") -> bytes:
     """Return a ZIP package suitable for download from the control plane."""
     profile = build_desktop_shell_profile(control_plane_url, runner_pool=runner_pool)
-    files: dict[str, str] = {
+    files: dict[str, str | bytes] = {
         "README.md": _readme(control_plane_url),
         "install-runner.ps1": _install_runner_ps1(control_plane_url),
         "start-runner.ps1": _start_runner_ps1(),
@@ -174,6 +249,8 @@ def build_windows_runner_package(control_plane_url: str, *, runner_pool: str = "
         "sample-inventory.yaml": _sample_inventory_yaml(),
         "netcode-shell-profile.json": json.dumps(profile, indent=2) + "\n",
     }
+    files.update(_rez_runtime_files())
+    files.update(_runner_source_files())
 
     buffer = BytesIO()
     with ZipFile(buffer, "w", compression=ZIP_DEFLATED) as archive:
@@ -183,6 +260,8 @@ def build_windows_runner_package(control_plane_url: str, *, runner_pool: str = "
 
 
 def package_manifest(control_plane_url: str, *, runner_pool: str = "default") -> dict[str, Any]:
+    rez_files = _rez_runtime_files()
+    runner_files = _runner_source_files()
     return {
         "ok": True,
         "platform": "windows",
@@ -198,4 +277,14 @@ def package_manifest(control_plane_url: str, *, runner_pool: str = "default") ->
         ],
         "network": "outbound_https_wss_only",
         "credentials": "runner_local_only",
+        "rez_adapter_bundle": {
+            "included": bool(rez_files),
+            "file_count": len(rez_files),
+            "scope": "device drivers and normalized state model only",
+        },
+        "runner_source_bundle": {
+            "included": bool(runner_files),
+            "file_count": len(runner_files),
+            "scope": "outbound runner and local execution modules",
+        },
     }

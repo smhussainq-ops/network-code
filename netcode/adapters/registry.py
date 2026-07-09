@@ -6,7 +6,7 @@ state collection and multi-vendor inventory support come from Rez drivers.
 
 from __future__ import annotations
 
-from netcode.adapters.rez import RezAdapterBridge
+from netcode.adapters.rez import READ_TRANSPORTS, RezAdapterBridge
 from netcode.inventory import Device
 
 
@@ -87,6 +87,8 @@ class AdapterRegistry:
                 "platform": platform,
                 "read_provider": "rez" if platform in rez_platforms else None,
                 "read_supported": platform in rez_platforms,
+                "read_transports": list(READ_TRANSPORTS.get(platform, ("ssh",))) if platform in rez_platforms else [],
+                "shell_supported": platform in rez_platforms and "ssh" in READ_TRANSPORTS.get(platform, ("ssh",)),
                 "write_adapter": self.EXECUTION_ADAPTERS.get(platform),
                 "write_supported": bool(self.EXECUTION_ADAPTERS.get(platform, {}).get("write_supported")),
             }
@@ -96,14 +98,21 @@ class AdapterRegistry:
     def device_capabilities(self, device: Device) -> dict[str, object]:
         rez_summary = self.rez.summary()
         rez_platforms = set(rez_summary.get("platforms", [])) if rez_summary.get("available") else set()
+        platform = self.rez.normalize_platform(device.platform)
+        read_transports = list(READ_TRANSPORTS.get(platform, ("ssh",)))
         return {
             "device_id": device.id,
-            "platform": device.platform,
-            "execution": self.EXECUTION_ADAPTERS.get(device.platform),
+            "platform": platform,
+            "execution": self.EXECUTION_ADAPTERS.get(platform),
+            "shell": {
+                "supported": "ssh" in read_transports,
+                "transport": "ssh" if "ssh" in read_transports else None,
+            },
             "state": {
                 "provider": "rez",
                 "available": bool(rez_summary.get("available")),
-                "supported": device.platform in rez_platforms,
+                "supported": platform in rez_platforms,
+                "transports": read_transports,
                 "rez_root": rez_summary.get("root"),
                 "error": rez_summary.get("error"),
             },
