@@ -267,7 +267,7 @@ def _enter_decision(state: ShellSessionState, enter_byte: str) -> GuardDecision:
         return GuardDecision(forward=enter_byte, events=[{
             "type": "guard", "action": "config_mode_entered_live",
             "change_id": state.change_id,
-            "message": "Config mode entered live. The session is being recorded.",
+            "message": "Configuration command sent live. The session is being recorded.",
         }, {"type": "command", "line": line.strip(), "kind": "config_enter",
             "change_id": state.change_id}])
 

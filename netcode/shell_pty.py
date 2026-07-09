@@ -43,6 +43,9 @@ class InteractivePtySession:
         self.on_event = on_event
         self.guard_enabled = guard_enabled
         self._direct_line = ""
+        self._direct_escape_state = ""
+        self._direct_history: list[str] = []
+        self._direct_history_index: int | None = None
         self._client = None
         self._chan = None
         self._stop = False
@@ -122,10 +125,35 @@ class InteractivePtySession:
         commands so the control plane can produce a useful session audit trail.
         """
         for char in text:
+            if self._direct_escape_state == "escape":
+                self._direct_escape_state = "csi" if char in ("[", "O") else ""
+                continue
+            if self._direct_escape_state == "csi":
+                if "@" <= char <= "~":
+                    if char == "A" and self._direct_history:
+                        if self._direct_history_index is None:
+                            self._direct_history_index = len(self._direct_history) - 1
+                        else:
+                            self._direct_history_index = max(0, self._direct_history_index - 1)
+                        self._direct_line = self._direct_history[self._direct_history_index]
+                    elif char == "B" and self._direct_history_index is not None:
+                        if self._direct_history_index < len(self._direct_history) - 1:
+                            self._direct_history_index += 1
+                            self._direct_line = self._direct_history[self._direct_history_index]
+                        else:
+                            self._direct_history_index = None
+                            self._direct_line = ""
+                    self._direct_escape_state = ""
+                continue
+            if char == "\x1b":
+                self._direct_escape_state = "escape"
+                continue
             if char in ("\r", "\n"):
                 line = self._direct_line.strip()
                 self._direct_line = ""
+                self._direct_history_index = None
                 if line:
+                    self._direct_history.append(line)
                     self._update_direct_state(line)
                     self.on_event({
                         "type": "command",
@@ -138,10 +166,13 @@ class InteractivePtySession:
                         "device_touched": self.state.device_touched,
                     })
             elif char in ("\b", "\x7f"):
+                self._direct_history_index = None
                 self._direct_line = self._direct_line[:-1]
             elif char == "\x03":
                 self._direct_line = ""
+                self._direct_history_index = None
             elif char.isprintable():
+                self._direct_history_index = None
                 self._direct_line += char
 
     def _update_direct_state(self, line: str) -> None:

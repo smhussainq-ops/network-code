@@ -714,6 +714,35 @@ def test_interactive_pty_uses_ssh_port_not_vendor_api_port(monkeypatch):
     assert calls["port"] == 2222
 
 
+def test_interactive_pty_audit_resolves_terminal_history_without_logging_escape_bytes():
+    from netcode.shell_guard import ShellSessionState
+    from netcode.shell_pty import InteractivePtySession
+
+    events = []
+    session = InteractivePtySession(
+        Device(
+            id="edge-1",
+            host="192.0.2.10",
+            platform="arista_eos",
+            username="admin",
+            password="local-only",
+            port=22,
+            hostname="edge-1",
+            site="lab",
+            groups=(),
+        ),
+        ShellSessionState(mode="direct"),
+        on_output=lambda _data: None,
+        on_event=events.append,
+    )
+
+    session._record_direct_input("show hostname\r")
+    session._record_direct_input("\x1b[A\r")
+
+    commands = [event["line"] for event in events if event.get("type") == "command"]
+    assert commands == ["show hostname", "show hostname"]
+
+
 def test_runner_rest_shell_persists_cli_mode_per_session(tmp_path: Path, monkeypatch):
     from netcode import runner_agent
     from netcode.adapters import shell
