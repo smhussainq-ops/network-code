@@ -17,6 +17,7 @@ from netcode.models import (
     CustomConfigIntent,
     Intent,
     InterfaceConfigIntent,
+    OsUpgradeIntent,
     RenderResult,
     SiteDeviceIntent,
     ValidationReport,
@@ -272,6 +273,40 @@ class StaticValidator:
             config_lines=len(lines),
             rollback_supplied=has_rollback,
             acknowledged_no_rollback=intent.custom.acknowledge_no_rollback,
+        )
+
+    def _os_upgrade_policy(self, intent: OsUpgradeIntent, render: RenderResult) -> CheckResult:
+        upgrade = intent.os_upgrade
+        if not upgrade.maintenance_window.strip():
+            return self._fail(
+                "os_upgrade_policy",
+                "OS Upgrade Policy",
+                "A maintenance window is required before staging an OS upgrade.",
+            )
+        if "reload" in {line.strip().lower() for line in render.config.splitlines()}:
+            return self._fail(
+                "os_upgrade_policy",
+                "OS Upgrade Policy",
+                "Rendered OS upgrade config must not include a reload command.",
+            )
+        if upgrade.batch_size < upgrade.canary_size:
+            return self._fail(
+                "os_upgrade_policy",
+                "OS Upgrade Policy",
+                "Batch size must be greater than or equal to canary size.",
+                canary_size=upgrade.canary_size,
+                batch_size=upgrade.batch_size,
+            )
+        return self._pass(
+            "os_upgrade_policy",
+            "OS Upgrade Policy",
+            "OS upgrade is staged only: image, MD5, maintenance window, canary, and rollback gates are present; reload is not rendered.",
+            target_version=upgrade.target_version,
+            image=upgrade.image,
+            md5=upgrade.md5,
+            maintenance_window=upgrade.maintenance_window,
+            canary_size=upgrade.canary_size,
+            batch_size=upgrade.batch_size,
         )
 
     def _render_scope(self, intent: Intent, render: RenderResult) -> CheckResult:

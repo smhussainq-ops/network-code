@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from netcode.drift import aggregate_device_vlans
+from netcode.diagnostics_handoff import attach_verification_handoff
 from netcode.inventory import Inventory
 from netcode.jobs import JobRunner, execution_mode, runner_pool
 from netcode.models import load_intent
@@ -420,6 +421,17 @@ def _verify_device(
         store.get_change(change_id).workflow_state, store.get_change(change_id).workflow_state,
         f"[fleet] verify on {device_id}: {'pass' if ok else 'fail'} — {message}",
         {"verify": result},
+    )
+    verification = dict(result.get("verification") or result)
+    verification.setdefault("ok", ok)
+    attach_verification_handoff(
+        store,
+        change_id=change_id,
+        device_id=device_id,
+        check="fleet_verify",
+        verification=verification,
+        actual=message,
+        intent_path=str(intent_path),
     )
     return ok, message
 

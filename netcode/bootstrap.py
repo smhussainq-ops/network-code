@@ -86,6 +86,18 @@ ntp server {{ server }}{% if ntp.prefer_first and loop.first %} prefer{% endif %
 """
 
 
+OS_UPGRADE_TEMPLATE = """! Netcode EOS OS upgrade staged workflow
+! pre-check: show version
+! pre-check: show boot-config
+{% if os_upgrade.verify_bgp %}! pre-check: show ip bgp summary
+{% endif %}! stage image: {{ os_upgrade.image_uri or 'runner-local image repository' }}
+! verify md5 {{ os_upgrade.image }} {{ os_upgrade.md5 }}
+! maintenance window required: {{ os_upgrade.maintenance_window }}
+boot system flash:{{ os_upgrade.image }}
+! device reload is not rendered; canary reload requires separate human approval
+"""
+
+
 
 WORKSPACE_GITIGNORE = """# Netcode change workspace: Git tracks ONLY change artifacts, never platform code,
 # UI, runtime state, or dev files. This keeps branch switching from colliding with
@@ -113,6 +125,7 @@ def init_workspace(paths: WorkspacePaths, force: bool = False) -> list[Path]:
         (paths.templates / "arista" / "site_device_intent.j2", SITE_DEVICE_INTENT_TEMPLATE),
         (paths.templates / "arista" / "custom_config.j2", CUSTOM_CONFIG_TEMPLATE),
         (paths.templates / "arista" / "ntp_standardize.j2", NTP_STANDARDIZE_TEMPLATE),
+        (paths.templates / "arista" / "os_upgrade.j2", OS_UPGRADE_TEMPLATE),
     ]
     for path, content in files:
         if force or not path.exists():
@@ -209,6 +222,10 @@ def init_workspace(paths: WorkspacePaths, force: bool = False) -> list[Path]:
             ],
             "site_device_intent_allowed_prefixes": [
                 "! ",
+            ],
+            "os_upgrade_allowed_prefixes": [
+                "! ",
+                "boot system flash:",
             ],
             "blocked_fragments": [
                 "username ",

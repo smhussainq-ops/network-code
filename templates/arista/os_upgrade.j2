@@ -1,0 +1,9 @@
+! Netcode EOS OS upgrade staged workflow
+! pre-check: show version
+! pre-check: show boot-config
+{% if os_upgrade.verify_bgp %}! pre-check: show ip bgp summary
+{% endif %}! stage image: {{ os_upgrade.image_uri or 'runner-local image repository' }}
+! verify md5 {{ os_upgrade.image }} {{ os_upgrade.md5 }}
+! maintenance window required: {{ os_upgrade.maintenance_window }}
+boot system flash:{{ os_upgrade.image }}
+! device reload is not rendered; canary reload requires separate human approval

@@ -20,7 +20,7 @@ from netcode.ansible_backend import build_ansible_pack_plan
 from netcode.adapters.registry import AdapterRegistry
 from netcode.bootstrap import init_workspace
 from netcode.discovery import DiscoveryService
-from netcode.diagnostics_handoff import build_verification_handoff
+from netcode.diagnostics_handoff import attach_verification_handoff, build_verification_handoff
 from netcode.drift import (
     aggregate_device_vlans,
     baseline_for_state,
@@ -1232,6 +1232,8 @@ def _import_runner_discovery_candidate(p: WorkspacePaths, discovery_result: dict
             "error": "Runner discovery did not return a source_of_truth_candidate.",
         }
         return result
+    public_keys = {"id", "hostname", "host", "platform", "site", "role", "groups", "port"}
+    candidate = {key: value for key, value in candidate.items() if key in public_keys}
 
     source_result = DiscoveryService(p).import_candidate(candidate)
     result["source_of_truth"] = source_result
@@ -1908,7 +1910,21 @@ def api_verify_intent(request: IntentPathRequest, http_request: Request) -> dict
     if execution_mode() == "runner":
         intent_yaml = Path(request.intent_path).read_text(encoding="utf-8")
         payload = {"intent_yaml": intent_yaml, "device_id": request.device_id, "present": True}
-        return _runner_read(p, "verify", payload, _request_principal(http_request).org_id)
+        result = _runner_read(p, "verify", payload, _request_principal(http_request).org_id)
+        verification = dict(result.get("verification") or result)
+        verification.setdefault("ok", result.get("ok"))
+        handoff = attach_verification_handoff(
+            PlatformStore(p),
+            change_id=request.change_id,
+            device_id=str(result.get("device_id") or request.device_id or ""),
+            check="post_change_verify",
+            verification=verification,
+            actual=str(result.get("message") or result.get("error") or verification.get("message") or ""),
+            intent_path=request.intent_path,
+        )
+        if handoff:
+            result["diagnostics_handoff"] = handoff
+        return result
     intent = load_intent(Path(request.intent_path))
     inventory = Inventory(configured_inventory_path(p))
     device_id = request.device_id or (intent.targets.device_ids[0] if intent.targets.device_ids else "")
@@ -1923,13 +1939,25 @@ def api_verify_intent(request: IntentPathRequest, http_request: Request) -> dict
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     finally:
         adapter.disconnect()
-    return {
+    response = {
         "ok": verification.status == "pass",
         "device_id": device.id,
         "platform": device.platform,
         "change_type": intent.change_type,
         "verification": verification.__dict__,
     }
+    handoff = attach_verification_handoff(
+        PlatformStore(p),
+        change_id=request.change_id,
+        device_id=device.id,
+        check="post_change_verify",
+        verification={"ok": verification.status == "pass", **verification.__dict__},
+        actual=verification.message,
+        intent_path=request.intent_path,
+    )
+    if handoff:
+        response["diagnostics_handoff"] = handoff
+    return response
 
 
 @app.post("/api/drift/vlan")

@@ -1097,6 +1097,7 @@ def test_runner_discovery_auto_imports_public_source_of_truth_and_unblocks_plann
                     "host": "192.0.2.10",
                     "platform": "arista_eos",
                     "site": "site-101",
+                    "role": "edge",
                     "groups": ["edge", "discovered"],
                     "port": 2222,
                     "username": "runner-admin",
@@ -1128,6 +1129,7 @@ def test_runner_discovery_auto_imports_public_source_of_truth_and_unblocks_plann
     serialized_source = json.dumps(source)
     assert "edge-1" in serialized_source
     assert "192.0.2.10" in serialized_source
+    assert "edge" in serialized_source
     assert "runner-secret" not in serialized_source
     assert "runner-admin" not in serialized_source
 
@@ -1275,6 +1277,49 @@ def test_verification_handoff_builds_rez_context_without_writes(tmp_path: Path, 
     assert after_changes == before_changes
 
 
+def test_failed_intent_verify_attaches_read_only_handoff_to_change(tmp_path: Path, monkeypatch):
+    init_workspace(WorkspacePaths(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    client = TestClient(api.app)
+
+    plan = client.post(
+        "/api/desired-state/plan",
+        json={
+            "change_type": "add_vlan",
+            "site": "store-1842",
+            "device_id": "v2-store1",
+            "requested_by": "unit",
+            "values": {"vlan_id": 210, "name": "APP_210", "subnet": "10.210.0.0/24"},
+        },
+    ).json()
+    change_id = plan["change"]["id"]
+
+    def fake_runner_read(p, action, payload, org_id, timeout=60.0):  # noqa: ANN001
+        assert action == "verify"
+        return {
+            "ok": False,
+            "device_id": payload["device_id"],
+            "verification": {"status": "fail", "message": "VLAN 210 is missing"},
+        }
+
+    monkeypatch.setenv("NETCODE_EXECUTION", "runner")
+    monkeypatch.setattr(api, "_runner_read", fake_runner_read)
+
+    verify = client.post(
+        "/api/verify/intent",
+        json={"intent_path": plan["intent_path"], "device_id": "v2-store1", "change_id": change_id},
+    )
+
+    assert verify.status_code == 200
+    body = verify.json()
+    assert body["ok"] is False
+    assert body["diagnostics_handoff"]["safety"]["device_writes"] == "none"
+    stored = PlatformStore(WorkspacePaths(tmp_path)).get_change(change_id)
+    assert stored.result["diagnostics_handoffs"][0]["context"]["read_only"] is True
+    assert stored.result["diagnostics_handoffs"][0]["context"]["failed"] is True
+    assert PlatformStore(WorkspacePaths(tmp_path)).list_jobs() == []
+
+
 def test_runner_credential_floor_survives_empty_and_hostile_policy(tmp_path: Path):
     """Trust-debt #2: a compromised control plane shipping an EMPTY policy (or a
     custom_config intent, whose allow-list is empty) still cannot push
@@ -1405,7 +1450,7 @@ def test_desired_state_catalog_and_dynamic_plans(tmp_path: Path, monkeypatch):
     ids = {item["id"] for item in catalog.json()["change_types"]}
 
     assert catalog.status_code == 200
-    assert {"add_vlan", "interface_config", "bgp_neighbor", "acl_rule", "site_device_intent"}.issubset(ids)
+    assert {"add_vlan", "interface_config", "bgp_neighbor", "acl_rule", "site_device_intent", "os_upgrade"}.issubset(ids)
 
     interface_plan = client.post(
         "/api/desired-state/plan",
@@ -1453,6 +1498,25 @@ def test_desired_state_catalog_and_dynamic_plans(tmp_path: Path, monkeypatch):
             "values": {"new_device_id": "v2-store4", "role": "access-switch", "platform": "arista_eos", "management_ip": "172.100.1.44"},
         },
     )
+    os_plan = client.post(
+        "/api/desired-state/plan",
+        json={
+            "change_type": "os_upgrade",
+            "site": "store-1842",
+            "device_id": "v2-store1",
+            "requested_by": "unit",
+            "values": {
+                "image": "EOS-4.35.1F.swi",
+                "target_version": "4.35.1F",
+                "md5": "0123456789abcdef0123456789abcdef",
+                "image_uri": "https://artifacts.example/EOS-4.35.1F.swi",
+                "rollback_image": "EOS-4.34.3M.swi",
+                "maintenance_window": "Sunday 02:00-04:00 UTC",
+                "canary_size": 1,
+                "batch_size": 4,
+            },
+        },
+    )
 
     assert interface_plan.status_code == 200
     assert interface_plan.json()["ok"] is True
@@ -1465,6 +1529,29 @@ def test_desired_state_catalog_and_dynamic_plans(tmp_path: Path, monkeypatch):
     assert site_plan.status_code == 200
     assert site_plan.json()["plan"]["lab_write_supported"] is False
     assert "Source-of-truth only intent" in site_plan.json()["pipeline"]["render"]["config"]
+    assert os_plan.status_code == 200
+    os_render = os_plan.json()["pipeline"]["render"]["config"]
+    assert "boot system flash:EOS-4.35.1F.swi" in os_render
+    assert "verify md5 EOS-4.35.1F.swi 0123456789abcdef0123456789abcdef" in os_render
+    assert all(line.strip().lower() != "reload" for line in os_render.splitlines())
+    assert os_plan.json()["plan"]["rollback"]["commands"].startswith("no boot system flash:EOS-4.35.1F.swi")
+
+    blocked_os_plan = client.post(
+        "/api/desired-state/plan",
+        json={
+            "change_type": "os_upgrade",
+            "site": "store-1842",
+            "device_id": "v2-store1",
+            "requested_by": "unit",
+            "values": {
+                "image": "EOS-4.35.1F.swi",
+                "target_version": "4.35.1F",
+                "md5": "0123456789abcdef0123456789abcdef",
+                "maintenance_window": "",
+            },
+        },
+    )
+    assert blocked_os_plan.status_code == 400
 
 
 def test_workflow_pack_catalog_references_supported_native_change_types():
@@ -1479,6 +1566,7 @@ def test_workflow_pack_catalog_references_supported_native_change_types():
         "golden-baseline-standardization",
         "branch-site-onboarding",
         "controlled-routing-acl-update",
+        "eos-os-upgrade",
     }
     assert catalog["safety"] == {
         "credentials": "runner-local",
@@ -1507,6 +1595,7 @@ def test_workflow_pack_catalog_endpoint(tmp_path: Path, monkeypatch):
         "golden-baseline-standardization",
         "branch-site-onboarding",
         "controlled-routing-acl-update",
+        "eos-os-upgrade",
     }
     assert all(pack["status"] == "ready" for pack in data["packs"])
 
@@ -2238,7 +2327,7 @@ def test_change_type_registry_contract_is_complete():
     from netcode.lab import AristaEOSLabAdapter
     from netcode.validation import StaticValidator
 
-    assert set(REGISTRY) == {"add_vlan", "interface_config", "bgp_neighbor", "acl_rule", "site_device_intent", "custom_config", "ntp_standardize"}
+    assert set(REGISTRY) == {"add_vlan", "interface_config", "bgp_neighbor", "acl_rule", "site_device_intent", "custom_config", "ntp_standardize", "os_upgrade"}
     for key, spec in REGISTRY.items():
         assert spec.template.endswith(".j2"), key
         assert spec.policy_checks, f"{key} has no policy checks"

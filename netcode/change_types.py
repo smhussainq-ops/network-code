@@ -25,6 +25,7 @@ from netcode.models import (
     Intent,
     InterfaceConfigIntent,
     NtpStandardizeIntent,
+    OsUpgradeIntent,
     SiteDeviceIntent,
 )
 
@@ -354,4 +355,67 @@ register(ChangeTypeSpec(
     verification_hint=lambda i: {"check": "running_config_contains", "params": {"section": f"ntp server {i.ntp.servers[0]}"}},
     policy_checks=["_ntp_policy"], verify_method="_verify_ntp",
     allow_prefixes=["ntp server "],
+))
+
+
+# ── os_upgrade ─────────────────────────────────────────────────────────────
+def _build_os_upgrade(common: dict, values: dict, device_id: str) -> dict:
+    common["os_upgrade"] = {
+        "image": str(values.get("image", "EOS-4.35.1F.swi")),
+        "target_version": str(values.get("target_version", "4.35.1F")),
+        "md5": str(values.get("md5", "")),
+        "image_uri": str(values.get("image_uri", "")),
+        "current_version": str(values.get("current_version", "")),
+        "rollback_image": str(values.get("rollback_image", "")),
+        "maintenance_window": str(values.get("maintenance_window", "")),
+        "canary_size": int(values.get("canary_size", 1)),
+        "batch_size": int(values.get("batch_size", 5)),
+        "verify_bgp": bool(values.get("verify_bgp", True)),
+    }
+    return common
+
+
+def _rollback_os_upgrade(intent: OsUpgradeIntent) -> str:
+    lines = [f"no boot system flash:{intent.os_upgrade.image}"]
+    if intent.os_upgrade.rollback_image:
+        lines.append(f"boot system flash:{intent.os_upgrade.rollback_image}")
+    lines.append("! reload is a separate approved maintenance-window action")
+    return "\n".join(lines) + "\n"
+
+
+register(ChangeTypeSpec(
+    key="os_upgrade", label="EOS OS Upgrade", model=OsUpgradeIntent, template="os_upgrade.j2",
+    risk="High: staged software upgrade, reload gated by maintenance approval", lab_write=True, build=_build_os_upgrade,
+    title=lambda i: f"Stage EOS {i.os_upgrade.target_version} ({i.os_upgrade.image})",
+    slug=lambda i: f"{i.site}-os-upgrade-{safe_name(i.os_upgrade.target_version)}",
+    rollback=_rollback_os_upgrade,
+    rollback_confidence=lambda i: {
+        "level": "medium" if i.os_upgrade.rollback_image else "low",
+        "reason": (
+            "Reverts the staged boot image to the supplied rollback image; reload still requires approval."
+            if i.os_upgrade.rollback_image
+            else "Removes only the newly staged boot image; previous boot image was not supplied."
+        ),
+    },
+    blast_objects=lambda i: [
+        f"Target EOS version {i.os_upgrade.target_version}",
+        f"Image {i.os_upgrade.image}",
+        f"Maintenance window {i.os_upgrade.maintenance_window}",
+        f"Canary {i.os_upgrade.canary_size}, batch {i.os_upgrade.batch_size}",
+    ],
+    checks=lambda i: {
+        "pre": [
+            {"id": "version_precheck", "description": "Collect current EOS version and boot image before staging.", "executable": True},
+            {"id": "md5_verify", "description": f"Verify image MD5 equals {i.os_upgrade.md5}.", "executable": True},
+            {"id": "maintenance_window", "description": f"Reload requires approved window: {i.os_upgrade.maintenance_window}.", "executable": True},
+        ],
+        "post": [
+            {"id": "boot_variable_staged", "description": f"Boot variable points to {i.os_upgrade.image}; reload is not rendered in this plan.", "executable": True},
+            {"id": "post_reload_version", "description": f"After approved canary reload, verify EOS version {i.os_upgrade.target_version}.", "executable": True},
+            {"id": "bgp_after_reload", "description": "After reload, verify BGP neighbors recover before batch promotion.", "executable": bool(i.os_upgrade.verify_bgp)},
+        ],
+    },
+    verification_hint=lambda i: {"check": "running_config_contains", "params": {"section": f"boot system flash:{i.os_upgrade.image}"}},
+    policy_checks=["_os_upgrade_policy"], verify_method="_verify_os_upgrade",
+    allow_prefixes=["! ", "boot system flash:"],
 ))

@@ -15,7 +15,7 @@ from netcode.adapters.registry import AdapterRegistry
 from netcode.change_types import spec_for
 from netcode.inventory import Device, Inventory
 from netcode.intent_utils import lab_write_supported, report_stem, rollback_config
-from netcode.models import AclRuleIntent, AddVlanIntent, BgpNeighborIntent, CustomConfigIntent, EndToEndArtifacts, EndToEndResult, Intent, InterfaceConfigIntent, NtpStandardizeIntent, PhaseResult, load_intent
+from netcode.models import AclRuleIntent, AddVlanIntent, BgpNeighborIntent, CustomConfigIntent, EndToEndArtifacts, EndToEndResult, Intent, InterfaceConfigIntent, NtpStandardizeIntent, OsUpgradeIntent, PhaseResult, load_intent
 from netcode.paths import WorkspacePaths
 from netcode.rendering import render_intent
 from netcode.reporting import write_end_to_end_reports
@@ -379,6 +379,26 @@ class AristaEOSLabAdapter(ExecutionAdapter):
             device_id=self.device.id,
             message=message,
             evidence={"commands": {command: output}, "servers": intent.ntp.servers},
+        )
+
+    def _verify_os_upgrade(self, intent: OsUpgradeIntent, present: bool) -> LabResult:
+        command = "show running-config | include ^boot system"
+        output = self.show(command)
+        image = intent.os_upgrade.image
+        staged = f"boot system flash:{image}" in output or image in output
+        ok = staged if present else not staged
+        return LabResult(
+            status="pass" if ok else "fail",
+            action="verify" if present else "verify_rollback",
+            device_id=self.device.id,
+            message=(
+                f"Boot image {image} is staged; reload remains a separate approved maintenance-window action."
+                if present and ok
+                else f"Boot image {image} is not staged."
+                if not present and ok
+                else f"Boot image {image} did not match expected staged state."
+            ),
+            evidence={"commands": {command: output}, "image": image, "target_version": intent.os_upgrade.target_version},
         )
 
 

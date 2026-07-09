@@ -252,7 +252,62 @@ class NtpStandardizeIntent(BaseModel):
     metadata: IntentMetadata = Field(default_factory=IntentMetadata)
 
 
-Intent = AddVlanIntent | InterfaceConfigIntent | BgpNeighborIntent | AclRuleIntent | SiteDeviceIntent | CustomConfigIntent | NtpStandardizeIntent
+class OsUpgradeSpec(BaseModel):
+    image: str
+    target_version: str
+    md5: str
+    image_uri: str = ""
+    current_version: str = ""
+    rollback_image: str = ""
+    maintenance_window: str
+    canary_size: int = 1
+    batch_size: int = 5
+    verify_bgp: bool = True
+
+    @field_validator("image", "target_version", "maintenance_window")
+    @classmethod
+    def required_text(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("OS upgrade image, target_version, and maintenance_window are required")
+        return value
+
+    @field_validator("image", "rollback_image")
+    @classmethod
+    def safe_image_name(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            return value
+        if any(fragment in value for fragment in (";", "|", "&", ">", "<", "`", "$", "\n", "\r")):
+            raise ValueError("image names cannot contain shell metacharacters")
+        return value
+
+    @field_validator("md5")
+    @classmethod
+    def md5_hex(cls, value: str) -> str:
+        value = value.strip().lower()
+        if len(value) != 32 or any(ch not in "0123456789abcdef" for ch in value):
+            raise ValueError("md5 must be 32 hex characters")
+        return value
+
+    @field_validator("canary_size", "batch_size")
+    @classmethod
+    def positive_batch(cls, value: int) -> int:
+        if value < 1:
+            raise ValueError("canary_size and batch_size must be at least 1")
+        return value
+
+
+class OsUpgradeIntent(BaseModel):
+    change_type: Literal["os_upgrade"] = "os_upgrade"
+    site: str
+    targets: TargetSpec
+    os_upgrade: OsUpgradeSpec
+    policy: PolicySpec = Field(default_factory=PolicySpec)
+    metadata: IntentMetadata = Field(default_factory=IntentMetadata)
+
+
+Intent = AddVlanIntent | InterfaceConfigIntent | BgpNeighborIntent | AclRuleIntent | SiteDeviceIntent | CustomConfigIntent | NtpStandardizeIntent | OsUpgradeIntent
 
 
 class CheckResult(BaseModel):

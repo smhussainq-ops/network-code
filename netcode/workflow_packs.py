@@ -38,6 +38,16 @@ _PACKS: list[dict[str, Any]] = [
         "diagnostics_handoff": True,
         "production_writes": "locked_until_approved",
     },
+    {
+        "id": "eos-os-upgrade",
+        "name": "EOS OS Upgrade",
+        "description": "Stage EOS images with MD5 proof, boot-variable rollback, maintenance-window approval, canary reload, and batch promotion.",
+        "change_types": ["os_upgrade"],
+        "target_selector": ["site", "device_id", "device_group"],
+        "default_gates": ["pre_check", "stage_image", "md5_verify", "dry_run", "peer_review", "maintenance_window", "canary", "verify", "batch_apply", "rollback"],
+        "diagnostics_handoff": True,
+        "production_writes": "locked_until_approved",
+    },
 ]
 
 

@@ -238,6 +238,7 @@ class DiscoveryService:
             "host": str(candidate.get("host")),
             "platform": self.rez.normalize_platform(str(candidate.get("platform"))) or str(candidate.get("platform")),
             "site": str(candidate.get("site") or "unassigned"),
+            "role": str(candidate.get("role") or ""),
             "groups": [str(group) for group in candidate.get("groups") or ["discovered"]],
             "port": int(candidate.get("port") or 22),
         }

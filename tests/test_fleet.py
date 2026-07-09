@@ -325,3 +325,38 @@ def test_ntp_pack_blocks_rogue_server_against_approved_list(tmp_path: Path):
     assert result.status == "fail"
     failing = [c for c in result.validation.checks if c.status != "pass"]
     assert any("approved NTP server list" in c.message for c in failing)
+
+
+def test_fleet_verify_failure_attaches_rez_handoff(tmp_path: Path, monkeypatch):
+    from netcode.orchestrator import create_desired_state_intent, run_static_pipeline
+
+    paths = _fleet_workspace(tmp_path, device_count=1)
+    intent_path = create_desired_state_intent(
+        paths,
+        change_type="add_vlan",
+        site="store-1",
+        device_id="sw1",
+        requested_by="tester",
+        values={"vlan_id": 210, "name": "APP_210", "subnet": "10.210.0.0/24"},
+    )
+    pipeline = run_static_pipeline(paths, intent_path)
+    store = PlatformStore(paths)
+    change = store.create_change(intent_path, "sw1")
+    store.update_change(change.id, "validated", pipeline.model_dump(), workflow_state="validated")
+
+    monkeypatch.setattr(fleet, "execution_mode", lambda: "runner")
+    monkeypatch.setattr(
+        fleet,
+        "_read_and_wait",
+        lambda store, org_id, action, payload: {"ok": False, "message": "VLAN 210 missing after canary"},
+    )
+
+    ok, message = fleet._verify_device(paths, store, intent_path, "sw1", change.id)
+
+    assert ok is False
+    assert "missing" in message
+    stored = store.get_change(change.id)
+    handoff = stored.result["diagnostics_handoffs"][0]
+    assert handoff["context"]["source"] == "netcode_verification"
+    assert handoff["context"]["read_only"] is True
+    assert handoff["safety"]["device_writes"] == "none"
