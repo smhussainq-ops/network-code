@@ -166,6 +166,58 @@ def test_site_context_interface_remediation_stays_typed_and_human_gated(tmp_path
     assert body["change"]["workflow_state"] in {"validated", "blocked"}
 
 
+def test_site_context_redistribution_remediation_is_typed_validated_and_human_gated(
+    tmp_path: Path, monkeypatch
+):
+    init_workspace(WorkspacePaths(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    client = TestClient(api.app)
+
+    response = client.post(
+        "/api/changes/from-rca",
+        json=_confirmed_proposal({
+            "root_atom_id": "CP_REDISTRIBUTION_GAP",
+            "proposal_source": "site_operational_context",
+            "source": "rez",
+            "incident_id": "INC-CAMPUS-REDIST",
+            "target_device": "v2-store1",
+            "suggested_pack": "routing_redistribution",
+            "rationale": "Approved BGP-to-OSPF boundary is absent and scoped reachability failed.",
+            "evidence_refs": ["approved-design:campus-bgp-to-ospf", "live:ssh"],
+            "proposed_intent": {
+                "change_type": "routing_redistribution",
+                "site": "campus",
+                "targets": {"device_ids": ["v2-store1"]},
+                "redistribution": {
+                    "from_protocol": "bgp",
+                    "to_protocol": "ospf",
+                    "target_process": "1",
+                    "route_map": "CAMPUS-BGP-TO-OSPF",
+                    "prefix_list": "ENTERPRISE-REMOTE-LOOPBACKS",
+                    "prefixes": ["1.1.1.0/24", "2.2.2.0/24", "4.4.4.0/24", "5.5.5.0/24"],
+                    "route_tag": 65002,
+                },
+            },
+        }),
+    )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["draft_only"] is True
+    assert body["human_approval_required"] is True
+    assert body["change"]["workflow_state"] == "validated"
+    assert body["intent"]["change_type"] == "routing_redistribution"
+    assert body["intent"]["redistribution"]["route_map"] == "CAMPUS-BGP-TO-OSPF"
+    commands = body["change"]["result"]["plan"]["commands"]
+    assert "ip prefix-list ENTERPRISE-REMOTE-LOOPBACKS" in commands
+    assert "route-map CAMPUS-BGP-TO-OSPF permit 10" in commands
+    assert "router ospf 1" in commands
+    assert "redistribute bgp route-map CAMPUS-BGP-TO-OSPF" in commands
+    rollback = body["change"]["result"]["plan"]["rollback"]
+    assert "no redistribute bgp route-map CAMPUS-BGP-TO-OSPF" in rollback
+    assert PlatformStore(WorkspacePaths(tmp_path.resolve())).list_jobs() == []
+
+
 def test_rez_rca_validated_draft_can_enter_dry_run_queue(tmp_path: Path, monkeypatch):
     init_workspace(WorkspacePaths(tmp_path))
     monkeypatch.chdir(tmp_path)

@@ -63,6 +63,17 @@ BGP_NEIGHBOR_TEMPLATE = """router bgp {{ bgp.asn }}
 """
 
 
+ROUTING_REDISTRIBUTION_TEMPLATE = """{% for prefix in redistribution.prefixes %}
+ip prefix-list {{ redistribution.prefix_list }} seq {{ loop.index * 10 }} permit {{ prefix }} le 32
+{% endfor %}
+route-map {{ redistribution.route_map }} permit 10
+   match ip address prefix-list {{ redistribution.prefix_list }}
+   set tag {{ redistribution.route_tag }}
+router {{ redistribution.to_protocol }} {{ redistribution.target_process }}
+   redistribute {{ redistribution.from_protocol }} route-map {{ redistribution.route_map }}
+"""
+
+
 ACL_RULE_TEMPLATE = """ip access-list {{ acl.name }}
 {% if acl.remark %}
    remark {{ acl.remark }}
@@ -121,6 +132,7 @@ def init_workspace(paths: WorkspacePaths, force: bool = False) -> list[Path]:
         (paths.templates / "arista" / "add_vlan.j2", ADD_VLAN_TEMPLATE),
         (paths.templates / "arista" / "interface_config.j2", INTERFACE_CONFIG_TEMPLATE),
         (paths.templates / "arista" / "bgp_neighbor.j2", BGP_NEIGHBOR_TEMPLATE),
+        (paths.templates / "arista" / "routing_redistribution.j2", ROUTING_REDISTRIBUTION_TEMPLATE),
         (paths.templates / "arista" / "acl_rule.j2", ACL_RULE_TEMPLATE),
         (paths.templates / "arista" / "site_device_intent.j2", SITE_DEVICE_INTENT_TEMPLATE),
         (paths.templates / "arista" / "custom_config.j2", CUSTOM_CONFIG_TEMPLATE),

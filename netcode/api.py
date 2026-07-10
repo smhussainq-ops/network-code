@@ -54,7 +54,7 @@ from netcode.fleet import (
 )
 from netcode.gitops import gitops_plan
 from netcode.inventory import Inventory
-from netcode.intent_utils import lab_write_supported, plan_metadata, production_write_supported
+from netcode.intent_utils import lab_write_supported, plan_metadata, production_write_supported, rollback_config
 from netcode.jobs import JobRunner, execution_mode, runner_pool
 from netcode.lab import AristaEOSLabAdapter, lab_status, run_arista_end_to_end, run_lab_action
 from netcode.auth import (
@@ -398,6 +398,7 @@ _RCA_ALLOWED_CHANGE_TYPES = {
     "site_device_intent",
     "custom_config",
     "ntp_standardize",
+    "routing_redistribution",
 }
 
 _RCA_PROPOSAL_SCHEMA = "netcode.remediation.v1"
@@ -412,6 +413,7 @@ _RCA_TOP_LEVEL_SECTIONS = {
     "acl_rule": "acl",
     "site_device_intent": "device",
     "ntp_standardize": "ntp",
+    "routing_redistribution": "redistribution",
 }
 
 _RCA_SENSITIVE_KEY_PARTS = (
@@ -2781,7 +2783,7 @@ def api_change_from_rca(request: RcaRemediationProposalRequest, http_request: Re
         "pipeline": pipeline.model_dump(),
         "plan": {
             "commands": pipeline.render.config,
-            "rollback": intent.get("custom", {}).get("rollback_lines", "") if isinstance(intent.get("custom"), dict) else "",
+            "rollback": rollback_config(load_intent_data(intent)),
             "validation_status": pipeline.status,
             "checks": [check.model_dump() for check in pipeline.validation.checks],
             "artifacts": pipeline.artifacts.model_dump() if pipeline.artifacts else None,

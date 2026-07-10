@@ -1360,6 +1360,60 @@ def test_runner_local_policy_gate_blocks_forbidden_config(tmp_path: Path):
     assert local_policy_gate(intent, clean, "{{ not: valid: yaml")["ok"] is False
 
 
+def test_runner_local_policy_gate_accepts_only_typed_redistribution_scope(tmp_path: Path):
+    """Runner and control plane must enforce the same typed redistribution contract."""
+    from netcode.models import RenderResult, RoutingRedistributionIntent
+    from netcode.runner_checks import local_policy_gate
+
+    paths = WorkspacePaths(tmp_path)
+    init_workspace(paths)
+    policy_yaml = (paths.root / "policies" / "invariants.yaml").read_text()
+    intent = RoutingRedistributionIntent.model_validate({
+        "site": "campus",
+        "targets": {"device_ids": ["v2-campus-edge-1"]},
+        "redistribution": {
+            "from_protocol": "bgp",
+            "to_protocol": "ospf",
+            "target_process": "1",
+            "route_map": "CAMPUS-BGP-TO-OSPF",
+            "prefix_list": "ENTERPRISE-REMOTE-LOOPBACKS",
+            "prefixes": ["1.1.1.0/24", "4.4.4.0/24"],
+            "route_tag": 65002,
+        },
+    })
+    clean = RenderResult(
+        template_path="routing_redistribution.j2",
+        config=(
+            "ip prefix-list ENTERPRISE-REMOTE-LOOPBACKS seq 10 permit 1.1.1.0/24 le 32\n"
+            "route-map CAMPUS-BGP-TO-OSPF permit 10\n"
+            "   match ip address prefix-list ENTERPRISE-REMOTE-LOOPBACKS\n"
+            "   set tag 65002\n"
+            "router ospf 1\n"
+            "   redistribute bgp route-map CAMPUS-BGP-TO-OSPF\n"
+        ),
+        variables={},
+    )
+    assert local_policy_gate(intent, clean, policy_yaml)["ok"] is True
+
+    out_of_scope = RenderResult(
+        template_path="routing_redistribution.j2",
+        config=clean.config + "router bgp 65030\n",
+        variables={},
+    )
+    result = local_policy_gate(intent, out_of_scope, policy_yaml)
+    assert result["ok"] is False
+    assert result["unexpected_lines"] == ["router bgp 65030"]
+
+    credentials = RenderResult(
+        template_path="routing_redistribution.j2",
+        config=clean.config + "username backdoor privilege 15 secret unsafe\n",
+        variables={},
+    )
+    result = local_policy_gate(intent, credentials, policy_yaml)
+    assert result["ok"] is False
+    assert result["blocked_lines"] == ["username backdoor privilege 15 secret unsafe"]
+
+
 def test_runner_mode_device_credentials_rejected_before_queue_or_import(tmp_path: Path, monkeypatch):
     """Enterprise mode: cloud paths never accept device credentials. Credentials
     are configured on the runner, then discovery/manual-add submit public facts
@@ -1771,7 +1825,7 @@ def test_desired_state_catalog_and_dynamic_plans(tmp_path: Path, monkeypatch):
     ids = {item["id"] for item in catalog.json()["change_types"]}
 
     assert catalog.status_code == 200
-    assert {"add_vlan", "interface_config", "bgp_neighbor", "acl_rule", "site_device_intent", "os_upgrade"}.issubset(ids)
+    assert {"add_vlan", "interface_config", "bgp_neighbor", "routing_redistribution", "acl_rule", "site_device_intent", "os_upgrade"}.issubset(ids)
 
     interface_plan = client.post(
         "/api/desired-state/plan",
@@ -2676,7 +2730,7 @@ def test_change_type_registry_contract_is_complete():
     from netcode.lab import AristaEOSLabAdapter
     from netcode.validation import StaticValidator
 
-    assert set(REGISTRY) == {"add_vlan", "interface_config", "bgp_neighbor", "acl_rule", "site_device_intent", "custom_config", "ntp_standardize", "os_upgrade"}
+    assert set(REGISTRY) == {"add_vlan", "interface_config", "bgp_neighbor", "routing_redistribution", "acl_rule", "site_device_intent", "custom_config", "ntp_standardize", "os_upgrade"}
     for key, spec in REGISTRY.items():
         assert spec.template.endswith(".j2"), key
         assert spec.policy_checks, f"{key} has no policy checks"

@@ -153,6 +153,22 @@ DEFAULT_UI_CONFIG: dict[str, Any] = {
                     {"name": "shutdown", "label": "Keep neighbor shutdown", "type": "checkbox", "value": False},
                 ],
             },
+            "routing_redistribution": {
+                "label": "Controlled Route Redistribution",
+                "outcome": "Propagate only approved prefix classes across a BGP-to-OSPF boundary.",
+                "risk": "High: changes route propagation; route-map, dry-run, approval, and rollback required",
+                "lab_write_supported": True,
+                "production_write_supported": False,
+                "fields": [
+                    {"name": "from_protocol", "label": "Source protocol", "type": "select", "value": "bgp", "options": [["bgp", "BGP"]]},
+                    {"name": "to_protocol", "label": "Target protocol", "type": "select", "value": "ospf", "options": [["ospf", "OSPF"]]},
+                    {"name": "target_process", "label": "OSPF process", "type": "text", "value": "1"},
+                    {"name": "route_map", "label": "Route-map", "type": "text", "value": "BGP-TO-OSPF"},
+                    {"name": "prefix_list", "label": "Prefix-list", "type": "text", "value": "APPROVED-BGP-TO-OSPF"},
+                    {"name": "prefixes", "label": "Approved prefixes", "type": "text", "value": "10.0.0.0/8", "placeholder": "comma separated, no default route"},
+                    {"name": "route_tag", "label": "Route tag", "type": "number", "value": 65000, "min": 1},
+                ],
+            },
             "acl_rule": {
                 "label": "ACL Rule",
                 "outcome": "Add a sequenced permit or deny rule to a named ACL.",

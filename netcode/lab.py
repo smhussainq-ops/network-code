@@ -16,7 +16,7 @@ from netcode.adapters.registry import AdapterRegistry
 from netcode.change_types import spec_for
 from netcode.inventory import Device, Inventory
 from netcode.intent_utils import lab_write_supported, report_stem, rollback_config
-from netcode.models import AclRuleIntent, AddVlanIntent, BgpNeighborIntent, CustomConfigIntent, EndToEndArtifacts, EndToEndResult, Intent, InterfaceConfigIntent, NtpStandardizeIntent, OsUpgradeIntent, PhaseResult, load_intent
+from netcode.models import AclRuleIntent, AddVlanIntent, BgpNeighborIntent, CustomConfigIntent, EndToEndArtifacts, EndToEndResult, Intent, InterfaceConfigIntent, NtpStandardizeIntent, OsUpgradeIntent, PhaseResult, RoutingRedistributionIntent, load_intent
 from netcode.paths import WorkspacePaths
 from netcode.rendering import render_intent
 from netcode.reporting import write_end_to_end_reports
@@ -397,6 +397,23 @@ class AristaEOSLabAdapter(ExecutionAdapter):
             device_id=self.device.id,
             message=f"BGP neighbor config {'is present' if present and seen else 'is absent' if not present and seen else 'did not match expected state'}.",
             evidence={"commands": {command: output}, "neighbors": neighbors},
+        )
+
+    def _verify_redistribution(self, intent: RoutingRedistributionIntent, present: bool) -> LabResult:
+        item = intent.redistribution
+        command = f"show running-config | section router {item.to_protocol} {item.target_process}"
+        output = self.show(command)
+        statement = f"redistribute {item.from_protocol} route-map {item.route_map}"
+        found = statement in output
+        seen = found if present else not found
+        return LabResult(
+            status="pass" if seen else "fail",
+            action="verify" if present else "verify_rollback",
+            device_id=self.device.id,
+            message=(
+                f"Controlled redistribution statement {'is present' if found else 'is absent'}: {statement}."
+            ),
+            evidence={"commands": {command: output}, "statement": statement, "found": found},
         )
 
     def _verify_acl(self, intent: AclRuleIntent, present: bool) -> LabResult:

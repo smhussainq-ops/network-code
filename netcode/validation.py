@@ -249,6 +249,36 @@ class StaticValidator:
             neighbors=[neighbor.address for neighbor in intent.bgp.neighbors],
         )
 
+    def _routing_redistribution_policy(self, intent, render: RenderResult) -> CheckResult:
+        item = intent.redistribution
+        if item.from_protocol != "bgp" or item.to_protocol != "ospf":
+            return self._fail(
+                "routing_redistribution_policy",
+                "Route Redistribution Policy",
+                "This controlled workflow currently supports only BGP-to-OSPF redistribution.",
+            )
+        if any(str(prefix) == "0.0.0.0/0" for prefix in item.prefixes):
+            return self._fail(
+                "routing_redistribution_policy",
+                "Route Redistribution Policy",
+                "Default-route redistribution is forbidden in this workflow.",
+            )
+        if f"redistribute bgp route-map {item.route_map}" not in render.config:
+            return self._fail(
+                "routing_redistribution_policy",
+                "Route Redistribution Policy",
+                "Redistribution must be constrained by the approved route-map.",
+            )
+        return self._pass(
+            "routing_redistribution_policy",
+            "Route Redistribution Policy",
+            "BGP-to-OSPF redistribution is constrained by an explicit prefix list, route-map, and route tag.",
+            route_map=item.route_map,
+            prefix_list=item.prefix_list,
+            prefixes=item.prefixes,
+            route_tag=item.route_tag,
+        )
+
     def _acl_policy(self, intent: AclRuleIntent, render: RenderResult) -> CheckResult:
         if intent.acl.sequence < 1 or intent.acl.sequence > 9999:
             return self._fail("acl_policy", "ACL Policy", "ACL sequence must be between 1 and 9999.", sequence=intent.acl.sequence)

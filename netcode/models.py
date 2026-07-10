@@ -156,6 +156,55 @@ class BgpNeighborIntent(BaseModel):
     metadata: IntentMetadata = Field(default_factory=IntentMetadata)
 
 
+class RoutingRedistributionSpec(BaseModel):
+    from_protocol: Literal["bgp"] = "bgp"
+    to_protocol: Literal["ospf"] = "ospf"
+    target_process: str
+    route_map: str
+    prefix_list: str
+    prefixes: list[str]
+    route_tag: int
+
+    @field_validator("target_process", "route_map", "prefix_list")
+    @classmethod
+    def required_safe_identifier(cls, value: str) -> str:
+        text = value.strip()
+        if not text:
+            raise ValueError("routing redistribution identifiers are required")
+        if not all(character.isalnum() or character in "_.-" for character in text):
+            raise ValueError("routing redistribution identifiers contain unsupported characters")
+        return text
+
+    @field_validator("prefixes")
+    @classmethod
+    def scoped_ipv4_prefixes(cls, values: list[str]) -> list[str]:
+        if not values:
+            raise ValueError("at least one approved prefix is required")
+        normalized: list[str] = []
+        for value in values:
+            network = ip_network(value, strict=False)
+            if network.version != 4 or network.prefixlen == 0:
+                raise ValueError("redistribution prefixes must be scoped IPv4 prefixes, never a default route")
+            normalized.append(str(network))
+        return normalized
+
+    @field_validator("route_tag")
+    @classmethod
+    def valid_route_tag(cls, value: int) -> int:
+        if value < 1 or value > 4294967295:
+            raise ValueError("route_tag must be between 1 and 4294967295")
+        return value
+
+
+class RoutingRedistributionIntent(BaseModel):
+    change_type: Literal["routing_redistribution"] = "routing_redistribution"
+    site: str
+    targets: TargetSpec
+    redistribution: RoutingRedistributionSpec
+    policy: PolicySpec = Field(default_factory=PolicySpec)
+    metadata: IntentMetadata = Field(default_factory=IntentMetadata)
+
+
 class AclRuleSpec(BaseModel):
     name: str
     sequence: int = 10
@@ -307,7 +356,7 @@ class OsUpgradeIntent(BaseModel):
     metadata: IntentMetadata = Field(default_factory=IntentMetadata)
 
 
-Intent = AddVlanIntent | InterfaceConfigIntent | BgpNeighborIntent | AclRuleIntent | SiteDeviceIntent | CustomConfigIntent | NtpStandardizeIntent | OsUpgradeIntent
+Intent = AddVlanIntent | InterfaceConfigIntent | BgpNeighborIntent | RoutingRedistributionIntent | AclRuleIntent | SiteDeviceIntent | CustomConfigIntent | NtpStandardizeIntent | OsUpgradeIntent
 
 
 class CheckResult(BaseModel):

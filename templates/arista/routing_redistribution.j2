@@ -1,0 +1,8 @@
+{% for prefix in redistribution.prefixes %}
+ip prefix-list {{ redistribution.prefix_list }} seq {{ loop.index * 10 }} permit {{ prefix }} le 32
+{% endfor %}
+route-map {{ redistribution.route_map }} permit 10
+   match ip address prefix-list {{ redistribution.prefix_list }}
+   set tag {{ redistribution.route_tag }}
+router {{ redistribution.to_protocol }} {{ redistribution.target_process }}
+   redistribute {{ redistribution.from_protocol }} route-map {{ redistribution.route_map }}

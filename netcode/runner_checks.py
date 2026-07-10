@@ -18,20 +18,9 @@ from typing import Any
 
 import yaml
 
+from netcode.change_types import spec_for
 from netcode.models import Intent, RenderResult
 from netcode.validation import StaticValidator
-
-
-# Mirror of validation.StaticValidator._render_scope default allow-lists, kept here
-# so the runner gate is self-contained and auditable.
-_DEFAULT_ALLOWED = {
-    "add_vlan": ["vlan ", "   name ", "interface Vlan", "   description ", "   ip address "],
-    "interface_config": ["interface ", "   description ", "   switchport ", "   no switchport", "   ip address ", "   shutdown", "   no shutdown"],
-    "bgp_neighbor": ["router bgp ", "   router-id ", "   neighbor ", "   no neighbor "],
-    "acl_rule": ["ip access-list ", "   remark ", "   permit ", "   deny "],
-    "site_device_intent": ["! "],
-    "custom_config": [],
-}
 
 # A hardcoded floor the runner enforces for EVERY change type, regardless of the
 # policy shipped by the control plane or configured locally. A compromised
@@ -78,21 +67,30 @@ def local_policy_gate(
     payload_scope = payload_policy.get("render_scope", {}) if isinstance(payload_policy, dict) else {}
     local_scope = local_policy.get("render_scope", {}) if isinstance(local_policy, dict) else {}
 
-    # Allowed prefixes: local wins, then payload, then built-in defaults.
+    # The signed intent is parsed locally before this function is called. Resolve
+    # its registry contract here as the runner's built-in source of truth so new
+    # typed change types cannot silently fall back to an obsolete generic policy.
+    spec = spec_for(intent)
+
+    # Allowed prefixes: local wins, then payload, then the typed registry contract.
     key = f"{change_type}_allowed_prefixes"
-    allowed_list = local_scope.get(key) or payload_scope.get(key) or _DEFAULT_ALLOWED.get(change_type, [])
+    allowed_list = local_scope.get(key) or payload_scope.get(key) or spec.allow_prefixes
     allowed = tuple(allowed_list)
 
     # Blocked fragments: hardcoded floor ∪ local ∪ payload (union = strictly safer).
-    blocked = {frag.lower() for frag in _ALWAYS_BLOCKED}
+    immutable_blocked = {frag.lower() for frag in _ALWAYS_BLOCKED}
+    blocked = set(immutable_blocked)
     blocked |= {str(v).lower() for v in payload_scope.get("blocked_fragments", [])}
     blocked |= {str(v).lower() for v in local_scope.get("blocked_fragments", [])}
     blocked = list(blocked)
-    # Same per-change-type carve-outs the control plane uses, applied locally.
-    if change_type == "bgp_neighbor":
-        blocked = [fragment for fragment in blocked if fragment != "router bgp"]
-    if change_type == "acl_rule":
-        blocked = [fragment for fragment in blocked if fragment != "ip access-list"]
+    # Apply the exact typed carve-outs used by the control-plane validator. The
+    # immutable credential/AAA floor intentionally has no registry carve-outs.
+    carveouts = {
+        fragment.lower()
+        for fragment in spec.block_carveouts
+        if fragment.lower() not in immutable_blocked
+    }
+    blocked = [fragment for fragment in blocked if fragment not in carveouts]
 
     blocked_lines: list[str] = []
     unexpected_lines: list[str] = []
