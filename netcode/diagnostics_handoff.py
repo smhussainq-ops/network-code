@@ -116,6 +116,9 @@ def attach_verification_handoff(
         change = store.get_change(change_id)
     except Exception:
         return None
+    from netcode.diagnostics_dispatch import dispatch_verification_handoff
+
+    handoff["dispatch"] = dispatch_verification_handoff(handoff)
     result = dict(change.result or {})
     handoffs = list(result.get("diagnostics_handoffs") or [])
     handoffs.append(handoff)
