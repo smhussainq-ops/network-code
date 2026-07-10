@@ -76,6 +76,7 @@ def plan_fleet_rollout(
     if batch_size < 1:
         raise ValueError("batch_size must be at least 1.")
     inventory = Inventory(configured_inventory_path(p))
+    store = PlatformStore(p)
 
     from netcode.change_types import spec_for
     try:
@@ -84,12 +85,36 @@ def plan_fleet_rollout(
         raise ValueError(f"Unknown change type '{change_type}'.") from exc
 
     if device_ids:
-        unknown = [d for d in device_ids if d not in inventory.by_id]
+        selected_metadata: dict[str, dict[str, Any]] = {}
+        selected: list[str] = []
+        unknown: list[str] = []
+        for requested_id in device_ids:
+            inventory_device = inventory.find_device(requested_id)
+            if inventory_device:
+                canonical_id = inventory_device.id
+                metadata = {"site": inventory_device.site, "platform": inventory_device.platform}
+            else:
+                catalog_device = store.resolve_device(org_id, requested_id)
+                if not catalog_device:
+                    unknown.append(requested_id)
+                    continue
+                canonical_id = str(catalog_device["canonical_id"])
+                metadata = {
+                    "site": catalog_device.get("site"),
+                    "platform": catalog_device.get("platform"),
+                }
+            if canonical_id not in selected_metadata:
+                selected.append(canonical_id)
+                selected_metadata[canonical_id] = metadata
         if unknown:
             raise ValueError(f"Unknown devices (not in source of truth): {', '.join(unknown)}")
-        selected = list(dict.fromkeys(device_ids))  # dedupe, keep order
     elif device_group:
         selected = [d.id for d in inventory.by_id.values() if device_group in d.groups]
+        selected_metadata = {
+            device.id: {"site": device.site, "platform": device.platform}
+            for device in inventory.by_id.values()
+            if device.id in selected
+        }
         if not selected:
             raise ValueError(f"No devices in group '{device_group}'.")
     else:
@@ -98,7 +123,6 @@ def plan_fleet_rollout(
     waves_plan = rollout_plan(p, selected, canary_size=canary_size, batch_size=batch_size)
     waves: list[list[str]] = [waves_plan["canaries"]] + waves_plan["batches"]
 
-    store = PlatformStore(p)
     rollout = store.create_rollout(
         description=description or f"{change_type} to {len(selected)} devices",
         change_type=change_type, values=values,
@@ -111,9 +135,9 @@ def plan_fleet_rollout(
     try:
         for wave_index, wave in enumerate(waves):
             for device_id in wave:
-                device = inventory.by_id[device_id]
+                device = selected_metadata[device_id]
                 built_path = create_desired_state_intent(
-                    p, change_type=change_type, site=device.site or "fleet",
+                    p, change_type=change_type, site=str(device.get("site") or "fleet"),
                     device_id=device_id, requested_by=requested_by, values=values,
                 )
                 # Re-home the intent under a rollout-unique path: the default
@@ -128,7 +152,7 @@ def plan_fleet_rollout(
                 )
                 store.add_rollout_target(rollout_id, device_id, wave_index,
                                          change_id=change.id, intent_path=str(intent_path))
-                result = run_static_pipeline(p, intent_path)
+                result = run_static_pipeline(p, intent_path, org_id=org_id)
                 passed = result.status == "pass"
                 workflow = state_after_static_validation(passed)
                 store.update_change(change.id, "validated" if passed else "blocked",

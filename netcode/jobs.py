@@ -125,9 +125,20 @@ class JobRunner:
             }
 
         if execution_mode() == "runner":
-            pool = runner_pool()
-            payload = self._runner_payload(intent_path, action, device_id, change.id)
-            job = self.store.queue_job(change.id, f"lab_{action}", pool, payload)
+            payload, pool, target_runner_id = self._runner_job_spec(
+                intent_path,
+                action,
+                device_id,
+                change.id,
+                change.org_id,
+            )
+            job = self.store.queue_job(
+                change.id,
+                f"lab_{action}",
+                pool,
+                payload,
+                target_runner_id=target_runner_id,
+            )
             self.store.record_workflow_event(
                 change.id,
                 action,
@@ -181,26 +192,74 @@ class JobRunner:
                 "result": error,
             }
 
-    def _runner_payload(self, intent_path: Path, action: str, device_id: str | None, change_id: str) -> dict[str, object]:
+    def _runner_job_spec(
+        self,
+        intent_path: Path,
+        action: str,
+        device_id: str | None,
+        change_id: str,
+        org_id: str,
+    ) -> tuple[dict[str, object], str, str | None]:
         """Build the job spec shipped to the runner. Deliberately credential-free:
-        the runner resolves credentials from its own local store by device id."""
+        the runner resolves credentials from its own local store by device id.
+
+        Legacy YAML inventory remains supported. Devices learned from a runner's
+        public catalog are routed back to that exact runner, rather than merely
+        to any connector that happens to share its pool.
+        """
         intent = load_intent(intent_path)
         render = render_intent(intent, self.paths)
         inventory = Inventory(configured_inventory_path(self.paths))
-        device = inventory.by_id.get(device_id) if device_id else None
-        if device is None:
-            device = inventory.resolve_targets(intent.targets, site=intent.site)[0]
-        policy_path = configured_policy_path(self.paths)
-        return {
-            "action": action,
-            "change_id": change_id,
-            "device": {
+        requested_id = str(device_id or "").strip()
+        if not requested_id and intent.targets.device_ids:
+            requested_id = str(intent.targets.device_ids[0]).strip()
+
+        device = inventory.find_device(requested_id) if requested_id else None
+        target_runner_id: str | None = None
+        pool = runner_pool()
+        if device is not None:
+            public_device = {
                 "id": device.id,
                 "host": device.host,
                 "platform": device.platform,
                 "port": device.port,
-            },
+            }
+        else:
+            catalog_device = self.store.resolve_device(org_id, requested_id) if requested_id else None
+            if catalog_device is None:
+                # Group-only legacy intents still resolve through the YAML source
+                # of truth. Catalog-backed execution requires one exact target.
+                if not requested_id:
+                    legacy_target = inventory.resolve_targets(intent.targets, site=intent.site)[0]
+                    public_device = {
+                        "id": legacy_target.id,
+                        "host": legacy_target.host,
+                        "platform": legacy_target.platform,
+                        "port": legacy_target.port,
+                    }
+                else:
+                    raise ValueError(f"Unknown target device(s): {requested_id}")
+            else:
+                public_device = {
+                    "id": str(catalog_device["canonical_id"]),
+                    "host": str(catalog_device["host"]),
+                    "platform": str(catalog_device["platform"]),
+                    "port": int(catalog_device["port"]),
+                }
+                pool = str(catalog_device["runner_pool"])
+                target_runner_id = str(catalog_device["runner_id"])
+        policy_path = configured_policy_path(self.paths)
+        payload = {
+            "action": action,
+            "change_id": change_id,
+            "device": public_device,
             "intent_yaml": intent_path.read_text(encoding="utf-8"),
             "rendered_config": render.config,
             "policy_yaml": policy_path.read_text(encoding="utf-8") if policy_path.exists() else "",
         }
+        return payload, pool, target_runner_id
+
+    def _runner_payload(self, intent_path: Path, action: str, device_id: str | None, change_id: str) -> dict[str, object]:
+        """Backward-compatible payload helper for legacy callers and tests."""
+        payload, _, _ = self._runner_job_spec(intent_path, action, device_id, change_id, "org_default")
+        return payload

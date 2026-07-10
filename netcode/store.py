@@ -96,6 +96,7 @@ class JobRecord:
     claimed_by: str | None = None
     signature: str | None = None
     org_id: str = DEFAULT_ORG_ID
+    target_runner_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -304,6 +305,11 @@ class PlatformStore:
             self._ensure_column(conn, "jobs", "payload_json", "TEXT")
             self._ensure_column(conn, "jobs", "claimed_by", "TEXT")
             self._ensure_column(conn, "jobs", "signature", "TEXT")
+            self._ensure_column(conn, "jobs", "target_runner_id", "TEXT")
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_jobs_runner_target "
+                "ON jobs (pool, status, target_runner_id, created_at)"
+            )
 
             # M5: tenancy + auth. Additive and default-valued so it is safe with
             # NETCODE_AUTH off (existing rows are backfilled to the default org).
@@ -625,6 +631,7 @@ class PlatformStore:
             claimed_by=self._col(row, "claimed_by"),
             signature=self._col(row, "signature"),
             org_id=self._col(row, "org_id") or DEFAULT_ORG_ID,
+            target_runner_id=self._col(row, "target_runner_id"),
         )
 
     def _runner(self, row: sqlite3.Row) -> RunnerRecord:
@@ -1121,12 +1128,26 @@ class PlatformStore:
             ).fetchall()
         return [self._shell_session_row(row) for row in rows]
 
-    def queue_job(self, change_id: str, action: str, pool: str, payload: dict[str, Any]) -> JobRecord:
+    def queue_job(
+        self,
+        change_id: str,
+        action: str,
+        pool: str,
+        payload: dict[str, Any],
+        *,
+        target_runner_id: str | None = None,
+    ) -> JobRecord:
         job = self.create_job(change_id, action)  # inherits org_id from the parent change
         with self._connect() as conn:
             conn.execute(
-                "UPDATE jobs SET pool = ?, payload_json = ?, message = ? WHERE id = ?",
-                (pool, json.dumps(payload), f"Queued for runner pool {pool}", job.id),
+                "UPDATE jobs SET pool = ?, payload_json = ?, target_runner_id = ?, message = ? WHERE id = ?",
+                (
+                    pool,
+                    json.dumps(payload),
+                    target_runner_id,
+                    f"Queued for runner pool {pool}",
+                    job.id,
+                ),
             )
         return self.get_job(job.id)
 
@@ -1291,32 +1312,59 @@ class PlatformStore:
             data["values"] = {}
         return data
 
-    def create_read_job(self, org_id: str, pool: str, action: str, payload: dict[str, Any]) -> JobRecord:
+    def create_read_job(
+        self,
+        org_id: str,
+        pool: str,
+        action: str,
+        payload: dict[str, Any],
+        *,
+        target_runner_id: str | None = None,
+    ) -> JobRecord:
         """Queue a device-READ job for a runner. Not tied to a change (uses the '__read__'
         sentinel), so submitting its result never advances a change workflow."""
         job_id = str(uuid.uuid4())
         now = utc_now()
         with self._connect() as conn:
             conn.execute(
-                "INSERT INTO jobs (id, change_id, action, status, message, created_at, updated_at, result_json, org_id, pool, payload_json)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (job_id, "__read__", f"read_{action}", "queued", f"Queued read '{action}' for pool {pool}", now, now, None, org_id, pool, json.dumps(payload)),
+                "INSERT INTO jobs (id, change_id, action, status, message, created_at, updated_at, result_json, "
+                "org_id, pool, payload_json, target_runner_id)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    job_id,
+                    "__read__",
+                    f"read_{action}",
+                    "queued",
+                    f"Queued read '{action}' for pool {pool}",
+                    now,
+                    now,
+                    None,
+                    org_id,
+                    pool,
+                    json.dumps(payload),
+                    target_runner_id,
+                ),
             )
         return self.get_job(job_id)
 
     def claim_next_job(self, org_id: str, pool: str, runner_id: str) -> JobRecord | None:
         """Atomically claim the oldest queued job for a (org, pool). Concurrent- and tenant-safe:
-        a runner may only claim jobs in its OWN org, so colliding pool names across tenants stay isolated."""
+        a runner may only claim jobs in its OWN org, and catalog-targeted jobs may
+        only be claimed by the runner that advertised the target device."""
         with self._connect() as conn:
             row = conn.execute(
-                "SELECT id FROM jobs WHERE status = 'queued' AND org_id = ? AND pool = ? ORDER BY created_at ASC LIMIT 1",
-                (org_id, pool),
+                "SELECT id FROM jobs WHERE status = 'queued' AND org_id = ? AND pool = ? "
+                "AND (target_runner_id IS NULL OR target_runner_id = ?) "
+                "ORDER BY created_at ASC LIMIT 1",
+                (org_id, pool, runner_id),
             ).fetchone()
             if not row:
                 return None
             cursor = conn.execute(
-                "UPDATE jobs SET status = 'running', claimed_by = ?, message = ?, updated_at = ? WHERE id = ? AND status = 'queued'",
-                (runner_id, f"Claimed by runner {runner_id}", utc_now(), row["id"]),
+                "UPDATE jobs SET status = 'running', claimed_by = ?, message = ?, updated_at = ? "
+                "WHERE id = ? AND status = 'queued' "
+                "AND (target_runner_id IS NULL OR target_runner_id = ?)",
+                (runner_id, f"Claimed by runner {runner_id}", utc_now(), row["id"], runner_id),
             )
             if cursor.rowcount != 1:
                 return None  # another runner won the race

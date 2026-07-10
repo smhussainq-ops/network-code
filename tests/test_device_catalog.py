@@ -8,8 +8,10 @@ from fastapi.testclient import TestClient
 
 from netcode import api, runner_agent
 from netcode.bootstrap import init_workspace
+from netcode.jobs import JobRunner
 from netcode.paths import WorkspacePaths
 from netcode.runner_hub import enroll_runner, mint_join_token
+from netcode.scale import rollout_plan
 from netcode.store import DEFAULT_ORG_ID, PlatformStore
 from netcode.yamlio import write_yaml
 
@@ -138,6 +140,92 @@ def test_shell_open_routes_catalog_device_to_exact_connector(tmp_path: Path, mon
         api._SHELL_SESSIONS.clear()
 
 
+def test_catalog_change_routes_to_exact_connector_even_when_pool_is_shared(tmp_path: Path, monkeypatch):
+    workspace = WorkspacePaths(tmp_path)
+    init_workspace(workspace)
+    monkeypatch.setenv("NETCODE_EXECUTION", "runner")
+    store = PlatformStore(workspace)
+    wrong_runner, _ = _runner(store, "connector-a", "shared")
+    assigned_runner, _ = _runner(store, "connector-b", "shared")
+    store.sync_runner_devices(wrong_runner, [_device("edge-a", "192.0.2.10")], revision="a")
+    store.sync_runner_devices(
+        assigned_runner,
+        [_device("v2-campus-core", "192.0.2.20", site="campus", role="core")],
+        revision="b",
+    )
+    intent_path = workspace.intents / "catalog-interface.yaml"
+    write_yaml(intent_path, {
+        "change_type": "interface_config",
+        "site": "campus",
+        "targets": {"device_ids": ["V2-CAMPUS-CORE"]},
+        "interface": {
+            "name": "Ethernet2",
+            "description": "Restore intended operational dependency",
+            "enabled": True,
+            "mode": "routed",
+            "ip_address": "10.3.2.1/30",
+        },
+    })
+    change = store.create_change(intent_path, "V2-CAMPUS-CORE")
+    store.update_change(change.id, "validated", {"unit": True}, workflow_state="validated")
+
+    result = JobRunner(workspace, store=store).run_lab_action(
+        intent_path,
+        "dry-run",
+        "V2-CAMPUS-CORE",
+        change.id,
+    )
+
+    assert result["ok"] is True
+    assert result["queued"] is True
+    assert result["job"]["pool"] == "shared"
+    assert result["job"]["target_runner_id"] == assigned_runner.id
+    assert result["job"]["payload"]["device"] == {
+        "id": "v2-campus-core",
+        "host": "192.0.2.20",
+        "platform": "arista_eos",
+        "port": 22,
+    }
+    assert store.claim_next_job(DEFAULT_ORG_ID, "shared", wrong_runner.id) is None
+    claimed = store.claim_next_job(DEFAULT_ORG_ID, "shared", assigned_runner.id)
+    assert claimed is not None
+    assert claimed.id == result["job"]["id"]
+
+
+def test_catalog_read_routes_to_exact_connector_even_when_pool_is_shared(tmp_path: Path):
+    workspace = WorkspacePaths(tmp_path)
+    init_workspace(workspace)
+    store = PlatformStore(workspace)
+    wrong_runner, _ = _runner(store, "connector-a", "shared")
+    assigned_runner, _ = _runner(store, "connector-b", "shared")
+    store.sync_runner_devices(wrong_runner, [_device("edge-a", "192.0.2.10")], revision="a")
+    store.sync_runner_devices(
+        assigned_runner,
+        [_device("v2-campus-core", "192.0.2.20", site="campus", role="core")],
+        revision="b",
+    )
+
+    pool, target_runner_id = api._runner_route_for_payload(
+        store,
+        DEFAULT_ORG_ID,
+        {"device": "V2-CAMPUS-CORE", "command": "show version"},
+    )
+    job = store.create_read_job(
+        DEFAULT_ORG_ID,
+        pool,
+        "rez_ssh_command",
+        {"device": "V2-CAMPUS-CORE", "command": "show version"},
+        target_runner_id=target_runner_id,
+    )
+
+    assert pool == "shared"
+    assert job.target_runner_id == assigned_runner.id
+    assert store.claim_next_job(DEFAULT_ORG_ID, "shared", wrong_runner.id) is None
+    claimed = store.claim_next_job(DEFAULT_ORG_ID, "shared", assigned_runner.id)
+    assert claimed is not None
+    assert claimed.id == job.id
+
+
 def test_device_search_is_metadata_only_and_marks_only_live_connector_connectable(tmp_path: Path, monkeypatch):
     workspace = WorkspacePaths(tmp_path)
     init_workspace(workspace)
@@ -195,6 +283,13 @@ def test_catalog_handles_ten_thousand_devices_with_bounded_pages(tmp_path: Path)
     assert {item["canonical_id"] for item in first["devices"]}.isdisjoint(
         {item["canonical_id"] for item in second["devices"]}
     )
+
+    selected = [f"edge-{index:05d}" for index in range(10_000)]
+    waves = rollout_plan(workspace, selected, canary_size=10, batch_size=500)
+    assert waves["device_count"] == 10_000
+    assert len(waves["canaries"]) == 10
+    assert len(waves["batches"]) == 20
+    assert sum(len(batch) for batch in waves["batches"]) == 9_990
 
 
 def test_runner_public_inventory_snapshot_never_contains_secrets(tmp_path: Path, monkeypatch):

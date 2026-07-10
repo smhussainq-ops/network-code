@@ -688,6 +688,7 @@ def api_ui_config_history() -> dict[str, object]:
 def wizard_add_vlan(request: AddVlanRequest, http_request: Request) -> dict[str, object]:
     p = paths()
     try:
+        principal = _request_principal(http_request)
         intent_path = create_add_vlan_intent(
             p,
             site=request.site,
@@ -699,9 +700,8 @@ def wizard_add_vlan(request: AddVlanRequest, http_request: Request) -> dict[str,
             pci_reachable=request.pci_reachable,
             requested_by=request.requested_by,
         )
-        result = run_static_pipeline(p, intent_path)
+        result = run_static_pipeline(p, intent_path, org_id=principal.org_id)
         store = PlatformStore(p)
-        principal = _request_principal(http_request)
         change = store.get_or_create_change(intent_path, request.device_id, requested_by=request.requested_by, org_id=principal.org_id, created_by_user_id=principal.user_id)
         workflow = state_after_static_validation(result.status == "pass")
         store.update_change(change.id, "validated" if result.status == "pass" else "blocked", result.model_dump(), workflow_state=workflow.state)
@@ -861,6 +861,7 @@ def api_ansible_pack_run(request: AnsiblePackPlanRequest, http_request: Request)
 def desired_state_plan(request: DesiredStatePlanRequest, http_request: Request) -> dict[str, object]:
     p = paths()
     try:
+        principal = _request_principal(http_request)
         intent_path = create_desired_state_intent(
             p,
             change_type=request.change_type,
@@ -870,9 +871,8 @@ def desired_state_plan(request: DesiredStatePlanRequest, http_request: Request) 
             values=request.values,
         )
         intent = load_intent(intent_path)
-        result = run_static_pipeline(p, intent_path)
+        result = run_static_pipeline(p, intent_path, org_id=principal.org_id)
         store = PlatformStore(p)
-        principal = _request_principal(http_request)
         change = store.get_or_create_change(intent_path, request.device_id, requested_by=request.requested_by, org_id=principal.org_id, created_by_user_id=principal.user_id)
         workflow = state_after_static_validation(result.status == "pass")
         metadata = plan_metadata(intent)
@@ -911,10 +911,11 @@ def desired_state_plan(request: DesiredStatePlanRequest, http_request: Request) 
 
 
 @app.post("/api/pipeline")
-def pipeline(request: IntentPathRequest) -> dict[str, object]:
+def pipeline(request: IntentPathRequest, http_request: Request) -> dict[str, object]:
     p = paths()
     try:
-        result = run_static_pipeline(p, Path(request.intent_path))
+        principal = _request_principal(http_request)
+        result = run_static_pipeline(p, Path(request.intent_path), org_id=principal.org_id)
         return {
             "ok": result.status == "pass",
             "pipeline": result.model_dump(),
@@ -1309,11 +1310,40 @@ def api_runner_inventory_sync(
     return {"ok": True, "runner_id": runner.id, "pool": runner.pool, **synced}
 
 
+def _runner_route_for_payload(
+    store: PlatformStore,
+    org_id: str,
+    payload: dict[str, object],
+) -> tuple[str, str | None]:
+    """Route known-device reads to the connector that advertised the device.
+
+    Discovery of a not-yet-known host intentionally falls back to the configured
+    pool; existing catalog devices must never be claimed by a sibling connector.
+    """
+    identifier = str(
+        payload.get("device")
+        or payload.get("device_id")
+        or payload.get("host")
+        or ""
+    ).strip()
+    catalog_device = store.resolve_device(org_id, identifier) if identifier else None
+    if catalog_device is None:
+        return runner_pool(), None
+    return str(catalog_device["runner_pool"]), str(catalog_device["runner_id"])
+
+
 def _runner_read(p, action: str, payload: dict, org_id: str, timeout: float = 60.0) -> dict[str, object]:
     """Runner mode: queue a device-read job and wait for the on-prem runner to report.
     Keeps the browser API synchronous while the actual device I/O happens on the runner."""
     store = PlatformStore(p)
-    job = store.create_read_job(org_id, runner_pool(), action, payload)
+    pool, target_runner_id = _runner_route_for_payload(store, org_id, payload)
+    job = store.create_read_job(
+        org_id,
+        pool,
+        action,
+        payload,
+        target_runner_id=target_runner_id,
+    )
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         current = store.get_job(job.id)
@@ -2724,7 +2754,7 @@ def api_change_from_rca(request: RcaRemediationProposalRequest, http_request: Re
     incident_slug = _safe_slug(request.incident_id)
     intent_path = p.intents / "rca" / f"{incident_slug}-{uuid.uuid4().hex[:8]}.yaml"
     write_yaml(intent_path, intent)
-    pipeline = run_static_pipeline(p, intent_path)
+    pipeline = run_static_pipeline(p, intent_path, org_id=principal.org_id)
 
     title = request.title.strip() or f"Rez RCA remediation for {request.incident_id.strip()}"
     target_device = request.target_device.strip() or None

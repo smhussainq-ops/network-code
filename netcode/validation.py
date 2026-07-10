@@ -23,16 +23,26 @@ from netcode.models import (
     ValidationReport,
 )
 from netcode.paths import WorkspacePaths
+from netcode.store import DEFAULT_ORG_ID, PlatformStore
 from netcode.rendering import render_intent
 from netcode.ui_config import configured_inventory_path, configured_policy_path
 from netcode.yamlio import read_yaml
 
 
 class StaticValidator:
-    def __init__(self, paths: WorkspacePaths, inventory_path: Path | None = None, policy_path: Path | None = None):
+    def __init__(
+        self,
+        paths: WorkspacePaths,
+        inventory_path: Path | None = None,
+        policy_path: Path | None = None,
+        *,
+        org_id: str = DEFAULT_ORG_ID,
+    ):
         self.paths = paths
         self.inventory = Inventory(inventory_path or configured_inventory_path(paths))
         self.policy = read_yaml(policy_path or configured_policy_path(paths))
+        self.org_id = org_id
+        self.catalog = PlatformStore(paths)
 
     def validate(self, intent: Intent, render: RenderResult) -> ValidationReport:
         checks: list[CheckResult] = []
@@ -80,12 +90,37 @@ class StaticValidator:
                 "Site/device intent may describe a new source-of-truth record. Device writes stay locked.",
                 device_id=intent.device.device_id,
             )
-        devices = self.inventory.resolve_targets(intent.targets, site=intent.site)
+        if intent.targets.device_group and not intent.targets.device_ids:
+            devices = self.inventory.resolve_targets(intent.targets, site=intent.site)
+            resolved_ids = [device.id for device in devices]
+            source = "workspace_inventory"
+        else:
+            resolved_ids: list[str] = []
+            missing: list[str] = []
+            sources: set[str] = set()
+            for device_id in intent.targets.device_ids:
+                inventory_device = self.inventory.find_device(device_id)
+                if inventory_device:
+                    resolved_ids.append(inventory_device.id)
+                    sources.add("workspace_inventory")
+                    continue
+                catalog_device = self.catalog.resolve_device(self.org_id, device_id)
+                if catalog_device:
+                    resolved_ids.append(str(catalog_device["canonical_id"]))
+                    sources.add("runner_catalog")
+                    continue
+                missing.append(device_id)
+            if missing:
+                raise ValueError(f"Unknown target device(s): {', '.join(missing)}")
+            if not resolved_ids:
+                raise ValueError("No target devices resolved from intent")
+            source = "+".join(sorted(sources))
         return self._pass(
             "targets",
             "Target Resolution",
-            "All requested target devices resolve in inventory.",
-            devices=[d.id for d in devices],
+            "All requested target devices resolve in the shared source of truth.",
+            devices=resolved_ids,
+            source=source,
         )
 
     def _site_policy(self, intent: SiteDeviceIntent, render: RenderResult) -> CheckResult:

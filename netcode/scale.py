@@ -11,7 +11,7 @@ from netcode.ui_config import configured_inventory_path
 
 def rollout_plan(paths: WorkspacePaths, device_ids: list[str] | None = None, canary_size: int = 1, batch_size: int = 100) -> dict[str, Any]:
     inventory = Inventory(configured_inventory_path(paths))
-    selected = [inventory.by_id[device_id] for device_id in device_ids or list(inventory.by_id) if device_id in inventory.by_id]
+    selected = list(dict.fromkeys(device_ids or list(inventory.by_id)))
     canaries = selected[:canary_size]
     remaining = selected[canary_size:]
     batches = [remaining[index:index + batch_size] for index in range(0, len(remaining), batch_size)]
@@ -20,8 +20,8 @@ def rollout_plan(paths: WorkspacePaths, device_ids: list[str] | None = None, can
         "device_count": len(selected),
         "canary_size": len(canaries),
         "batch_size": batch_size,
-        "canaries": [device.id for device in canaries],
-        "batches": [[device.id for device in batch] for batch in batches],
+        "canaries": canaries,
+        "batches": batches,
         "controls": {
             "per_device_lock": True,
             "per_site_limit": 25,

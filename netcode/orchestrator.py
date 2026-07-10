@@ -13,6 +13,7 @@ from netcode.models import PipelineArtifacts, PipelineResult, load_intent, load_
 from netcode.paths import WorkspacePaths
 from netcode.rendering import render_intent, write_rendered_config
 from netcode.reporting import write_reports
+from netcode.store import DEFAULT_ORG_ID
 from netcode.validation import StaticValidator
 from netcode.yamlio import dumps_yaml, read_yaml, write_yaml
 
@@ -93,13 +94,18 @@ def load_intent_from_data(data: dict[str, Any]):
     return load_intent_data(data)
 
 
-def run_static_pipeline(paths: WorkspacePaths, intent_path: Path) -> PipelineResult:
+def run_static_pipeline(
+    paths: WorkspacePaths,
+    intent_path: Path,
+    *,
+    org_id: str = DEFAULT_ORG_ID,
+) -> PipelineResult:
     ensure_initialized(paths)
     intent_path = intent_path.resolve()
     intent = load_intent(intent_path)
     render = render_intent(intent, paths)
     rendered_path = write_rendered_config(paths, intent, render)
-    validation = StaticValidator(paths).validate(intent, render)
+    validation = StaticValidator(paths, org_id=org_id).validate(intent, render)
     intent_data = read_yaml(intent_path)
     partial = PipelineResult(
         status=validation.status,
