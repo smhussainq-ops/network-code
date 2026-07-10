@@ -310,6 +310,10 @@ class RunnerReadRequest(BaseModel):
 
 class RcaRemediationProposalRequest(BaseModel):
     source: str = "rez"
+    proposal_schema: str = ""
+    proposal_source: str = ""
+    root_confirmed: bool = False
+    root_atom_id: str = ""
     incident_id: str
     target_device: str = ""
     suggested_pack: str = "custom_config"
@@ -396,6 +400,11 @@ _RCA_ALLOWED_CHANGE_TYPES = {
     "ntp_standardize",
 }
 
+_RCA_PROPOSAL_SCHEMA = "netcode.remediation.v1"
+_RCA_PROPOSAL_SOURCES = {"rez_structured_rca", "site_operational_context"}
+_RCA_NON_ACTIONABLE_ROOTS = {"AGENT_VALIDATED_FINDING"}
+_RCA_NON_ACTIONABLE_PREFIXES = ("CI_", "DATA_GAP", "XL_")
+
 _RCA_TOP_LEVEL_SECTIONS = {
     "add_vlan": "vlan",
     "interface_config": "interface",
@@ -423,6 +432,18 @@ _RCA_SENSITIVE_KEY_PARTS = (
 def _safe_slug(value: str, default: str = "rca-remediation") -> str:
     slug = re.sub(r"[^a-zA-Z0-9_.-]+", "-", value.strip()).strip("-._").lower()
     return slug[:80] or default
+
+
+def _require_confirmed_rca_provenance(request: RcaRemediationProposalRequest) -> None:
+    atom_id = request.root_atom_id.strip()
+    if request.proposal_schema.strip() != _RCA_PROPOSAL_SCHEMA:
+        raise HTTPException(status_code=400, detail="A structured Netcode remediation proposal is required.")
+    if request.proposal_source.strip() not in _RCA_PROPOSAL_SOURCES:
+        raise HTTPException(status_code=400, detail="The RCA proposal source is not trusted for remediation.")
+    if not request.root_confirmed or not atom_id:
+        raise HTTPException(status_code=400, detail="A confirmed primary root cause is required before creating a draft.")
+    if atom_id in _RCA_NON_ACTIONABLE_ROOTS or atom_id.startswith(_RCA_NON_ACTIONABLE_PREFIXES):
+        raise HTTPException(status_code=400, detail="The confirmed root is not an actionable device condition.")
 
 
 def _proposal_targets(request: RcaRemediationProposalRequest) -> dict[str, object]:
@@ -502,6 +523,9 @@ def _intent_from_rca_proposal(request: RcaRemediationProposalRequest) -> dict[st
         "rationale": request.rationale,
         "evidence_refs": request.evidence_refs,
         "confidence": request.confidence,
+        "proposal_schema": request.proposal_schema.strip(),
+        "proposal_source": request.proposal_source.strip(),
+        "confirmed_root_atom_id": request.root_atom_id.strip(),
     }
 
     if change_type == "custom_config":
@@ -2686,6 +2710,7 @@ def api_change_from_rca(request: RcaRemediationProposalRequest, http_request: Re
         raise HTTPException(status_code=400, detail="Only Rez RCA proposals are accepted.")
     if not request.incident_id.strip():
         raise HTTPException(status_code=400, detail="incident_id is required.")
+    _require_confirmed_rca_provenance(request)
 
     p = paths()
     principal = _request_principal(http_request)

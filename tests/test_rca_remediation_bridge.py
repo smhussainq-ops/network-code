@@ -10,6 +10,16 @@ from netcode.store import PlatformStore
 from netcode.yamlio import read_yaml
 
 
+def _confirmed_proposal(payload: dict) -> dict:
+    return {
+        "proposal_schema": "netcode.remediation.v1",
+        "proposal_source": "rez_structured_rca",
+        "root_confirmed": True,
+        "root_atom_id": "CONFIG_EXACT_REMEDIATION_REQUIRED",
+        **payload,
+    }
+
+
 def test_rca_remediation_runs_static_validation_without_jobs(tmp_path: Path, monkeypatch):
     init_workspace(WorkspacePaths(tmp_path))
     monkeypatch.chdir(tmp_path)
@@ -17,7 +27,7 @@ def test_rca_remediation_runs_static_validation_without_jobs(tmp_path: Path, mon
 
     response = client.post(
         "/api/changes/from-rca",
-        json={
+        json=_confirmed_proposal({
             "source": "rez",
             "incident_id": "INC-2048",
             "target_device": "Branch-EDGE-03",
@@ -37,7 +47,7 @@ def test_rca_remediation_runs_static_validation_without_jobs(tmp_path: Path, mon
                 "rollback_lines": "config firewall policy\nedit 2048\nunset nat\nnext\nend",
                 "verify_contains": "nat enable",
             },
-        },
+        }),
     )
 
     assert response.status_code == 200
@@ -79,7 +89,7 @@ def test_rca_remediation_preserves_known_typed_intent(tmp_path: Path, monkeypatc
 
     response = client.post(
         "/api/changes/from-rca",
-        json={
+        json=_confirmed_proposal({
             "source": "rez",
             "incident_id": "INC-ACL-01",
             "target_device": "Edge-FW-01",
@@ -98,7 +108,7 @@ def test_rca_remediation_preserves_known_typed_intent(tmp_path: Path, monkeypatc
                     "destination_port": "443",
                 },
             },
-        },
+        }),
     )
 
     assert response.status_code == 200
@@ -117,7 +127,7 @@ def test_site_context_interface_remediation_stays_typed_and_human_gated(tmp_path
 
     response = client.post(
         "/api/changes/from-rca",
-        json={
+        json=_confirmed_proposal({
             "source": "rez",
             "incident_id": "INC-CAMPUS-ET2",
             "target_device": "v2-store1",
@@ -142,7 +152,7 @@ def test_site_context_interface_remediation_stays_typed_and_human_gated(tmp_path
                     "ip_address": "10.3.2.1/30",
                 },
             },
-        },
+        }),
     )
 
     assert response.status_code == 200
@@ -164,7 +174,7 @@ def test_rez_rca_validated_draft_can_enter_dry_run_queue(tmp_path: Path, monkeyp
 
     response = client.post(
         "/api/changes/from-rca",
-        json={
+        json=_confirmed_proposal({
             "source": "rez",
             "incident_id": "INC-DRYRUN",
             "target_device": "v2-store1",
@@ -175,7 +185,7 @@ def test_rez_rca_validated_draft_can_enter_dry_run_queue(tmp_path: Path, monkeyp
                 "config_lines": "vlan 992\n   name RCA_DRYRUN\n",
                 "rollback_lines": "no vlan 992\n",
             },
-        },
+        }),
     )
 
     assert response.status_code == 200
@@ -207,7 +217,7 @@ def test_rca_remediation_strips_credential_shaped_fields(tmp_path: Path, monkeyp
 
     response = client.post(
         "/api/changes/from-rca",
-        json={
+        json=_confirmed_proposal({
             "source": "rez",
             "incident_id": "INC-CREDS",
             "target_device": "Edge-FW-01",
@@ -230,7 +240,7 @@ def test_rca_remediation_strips_credential_shaped_fields(tmp_path: Path, monkeyp
                     "enable_secret": "secret-should-not-persist",
                 },
             },
-        },
+        }),
     )
 
     assert response.status_code == 200
@@ -255,7 +265,7 @@ def test_rez_rca_draft_requires_approval_even_when_global_gate_off(tmp_path: Pat
 
     response = client.post(
         "/api/changes/from-rca",
-        json={
+        json=_confirmed_proposal({
             "source": "rez",
             "incident_id": "INC-APPROVAL",
             "target_device": "v2-store1",
@@ -266,7 +276,7 @@ def test_rez_rca_draft_requires_approval_even_when_global_gate_off(tmp_path: Pat
                 "config_lines": "vlan 991\n   name RCA_REVIEWED\n",
                 "rollback_lines": "no vlan 991\n",
             },
-        },
+        }),
     )
 
     assert response.status_code == 200
@@ -289,8 +299,9 @@ def test_rez_rca_draft_requires_approval_even_when_global_gate_off(tmp_path: Pat
     assert blocked["result"]["workflow_state"] == "dry_run_passed"
 
 
-def test_rca_remediation_requires_target_scope(tmp_path: Path, monkeypatch):
-    init_workspace(WorkspacePaths(tmp_path))
+def test_rca_remediation_rejects_agent_narrative_without_confirmed_root(tmp_path: Path, monkeypatch):
+    workspace = WorkspacePaths(tmp_path)
+    init_workspace(workspace)
     monkeypatch.chdir(tmp_path)
     client = TestClient(api.app)
 
@@ -298,10 +309,59 @@ def test_rca_remediation_requires_target_scope(tmp_path: Path, monkeypatch):
         "/api/changes/from-rca",
         json={
             "source": "rez",
+            "incident_id": "INC-UNCONFIRMED",
+            "target_device": "v2-store1",
+            "rationale": "Agent Analysis / Unverified Hypothesis",
+            "proposed_intent": {
+                "change_type": "custom_config",
+                "config_lines": "No configuration change is recommended from this run.",
+            },
+        },
+    )
+
+    assert response.status_code == 400
+    assert "structured Netcode remediation proposal" in response.json()["detail"]
+    assert PlatformStore(workspace).list_changes() == []
+
+
+def test_rca_remediation_rejects_non_actionable_framework_root(tmp_path: Path, monkeypatch):
+    workspace = WorkspacePaths(tmp_path)
+    init_workspace(workspace)
+    monkeypatch.chdir(tmp_path)
+    client = TestClient(api.app)
+
+    response = client.post(
+        "/api/changes/from-rca",
+        json=_confirmed_proposal({
+            "root_atom_id": "CI_ROOT_CAUSE",
+            "source": "rez",
+            "incident_id": "INC-FRAMEWORK",
+            "target_device": "v2-store1",
+            "proposed_intent": {
+                "change_type": "custom_config",
+                "config_lines": "description should-not-land",
+            },
+        }),
+    )
+
+    assert response.status_code == 400
+    assert "not an actionable device condition" in response.json()["detail"]
+    assert PlatformStore(workspace).list_changes() == []
+
+
+def test_rca_remediation_requires_target_scope(tmp_path: Path, monkeypatch):
+    init_workspace(WorkspacePaths(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    client = TestClient(api.app)
+
+    response = client.post(
+        "/api/changes/from-rca",
+        json=_confirmed_proposal({
+            "source": "rez",
             "incident_id": "INC-MISSING-SCOPE",
             "rationale": "Missing target should fail closed.",
             "proposed_intent": {"change_type": "custom_config", "config_lines": "description x"},
-        },
+        }),
     )
 
     assert response.status_code == 400
