@@ -261,6 +261,37 @@ class PlatformStore:
             conn.execute("CREATE INDEX IF NOT EXISTS idx_device_aliases_canonical ON device_aliases (org_id, canonical_id)")
             conn.execute(
                 """
+                CREATE TABLE IF NOT EXISTS shell_sessions (
+                    id TEXT PRIMARY KEY,
+                    org_id TEXT NOT NULL,
+                    device_id TEXT NOT NULL,
+                    display_id TEXT NOT NULL,
+                    platform TEXT NOT NULL,
+                    runner_id TEXT,
+                    runner_pool TEXT,
+                    status TEXT NOT NULL,
+                    guard_enabled INTEGER NOT NULL DEFAULT 0,
+                    change_id TEXT,
+                    started_at TEXT NOT NULL,
+                    last_activity TEXT NOT NULL,
+                    ended_at TEXT,
+                    transcript_path TEXT NOT NULL,
+                    command_count INTEGER NOT NULL DEFAULT 0,
+                    output_bytes INTEGER NOT NULL DEFAULT 0,
+                    device_touched INTEGER NOT NULL DEFAULT 0
+                )
+                """
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_shell_sessions_org_activity "
+                "ON shell_sessions (org_id, last_activity DESC)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_shell_sessions_device "
+                "ON shell_sessions (org_id, device_id, last_activity DESC)"
+            )
+            conn.execute(
+                """
                 CREATE TABLE IF NOT EXISTS join_tokens (
                     token_hash TEXT PRIMARY KEY,
                     pool TEXT NOT NULL,
@@ -953,6 +984,142 @@ class PlatformStore:
             "next_cursor": devices[-1]["canonical_id"] if has_more and devices else None,
             "facets": facets,
         }
+
+    @staticmethod
+    def _shell_session_row(row: Any) -> dict[str, Any]:
+        return {
+            "id": str(row["id"]),
+            "org_id": str(row["org_id"]),
+            "device_id": str(row["device_id"]),
+            "display_id": str(row["display_id"]),
+            "platform": str(row["platform"]),
+            "runner_id": str(row["runner_id"] or ""),
+            "runner_pool": str(row["runner_pool"] or ""),
+            "status": str(row["status"]),
+            "guard_enabled": bool(row["guard_enabled"]),
+            "change_id": str(row["change_id"] or ""),
+            "started_at": str(row["started_at"]),
+            "last_activity": str(row["last_activity"]),
+            "ended_at": str(row["ended_at"] or ""),
+            "transcript_path": str(row["transcript_path"]),
+            "command_count": int(row["command_count"] or 0),
+            "output_bytes": int(row["output_bytes"] or 0),
+            "device_touched": bool(row["device_touched"]),
+        }
+
+    def create_shell_session(
+        self,
+        *,
+        session_id: str,
+        org_id: str,
+        device_id: str,
+        display_id: str,
+        platform: str,
+        transcript_path: str,
+        runner_id: str = "",
+        runner_pool: str = "",
+        status: str = "opened",
+        guard_enabled: bool = False,
+        change_id: str = "",
+        started_at: str | None = None,
+        last_activity: str | None = None,
+        ended_at: str = "",
+        command_count: int = 0,
+        output_bytes: int = 0,
+        device_touched: bool = False,
+    ) -> dict[str, Any]:
+        started = started_at or utc_now()
+        activity = last_activity or started
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO shell_sessions (
+                    id, org_id, device_id, display_id, platform, runner_id, runner_pool,
+                    status, guard_enabled, change_id, started_at, last_activity, ended_at,
+                    transcript_path, command_count, output_bytes, device_touched
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO NOTHING
+                """,
+                (
+                    session_id, org_id, device_id, display_id or device_id, platform,
+                    runner_id or None, runner_pool or None, status, int(guard_enabled),
+                    change_id or None, started, activity, ended_at or None, transcript_path,
+                    max(0, int(command_count)), max(0, int(output_bytes)), int(device_touched),
+                ),
+            )
+        session = self.get_shell_session(session_id)
+        if session is None:
+            raise RuntimeError(f"Failed to persist shell session {session_id}")
+        return session
+
+    def update_shell_session(
+        self,
+        session_id: str,
+        *,
+        status: str | None = None,
+        change_id: str | None = None,
+        command_delta: int = 0,
+        output_bytes_delta: int = 0,
+        device_touched: bool | None = None,
+        ended: bool = False,
+    ) -> dict[str, Any] | None:
+        now = utc_now()
+        touched_value = None if device_touched is None else int(device_touched)
+        with self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE shell_sessions
+                SET status = COALESCE(?, status),
+                    change_id = COALESCE(?, change_id),
+                    command_count = command_count + ?,
+                    output_bytes = output_bytes + ?,
+                    device_touched = CASE WHEN ? IS NULL THEN device_touched ELSE ? END,
+                    last_activity = ?,
+                    ended_at = CASE WHEN ? = 1 THEN ? ELSE ended_at END
+                WHERE id = ?
+                """,
+                (
+                    status, change_id, max(0, int(command_delta)),
+                    max(0, int(output_bytes_delta)), touched_value, touched_value,
+                    now, int(ended), now, session_id,
+                ),
+            )
+        return self.get_shell_session(session_id)
+
+    def get_shell_session(self, session_id: str) -> dict[str, Any] | None:
+        with self._connect() as conn:
+            row = conn.execute("SELECT * FROM shell_sessions WHERE id = ?", (session_id,)).fetchone()
+        return self._shell_session_row(row) if row else None
+
+    def list_shell_sessions(
+        self,
+        org_id: str,
+        *,
+        limit: int = 50,
+        device_id: str = "",
+        before: str = "",
+    ) -> list[dict[str, Any]]:
+        clauses = ["org_id = ?"]
+        params: list[Any] = [org_id]
+        if device_id.strip():
+            clauses.append("LOWER(device_id) = ?")
+            params.append(device_id.strip().lower())
+        if before.strip():
+            cursor_time, separator, cursor_id = before.strip().rpartition("|")
+            if separator and cursor_time and cursor_id:
+                clauses.append("(last_activity < ? OR (last_activity = ? AND id < ?))")
+                params.extend([cursor_time, cursor_time, cursor_id])
+            else:
+                clauses.append("last_activity < ?")
+                params.append(before.strip())
+        limit = max(1, min(int(limit), 101))
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM shell_sessions WHERE " + " AND ".join(clauses)
+                + " ORDER BY last_activity DESC, id DESC LIMIT ?",
+                (*params, limit),
+            ).fetchall()
+        return [self._shell_session_row(row) for row in rows]
 
     def queue_job(self, change_id: str, action: str, pool: str, payload: dict[str, Any]) -> JobRecord:
         job = self.create_job(change_id, action)  # inherits org_id from the parent change

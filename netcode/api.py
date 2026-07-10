@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 import re
@@ -80,7 +81,7 @@ from netcode.platform import platform_capabilities
 from netcode.scale import rollout_plan
 from netcode.shell_desktop import build_desktop_shell_profile
 from netcode.source_of_truth import netbox_sync, netbox_test, provider_catalog, source_of_truth
-from netcode.store import DEFAULT_ORG_ID, PlatformStore, record_to_dict
+from netcode.store import DEFAULT_ORG_ID, PlatformStore, record_to_dict, utc_now
 from netcode.troubleshooting import troubleshoot_state
 from netcode.ui_config import (
     configured_inventory_path,
@@ -1737,11 +1738,11 @@ def api_diagnostics_verification_handoff(request: VerificationHandoffRequest) ->
 
 
 # ---- Netcode Shell (governed SSH, MVP1/2) -----------------------------------
-# Session state lives in memory (a restart drops live sessions — acceptable for
-# MVP); the transcript is written durably to reports/shell-<id>.jsonl as the
-# evidence artifact. The GUARD runs on the runner (trust boundary); the control
-# plane only orchestrates and records.
+# Live transport state stays in memory, while session metadata and the complete
+# transcript are durable. The GUARD runs on the runner (trust boundary); the
+# control plane only brokers and records.
 _SHELL_SESSIONS: dict[str, dict[str, object]] = {}
+_SHELL_BACKFILLED_WORKSPACES: set[tuple[str, str]] = set()
 
 
 @app.get("/api/shell/desktop/profile")
@@ -1771,8 +1772,87 @@ def _shell_transcript_path(p, session_id: str) -> Path:
 def _shell_append(p, session_id: str, entry: dict[str, object]) -> None:
     path = _shell_transcript_path(p, session_id)
     path.parent.mkdir(parents=True, exist_ok=True)
+    payload = dict(entry)
+    payload.setdefault("timestamp", utc_now())
     with path.open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps(entry, default=str) + "\n")
+        handle.write(json.dumps(payload, default=str) + "\n")
+
+
+def _record_shell_output(session_id: str, encoded: str) -> None:
+    """Persist one terminal-output frame without changing its byte content."""
+    if not encoded:
+        return
+    try:
+        raw = base64.b64decode(encoded, validate=True)
+    except Exception:  # noqa: BLE001 — malformed frames must not break the broker
+        return
+    p = paths()
+    _shell_append(p, session_id, {"event": "output", "data_b64": encoded})
+    PlatformStore(p).update_shell_session(session_id, output_bytes_delta=len(raw))
+
+
+def _backfill_shell_sessions(p, org_id: str) -> None:
+    """Index legacy JSONL transcripts so pre-index sessions remain discoverable."""
+    migration_key = (str(p.database), org_id)
+    if migration_key in _SHELL_BACKFILLED_WORKSPACES:
+        return
+    store = PlatformStore(p)
+    for path in p.reports.glob("shell-*.jsonl"):
+        session_id = path.stem.removeprefix("shell-")
+        if not re.fullmatch(r"[A-Za-z0-9_-]{8,128}", session_id):
+            continue
+        if store.get_shell_session(session_id):
+            continue
+        try:
+            entries = [
+                json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+        except Exception:  # noqa: BLE001 — one corrupt legacy artifact must not hide history
+            continue
+        opened = next((item for item in entries if item.get("event") == "session_opened"), None)
+        if not isinstance(opened, dict) or str(opened.get("org_id") or DEFAULT_ORG_ID) != org_id:
+            continue
+        device_id = str(opened.get("device_id") or "unknown")
+        started = str(opened.get("timestamp") or "")
+        if not started:
+            started = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(path.stat().st_mtime))
+        change_id = ""
+        output_bytes = 0
+        for item in entries:
+            candidate = str(item.get("change_id") or "").strip()
+            if candidate:
+                change_id = candidate
+            encoded = str(item.get("data_b64") or "")
+            if encoded:
+                try:
+                    output_bytes += len(base64.b64decode(encoded, validate=True))
+                except Exception:  # noqa: BLE001
+                    pass
+        store.create_shell_session(
+            session_id=session_id,
+            org_id=org_id,
+            device_id=device_id,
+            display_id=str(opened.get("display_id") or device_id),
+            platform=str(opened.get("platform") or "unknown"),
+            runner_id=str(opened.get("runner_id") or ""),
+            runner_pool=str(opened.get("runner_pool") or ""),
+            status="archived",
+            guard_enabled=bool(opened.get("guard_enabled")),
+            change_id=change_id,
+            started_at=started,
+            last_activity=started,
+            ended_at=started,
+            transcript_path=str(path),
+            command_count=sum(1 for item in entries if item.get("event") == "command"),
+            output_bytes=output_bytes,
+            device_touched=any(
+                item.get("device_touched") is True
+                or str(item.get("kind") or "").startswith("config")
+                for item in entries
+            ),
+        )
+    _SHELL_BACKFILLED_WORKSPACES.add(migration_key)
 
 
 def _record_shell_command(session_id: str, ev: dict[str, object]) -> None:
@@ -1801,6 +1881,12 @@ def _record_shell_command(session_id: str, ev: dict[str, object]) -> None:
             pass
     _shell_append(p, session_id, {"event": "command", "device_id": device_id,
                                   "command": line, "kind": kind, "change_id": change_id})
+    PlatformStore(p).update_shell_session(
+        session_id,
+        change_id=change_id or None,
+        command_delta=1,
+        device_touched=bool((session.get("state") or {}).get("device_touched")),
+    )
 
 
 @app.post("/api/shell/open")
@@ -1853,8 +1939,22 @@ def api_shell_open(request: ShellOpenRequest, http_request: Request) -> dict[str
         "runner_pool": assigned_pool,
         "state": state,
     }
+    transcript_path = _shell_transcript_path(p, session_id)
+    PlatformStore(p).create_shell_session(
+        session_id=session_id,
+        org_id=org,
+        device_id=device_id,
+        display_id=display_id,
+        platform=platform,
+        runner_id=runner_id,
+        runner_pool=assigned_pool,
+        status="opened",
+        guard_enabled=bool(request.guard_enabled),
+        transcript_path=str(transcript_path),
+    )
     _shell_append(p, session_id, {"event": "session_opened", "device_id": device_id,
                                   "display_id": display_id, "runner_id": runner_id, "org_id": org,
+                                  "runner_pool": assigned_pool, "platform": platform,
                                   "guard_enabled": bool(request.guard_enabled)})
     if request.guard_enabled:
         message = f"Live shell open on {display_id}. Safety prompts remain enabled; transcript logging is on."
@@ -1888,6 +1988,7 @@ def api_shell_attach(request: ShellAttachRequest, http_request: Request) -> dict
     state["change_id"] = request.change_id
     session["state"] = state
     _shell_append(p, request.session_id, {"event": "change_attached", "change_id": request.change_id})
+    PlatformStore(p).update_shell_session(request.session_id, change_id=request.change_id)
     return {"ok": True, "session_id": request.session_id, "state": state,
             "message": f"Change {request.change_id} attached as session metadata. The shell remains live."}
 
@@ -1947,6 +2048,14 @@ def api_shell_input(request: ShellInputRequest, http_request: Request) -> dict[s
                                           "cleared": result.get("cleared"), "executed": result.get("executed"),
                                           "guard": [e.get("action") for e in result.get("events", [])],
                                           "output_len": len(str(result.get("output") or ""))})
+    output = str(result.get("output") or "")
+    if output:
+        _record_shell_output(request.session_id, base64.b64encode(output.encode("utf-8")).decode("ascii"))
+    PlatformStore(p).update_shell_session(
+        request.session_id,
+        status="active",
+        device_touched=bool((session.get("state") or {}).get("device_touched")),
+    )
     return result
 
 
@@ -1982,6 +2091,11 @@ async def ws_runner_stream(ws: WebSocket) -> None:
         while True:
             frame = await ws.receive_json()
             sid = str(frame.get("sid", ""))
+            if frame.get("t") == "out":
+                _record_shell_output(sid, str(frame.get("d") or ""))
+            elif frame.get("t") == "status":
+                shell_status = str(frame.get("s") or "active")
+                PlatformStore(paths()).update_shell_session(sid, status=shell_status)
             if frame.get("t") == "event":
                 ev = frame.get("e") or {}
                 if isinstance(ev, dict):
@@ -1999,6 +2113,9 @@ async def ws_runner_stream(ws: WebSocket) -> None:
                         elif ev.get("action") == "config_mode_entered":
                             state["device_touched"] = True
                         session["state"] = state
+                        PlatformStore(paths()).update_shell_session(
+                            sid, device_touched=bool(state.get("device_touched"))
+                        )
                     if ev.get("type") == "command":
                         _record_shell_command(sid, ev)
             browser = _BROWSER_SOCKETS.get(sid)
@@ -2049,6 +2166,7 @@ async def ws_shell_session(ws: WebSocket, session_id: str) -> None:
         await runner_ws.send_json({"t": "open", "sid": session_id,
                                    "device_id": session["device_id"], "state": state})
         _shell_append(paths(), session_id, {"event": "interactive_opened", "device_id": session["device_id"]})
+        PlatformStore(paths()).update_shell_session(session_id, status="active")
         while True:
             frame = await ws.receive_json()
             kind = frame.get("t")
@@ -2074,6 +2192,7 @@ async def ws_shell_session(ws: WebSocket, session_id: str) -> None:
                 session["state"] = new_state
                 await runner_ws.send_json({"t": "attach", "sid": session_id, "change_id": change_id})
                 _shell_append(paths(), session_id, {"event": "change_attached", "change_id": change_id})
+                PlatformStore(paths()).update_shell_session(session_id, change_id=change_id)
     except WebSocketDisconnect:
         pass
     except Exception:  # noqa: BLE001
@@ -2086,6 +2205,44 @@ async def ws_shell_session(ws: WebSocket, session_id: str) -> None:
                 await current.send_json({"t": "close", "sid": session_id})
             except Exception:  # noqa: BLE001
                 pass
+        final_state = dict(session.get("state") or {})
+        _shell_append(paths(), session_id, {
+            "event": "session_closed",
+            "device_touched": bool(final_state.get("device_touched")),
+        })
+        PlatformStore(paths()).update_shell_session(
+            session_id,
+            status="closed",
+            device_touched=bool(final_state.get("device_touched")),
+            ended=True,
+        )
+
+
+@app.get("/api/shell/sessions")
+def api_shell_sessions(
+    request: Request,
+    limit: int = Query(default=50, ge=1, le=100),
+    device_id: str = Query(default="", max_length=255),
+    before: str = Query(default="", max_length=100),
+) -> dict[str, object]:
+    """List durable Shell sessions owned by the caller's organization."""
+    p = paths()
+    org = _request_principal(request).org_id
+    _backfill_shell_sessions(p, org)
+    page = PlatformStore(p).list_shell_sessions(
+        org, limit=limit + 1, device_id=device_id, before=before
+    )
+    sessions = page[:limit]
+    next_before = None
+    if len(page) > limit and sessions:
+        last = sessions[-1]
+        next_before = f"{last['last_activity']}|{last['id']}"
+    return {
+        "ok": True,
+        "sessions": sessions,
+        "returned": len(sessions),
+        "next_before": next_before,
+    }
 
 
 @app.get("/api/shell/{session_id}/transcript")
@@ -2093,14 +2250,27 @@ def api_shell_transcript(session_id: str, request: Request) -> dict[str, object]
     """The durable session transcript — the shell's evidence artifact."""
     p = paths()
     org = _request_principal(request).org_id
-    _shell_session_or_404(session_id, org)  # ownership check
+    if not re.fullmatch(r"[A-Za-z0-9_-]{8,128}", session_id):
+        raise HTTPException(status_code=404, detail=f"Unknown shell session {session_id}")
+    _backfill_shell_sessions(p, org)
+    stored = PlatformStore(p).get_shell_session(session_id)
+    if not stored or stored.get("org_id") != org:
+        raise HTTPException(status_code=404, detail=f"Unknown shell session {session_id}")
     path = _shell_transcript_path(p, session_id)
     lines = path.read_text(encoding="utf-8").splitlines() if path.exists() else []
     entries = [json.loads(line) for line in lines if line.strip()]
+    for entry in entries:
+        encoded = str(entry.get("data_b64") or "")
+        if entry.get("event") == "output" and encoded:
+            try:
+                entry["output"] = base64.b64decode(encoded, validate=True).decode("utf-8", errors="replace")
+            except Exception:  # noqa: BLE001
+                entry["output"] = "[unreadable terminal output]"
     state = _SHELL_SESSIONS.get(session_id, {}).get("state") or {}
+    touched = bool(state.get("device_touched")) if state else bool(stored.get("device_touched"))
     return {"ok": True, "session_id": session_id, "entries": entries,
-            "device_touched": bool(state.get("device_touched")),
-            "artifact": str(path), "device_config": "touched" if state.get("device_touched") else "not_touched"}
+            "session": stored, "device_touched": touched,
+            "artifact": str(path), "device_config": "touched" if touched else "not_touched"}
 
 
 @app.post("/api/verify/vlan")
