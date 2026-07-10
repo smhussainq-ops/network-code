@@ -108,6 +108,8 @@ class RunnerRecord:
     created_at: str
     last_seen: str | None
     org_id: str = DEFAULT_ORG_ID
+    inventory_revision: str = ""
+    device_count: int = 0
 
 
 @dataclass(frozen=True)
@@ -218,6 +220,45 @@ class PlatformStore:
                 )
                 """
             )
+            self._ensure_column(conn, "runners", "inventory_revision", "TEXT NOT NULL DEFAULT ''")
+            self._ensure_column(conn, "runners", "device_count", "INTEGER NOT NULL DEFAULT 0")
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS device_catalog (
+                    org_id TEXT NOT NULL,
+                    canonical_id TEXT NOT NULL,
+                    display_id TEXT NOT NULL,
+                    hostname TEXT NOT NULL,
+                    host TEXT NOT NULL,
+                    port INTEGER NOT NULL DEFAULT 22,
+                    platform TEXT NOT NULL,
+                    site TEXT,
+                    role TEXT,
+                    groups_json TEXT NOT NULL DEFAULT '[]',
+                    runner_id TEXT NOT NULL,
+                    runner_pool TEXT NOT NULL,
+                    source TEXT NOT NULL DEFAULT 'runner_inventory',
+                    last_seen TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (org_id, canonical_id)
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS device_aliases (
+                    org_id TEXT NOT NULL,
+                    alias TEXT NOT NULL,
+                    canonical_id TEXT NOT NULL,
+                    PRIMARY KEY (org_id, alias)
+                )
+                """
+            )
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_device_catalog_runner ON device_catalog (org_id, runner_id)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_device_catalog_site ON device_catalog (org_id, site, canonical_id)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_device_catalog_role ON device_catalog (org_id, role, canonical_id)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_device_catalog_platform ON device_catalog (org_id, platform, canonical_id)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_device_aliases_canonical ON device_aliases (org_id, canonical_id)")
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS join_tokens (
@@ -565,6 +606,8 @@ class PlatformStore:
             created_at=row["created_at"],
             last_seen=row["last_seen"],
             org_id=self._col(row, "org_id") or DEFAULT_ORG_ID,
+            inventory_revision=str(self._col(row, "inventory_revision") or ""),
+            device_count=int(self._col(row, "device_count") or 0),
         )
 
     # ── Runner registry & job queue (Phase 0 SaaS split) ──────────────────
@@ -636,6 +679,280 @@ class PlatformStore:
             else:
                 rows = conn.execute("SELECT * FROM runners WHERE org_id = ? ORDER BY created_at DESC", (org_id,)).fetchall()
         return [self._runner(row) for row in rows]
+
+    @staticmethod
+    def normalize_device_identifier(value: Any) -> str:
+        return str(value or "").strip().lower()
+
+    def sync_runner_devices(
+        self,
+        runner: RunnerRecord,
+        devices: list[dict[str, Any]],
+        *,
+        revision: str,
+        replace: bool = True,
+    ) -> dict[str, Any]:
+        """Persist public runner inventory metadata without accepting credentials."""
+        normalized: dict[str, dict[str, Any]] = {}
+        for raw in devices:
+            canonical_id = self.normalize_device_identifier(raw.get("id"))
+            if not canonical_id:
+                continue
+            display_id = str(raw.get("id") or canonical_id).strip()
+            hostname = str(raw.get("hostname") or display_id).strip()
+            host = str(raw.get("host") or "").strip()
+            port = int(raw.get("port") or 22)
+            platform = str(raw.get("platform") or "unknown").strip().lower()
+            groups = sorted({str(item).strip() for item in (raw.get("groups") or []) if str(item).strip()})
+            aliases = {
+                canonical_id,
+                self.normalize_device_identifier(display_id),
+                self.normalize_device_identifier(hostname),
+                self.normalize_device_identifier(host),
+                self.normalize_device_identifier(f"{host}:{port}" if host else ""),
+                *(self.normalize_device_identifier(item) for item in (raw.get("aliases") or [])),
+            }
+            normalized[canonical_id] = {
+                "canonical_id": canonical_id,
+                "display_id": display_id,
+                "hostname": hostname,
+                "host": host,
+                "port": port,
+                "platform": platform,
+                "site": str(raw.get("site") or "").strip() or None,
+                "role": str(raw.get("role") or "").strip() or None,
+                "groups": groups,
+                "aliases": sorted(alias for alias in aliases if alias),
+            }
+
+        now = utc_now()
+        conflicts: list[dict[str, str]] = []
+        with self._connect() as conn:
+            if replace:
+                conn.execute(
+                    "DELETE FROM device_aliases WHERE org_id = ? AND canonical_id IN "
+                    "(SELECT canonical_id FROM device_catalog WHERE org_id = ? AND runner_id = ?)",
+                    (runner.org_id, runner.org_id, runner.id),
+                )
+                conn.execute(
+                    "DELETE FROM device_catalog WHERE org_id = ? AND runner_id = ?",
+                    (runner.org_id, runner.id),
+                )
+            for device in normalized.values():
+                existing = conn.execute(
+                    "SELECT runner_id FROM device_catalog WHERE org_id = ? AND canonical_id = ?",
+                    (runner.org_id, device["canonical_id"]),
+                ).fetchone()
+                if existing and str(existing["runner_id"]) != runner.id:
+                    conflicts.append({
+                        "canonical_id": str(device["canonical_id"]),
+                        "existing_runner_id": str(existing["runner_id"]),
+                        "claiming_runner_id": runner.id,
+                    })
+                    continue
+                conn.execute(
+                    """
+                    INSERT INTO device_catalog
+                    (org_id, canonical_id, display_id, hostname, host, port, platform, site, role,
+                     groups_json, runner_id, runner_pool, source, last_seen, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'runner_inventory', ?, ?)
+                    ON CONFLICT (org_id, canonical_id) DO UPDATE SET
+                      display_id = excluded.display_id,
+                      hostname = excluded.hostname,
+                      host = excluded.host,
+                      port = excluded.port,
+                      platform = excluded.platform,
+                      site = excluded.site,
+                      role = excluded.role,
+                      groups_json = excluded.groups_json,
+                      runner_id = excluded.runner_id,
+                      runner_pool = excluded.runner_pool,
+                      source = excluded.source,
+                      last_seen = excluded.last_seen,
+                      updated_at = excluded.updated_at
+                    """,
+                    (
+                        runner.org_id,
+                        device["canonical_id"],
+                        device["display_id"],
+                        device["hostname"],
+                        device["host"],
+                        device["port"],
+                        device["platform"],
+                        device["site"],
+                        device["role"],
+                        json.dumps(device["groups"]),
+                        runner.id,
+                        runner.pool,
+                        now,
+                        now,
+                    ),
+                )
+                conn.execute(
+                    "DELETE FROM device_aliases WHERE org_id = ? AND canonical_id = ?",
+                    (runner.org_id, device["canonical_id"]),
+                )
+                for alias in device["aliases"]:
+                    conn.execute(
+                        """
+                        INSERT INTO device_aliases (org_id, alias, canonical_id) VALUES (?, ?, ?)
+                        ON CONFLICT (org_id, alias) DO NOTHING
+                        """,
+                        (runner.org_id, alias, device["canonical_id"]),
+                    )
+            if replace:
+                conn.execute(
+                    "UPDATE runners SET inventory_revision = ?, device_count = ?, last_seen = ?, status = 'online' WHERE id = ?",
+                    (revision, len(normalized), now, runner.id),
+                )
+            else:
+                conn.execute(
+                    "UPDATE runners SET last_seen = ?, status = 'online' WHERE id = ?",
+                    (now, runner.id),
+                )
+            count_row = conn.execute(
+                "SELECT COUNT(*) AS count FROM device_catalog WHERE org_id = ? AND runner_id = ?",
+                (runner.org_id, runner.id),
+            ).fetchone()
+        return {
+            "revision": revision,
+            "device_count": int(count_row["count"] if count_row else 0),
+            "conflicts": conflicts,
+        }
+
+    @staticmethod
+    def _catalog_row(row: Any) -> dict[str, Any]:
+        raw_groups = row["groups_json"] or "[]"
+        return {
+            "canonical_id": row["canonical_id"],
+            "id": row["display_id"],
+            "hostname": row["hostname"],
+            "host": row["host"],
+            "port": int(row["port"] or 22),
+            "platform": row["platform"],
+            "site": row["site"],
+            "role": row["role"],
+            "groups": json.loads(raw_groups),
+            "runner_id": row["runner_id"],
+            "runner_pool": row["runner_pool"],
+            "runner_status": row["runner_status"] or "offline",
+            "runner_last_seen": row["runner_last_seen"],
+            "source": row["source"],
+            "updated_at": row["updated_at"],
+        }
+
+    def resolve_device(self, org_id: str, identifier: str) -> dict[str, Any] | None:
+        alias = self.normalize_device_identifier(identifier)
+        if not alias:
+            return None
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT d.*, r.status AS runner_status, r.last_seen AS runner_last_seen
+                FROM device_aliases a
+                JOIN device_catalog d ON d.org_id = a.org_id AND d.canonical_id = a.canonical_id
+                LEFT JOIN runners r ON r.id = d.runner_id
+                WHERE a.org_id = ? AND a.alias = ?
+                """,
+                (org_id, alias),
+            ).fetchone()
+        return self._catalog_row(row) if row else None
+
+    def devices_by_identifiers(self, org_id: str, identifiers: list[str]) -> list[dict[str, Any]]:
+        aliases = list(dict.fromkeys(
+            self.normalize_device_identifier(value) for value in identifiers if self.normalize_device_identifier(value)
+        ))[:50]
+        if not aliases:
+            return []
+        placeholders = ", ".join("?" for _ in aliases)
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT a.alias AS matched_alias, d.*, r.status AS runner_status, r.last_seen AS runner_last_seen
+                FROM device_aliases a
+                JOIN device_catalog d ON d.org_id = a.org_id AND d.canonical_id = a.canonical_id
+                LEFT JOIN runners r ON r.id = d.runner_id
+                WHERE a.org_id = ? AND a.alias IN ({placeholders})
+                """,
+                (org_id, *aliases),
+            ).fetchall()
+        by_alias = {str(row["matched_alias"]): self._catalog_row(row) for row in rows}
+        devices: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for alias in aliases:
+            device = by_alias.get(alias)
+            if not device or device["canonical_id"] in seen:
+                continue
+            seen.add(device["canonical_id"])
+            devices.append(device)
+        return devices
+
+    def query_devices(
+        self,
+        org_id: str,
+        *,
+        query: str = "",
+        site: str = "",
+        role: str = "",
+        platform: str = "",
+        cursor: str = "",
+        limit: int = 50,
+    ) -> dict[str, Any]:
+        limit = max(1, min(int(limit), 50))
+        clauses = ["d.org_id = ?"]
+        params: list[Any] = [org_id]
+        if query.strip():
+            term = f"%{query.strip().lower()}%"
+            clauses.append(
+                "(LOWER(d.display_id) LIKE ? OR LOWER(d.hostname) LIKE ? OR LOWER(d.host) LIKE ? "
+                "OR EXISTS (SELECT 1 FROM device_aliases a WHERE a.org_id = d.org_id "
+                "AND a.canonical_id = d.canonical_id AND a.alias LIKE ?))"
+            )
+            params.extend([term, term, term, term])
+        for column, value in (("site", site), ("role", role), ("platform", platform)):
+            if value.strip():
+                clauses.append(f"LOWER(COALESCE(d.{column}, '')) = ?")
+                params.append(value.strip().lower())
+        count_where = " AND ".join(clauses)
+        count_params = tuple(params)
+        if cursor.strip():
+            clauses.append("d.canonical_id > ?")
+            params.append(self.normalize_device_identifier(cursor))
+        where = " AND ".join(clauses)
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT d.*, r.status AS runner_status, r.last_seen AS runner_last_seen
+                FROM device_catalog d
+                LEFT JOIN runners r ON r.id = d.runner_id
+                WHERE {where}
+                ORDER BY d.canonical_id ASC
+                LIMIT ?
+                """,
+                (*params, limit + 1),
+            ).fetchall()
+            count_row = conn.execute(
+                f"SELECT COUNT(*) AS count FROM device_catalog d WHERE {count_where}",
+                count_params,
+            ).fetchone()
+            facets: dict[str, list[str]] = {}
+            for column in ("site", "role", "platform"):
+                values = conn.execute(
+                    f"SELECT DISTINCT {column} AS value FROM device_catalog "
+                    "WHERE org_id = ? AND COALESCE(" + column + ", '') <> '' ORDER BY value ASC LIMIT 200",
+                    (org_id,),
+                ).fetchall()
+                facets[column + "s"] = [str(row["value"]) for row in values]
+        has_more = len(rows) > limit
+        page = rows[:limit]
+        devices = [self._catalog_row(row) for row in page]
+        return {
+            "devices": devices,
+            "returned": len(devices),
+            "total": int(count_row["count"] if count_row else 0),
+            "next_cursor": devices[-1]["canonical_id"] if has_more and devices else None,
+            "facets": facets,
+        }
 
     def queue_job(self, change_id: str, action: str, pool: str, payload: dict[str, Any]) -> JobRecord:
         job = self.create_job(change_id, action)  # inherits org_id from the parent change

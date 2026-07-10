@@ -21,6 +21,8 @@ class Device:
     hostname: str
     site: str | None
     groups: tuple[str, ...]
+    role: str | None = None
+    aliases: tuple[str, ...] = ()
     # Runner-local transport metadata. Secrets in this mapping are consumed only
     # by device adapters and are deliberately omitted from public inventory APIs.
     connection_options: dict[str, Any] = field(default_factory=dict, repr=False, compare=False)
@@ -48,6 +50,8 @@ class Inventory:
             port=int(raw.get("port") or defaults.get("port") or 22),
             site=raw.get("site"),
             groups=tuple(raw.get("groups") or []),
+            role=str(raw.get("role") or "").strip() or None,
+            aliases=tuple(str(item).strip() for item in (raw.get("aliases") or []) if str(item).strip()),
             connection_options=self._connection_options(defaults, raw),
         )
 
@@ -115,6 +119,7 @@ class Inventory:
                 str(device.hostname),
                 str(device.host),
                 host_port,
+                *device.aliases,
             }
             if target in candidates or normalized in {self.normalize_id(item) for item in candidates}:
                 return device

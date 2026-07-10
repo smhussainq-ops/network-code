@@ -37,7 +37,7 @@ IDENTITY_DIR = Path.home() / ".netcode-runner"
 IDENTITY_FILE = IDENTITY_DIR / "identity.json"
 INVENTORY_FILE = IDENTITY_DIR / "inventory.yaml"
 POLICY_FILE = IDENTITY_DIR / "policy.yaml"
-VERSION = "0.1.0-phase0"
+VERSION = "0.2.0-device-catalog"
 
 _stop = False
 _SHELL_ADAPTERS: dict[str, dict[str, Any]] = {}
@@ -179,6 +179,49 @@ def import_inventory(args: argparse.Namespace) -> int:
     print(f"[runner] Imported {len(devices)} device(s) into {INVENTORY_FILE}")
     print("[runner] Credentials stay on this runner. They are not sent to the control plane.")
     return 0
+
+
+def _public_inventory_snapshot() -> dict[str, Any]:
+    """Return only searchable device metadata; credentials never enter this payload."""
+    if not INVENTORY_FILE.exists():
+        devices: list[dict[str, Any]] = []
+    else:
+        from netcode.inventory import Inventory
+
+        devices = [
+            {
+                "id": device.id,
+                "hostname": device.hostname,
+                "host": device.host,
+                "port": device.port,
+                "platform": device.platform,
+                "site": device.site or "",
+                "role": device.role or "",
+                "groups": list(device.groups),
+                "aliases": list(device.aliases),
+            }
+            for device in Inventory(INVENTORY_FILE).devices
+        ]
+    serialized = json.dumps(devices, sort_keys=True, separators=(",", ":"))
+    return {
+        "revision": hashlib.sha256(serialized.encode("utf-8")).hexdigest(),
+        "devices": devices,
+        "replace": True,
+    }
+
+
+def _sync_inventory_catalog(server: str, token: str, previous_revision: str = "") -> str:
+    snapshot = _public_inventory_snapshot()
+    revision = str(snapshot["revision"])
+    if revision == previous_revision:
+        return previous_revision
+    response = _post(server, "/api/runner/inventory-sync", snapshot, token=token, timeout=120)
+    if not response or not response.get("ok"):
+        raise RuntimeError((response or {}).get("message") or "inventory catalog sync failed")
+    print(f"[runner] Synchronized {response.get('device_count', 0)} public device record(s).", flush=True)
+    if response.get("conflicts"):
+        print(f"[runner] Catalog conflicts require review: {len(response['conflicts'])}.", file=sys.stderr, flush=True)
+    return revision
 
 
 def _execute_job(job: dict[str, Any]) -> dict[str, Any]:
@@ -1443,12 +1486,10 @@ def _execute_read_inner(action: str, payload: dict[str, Any]) -> dict[str, Any]:
                 "device_id": device.id, "platform": device.platform}
 
     if action == "discovery":
-        from netcode.discovery import DiscoveryService
-        return DiscoveryService(_runner_ws()).scan(
-            host=str(payload.get("host", "")), username=str(payload.get("username", "")),
-            password=str(payload.get("password", "")), platform=str(payload.get("platform", "")),
-            port=int(payload.get("port") or 22), device_id=str(payload.get("device_id", "")),
-            site=str(payload.get("site", "")), groups=payload.get("groups"))
+        # Discovery must use the same runner-local inventory and credential
+        # defaults that later Shell sessions use. It also persists the public
+        # device facts locally so the connector can resolve the new device.
+        return _execute_rez_scan_device(payload)
 
     return {"ok": False, "error": f"Unknown read action '{action}'."}
 
@@ -1476,7 +1517,20 @@ def run(args: argparse.Namespace) -> int:
         _post(server, "/api/runner/heartbeat", {"version": VERSION}, token=token)
     except Exception as exc:  # noqa: BLE001
         print(f"[runner] Heartbeat failed (continuing): {exc}", file=sys.stderr)
+    inventory_revision = ""
+    inventory_sync_at = 0.0
+    try:
+        inventory_revision = _sync_inventory_catalog(server, token)
+        inventory_sync_at = time.monotonic()
+    except Exception as exc:  # noqa: BLE001
+        print(f"[runner] Inventory catalog sync failed (continuing): {exc}", file=sys.stderr)
     while not _stop:
+        if time.monotonic() - inventory_sync_at >= 30.0:
+            try:
+                inventory_revision = _sync_inventory_catalog(server, token, inventory_revision)
+            except Exception as exc:  # noqa: BLE001
+                print(f"[runner] Inventory catalog sync failed (continuing): {exc}", file=sys.stderr)
+            inventory_sync_at = time.monotonic()
         try:
             resp = _post(server, "/api/runner/poll", {"wait_seconds": 20}, token=token, timeout=40)
         except Exception as exc:  # noqa: BLE001

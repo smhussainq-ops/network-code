@@ -10,7 +10,7 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor, TimeoutError
 from pathlib import Path
 
-from fastapi import FastAPI, Header, HTTPException, Request, Response, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Header, HTTPException, Query, Request, Response, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -292,6 +292,12 @@ class RunnerResultRequest(BaseModel):
 
 class RunnerHeartbeatRequest(BaseModel):
     version: str = ""
+
+
+class RunnerInventorySyncRequest(BaseModel):
+    revision: str
+    devices: list[dict[str, object]] = []
+    replace: bool = True
 
 
 class RunnerReadRequest(BaseModel):
@@ -962,6 +968,59 @@ def api_source_of_truth() -> dict[str, object]:
     return source_of_truth(paths())
 
 
+@app.get("/api/devices")
+def api_devices(
+    request: Request,
+    q: str = Query(default="", max_length=200),
+    site: str = Query(default="", max_length=120),
+    role: str = Query(default="", max_length=120),
+    platform: str = Query(default="", max_length=120),
+    cursor: str = Query(default="", max_length=300),
+    limit: int = Query(default=50, ge=1, le=50),
+) -> dict[str, object]:
+    """Search public runner inventory metadata without touching a device."""
+    result = PlatformStore(paths()).query_devices(
+        _request_principal(request).org_id,
+        query=q,
+        site=site,
+        role=role,
+        platform=platform,
+        cursor=cursor,
+        limit=limit,
+    )
+    channels = globals().get("_RUNNER_CHANNELS", {})
+    for device in result["devices"]:
+        runner_id = str(device.get("runner_id") or "")
+        connected = runner_id in channels
+        device["runner_connected"] = connected
+        device["connectable"] = connected
+    result.update({"ok": True, "device_connections_opened": 0})
+    return result
+
+
+@app.get("/api/devices/resolve")
+def api_devices_resolve(
+    request: Request,
+    ids: str = Query(default="", max_length=10_000),
+) -> dict[str, object]:
+    identifiers = [item.strip() for item in ids.split(",") if item.strip()][:50]
+    devices = PlatformStore(paths()).devices_by_identifiers(_request_principal(request).org_id, identifiers)
+    channels = globals().get("_RUNNER_CHANNELS", {})
+    for device in devices:
+        connected = str(device.get("runner_id") or "") in channels
+        device["runner_connected"] = connected
+        device["connectable"] = connected
+    return {
+        "ok": True,
+        "devices": devices,
+        "returned": len(devices),
+        "total": len(devices),
+        "next_cursor": None,
+        "facets": {},
+        "device_connections_opened": 0,
+    }
+
+
 @app.get("/api/source-of-truth/providers")
 def api_source_of_truth_providers() -> dict[str, object]:
     return {"providers": provider_catalog()}
@@ -1140,6 +1199,90 @@ def api_runner_heartbeat(request: RunnerHeartbeatRequest, authorization: str | N
     return {"ok": True, "runner_id": runner.id, "pool": runner.pool}
 
 
+_RUNNER_INVENTORY_FIELDS = {
+    "id", "hostname", "host", "port", "platform", "site", "role", "groups", "aliases",
+}
+_RUNNER_INVENTORY_SECRET_MARKERS = {
+    "username", "password", "passwd", "pwd", "secret", "token", "credential",
+    "passphrase", "api_key", "apikey", "private_key", "privatekey", "enable_secret",
+}
+
+
+def _sanitize_runner_inventory(devices: list[dict[str, object]]) -> list[dict[str, object]]:
+    if len(devices) > 100_000:
+        raise HTTPException(status_code=413, detail="Runner inventory exceeds the 100,000-device sync limit.")
+    public: list[dict[str, object]] = []
+    for index, raw in enumerate(devices):
+        keys = {str(key).strip().lower() for key in raw}
+        secret_keys = sorted(
+            key for key in keys if any(marker in key for marker in _RUNNER_INVENTORY_SECRET_MARKERS)
+        )
+        if secret_keys:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Runner inventory item {index} contains forbidden credential fields: {', '.join(secret_keys)}.",
+            )
+        unknown = sorted(keys - _RUNNER_INVENTORY_FIELDS)
+        if unknown:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Runner inventory item {index} contains unsupported fields: {', '.join(unknown)}.",
+            )
+        device_id = str(raw.get("id") or "").strip()
+        host = str(raw.get("host") or "").strip()
+        scalar_fields = ("id", "hostname", "host", "port", "platform", "site", "role")
+        invalid_scalar = next(
+            (field for field in scalar_fields if isinstance(raw.get(field), (dict, list, tuple, set))),
+            None,
+        )
+        if invalid_scalar:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Runner inventory item {index} field {invalid_scalar} must be a scalar value.",
+            )
+        if not device_id or not host:
+            raise HTTPException(status_code=400, detail=f"Runner inventory item {index} requires id and host.")
+        try:
+            port = int(raw.get("port") or 22)
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail=f"Runner inventory item {index} has an invalid port.") from exc
+        if not 1 <= port <= 65535:
+            raise HTTPException(status_code=400, detail=f"Runner inventory item {index} has an invalid port.")
+        groups = raw.get("groups") or []
+        aliases = raw.get("aliases") or []
+        if not isinstance(groups, list) or not isinstance(aliases, list):
+            raise HTTPException(status_code=400, detail=f"Runner inventory item {index} groups and aliases must be lists.")
+        if any(not isinstance(item, str) for item in [*groups, *aliases]):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Runner inventory item {index} groups and aliases may contain strings only.",
+            )
+        public.append({
+            "id": device_id,
+            "hostname": str(raw.get("hostname") or device_id).strip(),
+            "host": host,
+            "port": port,
+            "platform": str(raw.get("platform") or "unknown").strip().lower(),
+            "site": str(raw.get("site") or "").strip(),
+            "role": str(raw.get("role") or "").strip(),
+            "groups": [str(item).strip() for item in groups if str(item).strip()],
+            "aliases": [str(item).strip() for item in aliases if str(item).strip()],
+        })
+    return public
+
+
+@app.post("/api/runner/inventory-sync")
+def api_runner_inventory_sync(
+    request: RunnerInventorySyncRequest,
+    authorization: str | None = Header(default=None),
+) -> dict[str, object]:
+    store = PlatformStore(paths())
+    runner = _require_runner(store, authorization)
+    public = _sanitize_runner_inventory(list(request.devices))
+    synced = store.sync_runner_devices(runner, public, revision=request.revision.strip(), replace=request.replace)
+    return {"ok": True, "runner_id": runner.id, "pool": runner.pool, **synced}
+
+
 def _runner_read(p, action: str, payload: dict, org_id: str, timeout: float = 60.0) -> dict[str, object]:
     """Runner mode: queue a device-read job and wait for the on-prem runner to report.
     Keeps the browser API synchronous while the actual device I/O happens on the runner."""
@@ -1149,7 +1292,10 @@ def _runner_read(p, action: str, payload: dict, org_id: str, timeout: float = 60
     while time.monotonic() < deadline:
         current = store.get_job(job.id)
         if current.status in ("completed", "failed"):
-            return current.result or {"ok": current.status == "completed", "message": current.message}
+            result = dict(current.result or {"ok": current.status == "completed", "message": current.message})
+            result["_runner_id"] = current.claimed_by
+            result["_runner_pool"] = current.pool
+            return result
         time.sleep(0.4)
     store.cancel_job_if_queued(job.id, f"read deadline: {action} exceeded {int(timeout)}s")
     return {"ok": False, "error": f"No runner completed the {action} read within {int(timeout)}s. Is a runner online for this pool? (Setup → Runners)"}
@@ -1214,7 +1360,37 @@ def _collect_rez_state_for_troubleshooting(device) -> dict[str, object]:  # noqa
         executor.shutdown(wait=False, cancel_futures=True)
 
 
-def _import_runner_discovery_candidate(p: WorkspacePaths, discovery_result: dict[str, object]) -> dict[str, object]:
+def _catalog_runner_candidate(
+    p: WorkspacePaths,
+    org_id: str,
+    candidate: dict[str, object],
+    runner_result: dict[str, object],
+) -> dict[str, object]:
+    runner_id = str(runner_result.get("_runner_id") or "").strip()
+    if not runner_id:
+        return {"ok": False, "error": "Runner result did not identify the local connector."}
+    store = PlatformStore(p)
+    try:
+        runner = store.get_runner(runner_id)
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc)}
+    if runner.org_id != org_id:
+        return {"ok": False, "error": "Runner and device belong to different organizations."}
+    public = _sanitize_runner_inventory([candidate])
+    synced = store.sync_runner_devices(
+        runner,
+        public,
+        revision=f"discovery:{uuid.uuid4().hex}",
+        replace=False,
+    )
+    return {"ok": True, "runner_id": runner.id, "runner_pool": runner.pool, **synced}
+
+
+def _import_runner_discovery_candidate(
+    p: WorkspacePaths,
+    discovery_result: dict[str, object],
+    org_id: str = DEFAULT_ORG_ID,
+) -> dict[str, object]:
     """Persist public discovery facts returned by the local runner.
 
     Runner discovery owns device access and credentials. The control plane only
@@ -1242,6 +1418,14 @@ def _import_runner_discovery_candidate(p: WorkspacePaths, discovery_result: dict
     if source_result.get("ok"):
         safety["message"] = "Discovery used runner-local collection and imported public facts into the control-plane source of truth."
         result["device"] = source_result.get("device")
+        catalog_result = _catalog_runner_candidate(p, org_id, candidate, result)
+        result["device_catalog"] = catalog_result
+        if not catalog_result.get("ok"):
+            safety["catalog_pending"] = True
+            safety["message"] = (
+                catalog_result.get("error")
+                or "Discovery succeeded; the local connector will synchronize the Shell catalog shortly."
+            )
     else:
         safety["message"] = source_result.get("error") or "Source-of-truth import failed."
         result["ok"] = False
@@ -1296,7 +1480,7 @@ def api_discovery_scan(request: DiscoveryScanRequest, http_request: Request) -> 
                    "platform": request.platform, "port": request.port, "device_id": request.device_id,
                    "site": request.site, "groups": request.groups}
         discovery_result = _runner_read(p, "discovery", payload, _request_principal(http_request).org_id)
-        return _import_runner_discovery_candidate(p, discovery_result)
+        return _import_runner_discovery_candidate(p, discovery_result, _request_principal(http_request).org_id)
     return DiscoveryService(p).scan(
         host=request.host,
         username=request.username,
@@ -1339,6 +1523,7 @@ def api_shell_manual_device(request: ShellManualDeviceRequest, http_request: Req
         return {"ok": False, "source_of_truth": source_result, "message": source_result.get("error") or "Source of truth update failed."}
 
     runner_result: dict[str, object] | None = None
+    catalog_result: dict[str, object] | None = None
     if execution_mode() == "runner":
         runner_candidate = dict(public_candidate)
         runner_result = _runner_read(
@@ -1355,11 +1540,26 @@ def api_shell_manual_device(request: ShellManualDeviceRequest, http_request: Req
                 "runner_inventory": runner_result,
                 "message": runner_result.get("error") or runner_result.get("message") or "Runner inventory update failed.",
             }
+        catalog_result = _catalog_runner_candidate(
+            p,
+            _request_principal(http_request).org_id,
+            dict(source_result.get("device") or public_candidate),
+            runner_result,
+        )
+        if not catalog_result.get("ok"):
+            return {
+                "ok": False,
+                "source_of_truth": source_result,
+                "runner_inventory": runner_result,
+                "device_catalog": catalog_result,
+                "message": catalog_result.get("error") or "Device catalog assignment failed.",
+            }
 
     return {
         "ok": True,
         "source_of_truth": source_result,
         "runner_inventory": runner_result,
+        "device_catalog": catalog_result,
         "device": source_result.get("device"),
         "message": f"Device {public_candidate['id']} is ready for Shell sessions.",
     }
@@ -1608,10 +1808,33 @@ def api_shell_open(request: ShellOpenRequest, http_request: Request) -> dict[str
     """Open a CLI session against a device."""
     p = paths()
     org = _request_principal(http_request).org_id
-    inventory = Inventory(configured_inventory_path(p))
-    device = inventory.find_device(request.device_id)
-    if not device:
-        raise HTTPException(status_code=404, detail=f"Unknown device {request.device_id}")
+    if execution_mode() == "runner":
+        catalog_device = PlatformStore(p).resolve_device(org, request.device_id)
+        if not catalog_device:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Unknown device {request.device_id}. Wait for the local connector to synchronize discovery.",
+            )
+        runner_id = str(catalog_device.get("runner_id") or "")
+        if runner_id not in _RUNNER_CHANNELS:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Local connector for {catalog_device['id']} is offline. Start it and retry.",
+            )
+        device_id = str(catalog_device["canonical_id"])
+        display_id = str(catalog_device["id"])
+        platform = str(catalog_device["platform"])
+        assigned_pool = str(catalog_device["runner_pool"])
+    else:
+        inventory = Inventory(configured_inventory_path(p))
+        device = inventory.find_device(request.device_id)
+        if not device:
+            raise HTTPException(status_code=404, detail=f"Unknown device {request.device_id}")
+        device_id = device.id
+        display_id = device.id
+        platform = device.platform
+        runner_id = ""
+        assigned_pool = runner_pool()
     session_id = uuid.uuid4().hex[:16]
     mode = "guarded" if request.guard_enabled else "direct"
     state = {
@@ -1621,15 +1844,24 @@ def api_shell_open(request: ShellOpenRequest, http_request: Request) -> dict[str
         "device_touched": False,
         "guard_enabled": bool(request.guard_enabled),
     }
-    _SHELL_SESSIONS[session_id] = {"org_id": org, "device_id": device.id, "platform": device.platform, "state": state}
-    _shell_append(p, session_id, {"event": "session_opened", "device_id": device.id, "org_id": org,
+    _SHELL_SESSIONS[session_id] = {
+        "org_id": org,
+        "device_id": device_id,
+        "display_id": display_id,
+        "platform": platform,
+        "runner_id": runner_id,
+        "runner_pool": assigned_pool,
+        "state": state,
+    }
+    _shell_append(p, session_id, {"event": "session_opened", "device_id": device_id,
+                                  "display_id": display_id, "runner_id": runner_id, "org_id": org,
                                   "guard_enabled": bool(request.guard_enabled)})
     if request.guard_enabled:
-        message = f"Live shell open on {device.id}. Safety prompts remain enabled; transcript logging is on."
+        message = f"Live shell open on {display_id}. Safety prompts remain enabled; transcript logging is on."
     else:
-        message = f"Full live shell open on {device.id}. Commands run on the device; transcript logging remains on."
-    return {"ok": True, "session_id": session_id, "device_id": device.id, "platform": device.platform,
-            "state": state, "message": message}
+        message = f"Full live shell open on {display_id}. Commands run on the device; transcript logging remains on."
+    return {"ok": True, "session_id": session_id, "device_id": device_id, "display_id": display_id,
+            "platform": platform, "runner_id": runner_id, "state": state, "message": message}
 
 
 def _shell_session_or_404(session_id: str, org: str) -> dict[str, object]:
@@ -1723,10 +1955,11 @@ def api_shell_input(request: ShellInputRequest, http_request: Request) -> dict[s
 # the devices are reachable only from it):
 #   browser xterm  <--WS-->  control plane  <--persistent WS-->  runner  <-->  device PTY
 # The control plane is a pure broker: it holds one control-channel WS per runner
-# pool and one browser WS per session, and pipes JSON frames between them. The
+# and one browser WS per session, and pipes JSON frames between them. The
 # guard and the device credentials live on the runner; the control plane never
 # sees a live device session or a credential.
-_RUNNER_CHANNELS: dict[str, WebSocket] = {}          # pool -> runner control WS
+_RUNNER_CHANNELS: dict[str, WebSocket] = {}          # runner_id -> runner control WS
+_RUNNER_CHANNEL_POOLS: dict[str, str] = {}           # runner_id -> pool
 _BROWSER_SOCKETS: dict[str, WebSocket] = {}          # session_id -> browser WS
 
 
@@ -1736,15 +1969,16 @@ async def ws_runner_stream(ws: WebSocket) -> None:
     then this coroutine forwards the runner's output/event frames to the matching
     browser sockets. Input frames flow the other way from the browser coroutine."""
     await ws.accept()
-    pool = None
+    runner_id = None
     try:
         auth = await ws.receive_json()
         token = str(auth.get("token", ""))
         store = PlatformStore(paths())
         runner = authenticate_runner(store, token)
-        pool = runner.pool
-        _RUNNER_CHANNELS[pool] = ws
-        await ws.send_json({"t": "ready", "pool": pool})
+        runner_id = runner.id
+        _RUNNER_CHANNELS[runner.id] = ws
+        _RUNNER_CHANNEL_POOLS[runner.id] = runner.pool
+        await ws.send_json({"t": "ready", "runner_id": runner.id, "pool": runner.pool})
         while True:
             frame = await ws.receive_json()
             sid = str(frame.get("sid", ""))
@@ -1778,8 +2012,20 @@ async def ws_runner_stream(ws: WebSocket) -> None:
     except Exception:  # noqa: BLE001 — auth failure or malformed frame ends the channel
         pass
     finally:
-        if pool and _RUNNER_CHANNELS.get(pool) is ws:
-            _RUNNER_CHANNELS.pop(pool, None)
+        if runner_id and _RUNNER_CHANNELS.get(runner_id) is ws:
+            _RUNNER_CHANNELS.pop(runner_id, None)
+            _RUNNER_CHANNEL_POOLS.pop(runner_id, None)
+
+
+def _runner_channel_for_session(session: dict[str, object]) -> tuple[str, WebSocket | None]:
+    assigned = str(session.get("runner_id") or "")
+    if assigned:
+        return assigned, _RUNNER_CHANNELS.get(assigned)
+    pool = str(session.get("runner_pool") or runner_pool())
+    for runner_id, channel in _RUNNER_CHANNELS.items():
+        if _RUNNER_CHANNEL_POOLS.get(runner_id) == pool:
+            return runner_id, channel
+    return "", None
 
 
 @app.websocket("/api/shell/session/{session_id}")
@@ -1792,10 +2038,9 @@ async def ws_shell_session(ws: WebSocket, session_id: str) -> None:
         await ws.send_json({"t": "status", "s": "error", "m": "Unknown or expired session."})
         await ws.close()
         return
-    pool = runner_pool()
-    runner_ws = _RUNNER_CHANNELS.get(pool)
+    runner_id, runner_ws = _runner_channel_for_session(session)
     if runner_ws is None:
-        await ws.send_json({"t": "status", "s": "error", "m": f"No runner online for pool '{pool}'."})
+        await ws.send_json({"t": "status", "s": "error", "m": "The assigned local connector is offline."})
         await ws.close()
         return
     _BROWSER_SOCKETS[session_id] = ws
@@ -1835,7 +2080,7 @@ async def ws_shell_session(ws: WebSocket, session_id: str) -> None:
         pass
     finally:
         _BROWSER_SOCKETS.pop(session_id, None)
-        current = _RUNNER_CHANNELS.get(pool)
+        current = _RUNNER_CHANNELS.get(runner_id)
         if current is not None:
             try:
                 await current.send_json({"t": "close", "sid": session_id})
