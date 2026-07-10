@@ -110,6 +110,52 @@ def test_rca_remediation_preserves_known_typed_intent(tmp_path: Path, monkeypatc
     assert body["change"]["workflow_state"] == "blocked"
 
 
+def test_site_context_interface_remediation_stays_typed_and_human_gated(tmp_path: Path, monkeypatch):
+    init_workspace(WorkspacePaths(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    client = TestClient(api.app)
+
+    response = client.post(
+        "/api/changes/from-rca",
+        json={
+            "source": "rez",
+            "incident_id": "INC-CAMPUS-ET2",
+            "target_device": "v2-store1",
+            "suggested_pack": "interface_config",
+            "rationale": "Restore the exact intended interface dependency.",
+            "proposed_intent": {
+                "change_type": "interface_config",
+                "site": "campus",
+                "values": {
+                    "interface": "Ethernet2",
+                    "mode": "routed",
+                    "enabled": True,
+                    "ip_address": "10.3.2.1/30",
+                },
+                "interface": {
+                    "name": "Ethernet2",
+                    "description": "Restore intended operational dependency",
+                    "enabled": True,
+                    "mode": "routed",
+                    "access_vlan": None,
+                    "trunk_allowed_vlans": [],
+                    "ip_address": "10.3.2.1/30",
+                },
+            },
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    intent = body["intent"]
+    assert intent["change_type"] == "interface_config"
+    assert intent["interface"]["name"] == "Ethernet2"
+    assert intent["interface"]["enabled"] is True
+    assert intent["metadata"]["draft_only"] is True
+    assert intent["metadata"]["human_approval_required"] is True
+    assert body["change"]["workflow_state"] in {"validated", "blocked"}
+
+
 def test_rez_rca_validated_draft_can_enter_dry_run_queue(tmp_path: Path, monkeypatch):
     init_workspace(WorkspacePaths(tmp_path))
     monkeypatch.chdir(tmp_path)

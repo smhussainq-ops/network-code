@@ -11,7 +11,7 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor, TimeoutError
 from pathlib import Path
 
-from fastapi import FastAPI, Header, HTTPException, Query, Request, Response, WebSocket, WebSocketDisconnect
+from fastapi import Body, FastAPI, Header, HTTPException, Query, Request, Response, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -19,6 +19,7 @@ from pydantic import BaseModel
 from netcode.ai_assistant import assistant_response
 from netcode.ansible_backend import build_ansible_pack_plan
 from netcode.adapters.registry import AdapterRegistry
+from netcode.adapters.rez import READ_TRANSPORTS
 from netcode.bootstrap import init_workspace
 from netcode.discovery import DiscoveryService
 from netcode.diagnostics_handoff import attach_verification_handoff, build_verification_handoff
@@ -1435,26 +1436,73 @@ def _import_runner_discovery_candidate(
 
 
 @app.post("/api/readiness/devices")
-def api_readiness_devices(request: Request) -> dict[str, object]:
-    """Live read test: can the platform actually read the trusted devices right now?"""
+def api_readiness_devices(
+    request: Request,
+    payload: dict[str, object] = Body(default_factory=dict),
+) -> dict[str, object]:
+    """Live read test scoped to explicitly selected targets when provided."""
     p = paths()
+    requested_ids = [
+        str(value).strip()
+        for value in (payload.get("device_ids") or [])
+        if str(value).strip()
+    ]
     if execution_mode() == "runner":
-        return _runner_read(p, "readiness", {}, _request_principal(request).org_id)
+        return _runner_read(
+            p,
+            "readiness",
+            {"device_ids": requested_ids},
+            _request_principal(request).org_id,
+        )
     inventory = Inventory(configured_inventory_path(p))
-    devices = list(inventory.by_id.values())
+    missing: list[str] = []
+    if requested_ids:
+        devices = []
+        for device_id in requested_ids:
+            device = inventory.find_device(device_id)
+            if device is None:
+                missing.append(device_id)
+            elif device not in devices:
+                devices.append(device)
+    else:
+        devices = list(inventory.by_id.values())
     if not devices:
         return {
             "ok": False,
             "tested": 0,
             "readable": 0,
-            "devices": [],
-            "message": "No devices in source of truth yet. Discover a device first.",
+            "devices": [
+                {"id": device_id, "ok": False, "eligible": False, "error": "unknown_target"}
+                for device_id in missing
+            ],
+            "message": (
+                "No selected target exists in source of truth."
+                if requested_ids
+                else "No devices in source of truth yet. Discover a device first."
+            ),
         }
-    collected = AdapterRegistry().rez.collect_many(devices)
+    registry = AdapterRegistry()
+    supported = []
+    excluded_rows: list[dict[str, object]] = []
+    for device in devices:
+        normalized_platform = registry.rez.normalize_platform(device.platform)
+        if normalized_platform not in READ_TRANSPORTS:
+            excluded_rows.append({
+                "id": device.id,
+                "host": device.host,
+                "platform": device.platform,
+                "site": device.site,
+                "ok": False,
+                "eligible": False,
+                "error": f"unsupported_platform:{device.platform}",
+            })
+        else:
+            supported.append(device)
+    collected = registry.rez.collect_many(supported) if supported else {"results": []}
     results = {str(item.get("device_id")): item for item in collected.get("results", []) if isinstance(item, dict)}
     rows: list[dict[str, object]] = []
     readable = 0
-    for device in devices:
+    for device in supported:
         result = results.get(device.id) or {}
         ok = bool(result.get("ok"))
         readable += 1 if ok else 0
@@ -1462,13 +1510,29 @@ def api_readiness_devices(request: Request) -> dict[str, object]:
         if not ok:
             errors = result.get("errors") or []
             error = str(result.get("error") or (errors[0] if errors else "unreadable"))
-        rows.append({"id": device.id, "host": device.host, "platform": device.platform, "ok": ok, "error": error})
+        rows.append({
+            "id": device.id,
+            "host": device.host,
+            "platform": device.platform,
+            "site": device.site,
+            "ok": ok,
+            "eligible": True,
+            "error": error,
+        })
+    rows.extend(excluded_rows)
+    rows.extend(
+        {"id": device_id, "ok": False, "eligible": False, "error": "unknown_target"}
+        for device_id in missing
+    )
+    tested = len(supported)
     return {
-        "ok": readable > 0,
-        "tested": len(devices),
+        "ok": tested > 0 and readable == tested and not missing and not excluded_rows,
+        "tested": tested,
         "readable": readable,
         "devices": rows,
-        "message": f"{readable}/{len(devices)} trusted devices are readable.",
+        "excluded": len(excluded_rows) + len(missing),
+        "requested": len(requested_ids),
+        "message": f"{readable}/{tested} selected supported devices are readable.",
     }
 
 

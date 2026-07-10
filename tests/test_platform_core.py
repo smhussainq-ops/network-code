@@ -19,7 +19,7 @@ from netcode.source_of_truth import source_of_truth
 from netcode.store import PlatformStore
 from netcode.verification import verify_vlan_state
 from netcode.workflow import state_after_lab_action, state_after_static_validation, workflow_snapshot
-from netcode.yamlio import write_yaml
+from netcode.yamlio import read_yaml, write_yaml
 
 
 def test_platform_store_persists_changes_and_jobs(tmp_path: Path):
@@ -2935,6 +2935,56 @@ def test_readiness_devices_reports_per_device_readability_honestly(tmp_path: Pat
     assert {device["id"] for device in body["devices"]} == {"v2-store1", "v2-store2", "v2-store3"}
     assert all(device["error"] for device in body["devices"])
     assert "0/3" in body["message"]
+
+
+def test_readiness_devices_only_checks_selected_targets(tmp_path: Path, monkeypatch):
+    init_workspace(WorkspacePaths(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    client = TestClient(api.app)
+
+    readiness = client.post("/api/readiness/devices", json={"device_ids": ["v2-store2"]})
+
+    assert readiness.status_code == 200
+    body = readiness.json()
+    assert body["requested"] == 1
+    assert body["tested"] == 1
+    assert {device["id"] for device in body["devices"]} == {"v2-store2"}
+
+
+def test_readiness_excludes_unsupported_selected_target_before_collection(tmp_path: Path, monkeypatch):
+    paths = WorkspacePaths(tmp_path)
+    init_workspace(paths)
+    monkeypatch.chdir(tmp_path)
+    inventory_path = paths.inventories / "lab.yaml"
+    inventory = read_yaml(inventory_path)
+    inventory["devices"].append({
+        "id": "ssh-test",
+        "host": "127.0.0.1",
+        "platform": "linux",
+        "username": "ignored",
+        "password": "ignored",
+    })
+    write_yaml(inventory_path, inventory)
+    client = TestClient(api.app)
+
+    readiness = client.post("/api/readiness/devices", json={"device_ids": ["ssh-test"]})
+
+    assert readiness.status_code == 200
+    body = readiness.json()
+    assert body["tested"] == 0
+    assert body["readable"] == 0
+    assert body["excluded"] == 1
+    assert body["devices"] == [
+        {
+            "id": "ssh-test",
+            "host": "127.0.0.1",
+            "platform": "linux",
+            "site": None,
+            "ok": False,
+            "eligible": False,
+            "error": "unsupported_platform:linux",
+        }
+    ]
 
 
 def test_health_endpoint_returns_lab_summary_not_raw_dump(tmp_path: Path, monkeypatch):

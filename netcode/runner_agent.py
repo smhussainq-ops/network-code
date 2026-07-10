@@ -1329,19 +1329,86 @@ def _execute_read_inner(action: str, payload: dict[str, Any]) -> dict[str, Any]:
 
     if action == "readiness":
         from netcode.adapters.registry import AdapterRegistry
-        devices = list(Inventory(INVENTORY_FILE).by_id.values())
+        from netcode.adapters.rez import READ_TRANSPORTS
+        inventory = Inventory(INVENTORY_FILE)
+        requested_ids = [
+            str(value).strip()
+            for value in (payload.get("device_ids") or [])
+            if str(value).strip()
+        ]
+        missing: list[str] = []
+        if requested_ids:
+            devices = []
+            for device_id in requested_ids:
+                device = inventory.find_device(device_id)
+                if device is None:
+                    missing.append(device_id)
+                elif device not in devices:
+                    devices.append(device)
+        else:
+            devices = list(inventory.by_id.values())
         if not devices:
-            return {"ok": False, "tested": 0, "readable": 0, "devices": [], "message": "No devices in runner inventory."}
-        results = {str(i.get("device_id")): i for i in AdapterRegistry().rez.collect_many(devices).get("results", []) if isinstance(i, dict)}
+            return {
+                "ok": False,
+                "tested": 0,
+                "readable": 0,
+                "devices": [
+                    {"id": device_id, "ok": False, "eligible": False, "error": "unknown_target"}
+                    for device_id in missing
+                ],
+                "message": "No selected target exists in runner inventory." if requested_ids else "No devices in runner inventory.",
+            }
+        registry = AdapterRegistry()
+        supported, excluded_rows = [], []
+        for device in devices:
+            normalized_platform = registry.rez.normalize_platform(device.platform)
+            if normalized_platform not in READ_TRANSPORTS:
+                excluded_rows.append({
+                    "id": device.id,
+                    "host": device.host,
+                    "platform": device.platform,
+                    "site": device.site,
+                    "ok": False,
+                    "eligible": False,
+                    "error": f"unsupported_platform:{device.platform}",
+                })
+            else:
+                supported.append(device)
+        results = {
+            str(item.get("device_id")): item
+            for item in (registry.rez.collect_many(supported).get("results", []) if supported else [])
+            if isinstance(item, dict)
+        }
         rows, readable = [], 0
-        for d in devices:
+        for d in supported:
             r = results.get(d.id) or {}
             ok = bool(r.get("ok"))
             readable += 1 if ok else 0
             err = "" if ok else str(r.get("error") or (r.get("errors") or ["unreadable"])[0])
-            rows.append({"id": d.id, "host": d.host, "platform": d.platform, "ok": ok, "error": err})
-        return {"ok": readable > 0, "tested": len(devices), "readable": readable, "devices": rows,
-                "message": f"{readable}/{len(devices)} trusted devices are readable."}
+            rows.append({
+                "id": d.id,
+                "host": d.host,
+                "platform": d.platform,
+                "site": d.site,
+                "ok": ok,
+                "eligible": True,
+                "error": err,
+            })
+        rows.extend(excluded_rows)
+        rows.extend(
+            {"id": device_id, "ok": False, "eligible": False, "error": "unknown_target"}
+            for device_id in missing
+        )
+        tested = len(supported)
+        return {
+            "ok": tested > 0 and readable == tested and not missing and not excluded_rows,
+            "tested": tested,
+            "readable": readable,
+            "devices": rows,
+            "excluded": len(excluded_rows) + len(missing),
+            "requested": len(requested_ids),
+            "message": f"{readable}/{tested} selected supported devices are readable.",
+        }
 
     if action == "rez_ssh_command":
         return _execute_rez_ssh_command(payload)
