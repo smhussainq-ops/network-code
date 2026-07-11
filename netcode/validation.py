@@ -7,7 +7,7 @@ from ipaddress import ip_address
 from ipaddress import ip_network
 from pathlib import Path
 
-from netcode.change_types import spec_for
+from netcode.change_types import redistribution_items, spec_for
 from netcode.inventory import Inventory
 from netcode.models import (
     AclRuleIntent,
@@ -250,33 +250,58 @@ class StaticValidator:
         )
 
     def _routing_redistribution_policy(self, intent, render: RenderResult) -> CheckResult:
-        item = intent.redistribution
-        if item.from_protocol != "bgp" or item.to_protocol != "ospf":
-            return self._fail(
-                "routing_redistribution_policy",
-                "Route Redistribution Policy",
-                "This controlled workflow currently supports only BGP-to-OSPF redistribution.",
-            )
-        if any(str(prefix) == "0.0.0.0/0" for prefix in item.prefixes):
-            return self._fail(
-                "routing_redistribution_policy",
-                "Route Redistribution Policy",
-                "Default-route redistribution is forbidden in this workflow.",
-            )
-        if f"redistribute bgp route-map {item.route_map}" not in render.config:
-            return self._fail(
-                "routing_redistribution_policy",
-                "Route Redistribution Policy",
-                "Redistribution must be constrained by the approved route-map.",
-            )
+        items = redistribution_items(intent)
+        supported = {("bgp", "ospf"), ("ospf", "bgp")}
+        for item in items:
+            if (item.from_protocol, item.to_protocol) not in supported:
+                return self._fail(
+                    "routing_redistribution_policy",
+                    "Route Redistribution Policy",
+                    "This controlled workflow supports only BGP/OSPF protocol boundaries.",
+                )
+            if any(str(prefix) == "0.0.0.0/0" for prefix in item.prefixes):
+                return self._fail(
+                    "routing_redistribution_policy",
+                    "Route Redistribution Policy",
+                    "Default-route redistribution is forbidden in this workflow.",
+                )
+            if item.to_protocol == "bgp" and not str(item.target_process).isdigit():
+                return self._fail(
+                    "routing_redistribution_policy",
+                    "Route Redistribution Policy",
+                    "The BGP target process must be a numeric ASN.",
+                )
+            statement = f"redistribute {item.from_protocol} route-map {item.route_map}"
+            if statement not in render.config:
+                return self._fail(
+                    "routing_redistribution_policy",
+                    "Route Redistribution Policy",
+                    "Every redistribution direction must be constrained by its approved route-map.",
+                )
+
+        if len(items) == 2:
+            forward = [ip_network(prefix, strict=False) for prefix in items[0].prefixes]
+            reverse = [ip_network(prefix, strict=False) for prefix in items[1].prefixes]
+            if any(left.overlaps(right) for left in forward for right in reverse):
+                return self._fail(
+                    "routing_redistribution_policy",
+                    "Route Redistribution Policy",
+                    "Bidirectional redistribution prefix scopes must not overlap.",
+                )
         return self._pass(
             "routing_redistribution_policy",
             "Route Redistribution Policy",
-            "BGP-to-OSPF redistribution is constrained by an explicit prefix list, route-map, and route tag.",
-            route_map=item.route_map,
-            prefix_list=item.prefix_list,
-            prefixes=item.prefixes,
-            route_tag=item.route_tag,
+            "Each route-exchange direction is constrained by a disjoint prefix list and explicit route-map.",
+            boundaries=[
+                {
+                    "direction": f"{item.from_protocol}_to_{item.to_protocol}",
+                    "route_map": item.route_map,
+                    "prefix_list": item.prefix_list,
+                    "prefixes": item.prefixes,
+                    "route_tag": item.route_tag,
+                }
+                for item in items
+            ],
         )
 
     def _acl_policy(self, intent: AclRuleIntent, render: RenderResult) -> CheckResult:

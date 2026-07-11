@@ -595,6 +595,31 @@ devices:
     assert calls["disconnect"] is True
 
 
+def test_runner_typed_reachability_checks_require_real_ping_success(monkeypatch):
+    from types import SimpleNamespace
+
+    from netcode import runner_agent
+
+    intent = SimpleNamespace(
+        reachability_checks=[
+            SimpleNamespace(source_device="campus-core", source_ip="3.3.3.1", destination="1.1.1.2"),
+            SimpleNamespace(source_device="campus-core", source_ip="3.3.3.1", destination="4.4.4.1"),
+        ]
+    )
+
+    def fake_ssh(payload):  # noqa: ANN001
+        destination = str(payload["command"]).split()[1]
+        received = "5 received, 0% packet loss" if destination == "1.1.1.2" else "0 received, 100% packet loss"
+        return {"ok": True, "stdout": received}
+
+    monkeypatch.setattr(runner_agent, "_execute_rez_ssh_command", fake_ssh)
+    result = runner_agent._execute_routing_reachability_checks(intent)
+
+    assert result["passed"] is False
+    assert [item["passed"] for item in result["checks"]] == [True, False]
+    assert result["checks"][0]["command"] == "ping 1.1.1.2 source 3.3.3.1"
+
+
 def test_vendor_aware_shell_uses_runner_local_ssh_port(monkeypatch):
     import sys
     import types
@@ -1414,6 +1439,65 @@ def test_runner_local_policy_gate_accepts_only_typed_redistribution_scope(tmp_pa
     assert result["blocked_lines"] == ["username backdoor privilege 15 secret unsafe"]
 
 
+def test_runner_local_policy_gate_accepts_exact_bidirectional_exchange(tmp_path: Path):
+    from netcode.models import RenderResult, RoutingRedistributionIntent
+    from netcode.runner_checks import local_policy_gate
+
+    paths = WorkspacePaths(tmp_path)
+    init_workspace(paths)
+    policy_yaml = (paths.root / "policies" / "invariants.yaml").read_text()
+    intent = RoutingRedistributionIntent.model_validate({
+        "site": "campus",
+        "targets": {"device_ids": ["v2-campus-edge-1"]},
+        "redistribution": {
+            "from_protocol": "bgp",
+            "to_protocol": "ospf",
+            "target_process": "1",
+            "route_map": "CAMPUS-BGP-TO-OSPF",
+            "prefix_list": "REMOTE-ROUTES",
+            "prefixes": ["1.1.1.0/24"],
+            "route_tag": 65002,
+        },
+        "reverse_redistribution": {
+            "from_protocol": "ospf",
+            "to_protocol": "bgp",
+            "target_process": "65002",
+            "route_map": "CAMPUS-OSPF-TO-BGP",
+            "prefix_list": "CAMPUS-ROUTES",
+            "prefixes": ["3.3.3.0/24"],
+            "route_tag": 65003,
+        },
+    })
+    clean = RenderResult(
+        template_path="routing_redistribution.j2",
+        config=(
+            "ip prefix-list REMOTE-ROUTES seq 10 permit 1.1.1.0/24 le 32\n"
+            "route-map CAMPUS-BGP-TO-OSPF permit 10\n"
+            "   match ip address prefix-list REMOTE-ROUTES\n"
+            "   set tag 65002\n"
+            "router ospf 1\n"
+            "   redistribute bgp route-map CAMPUS-BGP-TO-OSPF\n"
+            "ip prefix-list CAMPUS-ROUTES seq 10 permit 3.3.3.0/24 le 32\n"
+            "route-map CAMPUS-OSPF-TO-BGP permit 10\n"
+            "   match ip address prefix-list CAMPUS-ROUTES\n"
+            "router bgp 65002\n"
+            "   address-family ipv4\n"
+            "      redistribute ospf route-map CAMPUS-OSPF-TO-BGP\n"
+        ),
+        variables={},
+    )
+
+    assert local_policy_gate(intent, clean, policy_yaml)["ok"] is True
+    injected = RenderResult(
+        template_path=clean.template_path,
+        config=clean.config + "router bgp 65123\n",
+        variables={},
+    )
+    result = local_policy_gate(intent, injected, policy_yaml)
+    assert result["ok"] is False
+    assert result["unexpected_lines"] == ["router bgp 65123"]
+
+
 def test_runner_mode_device_credentials_rejected_before_queue_or_import(tmp_path: Path, monkeypatch):
     """Enterprise mode: cloud paths never accept device credentials. Credentials
     are configured on the runner, then discovery/manual-add submit public facts
@@ -1693,6 +1777,48 @@ def test_failed_intent_verify_attaches_read_only_handoff_to_change(tmp_path: Pat
     assert stored.result["diagnostics_handoffs"][0]["context"]["read_only"] is True
     assert stored.result["diagnostics_handoffs"][0]["context"]["failed"] is True
     assert PlatformStore(WorkspacePaths(tmp_path)).list_jobs() == []
+
+
+def test_successful_intent_verify_persists_proof_and_verified_state(tmp_path: Path, monkeypatch):
+    init_workspace(WorkspacePaths(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    client = TestClient(api.app)
+
+    plan = client.post(
+        "/api/desired-state/plan",
+        json={
+            "change_type": "add_vlan",
+            "site": "store-1842",
+            "device_id": "v2-store1",
+            "requested_by": "unit",
+            "values": {"vlan_id": 211, "name": "APP_211", "subnet": "10.211.0.0/24"},
+        },
+    ).json()
+    change_id = plan["change"]["id"]
+
+    def fake_runner_read(p, action, payload, org_id, timeout=60.0):  # noqa: ANN001
+        assert action == "verify"
+        return {
+            "ok": True,
+            "device_id": payload["device_id"],
+            "verification": {"status": "pass", "message": "VLAN 211 is present"},
+        }
+
+    monkeypatch.setenv("NETCODE_EXECUTION", "runner")
+    monkeypatch.setattr(api, "_runner_read", fake_runner_read)
+
+    verify = client.post(
+        "/api/verify/intent",
+        json={"intent_path": plan["intent_path"], "device_id": "v2-store1", "change_id": change_id},
+    )
+
+    assert verify.status_code == 200
+    assert verify.json()["ok"] is True
+    store = PlatformStore(WorkspacePaths(tmp_path))
+    stored = store.get_change(change_id)
+    assert stored.workflow_state == "verified"
+    assert stored.result["verify_proof"]["message"] == "VLAN 211 is present"
+    assert any(event.action == "verify" and event.to_state == "verified" for event in store.list_workflow_events(change_id))
 
 
 def test_runner_credential_floor_survives_empty_and_hostile_policy(tmp_path: Path):

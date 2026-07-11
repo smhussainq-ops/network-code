@@ -621,6 +621,37 @@ def _execute_rez_ssh_command(payload: dict[str, Any]) -> dict[str, Any]:
                 pass
 
 
+def _ping_succeeded(output: str) -> bool:
+    text = str(output or "").lower()
+    if re.search(r"(?:0\s+received|100(?:\.0)?%\s+packet\s+loss|success\s+rate\s+is\s+0\s+percent)", text):
+        return False
+    return bool(
+        re.search(r"(?:[1-9]\d*\s+received|0(?:\.0)?%\s+packet\s+loss|success\s+rate\s+is\s+(?:[1-9]\d?|100)\s+percent)", text)
+    )
+
+
+def _execute_routing_reachability_checks(intent: Any) -> dict[str, Any]:
+    results: list[dict[str, Any]] = []
+    for check in list(getattr(intent, "reachability_checks", None) or []):
+        command = f"ping {check.destination} source {check.source_ip}"
+        response = _execute_rez_ssh_command({"device": check.source_device, "command": command})
+        output = str(response.get("stdout") or "")
+        passed = bool(response.get("ok")) and _ping_succeeded(output)
+        results.append({
+            "source_device": check.source_device,
+            "source_ip": check.source_ip,
+            "destination": check.destination,
+            "command": command,
+            "passed": passed,
+            "output": output,
+            "error": str(response.get("error") or response.get("stderr") or ""),
+        })
+    return {
+        "passed": bool(results) and all(bool(item["passed"]) for item in results),
+        "checks": results,
+    }
+
+
 def _public_state_metadata(state: dict[str, Any], device: Any) -> dict[str, Any]:
     nested_device = state.get("device") if isinstance(state.get("device"), dict) else {}
     meta: dict[str, Any] = {
@@ -1450,8 +1481,31 @@ def _execute_read_inner(action: str, payload: dict[str, Any]) -> dict[str, Any]:
             return {"ok": False, "error": str(exc), "device_id": device_id}
         finally:
             adapter.disconnect()
-        return {"ok": verification.status == "pass", "device_id": device.id, "platform": device.platform,
-                "change_type": intent.change_type, "verification": verification.__dict__}
+        verification_payload = dict(verification.__dict__)
+        overall_ok = verification.status == "pass"
+        if intent.change_type == "routing_redistribution" and bool(getattr(intent, "reachability_checks", None)):
+            reachability = _execute_routing_reachability_checks(intent) if overall_ok else {
+                "passed": False,
+                "checks": [],
+                "skipped": "configuration verification failed",
+            }
+            evidence = dict(verification_payload.get("evidence") or {})
+            evidence["reachability"] = reachability
+            verification_payload["evidence"] = evidence
+            overall_ok = overall_ok and bool(reachability.get("passed"))
+            verification_payload["status"] = "pass" if overall_ok else "fail"
+            verification_payload["message"] = (
+                "Controlled route exchange and scoped reachability checks passed."
+                if overall_ok
+                else "Controlled route exchange is present, but scoped reachability still failed."
+            )
+        return {
+            "ok": overall_ok,
+            "device_id": device.id,
+            "platform": device.platform,
+            "change_type": intent.change_type,
+            "verification": verification_payload,
+        }
 
     if action == "drift":
         from netcode.adapters.registry import AdapterRegistry

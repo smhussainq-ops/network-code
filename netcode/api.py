@@ -495,7 +495,13 @@ def _safe_proposal_dict(value: object) -> dict[str, object]:
 def _typed_proposal_section(change_type: str, proposed: dict[str, object]) -> dict[str, object]:
     section = _RCA_TOP_LEVEL_SECTIONS.get(change_type)
     if section and isinstance(proposed.get(section), dict):
-        return {section: _safe_proposal_dict(proposed.get(section))}
+        typed = {section: _safe_proposal_dict(proposed.get(section))}
+        if change_type == "routing_redistribution":
+            if isinstance(proposed.get("reverse_redistribution"), dict):
+                typed["reverse_redistribution"] = _safe_proposal_dict(proposed.get("reverse_redistribution"))
+            if isinstance(proposed.get("reachability_checks"), list):
+                typed["reachability_checks"] = _strip_sensitive_proposal_fields(proposed.get("reachability_checks"))
+        return typed
     # Some callers may send the same field values used by desired-state plans.
     # Use the registry builder to produce a typed section without copying extra keys.
     values = proposed.get("values") if isinstance(proposed.get("values"), dict) else None
@@ -2444,6 +2450,38 @@ def api_verify(request: GenericVerifyRequest) -> dict[str, object]:
     }
 
 
+def _persist_intent_verification(
+    store: PlatformStore,
+    *,
+    change_id: str | None,
+    verification: dict[str, object],
+    passed: bool,
+) -> None:
+    if not change_id:
+        return
+    try:
+        change = store.get_change(change_id)
+    except Exception:
+        return
+    result = dict(change.result or {})
+    result["verify_proof"] = verification
+    next_state = "verified" if passed else change.workflow_state
+    store.update_change(
+        change.id,
+        "completed" if passed else change.status,
+        result,
+        workflow_state=next_state,
+    )
+    store.record_workflow_event(
+        change.id,
+        "verify",
+        change.workflow_state,
+        next_state,
+        str(verification.get("message") or ("Post-change verification passed." if passed else "Post-change verification failed.")),
+        verification,
+    )
+
+
 @app.post("/api/verify/intent")
 def api_verify_intent(request: IntentPathRequest, http_request: Request) -> dict[str, object]:
     p = paths()
@@ -2453,6 +2491,12 @@ def api_verify_intent(request: IntentPathRequest, http_request: Request) -> dict
         result = _runner_read(p, "verify", payload, _request_principal(http_request).org_id)
         verification = dict(result.get("verification") or result)
         verification.setdefault("ok", result.get("ok"))
+        _persist_intent_verification(
+            PlatformStore(p),
+            change_id=request.change_id,
+            verification=verification,
+            passed=bool(result.get("ok")),
+        )
         handoff = attach_verification_handoff(
             PlatformStore(p),
             change_id=request.change_id,
@@ -2486,6 +2530,12 @@ def api_verify_intent(request: IntentPathRequest, http_request: Request) -> dict
         "change_type": intent.change_type,
         "verification": verification.__dict__,
     }
+    _persist_intent_verification(
+        PlatformStore(p),
+        change_id=request.change_id,
+        verification={"ok": verification.status == "pass", **verification.__dict__},
+        passed=verification.status == "pass",
+    )
     handoff = attach_verification_handoff(
         PlatformStore(p),
         change_id=request.change_id,
@@ -2761,6 +2811,89 @@ def api_change_from_rca(request: RcaRemediationProposalRequest, http_request: Re
     title = request.title.strip() or f"Rez RCA remediation for {request.incident_id.strip()}"
     target_device = request.target_device.strip() or None
     requested_by = request.requested_by.strip() or "rez-rca"
+    target_ids = [
+        str(item).strip()
+        for item in ((intent.get("targets") or {}).get("device_ids") or [])
+        if str(item).strip()
+    ]
+
+    if pipeline.status == "pass" and intent.get("change_type") == "routing_redistribution" and len(target_ids) > 1:
+        redistribution = dict(intent.get("redistribution") or {})
+        if isinstance(intent.get("reverse_redistribution"), dict):
+            redistribution["reverse_redistribution"] = dict(intent["reverse_redistribution"])
+        if isinstance(intent.get("reachability_checks"), list):
+            redistribution["reachability_checks"] = [
+                dict(item) for item in intent["reachability_checks"] if isinstance(item, dict)
+            ]
+        redistribution["ticket_id"] = request.incident_id.strip()
+        rollout = plan_fleet_rollout(
+            p,
+            change_type="routing_redistribution",
+            values=redistribution,
+            device_ids=target_ids,
+            device_group=None,
+            canary_size=1,
+            batch_size=max(1, len(target_ids) - 1),
+            description=title,
+            requested_by=requested_by,
+            org_id=principal.org_id,
+            created_by_user_id=principal.user_id,
+        )
+        rollout_evidence = {
+            "source": "rez_rca",
+            "draft_only": True,
+            "human_approval_required": True,
+            "incident_id": request.incident_id.strip(),
+            "title": title,
+            "suggested_pack": request.suggested_pack,
+            "change_type": intent.get("change_type"),
+            "rationale": request.rationale,
+            "confidence": request.confidence,
+            "evidence_refs": request.evidence_refs,
+            "rollout_id": rollout["id"],
+        }
+        target_rows = [
+            target
+            for wave in rollout.get("waves", [])
+            for target in wave.get("targets", [])
+            if isinstance(target, dict)
+        ]
+        for target in target_rows:
+            change_id = str(target.get("change_id") or "")
+            if not change_id:
+                continue
+            target_change = store.get_change(change_id)
+            result = dict(target_change.result or {})
+            result.update(rollout_evidence)
+            result["pipeline"] = result.get("pipeline") or result.copy()
+            store.update_change(
+                change_id,
+                target_change.status,
+                result,
+                workflow_state=target_change.workflow_state,
+            )
+            store.record_workflow_event(
+                change_id,
+                "rca_proposal",
+                target_change.workflow_state,
+                target_change.workflow_state,
+                f"Added to Rez RCA rollout {str(rollout['id'])[:8]} for incident {request.incident_id.strip()}.",
+                rollout_evidence,
+            )
+        canary = target_rows[0] if target_rows else {}
+        canary_change = store.get_change(str(canary.get("change_id"))) if canary.get("change_id") else None
+        return {
+            "ok": True,
+            "draft_only": True,
+            "human_approval_required": True,
+            "rollout_id": rollout["id"],
+            "rollout": rollout,
+            "change_id": canary_change.id if canary_change else None,
+            "change": record_to_dict(canary_change) if canary_change else None,
+            "intent_path": canary.get("intent_path") or str(intent_path),
+            "intent": intent,
+        }
+
     change = store.create_change(
         intent_path,
         target_device,

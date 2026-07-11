@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from ipaddress import ip_network
+from ipaddress import ip_address, ip_network
 from pathlib import Path
 from typing import Any, Literal
 
@@ -157,8 +157,8 @@ class BgpNeighborIntent(BaseModel):
 
 
 class RoutingRedistributionSpec(BaseModel):
-    from_protocol: Literal["bgp"] = "bgp"
-    to_protocol: Literal["ospf"] = "ospf"
+    from_protocol: Literal["bgp", "ospf"] = "bgp"
+    to_protocol: Literal["bgp", "ospf"] = "ospf"
     target_process: str
     route_map: str
     prefix_list: str
@@ -196,13 +196,52 @@ class RoutingRedistributionSpec(BaseModel):
         return value
 
 
+class RoutingReachabilityCheck(BaseModel):
+    source_device: str
+    source_ip: str
+    destination: str
+
+    @field_validator("source_device")
+    @classmethod
+    def safe_source_device(cls, value: str) -> str:
+        text = value.strip()
+        if not text or not all(character.isalnum() or character in "_.-" for character in text):
+            raise ValueError("reachability source_device contains unsupported characters")
+        return text
+
+    @field_validator("source_ip", "destination")
+    @classmethod
+    def ipv4_address(cls, value: str) -> str:
+        address = ip_address(value.strip())
+        if address.version != 4:
+            raise ValueError("reachability checks currently require IPv4 addresses")
+        return str(address)
+
+
 class RoutingRedistributionIntent(BaseModel):
     change_type: Literal["routing_redistribution"] = "routing_redistribution"
     site: str
     targets: TargetSpec
     redistribution: RoutingRedistributionSpec
+    reverse_redistribution: RoutingRedistributionSpec | None = None
+    reachability_checks: list[RoutingReachabilityCheck] = Field(default_factory=list)
     policy: PolicySpec = Field(default_factory=PolicySpec)
     metadata: IntentMetadata = Field(default_factory=IntentMetadata)
+
+    @model_validator(mode="after")
+    def valid_protocol_exchange(self) -> "RoutingRedistributionIntent":
+        if self.redistribution.from_protocol == self.redistribution.to_protocol:
+            raise ValueError("redistribution protocols must differ")
+        reverse = self.reverse_redistribution
+        if reverse is not None:
+            if reverse.from_protocol == reverse.to_protocol:
+                raise ValueError("reverse redistribution protocols must differ")
+            if (
+                reverse.from_protocol != self.redistribution.to_protocol
+                or reverse.to_protocol != self.redistribution.from_protocol
+            ):
+                raise ValueError("reverse_redistribution must reverse the primary protocol direction")
+        return self
 
 
 class AclRuleSpec(BaseModel):

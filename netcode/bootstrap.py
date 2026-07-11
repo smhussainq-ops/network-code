@@ -63,14 +63,26 @@ BGP_NEIGHBOR_TEMPLATE = """router bgp {{ bgp.asn }}
 """
 
 
-ROUTING_REDISTRIBUTION_TEMPLATE = """{% for prefix in redistribution.prefixes %}
-ip prefix-list {{ redistribution.prefix_list }} seq {{ loop.index * 10 }} permit {{ prefix }} le 32
+ROUTING_REDISTRIBUTION_TEMPLATE = """{% macro render_boundary(item) -%}
+{% for prefix in item.prefixes %}
+ip prefix-list {{ item.prefix_list }} seq {{ loop.index * 10 }} permit {{ prefix }} le 32
 {% endfor %}
-route-map {{ redistribution.route_map }} permit 10
-   match ip address prefix-list {{ redistribution.prefix_list }}
-   set tag {{ redistribution.route_tag }}
-router {{ redistribution.to_protocol }} {{ redistribution.target_process }}
-   redistribute {{ redistribution.from_protocol }} route-map {{ redistribution.route_map }}
+route-map {{ item.route_map }} permit 10
+   match ip address prefix-list {{ item.prefix_list }}
+{% if item.to_protocol == "ospf" %}
+   set tag {{ item.route_tag }}
+router ospf {{ item.target_process }}
+   redistribute {{ item.from_protocol }} route-map {{ item.route_map }}
+{% else %}
+router bgp {{ item.target_process }}
+   address-family ipv4
+      redistribute {{ item.from_protocol }} route-map {{ item.route_map }}
+{% endif %}
+{%- endmacro %}
+{{ render_boundary(redistribution) }}
+{% if reverse_redistribution %}
+{{ render_boundary(reverse_redistribution) }}
+{% endif %}
 """
 
 

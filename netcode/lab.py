@@ -13,7 +13,7 @@ from typing import Any, Literal
 
 from netcode.adapters.execution import ExecutionAdapter, ExecutionAdapterMetadata
 from netcode.adapters.registry import AdapterRegistry
-from netcode.change_types import spec_for
+from netcode.change_types import redistribution_items, spec_for
 from netcode.inventory import Device, Inventory
 from netcode.intent_utils import lab_write_supported, report_stem, rollback_config
 from netcode.models import AclRuleIntent, AddVlanIntent, BgpNeighborIntent, CustomConfigIntent, EndToEndArtifacts, EndToEndResult, Intent, InterfaceConfigIntent, NtpStandardizeIntent, OsUpgradeIntent, PhaseResult, RoutingRedistributionIntent, load_intent
@@ -400,20 +400,30 @@ class AristaEOSLabAdapter(ExecutionAdapter):
         )
 
     def _verify_redistribution(self, intent: RoutingRedistributionIntent, present: bool) -> LabResult:
-        item = intent.redistribution
-        command = f"show running-config | section router {item.to_protocol} {item.target_process}"
-        output = self.show(command)
-        statement = f"redistribute {item.from_protocol} route-map {item.route_map}"
-        found = statement in output
-        seen = found if present else not found
+        commands: dict[str, str] = {}
+        boundaries: list[dict[str, object]] = []
+        for item in redistribution_items(intent):
+            command = f"show running-config | section router {item.to_protocol} {item.target_process}"
+            output = self.show(command)
+            commands[command] = output
+            statement = f"redistribute {item.from_protocol} route-map {item.route_map}"
+            boundaries.append({
+                "direction": f"{item.from_protocol}_to_{item.to_protocol}",
+                "statement": statement,
+                "found": statement in output,
+            })
+        seen = (
+            all(bool(item["found"]) for item in boundaries)
+            if present
+            else all(not bool(item["found"]) for item in boundaries)
+        )
+        state = "present" if present and seen else "absent" if not present and seen else "did not match expected state"
         return LabResult(
             status="pass" if seen else "fail",
             action="verify" if present else "verify_rollback",
             device_id=self.device.id,
-            message=(
-                f"Controlled redistribution statement {'is present' if found else 'is absent'}: {statement}."
-            ),
-            evidence={"commands": {command: output}, "statement": statement, "found": found},
+            message=f"Controlled route-exchange boundaries are {state}.",
+            evidence={"commands": commands, "boundaries": boundaries},
         )
 
     def _verify_acl(self, intent: AclRuleIntent, present: bool) -> LabResult:

@@ -218,6 +218,142 @@ def test_site_context_redistribution_remediation_is_typed_validated_and_human_ga
     assert PlatformStore(WorkspacePaths(tmp_path.resolve())).list_jobs() == []
 
 
+def test_site_context_bidirectional_exchange_is_typed_scoped_and_human_gated(
+    tmp_path: Path, monkeypatch
+):
+    init_workspace(WorkspacePaths(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    client = TestClient(api.app)
+
+    response = client.post(
+        "/api/changes/from-rca",
+        json=_confirmed_proposal({
+            "root_atom_id": "CP_REDISTRIBUTION_GAP",
+            "proposal_source": "site_operational_context",
+            "source": "rez",
+            "incident_id": "INC-CAMPUS-BIDIRECTIONAL",
+            "target_device": "v2-store1",
+            "suggested_pack": "routing_redistribution",
+            "rationale": "Approved bidirectional route exchange is absent and scoped reachability failed.",
+            "evidence_refs": ["approved-design:campus-route-exchange", "live:ssh"],
+            "proposed_intent": {
+                "change_type": "routing_redistribution",
+                "site": "campus",
+                "targets": {"device_ids": ["v2-store1"]},
+                "redistribution": {
+                    "from_protocol": "bgp",
+                    "to_protocol": "ospf",
+                    "target_process": "1",
+                    "route_map": "CAMPUS-BGP-TO-OSPF",
+                    "prefix_list": "ENTERPRISE-REMOTE-LOOPBACKS",
+                    "prefixes": ["1.1.1.0/24", "2.2.2.0/24", "4.4.4.0/24", "5.5.5.0/24"],
+                    "route_tag": 65002,
+                },
+                "reverse_redistribution": {
+                    "from_protocol": "ospf",
+                    "to_protocol": "bgp",
+                    "target_process": "65002",
+                    "route_map": "CAMPUS-OSPF-TO-BGP",
+                    "prefix_list": "CAMPUS-SITE-ROUTES",
+                    "prefixes": ["3.3.3.0/24", "10.3.0.0/16"],
+                    "route_tag": 65003,
+                },
+                "reachability_checks": [
+                    {"source_device": "v2-store1", "source_ip": "3.3.3.1", "destination": "1.1.1.2"}
+                ],
+            },
+        }),
+    )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["change"]["workflow_state"] == "validated"
+    assert body["draft_only"] is True
+    assert body["human_approval_required"] is True
+    intent = body["intent"]
+    assert intent["reverse_redistribution"]["route_map"] == "CAMPUS-OSPF-TO-BGP"
+    assert intent["reachability_checks"][0]["source_device"] == "v2-store1"
+    commands = body["change"]["result"]["plan"]["commands"]
+    assert "redistribute bgp route-map CAMPUS-BGP-TO-OSPF" in commands
+    assert "router bgp 65002" in commands
+    assert "address-family ipv4" in commands
+    assert "redistribute ospf route-map CAMPUS-OSPF-TO-BGP" in commands
+    rollback = body["change"]["result"]["plan"]["rollback"]
+    assert "no redistribute ospf route-map CAMPUS-OSPF-TO-BGP" in rollback
+    assert "no redistribute bgp route-map CAMPUS-BGP-TO-OSPF" in rollback
+    assert PlatformStore(WorkspacePaths(tmp_path.resolve())).list_jobs() == []
+
+
+def test_multitarget_site_context_exchange_creates_canary_rollout_without_jobs(
+    tmp_path: Path, monkeypatch
+):
+    init_workspace(WorkspacePaths(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    client = TestClient(api.app)
+
+    response = client.post(
+        "/api/changes/from-rca",
+        json=_confirmed_proposal({
+            "root_atom_id": "CP_REDISTRIBUTION_GAP",
+            "proposal_source": "site_operational_context",
+            "source": "rez",
+            "incident_id": "INC-CAMPUS-HA-EXCHANGE",
+            "target_device": "v2-store1",
+            "suggested_pack": "routing_redistribution",
+            "rationale": "Both approved route-exchange boundaries are absent.",
+            "evidence_refs": ["approved-design:campus-route-exchange", "live:ssh"],
+            "proposed_intent": {
+                "change_type": "routing_redistribution",
+                "site": "campus",
+                "targets": {"device_ids": ["v2-store1", "v2-store2"]},
+                "redistribution": {
+                    "from_protocol": "bgp",
+                    "to_protocol": "ospf",
+                    "target_process": "1",
+                    "route_map": "CAMPUS-BGP-TO-OSPF",
+                    "prefix_list": "ENTERPRISE-REMOTE-LOOPBACKS",
+                    "prefixes": ["1.1.1.0/24", "4.4.4.0/24"],
+                    "route_tag": 65002,
+                },
+                "reverse_redistribution": {
+                    "from_protocol": "ospf",
+                    "to_protocol": "bgp",
+                    "target_process": "65002",
+                    "route_map": "CAMPUS-OSPF-TO-BGP",
+                    "prefix_list": "CAMPUS-SITE-ROUTES",
+                    "prefixes": ["3.3.3.0/24", "10.3.0.0/16"],
+                    "route_tag": 65003,
+                },
+                "reachability_checks": [
+                    {"source_device": "v2-store1", "source_ip": "3.3.3.1", "destination": "1.1.1.2"}
+                ],
+            },
+        }),
+    )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["rollout_id"]
+    assert body["rollout"]["status"] == "planned"
+    assert body["rollout"]["device_count"] == 2
+    assert len(body["rollout"]["waves"][0]["targets"]) == 1
+    assert len(body["rollout"]["waves"][1]["targets"]) == 1
+    assert body["rollout"].get("approved_by") is None
+
+    store = PlatformStore(WorkspacePaths(tmp_path.resolve()))
+    assert store.list_jobs() == []
+    for wave in body["rollout"]["waves"]:
+        for target in wave["targets"]:
+            target_intent = read_yaml(Path(target["intent_path"]))
+            assert target_intent["targets"]["device_ids"] == [target["device_id"]]
+            assert target_intent["reverse_redistribution"]["route_map"] == "CAMPUS-OSPF-TO-BGP"
+            assert target_intent["reachability_checks"][0]["destination"] == "1.1.1.2"
+            target_change = store.get_change(target["change_id"])
+            assert target_change.workflow_state == "validated"
+            assert target_change.result["source"] == "rez_rca"
+            assert target_change.result["rollout_id"] == body["rollout_id"]
+
+
 def test_rez_rca_validated_draft_can_enter_dry_run_queue(tmp_path: Path, monkeypatch):
     init_workspace(WorkspacePaths(tmp_path))
     monkeypatch.chdir(tmp_path)

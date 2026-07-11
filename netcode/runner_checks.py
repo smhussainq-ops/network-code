@@ -18,7 +18,7 @@ from typing import Any
 
 import yaml
 
-from netcode.change_types import spec_for
+from netcode.change_types import redistribution_items, spec_for
 from netcode.models import Intent, RenderResult
 from netcode.validation import StaticValidator
 
@@ -37,6 +37,28 @@ _ALWAYS_BLOCKED = (
     "crypto key",
     "key config-key",
 )
+
+
+def _typed_redistribution_lines(intent: Intent) -> set[str]:
+    if intent.change_type != "routing_redistribution":
+        return set()
+    expected: set[str] = set()
+    for item in redistribution_items(intent):
+        for index, prefix in enumerate(item.prefixes, start=1):
+            expected.add(
+                f"ip prefix-list {item.prefix_list} seq {index * 10} permit {prefix} le 32".lower()
+            )
+        expected.add(f"route-map {item.route_map} permit 10".lower())
+        expected.add(f"match ip address prefix-list {item.prefix_list}".lower())
+        if item.to_protocol == "ospf":
+            expected.add(f"set tag {item.route_tag}".lower())
+            expected.add(f"router ospf {item.target_process}".lower())
+            expected.add(f"redistribute {item.from_protocol} route-map {item.route_map}".lower())
+        else:
+            expected.add(f"router bgp {item.target_process}".lower())
+            expected.add("address-family ipv4")
+            expected.add(f"redistribute {item.from_protocol} route-map {item.route_map}".lower())
+    return expected
 
 
 def local_policy_gate(
@@ -94,6 +116,7 @@ def local_policy_gate(
 
     blocked_lines: list[str] = []
     unexpected_lines: list[str] = []
+    exact_redistribution_lines = _typed_redistribution_lines(intent)
     for line in render.config.splitlines():
         if not line.strip():
             continue
@@ -105,6 +128,8 @@ def local_policy_gate(
         if any(fragment in lower for fragment in blocked):
             blocked_lines.append(line)
         if allowed and not line.startswith(allowed):
+            unexpected_lines.append(line)
+        if exact_redistribution_lines and lower not in exact_redistribution_lines:
             unexpected_lines.append(line)
 
     if blocked_lines:
