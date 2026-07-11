@@ -1,0 +1,29 @@
+change_type: custom_config
+site: rca-remediation
+targets:
+  device_ids:
+  - v2-campus-core
+custom:
+  config_lines: No configuration change is recommended from this run because the canonical
+    RCA trace did not select an active root cause.
+  rollback_lines: ''
+  verify_contains: ''
+  description: Agent Analysis / Unverified Hypothesis
+  acknowledge_no_rollback: true
+policy: {}
+metadata:
+  requested_by: rez-rca
+  ticket_id: 20260710_035326_chat_47d2be57
+  learning_mode: true
+  source: rez_rca
+  draft_only: true
+  human_approval_required: true
+  rationale: Agent Analysis / Unverified Hypothesis
+  evidence_refs:
+  - v2-campus-core interfaces (snapshot)
+  - "Et1: 10.3.1.1/30 \u2192 admin up/oper up, 0 errors"
+  - "Et2: 10.3.2.1/30 \u2192 admin up/oper up, 0 errors"
+  - No Et3 or Et4 configured (only Et1, Et2, Loopback0, Management0 exist)
+  - v2-campus-core OSPF neighbors
+  - v2-campus-core routing table
+  confidence: 0.0

@@ -1,0 +1,25 @@
+change_type: routing_redistribution
+site: campus
+targets:
+  device_ids:
+  - v2-campus-edge-1
+  device_group: access-switches
+policy:
+  pci_reachable: false
+  internet_reachable: true
+metadata:
+  requested_by: codex-live-e2e-20260710
+  ticket_id: null
+  learning_mode: true
+redistribution:
+  from_protocol: bgp
+  to_protocol: ospf
+  target_process: '1'
+  route_map: CAMPUS-BGP-TO-OSPF
+  prefix_list: ENTERPRISE-REMOTE-LOOPBACKS
+  prefixes:
+  - 1.1.1.0/24
+  - 2.2.2.0/24
+  - 4.4.4.0/24
+  - 5.5.5.0/24
+  route_tag: 65002

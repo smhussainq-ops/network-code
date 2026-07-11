@@ -1,21 +1,21 @@
 change_type: add_vlan
-site: store-1846
+site: closed-loop-test
 targets:
   device_ids:
-  - v2-store5
+  - v2-store1
   device_group: access-switches
 policy:
   pci_reachable: false
   internet_reachable: true
 metadata:
-  requested_by: netcode-user
+  requested_by: codex-e2e
   ticket_id: null
   learning_mode: true
 vlan:
-  id: 777
-  name: FLEET_GUEST_WIFI
-  subnet: 10.42.90.0/24
-  purpose: guest
+  id: 4093
+  name: REZ_TRIGGER_E2E_2
+  subnet: 10.255.93.0/24
+  purpose: closed-loop-test
   svi:
     enabled: false
     gateway_ip: null

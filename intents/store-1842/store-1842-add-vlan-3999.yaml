@@ -4,18 +4,16 @@ targets:
   device_ids:
   - v2-store1
   device_group: access-switches
+vlan:
+  id: 3999
+  name: RCA_PROOF
+  subnet: 10.99.99.0/24
+  purpose: guest
+  svi:
+    enabled: false
 policy:
   pci_reachable: false
   internet_reachable: true
 metadata:
-  requested_by: netcode-user
-  ticket_id: null
+  requested_by: rez_rca
   learning_mode: true
-vlan:
-  id: 777
-  name: FLEET_GUEST_WIFI
-  subnet: 10.42.90.0/24
-  purpose: guest
-  svi:
-    enabled: false
-    gateway_ip: null

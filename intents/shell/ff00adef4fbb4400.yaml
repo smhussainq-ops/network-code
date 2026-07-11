@@ -1,0 +1,5 @@
+change_type: shell_session
+description: "Marcus shell MARCUS-SHELL-1"
+device: "v2-store2"
+ticket: "MARCUS-555"
+commands: []  # captured live from the governed shell session

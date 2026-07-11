@@ -1,21 +1,21 @@
 change_type: add_vlan
-site: store-1846
+site: store-1842
 targets:
   device_ids:
-  - v2-store5
+  - v2-store1
   device_group: access-switches
 policy:
   pci_reachable: false
   internet_reachable: true
 metadata:
-  requested_by: netcode-user
+  requested_by: postfix-bot
   ticket_id: null
   learning_mode: true
 vlan:
-  id: 777
-  name: FLEET_GUEST_WIFI
-  subnet: 10.42.90.0/24
-  purpose: guest
+  id: 3966
+  name: POSTFIX
+  subnet: 10.66.66.0/24
+  purpose: postfix-check
   svi:
     enabled: false
     gateway_ip: null

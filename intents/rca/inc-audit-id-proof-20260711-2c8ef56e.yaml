@@ -1,0 +1,29 @@
+change_type: interface_config
+site: campus
+targets:
+  device_ids:
+  - v2-campus-core
+policy: {}
+metadata:
+  requested_by: rez-rca
+  ticket_id: INC-AUDIT-ID-PROOF-20260711
+  learning_mode: true
+  source: rez_rca
+  draft_only: true
+  human_approval_required: true
+  rationale: Restore the exact intended interface dependency confirmed by Rez.
+  evidence_refs:
+  - show interfaces Ethernet1
+  - show ip ospf neighbor
+  confidence: 0.98
+  proposal_schema: netcode.remediation.v1
+  proposal_source: rez_structured_rca
+  confirmed_root_atom_id: L1_INTERFACE_ADMIN_DOWN
+interface:
+  name: Ethernet1
+  description: Restore intended campus uplink
+  enabled: true
+  mode: routed
+  access_vlan: null
+  trunk_allowed_vlans: []
+  ip_address: 10.3.1.1/30

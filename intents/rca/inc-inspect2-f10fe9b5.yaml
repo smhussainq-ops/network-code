@@ -1,0 +1,24 @@
+change_type: add_vlan
+site: store-1844
+targets:
+  device_ids:
+  - v2-store3
+policy: {}
+metadata:
+  requested_by: rez_rca
+  ticket_id: INC-INSPECT2
+  learning_mode: true
+  source: rez_rca
+  draft_only: true
+  human_approval_required: true
+  rationale: ''
+  evidence_refs: []
+  confidence: 0.9
+vlan:
+  id: 3898
+  name: INSPECT
+  subnet: 10.15.98.0/24
+  purpose: inspect
+  svi:
+    enabled: false
+    gateway_ip: null

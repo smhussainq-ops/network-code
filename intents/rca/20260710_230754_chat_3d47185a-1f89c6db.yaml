@@ -1,0 +1,34 @@
+change_type: routing_redistribution
+site: campus
+targets:
+  device_ids:
+  - v2-campus-edge-1
+  - v2-campus-edge-2
+policy: {}
+metadata:
+  requested_by: rez-rca
+  ticket_id: 20260710_230754_chat_3d47185a
+  learning_mode: true
+  source: rez_rca
+  draft_only: true
+  human_approval_required: true
+  rationale: Restore the exact intended redistribution dependency confirmed by Rez.
+  evidence_refs:
+  - 'root atom: CP_REDISTRIBUTION_GAP'
+  - 'dependency: design:campus:redistribution:campus-bgp-to-ospf'
+  confidence: 1.0
+  proposal_schema: netcode.remediation.v1
+  proposal_source: site_operational_context
+  confirmed_root_atom_id: CP_REDISTRIBUTION_GAP
+redistribution:
+  from_protocol: bgp
+  to_protocol: ospf
+  target_process: '1'
+  route_map: CAMPUS-BGP-TO-OSPF
+  prefix_list: ENTERPRISE-REMOTE-LOOPBACKS
+  prefixes:
+  - 1.1.1.0/24
+  - 2.2.2.0/24
+  - 4.4.4.0/24
+  - 5.5.5.0/24
+  route_tag: 65002

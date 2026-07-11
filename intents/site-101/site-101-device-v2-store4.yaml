@@ -1,0 +1,22 @@
+change_type: site_device_intent
+site: site-101
+targets:
+  device_ids:
+  - v2-store4
+  device_group: stores
+policy:
+  pci_reachable: false
+  internet_reachable: true
+metadata:
+  requested_by: rez-ui
+  ticket_id: null
+  learning_mode: true
+device:
+  device_id: v2-store4
+  role: access-switch
+  platform: arista_eos
+  management_ip: 172.100.1.44
+  groups:
+  - stores
+  - access-switches
+  notes: source-of-truth proposal only

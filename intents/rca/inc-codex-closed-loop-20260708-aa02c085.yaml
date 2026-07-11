@@ -1,0 +1,24 @@
+change_type: add_vlan
+site: store-8
+targets:
+  device_ids:
+  - v2-store8
+policy: {}
+metadata:
+  requested_by: rez_rca
+  ticket_id: INC-codex-closed-loop-20260708
+  learning_mode: true
+  source: rez_rca
+  draft_only: true
+  human_approval_required: true
+  rationale: ''
+  evidence_refs: []
+  confidence: 0.91
+vlan:
+  id: 3996
+  name: CODEX_VERIFY
+  subnet: 10.96.96.0/24
+  purpose: verify
+  svi:
+    enabled: false
+    gateway_ip: null

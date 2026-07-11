@@ -1,0 +1,19 @@
+change_type: custom_config
+site: store-1845
+targets:
+  device_ids:
+  - v2-store4
+  device_group: access-switches
+policy:
+  pci_reachable: false
+  internet_reachable: true
+metadata:
+  requested_by: rez-ui-cert
+  ticket_id: null
+  learning_mode: true
+custom:
+  config_lines: "interface Loopback991\n   description NETCODE-CERT-991"
+  rollback_lines: no interface Loopback991
+  verify_contains: Loopback991
+  description: ''
+  acknowledge_no_rollback: false

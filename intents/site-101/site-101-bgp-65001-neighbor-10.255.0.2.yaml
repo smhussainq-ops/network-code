@@ -1,0 +1,22 @@
+change_type: bgp_neighbor
+site: site-101
+targets:
+  device_ids:
+  - v2-store1
+  device_group: access-switches
+policy:
+  pci_reachable: false
+  internet_reachable: true
+metadata:
+  requested_by: rez-ui
+  ticket_id: null
+  learning_mode: true
+bgp:
+  asn: 65001
+  router_id: 10.255.0.1
+  neighbors:
+  - address: 10.255.0.2
+    remote_as: 65002
+    description: NETCODE_LAB_PEER
+    update_source: null
+    shutdown: true

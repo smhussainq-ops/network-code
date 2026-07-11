@@ -1,21 +1,21 @@
 change_type: add_vlan
-site: store-1846
+site: discovered
 targets:
   device_ids:
-  - v2-store5
+  - v2-store1
   device_group: access-switches
 policy:
   pci_reachable: false
   internet_reachable: true
 metadata:
-  requested_by: netcode-user
+  requested_by: rez-ui
   ticket_id: null
   learning_mode: true
 vlan:
-  id: 777
-  name: FLEET_GUEST_WIFI
-  subnet: 10.42.90.0/24
-  purpose: guest
+  id: 3987
+  name: MARCUS_E2E_3987
+  subnet: 10.250.87.0/24
+  purpose: operations
   svi:
     enabled: false
     gateway_ip: null

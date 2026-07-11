@@ -1,0 +1,21 @@
+change_type: custom_config
+site: store-1842
+targets:
+  device_ids:
+  - v2-store1
+  device_group: access-switches
+policy:
+  pci_reachable: false
+  internet_reachable: true
+metadata:
+  requested_by: netcode-user
+  ticket_id: null
+  learning_mode: true
+custom:
+  config_lines: 'interface Loopback9999
+
+    description AUDIT_DELETE_TEST'
+  rollback_lines: no interface Loopback9999
+  verify_contains: description AUDIT_DELETE_TEST
+  description: Audit delete UI proof
+  acknowledge_no_rollback: false

@@ -1,4 +1,4 @@
-change_type: add_vlan
+change_type: custom_config
 site: store-1845
 targets:
   device_ids:
@@ -11,11 +11,9 @@ metadata:
   requested_by: netcode-user
   ticket_id: null
   learning_mode: true
-vlan:
-  id: 777
-  name: FLEET_GUEST_WIFI
-  subnet: 10.42.90.0/24
-  purpose: guest
-  svi:
-    enabled: false
-    gateway_ip: null
+custom:
+  config_lines: ntp server 1.1.1.1
+  rollback_lines: no ntp server 1.1.1.1
+  verify_contains: ''
+  description: NTP Server
+  acknowledge_no_rollback: false

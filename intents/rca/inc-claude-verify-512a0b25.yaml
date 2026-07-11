@@ -1,0 +1,24 @@
+change_type: add_vlan
+site: store-8
+targets:
+  device_ids:
+  - v2-store8
+policy: {}
+metadata:
+  requested_by: rez_rca
+  ticket_id: INC-claude-verify
+  learning_mode: true
+  source: rez_rca
+  draft_only: true
+  human_approval_required: true
+  rationale: ''
+  evidence_refs: []
+  confidence: 0.9
+vlan:
+  id: 3995
+  name: CLAUDE_VERIFY
+  subnet: 10.95.95.0/24
+  purpose: verify
+  svi:
+    enabled: false
+    gateway_ip: null

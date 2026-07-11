@@ -1,8 +1,8 @@
 change_type: add_vlan
-site: store-1846
+site: store-1847
 targets:
   device_ids:
-  - v2-store5
+  - v2-store6
   device_group: access-switches
 policy:
   pci_reachable: false
@@ -12,10 +12,10 @@ metadata:
   ticket_id: null
   learning_mode: true
 vlan:
-  id: 777
-  name: FLEET_GUEST_WIFI
-  subnet: 10.42.90.0/24
-  purpose: guest
+  id: 3980
+  name: RLSHAPE
+  subnet: 10.15.80.0/24
+  purpose: shape
   svi:
     enabled: false
     gateway_ip: null

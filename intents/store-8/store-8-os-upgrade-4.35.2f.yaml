@@ -1,0 +1,24 @@
+change_type: os_upgrade
+site: store-8
+targets:
+  device_ids:
+  - v2-store8
+  device_group: access-switches
+policy:
+  pci_reachable: false
+  internet_reachable: true
+metadata:
+  requested_by: rez-ui
+  ticket_id: null
+  learning_mode: true
+os_upgrade:
+  image: EOS-4.35.2F.swi
+  target_version: 4.35.2F
+  md5: d41d8cd98f00b204e9800998ecf8427e
+  image_uri: http://images.local/EOS-4.35.2F.swi
+  current_version: ''
+  rollback_image: EOS-4.35.1F.swi
+  maintenance_window: 2026-07-09 02:00-04:00
+  canary_size: 1
+  batch_size: 3
+  verify_bgp: true

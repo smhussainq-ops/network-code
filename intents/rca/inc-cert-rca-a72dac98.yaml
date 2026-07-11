@@ -1,0 +1,24 @@
+change_type: add_vlan
+site: store-1844
+targets:
+  device_ids:
+  - v2-store3
+policy: {}
+metadata:
+  requested_by: rez_rca
+  ticket_id: INC-CERT-RCA
+  learning_mode: true
+  source: rez_rca
+  draft_only: true
+  human_approval_required: true
+  rationale: ''
+  evidence_refs: []
+  confidence: 0.9
+vlan:
+  id: 3993
+  name: RCA3993
+  subnet: 10.15.153.0/24
+  purpose: rca-cert
+  svi:
+    enabled: false
+    gateway_ip: null

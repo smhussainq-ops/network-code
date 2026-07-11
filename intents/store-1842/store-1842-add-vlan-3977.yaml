@@ -1,21 +1,21 @@
 change_type: add_vlan
-site: store-1846
+site: store-1842
 targets:
   device_ids:
-  - v2-store5
+  - v2-store1
   device_group: access-switches
 policy:
   pci_reachable: false
   internet_reachable: true
 metadata:
-  requested_by: netcode-user
+  requested_by: verify-bot
   ticket_id: null
   learning_mode: true
 vlan:
-  id: 777
-  name: FLEET_GUEST_WIFI
-  subnet: 10.42.90.0/24
-  purpose: guest
+  id: 3977
+  name: DRVERIFY
+  subnet: 10.77.77.0/24
+  purpose: dryrun-verify
   svi:
     enabled: false
     gateway_ip: null
