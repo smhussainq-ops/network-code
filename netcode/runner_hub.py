@@ -124,6 +124,45 @@ def submit_job_result(
         store.touch_runner(runner.id, status="online")
         return {"ok": True, "job": record_to_dict(final_job), "message": "Read result accepted."}
 
+    if job.action.startswith("manager_"):
+        action = job.action.removeprefix("manager_")
+        passed = result.get("status") == "pass"
+        status = "completed" if passed else "failed"
+        change = store.get_change(job.change_id)
+        if not passed:
+            next_state = "failed"
+        elif action in {"preview", "validate"}:
+            next_state = "dry_run_passed"
+        elif action == "deploy":
+            next_state = "rollback_available"
+        elif action == "rollback":
+            next_state = "rolled_back"
+        else:
+            next_state = change.workflow_state
+        combined_result = dict(change.result or {})
+        manager_results = list(combined_result.get("manager_results") or [])
+        manager_results.append({"action": action, "job_id": job.id, "result": result})
+        combined_result["manager_results"] = manager_results
+        store.update_change(change.id, status, combined_result, workflow_state=next_state)
+        store.record_workflow_event(
+            change.id,
+            f"manager_{action}",
+            change.workflow_state,
+            next_state,
+            str(result.get("message", "")),
+            {"job_id": job.id, "status": status, "runner_id": runner.id, "signature_valid": True},
+        )
+        final_job = store.update_job(job.id, status, str(result.get("message", "")), result)
+        store.record_job_signature(job.id, signature)
+        store.touch_runner(runner.id, status="online")
+        return {
+            "ok": True,
+            "job": record_to_dict(final_job),
+            "change": record_to_dict(store.get_change(change.id)),
+            "workflow_state": next_state,
+            "message": f"Manager result accepted; change moved to {next_state}.",
+        }
+
     action = job.action.removeprefix("lab_")
     passed = result.get("status") == "pass"
     status = "completed" if passed else "failed"

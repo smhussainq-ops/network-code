@@ -37,7 +37,8 @@ IDENTITY_DIR = Path.home() / ".netcode-runner"
 IDENTITY_FILE = IDENTITY_DIR / "identity.json"
 INVENTORY_FILE = IDENTITY_DIR / "inventory.yaml"
 POLICY_FILE = IDENTITY_DIR / "policy.yaml"
-VERSION = "0.2.0-device-catalog"
+MANAGER_LEDGER_FILE = IDENTITY_DIR / "manager-operations.json"
+VERSION = "0.3.0-manager-transactions"
 
 _stop = False
 _SHELL_ADAPTERS: dict[str, dict[str, Any]] = {}
@@ -199,6 +200,7 @@ def _public_inventory_snapshot() -> dict[str, Any]:
                 "role": device.role or "",
                 "groups": list(device.groups),
                 "aliases": list(device.aliases),
+                "management": dict(device.management),
             }
             for device in Inventory(INVENTORY_FILE).devices
         ]
@@ -238,6 +240,16 @@ def _execute_job(job: dict[str, Any]) -> dict[str, Any]:
     job_action = str(job.get("action") or "")
     if job_action.startswith("read_"):
         return _execute_read(job_action[len("read_"):], payload)
+    if job_action.startswith("manager_"):
+        from netcode.manager_execution import execute_manager_job
+
+        manager_payload = dict(payload)
+        manager_payload["action"] = job_action.removeprefix("manager_")
+        return execute_manager_job(
+            manager_payload,
+            inventory_path=INVENTORY_FILE,
+            ledger_path=MANAGER_LEDGER_FILE,
+        )
     action = payload.get("action")
     if action == "ansible_pack":
         return _execute_ansible_pack(payload)
@@ -1461,6 +1473,32 @@ def _execute_read_inner(action: str, payload: dict[str, Any]) -> dict[str, Any]:
 
     if action == "rez_http_flow_probe":
         return _execute_rez_http_flow_probe(payload)
+    if action == "cross_domain_verify":
+        from netcode.cross_domain_runner import collect_exact_flow_evidence
+
+        def collect_state(device_id: str) -> dict[str, Any]:
+            device, state, error = _collect_rez_runner_state(device_id)
+            if error:
+                return error
+            return {"ok": True, "device_id": getattr(device, "id", device_id), "state": state}
+
+        def application_probe(flow) -> dict[str, Any]:  # noqa: ANN001
+            if flow.protocol != "tcp" or flow.destination_port is None:
+                return {"connected": None, "reason": "no_certified_probe_for_protocol"}
+            result = _execute_rez_server_listener_probe({
+                "source_device": flow.source_device,
+                "src_ip": flow.source_ip,
+                "dst_ip": flow.destination_ip,
+                "dst_port": flow.destination_port,
+                "timeout_seconds": 3,
+            })
+            return {
+                **result,
+                "connected": result.get("listener_present") is True,
+                "refused": result.get("listener_present") is False,
+            }
+
+        return collect_exact_flow_evidence(payload, collect_state=collect_state, application_probe=application_probe)
 
     if action == "verify":
         from netcode.lab import AristaEOSLabAdapter

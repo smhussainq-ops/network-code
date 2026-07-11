@@ -12,6 +12,7 @@ import os
 from pathlib import Path
 
 from netcode.inventory import Inventory
+from netcode.firewall_managers import ManagerJobRequest, WRITE_ACTIONS
 from netcode.lab import run_arista_end_to_end, run_lab_action
 from netcode.models import load_intent
 from netcode.paths import WorkspacePaths
@@ -191,6 +192,70 @@ class JobRunner:
                 "job": record_to_dict(final_job),
                 "result": error,
             }
+
+    def queue_manager_action(self, change_id: str, request_data: dict[str, object]) -> dict[str, object]:
+        """Queue one manager lifecycle action to the manager's assigned runner.
+
+        Approval is verified against the durable workflow event, not trusted from
+        a browser-supplied boolean. The runner repeats the check locally.
+        """
+        request = ManagerJobRequest.model_validate(request_data)
+        change = self.store.get_change(change_id)
+        if request.change_id != change.id:
+            raise ValueError("manager request change_id does not match the durable change record")
+        events = self.store.list_workflow_events(change.id)
+        approvals = [event for event in events if event.action in {"approve", "approve_manager", "approve_rollback"}]
+        if request.action in WRITE_ACTIONS:
+            if not approvals:
+                raise ValueError("manager write is blocked: no durable human approval event exists")
+            approved_by = str((approvals[-1].evidence or {}).get("approved_by") or "")
+            if approved_by != str(request.approval.approved_by or ""):
+                raise ValueError("manager write approval does not match the durable workflow event")
+            if change.workflow_state != "approved" and request.action not in {"discard", "unlock"}:
+                raise ValueError(f"manager {request.action} is blocked in workflow state {change.workflow_state}")
+        elif change.workflow_state not in {
+            "validated", "dry_run_passed", "approved", "rollback_available", "failed", "blocked"
+        }:
+            raise ValueError(f"manager {request.action} is blocked in workflow state {change.workflow_state}")
+
+        manager = self.store.resolve_device(change.org_id, request.manager_id)
+        if manager is None:
+            raise ValueError(f"manager {request.manager_id} is not in the runner device catalog")
+        target = self.store.resolve_device(change.org_id, request.ownership.device_id)
+        if target is None:
+            raise ValueError(f"managed firewall {request.ownership.device_id} is not in the runner device catalog")
+        if target.get("management") != request.ownership.public_dict():
+            raise ValueError("catalog manager ownership does not match the reviewed manager plan")
+        if manager["runner_id"] != target["runner_id"]:
+            raise ValueError("manager and managed firewall must resolve to the same runner trust boundary")
+
+        job = self.store.queue_job(
+            change.id,
+            f"manager_{request.action}",
+            str(manager["runner_pool"]),
+            request.model_dump(mode="json"),
+            target_runner_id=str(manager["runner_id"]),
+        )
+        self.store.record_workflow_event(
+            change.id,
+            f"manager_{request.action}",
+            change.workflow_state,
+            change.workflow_state,
+            f"Queued {request.ownership.manager_type} {request.action} on runner {manager['runner_id']}.",
+            {"job_id": job.id, "manager_id": request.manager_id, "operation_id": request.operation_id},
+        )
+        return {
+            "ok": True,
+            "queued": True,
+            "change": record_to_dict(self.store.get_change(change.id)),
+            "job": record_to_dict(job),
+            "result": {
+                "status": "queued",
+                "manager_id": request.manager_id,
+                "action": request.action,
+                "operation_id": request.operation_id,
+            },
+        }
 
     def _runner_job_spec(
         self,

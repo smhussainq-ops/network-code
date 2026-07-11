@@ -15,14 +15,17 @@ class Device:
     id: str
     host: str
     platform: str
-    username: str
-    password: str
+    username: str = field(repr=False)
+    password: str = field(repr=False)
     port: int
     hostname: str
     site: str | None
     groups: tuple[str, ...]
     role: str | None = None
     aliases: tuple[str, ...] = ()
+    # Public, non-secret ownership metadata for devices controlled by a native
+    # manager such as FortiManager or Panorama.
+    management: dict[str, Any] = field(default_factory=dict, repr=False, compare=False)
     # Runner-local transport metadata. Secrets in this mapping are consumed only
     # by device adapters and are deliberately omitted from public inventory APIs.
     connection_options: dict[str, Any] = field(default_factory=dict, repr=False, compare=False)
@@ -40,6 +43,7 @@ class Inventory:
     def _device(self, raw: dict[str, Any]) -> Device:
         defaults = self.defaults
         device_id = str(raw.get("id") or raw.get("hostname") or raw.get("host"))
+        management = self._management(device_id, raw)
         return Device(
             id=device_id,
             hostname=str(raw.get("hostname") or device_id),
@@ -52,8 +56,22 @@ class Inventory:
             groups=tuple(raw.get("groups") or []),
             role=str(raw.get("role") or "").strip() or None,
             aliases=tuple(str(item).strip() for item in (raw.get("aliases") or []) if str(item).strip()),
+            management=management,
             connection_options=self._connection_options(defaults, raw),
         )
+
+    @staticmethod
+    def _management(device_id: str, raw: dict[str, Any]) -> dict[str, Any]:
+        value = raw.get("management")
+        if not value:
+            return {}
+        if not isinstance(value, dict):
+            raise ValueError(f"management for {device_id} must be a mapping")
+        from netcode.firewall_managers import ManagerOwnership, assert_no_secrets
+
+        assert_no_secrets(value, f"inventory.{device_id}.management")
+        ownership = ManagerOwnership.model_validate({"device_id": device_id, **value})
+        return ownership.public_dict()
 
     @staticmethod
     def _connection_options(defaults: dict[str, Any], raw: dict[str, Any]) -> dict[str, Any]:
@@ -80,6 +98,10 @@ class Inventory:
             "vdom",
             "api_version",
             "secret",
+            "manager_type",
+            "manager_capabilities",
+            "workspace_mode",
+            "ca_bundle",
         }
         options: dict[str, Any] = {}
         for source in (defaults, defaults.get("connection"), defaults.get("api"), raw, raw.get("connection"), raw.get("api")):

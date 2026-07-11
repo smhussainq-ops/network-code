@@ -245,6 +245,7 @@ class PlatformStore:
                     site TEXT,
                     role TEXT,
                     groups_json TEXT NOT NULL DEFAULT '[]',
+                    management_json TEXT NOT NULL DEFAULT '{}',
                     runner_id TEXT NOT NULL,
                     runner_pool TEXT NOT NULL,
                     source TEXT NOT NULL DEFAULT 'runner_inventory',
@@ -254,6 +255,7 @@ class PlatformStore:
                 )
                 """
             )
+            self._ensure_column(conn, "device_catalog", "management_json", "TEXT NOT NULL DEFAULT '{}'")
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS device_aliases (
@@ -755,6 +757,15 @@ class PlatformStore:
             port = int(raw.get("port") or 22)
             platform = str(raw.get("platform") or "unknown").strip().lower()
             groups = sorted({str(item).strip() for item in (raw.get("groups") or []) if str(item).strip()})
+            management: dict[str, Any] = {}
+            if raw.get("management"):
+                from netcode.firewall_managers import ManagerOwnership, assert_no_secrets
+
+                assert_no_secrets(raw["management"], f"runner_inventory.{display_id}.management")
+                ownership = ManagerOwnership.model_validate(raw["management"])
+                if self.normalize_device_identifier(ownership.device_id) != canonical_id:
+                    raise ValueError(f"manager ownership device_id does not match catalog device {display_id}")
+                management = ownership.public_dict()
             aliases = {
                 canonical_id,
                 self.normalize_device_identifier(display_id),
@@ -774,6 +785,7 @@ class PlatformStore:
                 "role": str(raw.get("role") or "").strip() or None,
                 "groups": groups,
                 "aliases": sorted(alias for alias in aliases if alias),
+                "management": management,
             }
 
         now = utc_now()
@@ -805,8 +817,8 @@ class PlatformStore:
                     """
                     INSERT INTO device_catalog
                     (org_id, canonical_id, display_id, hostname, host, port, platform, site, role,
-                     groups_json, runner_id, runner_pool, source, last_seen, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'runner_inventory', ?, ?)
+                     groups_json, management_json, runner_id, runner_pool, source, last_seen, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'runner_inventory', ?, ?)
                     ON CONFLICT (org_id, canonical_id) DO UPDATE SET
                       display_id = excluded.display_id,
                       hostname = excluded.hostname,
@@ -816,6 +828,7 @@ class PlatformStore:
                       site = excluded.site,
                       role = excluded.role,
                       groups_json = excluded.groups_json,
+                      management_json = excluded.management_json,
                       runner_id = excluded.runner_id,
                       runner_pool = excluded.runner_pool,
                       source = excluded.source,
@@ -833,6 +846,7 @@ class PlatformStore:
                         device["site"],
                         device["role"],
                         json.dumps(device["groups"]),
+                        json.dumps(device["management"]),
                         runner.id,
                         runner.pool,
                         now,
@@ -874,6 +888,7 @@ class PlatformStore:
     @staticmethod
     def _catalog_row(row: Any) -> dict[str, Any]:
         raw_groups = row["groups_json"] or "[]"
+        raw_management = row["management_json"] or "{}"
         return {
             "canonical_id": row["canonical_id"],
             "id": row["display_id"],
@@ -884,6 +899,7 @@ class PlatformStore:
             "site": row["site"],
             "role": row["role"],
             "groups": json.loads(raw_groups),
+            "management": json.loads(raw_management),
             "runner_id": row["runner_id"],
             "runner_pool": row["runner_pool"],
             "runner_status": row["runner_status"] or "offline",

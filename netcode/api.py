@@ -23,6 +23,21 @@ from netcode.adapters.rez import READ_TRANSPORTS
 from netcode.bootstrap import init_workspace
 from netcode.discovery import DiscoveryService
 from netcode.diagnostics_handoff import attach_verification_handoff, build_verification_handoff
+from netcode.cross_domain import (
+    CheckEvidence,
+    CrossDomainPlan,
+    build_cross_domain_plan,
+    evaluate_service_assurance,
+)
+from netcode.firewall_managers import (
+    ApplicationFlow,
+    ApprovalProof,
+    FirewallNatChange,
+    FirewallPolicyChange,
+    ManagerCapabilities,
+    ManagerJobRequest,
+    WRITE_ACTIONS,
+)
 from netcode.drift import (
     aggregate_device_vlans,
     baseline_for_state,
@@ -169,6 +184,29 @@ class GenericVerifyRequest(BaseModel):
     device_id: str
     check: str
     params: dict[str, object] = {}
+
+
+class CrossDomainPlanRequest(BaseModel):
+    title: str
+    requested_by: str = "netcode-user"
+    ticket_id: str
+    flow: ApplicationFlow
+    routing_owner: str
+    sdwan_owner: str | None = None
+    firewall_policy: FirewallPolicyChange
+    firewall_nat: FirewallNatChange | None = None
+
+
+class ManagerActionQueueRequest(BaseModel):
+    capabilities: ManagerCapabilities
+    operation_id: str = ""
+    manager_task_id: str | None = None
+    pre_change_revision: str | None = None
+
+
+class CrossDomainVerifyRequest(BaseModel):
+    manager_job_id: str
+    evidence_job_ids: list[str]
 
 
 class TroubleshootRequest(BaseModel):
@@ -2769,6 +2807,325 @@ def api_change_approve(change_id: str, request: ApproveRequest, http_request: Re
     return {"ok": True, "change": record_to_dict(store.get_change(change_id)),
             "approved_by": approver,
             "message": f"Approved by {approver}. Apply is now unlocked."}
+
+
+@app.post("/api/cross-domain/plans")
+def api_cross_domain_plan(request: CrossDomainPlanRequest, http_request: Request) -> dict[str, object]:
+    """Create a reviewable cross-domain plan. This endpoint never queues work."""
+    principal = _request_principal(http_request)
+    requested_by = request.requested_by.strip() or principal.email or principal.user_id or "netcode-user"
+    plan = build_cross_domain_plan(
+        title=request.title,
+        requested_by=requested_by,
+        ticket_id=request.ticket_id,
+        flow=request.flow,
+        routing_owner=request.routing_owner,
+        sdwan_owner=request.sdwan_owner,
+        firewall_policy=request.firewall_policy,
+        firewall_nat=request.firewall_nat,
+    )
+    p = paths()
+    intent_path = p.intents / "generated" / f"{plan.plan_id.lower()}.yaml"
+    write_yaml(intent_path, {"schema": "netcode.cross-domain.v1", "plan": plan.model_dump(mode="json")})
+    store = PlatformStore(p)
+    change = store.create_change(
+        intent_path,
+        request.firewall_policy.ownership.device_id,
+        requested_by=requested_by,
+        org_id=principal.org_id,
+        created_by_user_id=principal.user_id,
+    )
+    result = {
+        "source": "cross_domain_plan",
+        "plan": plan.model_dump(mode="json"),
+        "manager_results": [],
+        "service_assurance": None,
+        "human_approval_required": True,
+        "device_writes_queued": False,
+    }
+    store.update_change(change.id, "validated", result, workflow_state="validated")
+    store.record_workflow_event(
+        change.id,
+        "cross_domain_plan",
+        "draft",
+        "validated",
+        "Cross-domain dependency plan created. No manager or device write was queued.",
+        {"plan_id": plan.plan_id, "ticket_id": plan.ticket_id, "flow": plan.flow.model_dump()},
+    )
+    return {
+        "ok": True,
+        "change": record_to_dict(store.get_change(change.id)),
+        "plan": plan.model_dump(mode="json"),
+        "intent_path": str(intent_path),
+        "next_action": "Run manager preview and validation through the assigned runner.",
+    }
+
+
+@app.get("/api/cross-domain/plans/{change_id}")
+def api_cross_domain_plan_get(change_id: str, http_request: Request) -> dict[str, object]:
+    principal = _request_principal(http_request)
+    change = PlatformStore(paths()).get_change(change_id)
+    if change.org_id != principal.org_id:
+        raise HTTPException(status_code=404, detail="Unknown cross-domain change")
+    result = dict(change.result or {})
+    if result.get("source") != "cross_domain_plan":
+        raise HTTPException(status_code=400, detail="Change is not a cross-domain plan")
+    return {"ok": True, "change": record_to_dict(change), **result}
+
+
+@app.post("/api/cross-domain/plans/{change_id}/manager/{action}")
+def api_cross_domain_manager_action(
+    change_id: str,
+    action: str,
+    request: ManagerActionQueueRequest,
+    http_request: Request,
+) -> dict[str, object]:
+    allowed = {
+        "probe", "snapshot", "preview", "validate", "lock", "stage", "deploy",
+        "poll", "verify", "discard", "unlock", "rollback",
+    }
+    if action not in allowed:
+        raise HTTPException(status_code=400, detail=f"Unsupported manager action {action}")
+    principal = _request_principal(http_request)
+    store = PlatformStore(paths())
+    try:
+        change = store.get_change(change_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    if change.org_id != principal.org_id:
+        raise HTTPException(status_code=404, detail="Unknown cross-domain change")
+    stored = dict(change.result or {})
+    try:
+        plan = CrossDomainPlan.model_validate(stored.get("plan"))
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=400, detail="Change does not contain a valid cross-domain plan") from exc
+    policy = plan.firewall_policy
+    nat = plan.firewall_nat
+    ownership = (policy or nat).ownership if (policy or nat) else None
+    if ownership is None:
+        raise HTTPException(status_code=400, detail="Cross-domain plan has no manager-owned firewall intent")
+
+    approved_by: str | None = None
+    approvals = [
+        event for event in store.list_workflow_events(change.id)
+        if event.action in {"approve", "approve_manager", "approve_rollback"}
+    ]
+    if action in WRITE_ACTIONS:
+        approved_by = str((approvals[-1].evidence or {}).get("approved_by") or "") if approvals else None
+    approval = ApprovalProof(
+        approved=bool(approved_by),
+        requested_by=change.requested_by,
+        approved_by=approved_by,
+        workflow_state="approved" if approved_by else change.workflow_state,
+    )
+    scope = ownership.scope
+    location = (
+        f"{scope.adom}/{scope.policy_package}"
+        if ownership.manager_type == "fortimanager"
+        else f"{scope.device_group}/{scope.rulebase}"
+    )
+    operation_id = request.operation_id.strip() or f"{change.id}:{action}:{uuid.uuid4().hex[:10]}"
+    try:
+        manager_request = ManagerJobRequest(
+            action=action,
+            operation_id=operation_id,
+            change_id=change.id,
+            manager_id=ownership.manager_id,
+            ownership=ownership,
+            capabilities=request.capabilities,
+            policy_change=policy,
+            nat_change=nat,
+            flow=plan.flow,
+            approval=approval,
+            expected_candidate_owner=change.requested_by,
+            expected_candidate_location=location,
+            unrelated_candidate_changes=[],
+            manager_task_id=request.manager_task_id,
+            pre_change_revision=request.pre_change_revision,
+        )
+        return JobRunner(paths(), store=store).queue_manager_action(change.id, manager_request.model_dump(mode="json"))
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/cross-domain/plans/{change_id}/approve-rollback")
+def api_cross_domain_approve_rollback(
+    change_id: str,
+    request: ApproveRequest,
+    http_request: Request,
+) -> dict[str, object]:
+    """Require a fresh human decision before a manager rollback write."""
+    principal = _request_principal(http_request)
+    store = PlatformStore(paths())
+    try:
+        change = store.get_change(change_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    if change.org_id != principal.org_id:
+        raise HTTPException(status_code=404, detail="Unknown cross-domain change")
+    if change.workflow_state not in {"rollback_available", "failed"}:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Rollback approval requires an applied or failed change (state: {change.workflow_state}).",
+        )
+    approver = _approver_identity(
+        principal,
+        request.approved_by,
+        change.requested_by,
+        change.created_by_user_id,
+        principal.user_id,
+    )
+    store.record_workflow_event(
+        change.id,
+        "approve_rollback",
+        change.workflow_state,
+        "approved",
+        f"Rollback approved by {approver}.",
+        {"approved_by": approver, "requested_by": change.requested_by, "rollback_only": True},
+    )
+    return {
+        "ok": True,
+        "approved_by": approver,
+        "change": record_to_dict(store.get_change(change.id)),
+        "message": "Rollback is approved; the manager rollback action remains runner-gated.",
+    }
+
+
+@app.post("/api/cross-domain/plans/{change_id}/verify")
+def api_cross_domain_verify(
+    change_id: str,
+    request: CrossDomainVerifyRequest,
+    http_request: Request,
+) -> dict[str, object]:
+    principal = _request_principal(http_request)
+    store = PlatformStore(paths())
+    try:
+        change = store.get_change(change_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    if change.org_id != principal.org_id:
+        raise HTTPException(status_code=404, detail="Unknown cross-domain change")
+    stored = dict(change.result or {})
+    try:
+        plan = CrossDomainPlan.model_validate(stored.get("plan"))
+        manager_job = store.get_job(request.manager_job_id)
+        if manager_job.change_id != change.id or manager_job.action != "manager_deploy":
+            raise ValueError("manager_job_id is not the deploy job for this cross-domain change")
+        if manager_job.status not in {"completed", "failed"} or not manager_job.signature:
+            raise ValueError("manager deploy evidence must be a completed, signed runner result")
+        manager_push_status = "success" if manager_job.status == "completed" else "failed"
+        evidence: list[CheckEvidence] = []
+        for job_id in list(dict.fromkeys(request.evidence_job_ids)):
+            job = store.get_job(job_id)
+            if job.action != "read_cross_domain_verify" or job.status not in {"completed", "failed"} or not job.signature:
+                raise ValueError(f"evidence job {job_id} is not a completed, signed cross-domain runner result")
+            job_change_id = str((job.result or {}).get("change_id") or "")
+            if job_change_id != change.id:
+                raise ValueError(f"evidence job {job_id} belongs to a different change")
+            for item in (job.result or {}).get("service_checks") or []:
+                evidence.append(CheckEvidence.model_validate(item))
+        evidence.append(CheckEvidence(
+            check="manager_intent",
+            status="pass" if manager_push_status == "success" else "fail",
+            fresh=True,
+            flow_key=f"{plan.flow.source_ip}>{plan.flow.destination_ip}/{plan.flow.protocol}/{plan.flow.destination_port or '-'}",
+            source=f"signed-manager-job:{manager_job.id}",
+            observed=manager_push_status,
+            expected="success",
+            evidence_refs=[manager_job.id],
+        ))
+        assurance = evaluate_service_assurance(
+            plan,
+            manager_push_status=manager_push_status,
+            evidence=evidence,
+        )
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    stored["service_assurance"] = assurance.model_dump(mode="json")
+    if assurance.status == "verified":
+        record_status, next_state = "completed", "completed"
+    elif assurance.status == "failed":
+        record_status, next_state = "failed", "failed"
+    else:
+        record_status, next_state = "blocked", change.workflow_state
+    store.update_change(change.id, record_status, stored, workflow_state=next_state)
+    store.record_workflow_event(
+        change.id,
+        "service_verify",
+        change.workflow_state,
+        next_state,
+        f"Exact-flow service assurance: {assurance.status}.",
+        assurance.model_dump(mode="json"),
+    )
+    handoff = None
+    if assurance.status == "failed":
+        handoff = attach_verification_handoff(
+            store,
+            change_id=change.id,
+            device_id=plan.flow.source_device,
+            check="cross_domain_application_flow",
+            expected=f"{plan.flow.protocol}/{plan.flow.destination_port or '-'} succeeds to {plan.flow.destination_ip}",
+            actual=f"Failed domain: {assurance.failed_domain}",
+            verification={
+                "status": "fail",
+                "failed": True,
+                "expected": "exact application flow succeeds",
+                "actual": f"failed domain {assurance.failed_domain}",
+                "assurance": assurance.model_dump(mode="json"),
+            },
+            intent_path=change.intent_path,
+        )
+    return {
+        "ok": assurance.status == "verified",
+        "change": record_to_dict(store.get_change(change.id)),
+        "service_assurance": assurance.model_dump(mode="json"),
+        "diagnostics_handoff": handoff,
+    }
+
+
+@app.post("/api/cross-domain/plans/{change_id}/verify/start")
+def api_cross_domain_verify_start(change_id: str, http_request: Request) -> dict[str, object]:
+    """Queue credential-free exact-flow collection to the source device's runner."""
+    principal = _request_principal(http_request)
+    store = PlatformStore(paths())
+    try:
+        change = store.get_change(change_id)
+        plan = CrossDomainPlan.model_validate((change.result or {}).get("plan"))
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=404, detail="Unknown cross-domain plan") from exc
+    if change.org_id != principal.org_id:
+        raise HTTPException(status_code=404, detail="Unknown cross-domain plan")
+    source = store.resolve_device(change.org_id, plan.flow.source_device)
+    if source is None:
+        raise HTTPException(status_code=400, detail=f"Source device {plan.flow.source_device} is not in the runner catalog")
+    firewall_id = (plan.firewall_policy or plan.firewall_nat).ownership.device_id
+    payload = {
+        "change_id": change.id,
+        "plan_id": plan.plan_id,
+        "flow": plan.flow.model_dump(mode="json"),
+        "required_checks": [check for check in plan.verification.required_checks if check != "manager_intent"],
+        "devices": {
+            "source": plan.flow.source_device,
+            "route_owner": plan.flow.expected_route_owner or plan.flow.source_device,
+            "firewall": firewall_id,
+        },
+    }
+    job = store.create_read_job(
+        change.org_id,
+        str(source["runner_pool"]),
+        "cross_domain_verify",
+        payload,
+        target_runner_id=str(source["runner_id"]),
+    )
+    store.record_workflow_event(
+        change.id,
+        "service_verify_start",
+        change.workflow_state,
+        change.workflow_state,
+        "Queued exact-flow verification through the source device's runner.",
+        {"job_id": job.id, "flow": plan.flow.model_dump(mode="json")},
+    )
+    return {"ok": True, "job": record_to_dict(job), "change": record_to_dict(store.get_change(change.id))}
 
 
 @app.post("/api/fleet/rollouts/{rollout_id}/approve")
