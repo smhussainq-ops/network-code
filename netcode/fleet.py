@@ -47,6 +47,58 @@ _DRIFT_LOCK = threading.Lock()
 _DRIFT_STATES: dict[str, dict[str, Any]] = {}
 
 
+def rez_change_id(rollout: dict[str, Any]) -> str:
+    """Stable, human-readable alias for the canonical rollout UUID.
+
+    The full UUID remains the database/audit key. The dated alias is safe to
+    quote in tickets and change windows without replacing that canonical ID.
+    """
+    canonical = "".join(ch for ch in str(rollout.get("id") or "") if ch.isalnum()).upper()
+    token = canonical[:12] or "UNKNOWN"
+    created_date = str(rollout.get("created_at") or "").split("T", 1)[0]
+    date_token = "".join(ch for ch in created_date if ch.isdigit())
+    return f"REZ-CHG-{date_token}-{token}" if date_token else f"REZ-CHG-{token}"
+
+
+def device_audit_ref(change_id: str | None) -> str:
+    canonical = "".join(ch for ch in str(change_id or "") if ch.isalnum()).upper()
+    return f"REZ-DEV-{canonical[:12]}" if canonical else ""
+
+
+def annotate_rollout_audit(
+    rollout: dict[str, Any],
+    targets: list[dict[str, Any]],
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """Add audit correlation without mutating persisted records."""
+    enriched_rollout = dict(rollout)
+    parent_ref = rez_change_id(enriched_rollout)
+    enriched_targets: list[dict[str, Any]] = []
+    for target in targets:
+        enriched = dict(target)
+        enriched["audit_ref"] = device_audit_ref(enriched.get("change_id"))
+        enriched["rez_change_id"] = parent_ref
+        enriched_targets.append(enriched)
+
+    statuses = [str(target.get("status") or "").lower() for target in enriched_targets]
+    stages = [str(target.get("stage") or "").lower() for target in enriched_targets]
+    applied = sum(
+        1
+        for status, stage in zip(statuses, stages)
+        if status in {"passed", "completed", "verified"} or stage in {"verify", "done"}
+    )
+    enriched_rollout["rez_change_id"] = parent_ref
+    enriched_rollout["audit"] = {
+        "canonical_rollout_id": str(enriched_rollout.get("id") or ""),
+        "device_change_records": sum(1 for target in enriched_targets if target.get("change_id")),
+        "applied_devices": applied,
+        "verified_devices": sum(1 for status in statuses if status in {"passed", "completed", "verified"}),
+        "failed_devices": sum(1 for status in statuses if status in {"failed", "blocked", "error"}),
+        "created_at": enriched_rollout.get("created_at"),
+        "updated_at": enriched_rollout.get("updated_at"),
+    }
+    return enriched_rollout, enriched_targets
+
+
 def _empty_drift_state() -> dict[str, Any]:
     return {"status": "never_run", "started_at": None, "finished_at": None,
             "progress": {"done": 0, "total": 0}, "devices": [], "report_path": None}
@@ -130,6 +182,7 @@ def plan_fleet_rollout(
         requested_by=requested_by, org_id=org_id, created_by_user_id=created_by_user_id,
     )
     rollout_id = rollout["id"]
+    parent_audit_id = rez_change_id(rollout)
 
     blocked: list[str] = []
     try:
@@ -155,12 +208,14 @@ def plan_fleet_rollout(
                 result = run_static_pipeline(p, intent_path, org_id=org_id)
                 passed = result.status == "pass"
                 workflow = state_after_static_validation(passed)
+                stored_result = result.model_dump()
+                stored_result.update({"rollout_id": rollout_id, "rez_change_id": parent_audit_id})
                 store.update_change(change.id, "validated" if passed else "blocked",
-                                    result.model_dump(), workflow_state=workflow.state)
+                                    stored_result, workflow_state=workflow.state)
                 store.record_workflow_event(
                     change.id, "plan", "draft", workflow.state,
-                    f"[fleet {rollout_id[:8]}] {workflow.message}",
-                    {"rollout_id": rollout_id, "wave_index": wave_index},
+                    f"[{parent_audit_id}] {workflow.message}",
+                    {"rollout_id": rollout_id, "rez_change_id": parent_audit_id, "wave_index": wave_index},
                 )
                 if passed:
                     store.update_rollout_target(rollout_id, device_id, stage="planned",
@@ -185,6 +240,7 @@ def rollout_status(p: WorkspacePaths, rollout_id: str) -> dict[str, Any]:
     store = PlatformStore(p)
     rollout = store.get_rollout(rollout_id)
     targets = store.list_rollout_targets(rollout_id)
+    rollout, targets = annotate_rollout_audit(rollout, targets)
     wave_count = (max((t["wave_index"] for t in targets), default=-1)) + 1
     waves = []
     for index in range(wave_count):
@@ -218,13 +274,14 @@ def approve_rollout(p: WorkspacePaths, rollout_id: str, approved_by: str) -> dic
     if approver == rollout["requested_by"]:
         raise ValueError("The requester cannot approve their own rollout — a second engineer must approve.")
     rollout = store.approve_rollout(rollout_id, approver)
+    parent_audit_id = rez_change_id(rollout)
     for target in store.list_rollout_targets(rollout_id):
         if target.get("change_id"):
             change = store.get_change(str(target["change_id"]))
             store.record_workflow_event(
                 str(target["change_id"]), "approve", change.workflow_state, change.workflow_state,
-                f"Approved via rollout {rollout_id[:8]} by {approver}.",
-                {"rollout_id": rollout_id, "approved_by": approver},
+                f"Approved via {parent_audit_id} by {approver}.",
+                {"rollout_id": rollout_id, "rez_change_id": parent_audit_id, "approved_by": approver},
             )
     return rollout_status(p, rollout_id)
 
@@ -354,7 +411,7 @@ def _run_device(p: WorkspacePaths, store: PlatformStore, rollout_id: str, target
             return False
 
     store.update_rollout_target(rollout_id, device_id, stage="verify")
-    ok, message = _verify_device(p, store, intent_path, device_id, change_id)
+    ok, message = _verify_device(p, store, intent_path, device_id, change_id, rollout_id)
     if not ok:
         store.update_rollout_target(rollout_id, device_id, status="failed", stage="verify", message=message)
         return False
@@ -371,6 +428,7 @@ def _inherit_rollout_approval(store: PlatformStore, rollout_id: str, change_id: 
     if not approval_required():
         return
     rollout = store.get_rollout(rollout_id)
+    parent_audit_id = rez_change_id(rollout)
     approver = rollout.get("approved_by")
     if not approver:
         return  # start_rollout blocks unapproved rollouts; fail-closed at jobs gate anyway
@@ -378,8 +436,8 @@ def _inherit_rollout_approval(store: PlatformStore, rollout_id: str, change_id: 
     if change.workflow_state == "dry_run_passed":
         store.record_workflow_event(
             change_id, "approve", change.workflow_state, "approved",
-            f"Apply authorized by rollout {rollout_id[:8]} approval ({approver}).",
-            {"rollout_id": rollout_id, "approved_by": approver},
+            f"Apply authorized by {parent_audit_id} approval ({approver}).",
+            {"rollout_id": rollout_id, "rez_change_id": parent_audit_id, "approved_by": approver},
         )
 
 
@@ -413,6 +471,7 @@ def _lab_action_and_wait(
 
 def _verify_device(
     p: WorkspacePaths, store: PlatformStore, intent_path: Path, device_id: str, change_id: str,
+    rollout_id: str | None = None,
 ) -> tuple[bool, str]:
     org_id = store.get_change(change_id).org_id
     if execution_mode() == "runner":
@@ -440,11 +499,15 @@ def _verify_device(
                 pass
     ok = bool(result.get("ok"))
     message = str(result.get("message") or result.get("error") or ("verified" if ok else "verification failed"))
+    audit_evidence: dict[str, Any] = {"verify": result}
+    if rollout_id:
+        rollout = store.get_rollout(rollout_id)
+        audit_evidence.update({"rollout_id": rollout_id, "rez_change_id": rez_change_id(rollout)})
     store.record_workflow_event(
         change_id, "fleet_verify",
         store.get_change(change_id).workflow_state, store.get_change(change_id).workflow_state,
         f"[fleet] verify on {device_id}: {'pass' if ok else 'fail'} — {message}",
-        {"verify": result},
+        audit_evidence,
     )
     verification = dict(result.get("verification") or result)
     verification.setdefault("ok", ok)

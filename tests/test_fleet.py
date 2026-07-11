@@ -57,6 +57,9 @@ def test_plan_builds_canary_then_batches_with_a_change_per_device(tmp_path: Path
     rollout = _plan(paths)
     assert rollout["status"] == "planned"
     assert rollout["device_count"] == 6
+    assert rollout["rez_change_id"].startswith("REZ-CHG-")
+    assert rollout["audit"]["canonical_rollout_id"] == rollout["id"]
+    assert rollout["audit"]["device_change_records"] == 6
     waves = rollout["waves"]
     assert [len(w["targets"]) for w in waves] == [1, 2, 2, 1]  # canary + batches of 2
     assert waves[0]["label"] == "Canary"
@@ -64,9 +67,13 @@ def test_plan_builds_canary_then_batches_with_a_change_per_device(tmp_path: Path
     for wave in waves:
         for target in wave["targets"]:
             assert target["change_id"], "every device gets its own change record"
+            assert target["audit_ref"].startswith("REZ-DEV-")
+            assert target["rez_change_id"] == rollout["rez_change_id"]
             change = store.get_change(target["change_id"])
             assert change.workflow_state == "validated"
             assert change.device_id == target["device_id"]
+            plan_event = store.list_workflow_events(target["change_id"])[0]
+            assert plan_event.evidence["rez_change_id"] == rollout["rez_change_id"]
 
 
 def test_plan_rejects_unknown_devices_instead_of_silently_dropping(tmp_path: Path):

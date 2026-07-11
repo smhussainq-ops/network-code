@@ -40,6 +40,7 @@ from netcode.gitflow import (
     setup_git_workspace,
 )
 from netcode.fleet import (
+    annotate_rollout_audit,
     approve_rollout,
     create_remediation_rollouts,
     drift_watch_status,
@@ -2642,6 +2643,7 @@ def api_fleet_rollouts(request: Request) -> dict[str, object]:
     rollouts = []
     for rollout in store.list_rollouts(org_id=org):
         targets = store.list_rollout_targets(str(rollout["id"]))
+        rollout, targets = annotate_rollout_audit(rollout, targets)
         counts: dict[str, int] = {}
         for t in targets:
             counts[t["status"]] = counts.get(t["status"], 0) + 1
