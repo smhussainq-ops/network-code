@@ -315,6 +315,56 @@ def request_halt(p: WorkspacePaths, rollout_id: str, reason: str) -> dict[str, A
     return rollout_status(p, rollout_id)
 
 
+def cancel_rollout(p: WorkspacePaths, rollout_id: str, cancelled_by: str) -> dict[str, Any]:
+    """Soft-delete an unexecuted rollout while preserving its audit tombstone."""
+    store = PlatformStore(p)
+    rollout = store.get_rollout(rollout_id)
+    status = str(rollout.get("status") or "").lower()
+    if status not in {"planned", "blocked"}:
+        raise ValueError(
+            f"Rollout is '{status}' — only an unexecuted planned or blocked draft can be deleted. "
+            "Executed changes remain immutable for audit."
+        )
+    actor = (cancelled_by or "netcode-user").strip() or "netcode-user"
+    parent_audit_id = rez_change_id(rollout)
+    final = store.update_rollout(
+        rollout_id,
+        status="cancelled",
+        halt_reason=f"Draft deleted by {actor} before execution; audit tombstone retained.",
+        expected_status=status,
+    )
+    if final.get("status") != "cancelled":
+        raise ValueError("Rollout state changed while deletion was requested; no deletion was performed.")
+
+    for target in store.list_rollout_targets(rollout_id):
+        change_id = str(target.get("change_id") or "")
+        if change_id:
+            store.cancel_queued_jobs_for_change(change_id, f"{parent_audit_id} draft deleted")
+            change = store.get_change(change_id)
+            store.record_workflow_event(
+                change_id,
+                "delete_draft",
+                change.workflow_state,
+                change.workflow_state,
+                f"{parent_audit_id} removed from the active work queue by {actor}; no device write occurred.",
+                {"rollout_id": rollout_id, "rez_change_id": parent_audit_id, "deleted_by": actor},
+            )
+            store.update_change(
+                change_id,
+                "cancelled",
+                change.result,
+                workflow_state=change.workflow_state,
+            )
+        store.update_rollout_target(
+            rollout_id,
+            str(target["device_id"]),
+            status="skipped",
+            stage="cancelled",
+            message="Draft deleted before execution; device was untouched.",
+        )
+    return rollout_status(p, rollout_id)
+
+
 def reconcile_rollouts_on_startup(p: WorkspacePaths) -> int:
     """The orchestrator thread dies with the process. Any rollout still marked
     running/halt_requested after a restart is unowned: fail it closed — mark it

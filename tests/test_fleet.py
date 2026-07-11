@@ -88,6 +88,34 @@ def test_plan_rejects_zero_canary(tmp_path: Path):
         _plan(paths, canary_size=0)
 
 
+def test_delete_draft_soft_deletes_targets_but_retains_audit(tmp_path: Path):
+    paths = _fleet_workspace(tmp_path, device_count=2)
+    rollout = _plan(paths)
+    final = fleet.cancel_rollout(paths, rollout["id"], "reviewer@example.com")
+
+    assert final["status"] == "cancelled"
+    assert "audit tombstone retained" in final["halt_reason"]
+    assert final["rez_change_id"] == rollout["rez_change_id"]
+    store = PlatformStore(paths)
+    for wave in final["waves"]:
+        for target in wave["targets"]:
+            assert target["status"] == "skipped"
+            assert target["stage"] == "cancelled"
+            change = store.get_change(target["change_id"])
+            assert change.status == "cancelled"
+            assert any(event.action == "delete_draft" for event in store.list_workflow_events(change.id))
+    with pytest.raises(ValueError, match="only a planned rollout can start"):
+        fleet.start_rollout(paths, rollout["id"])
+
+
+def test_delete_rejects_executed_rollout(tmp_path: Path):
+    paths = _fleet_workspace(tmp_path, device_count=2)
+    rollout = _plan(paths)
+    PlatformStore(paths).update_rollout(rollout["id"], status="completed")
+    with pytest.raises(ValueError, match="remain immutable for audit"):
+        fleet.cancel_rollout(paths, rollout["id"], "reviewer@example.com")
+
+
 def test_rollout_auto_halts_on_first_failure_and_skips_the_rest(tmp_path: Path, monkeypatch):
     paths = _fleet_workspace(tmp_path, device_count=6)
     rollout = _plan(paths)

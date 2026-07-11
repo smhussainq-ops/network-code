@@ -42,6 +42,7 @@ from netcode.gitflow import (
 from netcode.fleet import (
     annotate_rollout_audit,
     approve_rollout,
+    cancel_rollout,
     create_remediation_rollouts,
     drift_watch_status,
     fleet_drift_snapshot,
@@ -2672,6 +2673,17 @@ def api_fleet_rollout_start(rollout_id: str, request: Request) -> dict[str, obje
 def api_fleet_rollout_halt(rollout_id: str, request: FleetHaltRequest, http_request: Request) -> dict[str, object]:
     _rollout_or_404(rollout_id, _request_principal(http_request).org_id)
     return request_halt(paths(), rollout_id, request.reason)
+
+
+@app.delete("/api/fleet/rollouts/{rollout_id}")
+def api_fleet_rollout_delete(rollout_id: str, request: Request) -> dict[str, object]:
+    principal = _request_principal(request)
+    _rollout_or_404(rollout_id, principal.org_id)
+    actor = principal.email or principal.user_id or "netcode-user"
+    try:
+        return cancel_rollout(paths(), rollout_id, actor)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 def _approver_identity(principal, fallback_name: str, requester: str, requester_user_id: str | None,
