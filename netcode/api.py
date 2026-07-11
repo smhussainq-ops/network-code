@@ -49,6 +49,8 @@ from netcode.fleet import (
     plan_fleet_rollout,
     reconcile_rollouts_on_startup,
     request_halt,
+    retry_rollout,
+    rollout_failure_handoff,
     rollout_status,
     set_drift_watch,
     start_fleet_drift,
@@ -232,6 +234,10 @@ class FleetRolloutRequest(BaseModel):
 
 class FleetHaltRequest(BaseModel):
     reason: str = ""
+
+
+class FleetRetryRequest(BaseModel):
+    scope: str = "failed_and_untouched"
 
 
 class ApproveRequest(BaseModel):
@@ -2686,6 +2692,37 @@ def api_fleet_rollout_delete(rollout_id: str, request: Request) -> dict[str, obj
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
+@app.post("/api/fleet/rollouts/{rollout_id}/retry")
+def api_fleet_rollout_retry(
+    rollout_id: str,
+    retry: FleetRetryRequest,
+    request: Request,
+) -> dict[str, object]:
+    principal = _request_principal(request)
+    _rollout_or_404(rollout_id, principal.org_id)
+    actor = principal.email or principal.user_id or "netcode-user"
+    try:
+        return retry_rollout(
+            paths(),
+            rollout_id,
+            scope=retry.scope,
+            requested_by=actor,
+            created_by_user_id=principal.user_id,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/fleet/rollouts/{rollout_id}/diagnostics-handoff")
+def api_fleet_rollout_diagnostics_handoff(rollout_id: str, request: Request) -> dict[str, object]:
+    principal = _request_principal(request)
+    _rollout_or_404(rollout_id, principal.org_id)
+    try:
+        return rollout_failure_handoff(paths(), rollout_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 def _approver_identity(principal, fallback_name: str, requester: str, requester_user_id: str | None,
                        created_by: str | None = None) -> str:
     """Resolve who is approving and enforce requester != approver. With auth on,
@@ -2900,6 +2937,7 @@ def api_change_from_rca(request: RcaRemediationProposalRequest, http_request: Re
             "ok": True,
             "draft_only": True,
             "human_approval_required": True,
+            "rez_change_id": rollout.get("rez_change_id"),
             "rollout_id": rollout["id"],
             "rollout": rollout,
             "change_id": canary_change.id if canary_change else None,
@@ -2952,12 +2990,14 @@ def api_change_from_rca(request: RcaRemediationProposalRequest, http_request: Re
         evidence,
     )
     change = store.get_change(change.id)
+    serialized_change = record_to_dict(change)
     return {
         "ok": True,
         "draft_only": True,
         "human_approval_required": True,
+        "rez_change_id": serialized_change["rez_change_id"],
         "change_id": change.id,
-        "change": record_to_dict(change),
+        "change": serialized_change,
         "intent_path": str(intent_path),
         "intent": intent,
         "workflow": workflow_snapshot(change.workflow_state).as_dict(),
@@ -3125,6 +3165,7 @@ def api_change_record(change_id: str, request: Request) -> dict[str, object]:
     return {
         "ok": True,
         "change_id": change_id,
+        "rez_change_id": change_dict.get("rez_change_id"),
         "workflow_state": change_dict.get("workflow_state"),
         "status": change_dict.get("status"),
         "request": {
@@ -3163,6 +3204,7 @@ def api_change_record(change_id: str, request: Request) -> dict[str, object]:
         "apply_proof": proof_for("apply"),
         "verify_proof": verify_proof(),
         "rollback_record": proof_for("rollback"),
+        "diagnostics_handoffs": list(result.get("diagnostics_handoffs") or []),
         "git": {
             "branch": git_status.get("branch"),
             "upstream": git_status.get("upstream"),

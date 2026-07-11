@@ -8,6 +8,11 @@ from typing import Any
 PASS_STATUSES = {"pass", "passed", "ok", "success", "true"}
 
 
+def _labeled_sentence(label: str, value: str) -> str:
+    text = value.strip()
+    return f" {label}: {text}{'' if text.endswith(('.', '!', '?')) else '.'}"
+
+
 def verification_failed(verification: dict[str, Any] | None) -> bool:
     """Return True only when verification evidence explicitly failed."""
     if not isinstance(verification, dict):
@@ -50,9 +55,9 @@ def build_verification_handoff(
         "or rollback plan. Do not apply configuration."
     )
     if expected_value:
-        question += f" Expected: {expected_value}."
+        question += _labeled_sentence("Expected", expected_value)
     if actual_value:
-        question += f" Actual: {actual_value}."
+        question += _labeled_sentence("Actual", actual_value)
 
     context = {
         "source": "netcode_verification",

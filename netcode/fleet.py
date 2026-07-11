@@ -28,7 +28,7 @@ from netcode.models import load_intent
 from netcode.orchestrator import create_desired_state_intent, run_static_pipeline
 from netcode.paths import WorkspacePaths
 from netcode.scale import rollout_plan
-from netcode.store import DEFAULT_ORG_ID, PlatformStore, record_to_dict
+from netcode.store import DEFAULT_ORG_ID, PlatformStore, change_audit_id, record_to_dict
 from netcode.ui_config import configured_inventory_path
 from netcode.workflow import state_after_static_validation
 
@@ -53,11 +53,7 @@ def rez_change_id(rollout: dict[str, Any]) -> str:
     The full UUID remains the database/audit key. The dated alias is safe to
     quote in tickets and change windows without replacing that canonical ID.
     """
-    canonical = "".join(ch for ch in str(rollout.get("id") or "") if ch.isalnum()).upper()
-    token = canonical[:12] or "UNKNOWN"
-    created_date = str(rollout.get("created_at") or "").split("T", 1)[0]
-    date_token = "".join(ch for ch in created_date if ch.isdigit())
-    return f"REZ-CHG-{date_token}-{token}" if date_token else f"REZ-CHG-{token}"
+    return change_audit_id(str(rollout.get("id") or ""), str(rollout.get("created_at") or ""))
 
 
 def device_audit_ref(change_id: str | None) -> str:
@@ -119,6 +115,8 @@ def plan_fleet_rollout(
     requested_by: str,
     org_id: str = DEFAULT_ORG_ID,
     created_by_user_id: str | None = None,
+    parent_rollout_id: str | None = None,
+    retry_scope: str | None = None,
 ) -> dict[str, Any]:
     """Create a rollout: resolve targets, compute waves, and build a per-device
     intent + change + static plan. Fail-closed: if ANY device fails the static
@@ -180,6 +178,7 @@ def plan_fleet_rollout(
         change_type=change_type, values=values,
         canary_size=canary_size, batch_size=batch_size,
         requested_by=requested_by, org_id=org_id, created_by_user_id=created_by_user_id,
+        parent_rollout_id=parent_rollout_id, retry_scope=retry_scope,
     )
     rollout_id = rollout["id"]
     parent_audit_id = rez_change_id(rollout)
@@ -210,12 +209,20 @@ def plan_fleet_rollout(
                 workflow = state_after_static_validation(passed)
                 stored_result = result.model_dump()
                 stored_result.update({"rollout_id": rollout_id, "rez_change_id": parent_audit_id})
+                if parent_rollout_id:
+                    stored_result.update({"parent_rollout_id": parent_rollout_id, "retry_scope": retry_scope})
                 store.update_change(change.id, "validated" if passed else "blocked",
                                     stored_result, workflow_state=workflow.state)
                 store.record_workflow_event(
                     change.id, "plan", "draft", workflow.state,
                     f"[{parent_audit_id}] {workflow.message}",
-                    {"rollout_id": rollout_id, "rez_change_id": parent_audit_id, "wave_index": wave_index},
+                    {
+                        "rollout_id": rollout_id,
+                        "rez_change_id": parent_audit_id,
+                        "wave_index": wave_index,
+                        "parent_rollout_id": parent_rollout_id,
+                        "retry_scope": retry_scope,
+                    },
                 )
                 if passed:
                     store.update_rollout_target(rollout_id, device_id, stage="planned",
@@ -365,6 +372,104 @@ def cancel_rollout(p: WorkspacePaths, rollout_id: str, cancelled_by: str) -> dic
     return rollout_status(p, rollout_id)
 
 
+def retry_rollout(
+    p: WorkspacePaths,
+    rollout_id: str,
+    *,
+    scope: str,
+    requested_by: str,
+    created_by_user_id: str | None = None,
+) -> dict[str, Any]:
+    """Create a new governed rollout for failed and optionally untouched targets.
+
+    The original rollout remains immutable. Passed devices are never selected,
+    approval is intentionally not inherited, and no execution job is queued.
+    """
+    if scope not in {"failed", "failed_and_untouched"}:
+        raise ValueError("retry scope must be 'failed' or 'failed_and_untouched'.")
+    store = PlatformStore(p)
+    original = store.get_rollout(rollout_id)
+    status = str(original.get("status") or "").lower()
+    if status not in {"halted", "blocked"}:
+        raise ValueError("Only a halted or blocked rollout can be retried.")
+
+    failed_states = {"failed", "blocked"}
+    untouched_states = {"skipped", "pending"}
+    allowed = failed_states | (untouched_states if scope == "failed_and_untouched" else set())
+    candidates = [
+        str(target.get("device_id") or "")
+        for target in store.list_rollout_targets(rollout_id)
+        if str(target.get("status") or "").lower() in allowed and str(target.get("device_id") or "")
+    ]
+    if not candidates:
+        raise ValueError("No eligible failed or untouched devices remain in this rollout.")
+
+    parent_ref = rez_change_id(original)
+    scope_label = "failed and untouched" if scope == "failed_and_untouched" else "failed"
+    return plan_fleet_rollout(
+        p,
+        change_type=str(original.get("change_type") or ""),
+        values=dict(original.get("values") or {}),
+        device_ids=candidates,
+        device_group=None,
+        canary_size=1,
+        batch_size=max(1, min(int(original.get("batch_size") or 1), max(1, len(candidates) - 1))),
+        description=f"Retry {scope_label} targets from {parent_ref}: {original.get('description') or 'fleet rollout'}",
+        requested_by=(requested_by or "netcode-user").strip() or "netcode-user",
+        org_id=str(original.get("org_id") or DEFAULT_ORG_ID),
+        created_by_user_id=created_by_user_id,
+        parent_rollout_id=rollout_id,
+        retry_scope=scope,
+    )
+
+
+def rollout_failure_handoff(p: WorkspacePaths, rollout_id: str) -> dict[str, Any]:
+    """Return or create the read-only Rez handoff for the first failed target."""
+    store = PlatformStore(p)
+    rollout = store.get_rollout(rollout_id)
+    failed = next(
+        (
+            target for target in store.list_rollout_targets(rollout_id)
+            if str(target.get("status") or "").lower() in {"failed", "blocked"}
+        ),
+        None,
+    )
+    if not failed:
+        raise ValueError("This rollout has no failed target to investigate.")
+    change_id = str(failed.get("change_id") or "")
+    if not change_id:
+        raise ValueError("The failed target has no change record.")
+    change = store.get_change(change_id)
+    existing = list((change.result or {}).get("diagnostics_handoffs") or [])
+    handoff = existing[-1] if existing else attach_verification_handoff(
+        store,
+        change_id=change_id,
+        device_id=str(failed.get("device_id") or ""),
+        check=f"fleet_{str(failed.get('stage') or 'execution').replace('-', '_')}",
+        expected="The planned change passes its safety stage and verification checks.",
+        actual=str(failed.get("message") or "Fleet execution failed."),
+        verification={
+            "ok": False,
+            "status": "fail",
+            "stage": str(failed.get("stage") or "execution"),
+            "message": str(failed.get("message") or "Fleet execution failed."),
+        },
+        intent_path=str(failed.get("intent_path") or ""),
+    )
+    if not handoff:
+        raise ValueError("Unable to build a diagnostics handoff for the failed target.")
+    return {
+        "ok": True,
+        "rollout_id": rollout_id,
+        "rez_change_id": rez_change_id(rollout),
+        "failed_device": failed.get("device_id"),
+        "change_id": change_id,
+        "handoff": handoff,
+        "question": handoff.get("question"),
+        "read_only": True,
+    }
+
+
 def reconcile_rollouts_on_startup(p: WorkspacePaths) -> int:
     """The orchestrator thread dies with the process. Any rollout still marked
     running/halt_requested after a restart is unowned: fail it closed — mark it
@@ -458,6 +563,20 @@ def _run_device(p: WorkspacePaths, store: PlatformStore, rollout_id: str, target
         ok, message = _lab_action_and_wait(p, store, intent_path, action, device_id, change_id)
         if not ok:
             store.update_rollout_target(rollout_id, device_id, status="failed", stage=action, message=message)
+            attach_verification_handoff(
+                store,
+                change_id=change_id,
+                device_id=device_id,
+                check=f"fleet_{action.replace('-', '_')}",
+                expected=(
+                    "The planned commands pass dry-run validation without a production write."
+                    if action == "dry-run"
+                    else "The approved commands apply successfully before post-change verification."
+                ),
+                actual=message,
+                verification={"ok": False, "status": "fail", "stage": action, "message": message},
+                intent_path=str(intent_path),
+            )
             return False
 
     store.update_rollout_target(rollout_id, device_id, stage="verify")

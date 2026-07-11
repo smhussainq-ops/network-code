@@ -116,6 +116,60 @@ def test_delete_rejects_executed_rollout(tmp_path: Path):
         fleet.cancel_rollout(paths, rollout["id"], "reviewer@example.com")
 
 
+def test_retry_creates_new_unapproved_rollout_for_failed_and_untouched_only(tmp_path: Path):
+    paths = _fleet_workspace(tmp_path, device_count=3)
+    original = _plan(paths, batch_size=1)
+    store = PlatformStore(paths)
+    targets = store.list_rollout_targets(original["id"])
+    store.update_rollout(original["id"], status="halted", halt_reason="canary failed")
+    store.update_rollout_target(original["id"], targets[0]["device_id"], status="failed", stage="dry-run")
+    store.update_rollout_target(original["id"], targets[1]["device_id"], status="skipped", stage="planned")
+    store.update_rollout_target(original["id"], targets[2]["device_id"], status="passed", stage="done")
+
+    retry = fleet.retry_rollout(
+        paths,
+        original["id"],
+        scope="failed_and_untouched",
+        requested_by="marcus",
+    )
+
+    assert retry["id"] != original["id"]
+    assert retry["status"] == "planned"
+    assert retry["parent_rollout_id"] == original["id"]
+    assert retry["retry_scope"] == "failed_and_untouched"
+    assert retry.get("approved_by") is None
+    retried_devices = {
+        target["device_id"] for wave in retry["waves"] for target in wave["targets"]
+    }
+    assert retried_devices == {targets[0]["device_id"], targets[1]["device_id"]}
+    assert targets[2]["device_id"] not in retried_devices
+    assert store.get_rollout(original["id"])["status"] == "halted"
+    assert store.list_jobs() == []
+
+
+def test_dry_run_failure_attaches_reusable_read_only_rez_handoff(tmp_path: Path, monkeypatch):
+    paths = _fleet_workspace(tmp_path, device_count=1)
+    rollout = _plan(paths, canary_size=1, batch_size=1)
+    store = PlatformStore(paths)
+    store.update_rollout(rollout["id"], status="running")
+    target = store.list_rollout_targets(rollout["id"])[0]
+    monkeypatch.setattr(fleet, "_lab_action_and_wait", lambda *args, **kwargs: (False, "candidate rejected"))
+
+    assert fleet._run_device(paths, store, rollout["id"], target) is False
+    change = store.get_change(target["change_id"])
+    handoffs = list((change.result or {}).get("diagnostics_handoffs") or [])
+    assert len(handoffs) == 1
+    assert handoffs[0]["context"]["check"] == "fleet_dry_run"
+    assert handoffs[0]["context"]["read_only"] is True
+    assert handoffs[0]["safety"]["device_writes"] == "none"
+
+    opened = fleet.rollout_failure_handoff(paths, rollout["id"])
+    assert opened["failed_device"] == target["device_id"]
+    assert opened["read_only"] is True
+    assert "Do not apply configuration" in opened["question"]
+    assert len((store.get_change(target["change_id"]).result or {}).get("diagnostics_handoffs") or []) == 1
+
+
 def test_rollout_auto_halts_on_first_failure_and_skips_the_rest(tmp_path: Path, monkeypatch):
     paths = _fleet_workspace(tmp_path, device_count=6)
     rollout = _plan(paths)

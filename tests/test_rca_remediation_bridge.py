@@ -55,6 +55,9 @@ def test_rca_remediation_runs_static_validation_without_jobs(tmp_path: Path, mon
     assert body["ok"] is True
     assert body["draft_only"] is True
     assert body["human_approval_required"] is True
+    assert body["rez_change_id"] == body["change"]["rez_change_id"]
+    assert body["rez_change_id"].startswith("REZ-CHG-")
+    assert body["rez_change_id"].endswith(body["change_id"].replace("-", "").upper()[:12])
 
     store = PlatformStore(WorkspacePaths(tmp_path.resolve()))
     change = store.get_change(body["change_id"])
@@ -334,6 +337,7 @@ def test_multitarget_site_context_exchange_creates_canary_rollout_without_jobs(
     assert response.status_code == 200, response.text
     body = response.json()
     assert body["rollout_id"]
+    assert body["rez_change_id"] == body["rollout"]["rez_change_id"]
     assert body["rollout"]["status"] == "planned"
     assert body["rollout"]["device_count"] == 2
     assert len(body["rollout"]["waves"][0]["targets"]) == 1

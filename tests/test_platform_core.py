@@ -1726,6 +1726,7 @@ def test_verification_handoff_builds_rez_context_without_writes(tmp_path: Path, 
     assert "expected state" in body["question"]
     assert "VLAN 210 present" in body["question"]
     assert "VLAN 210 missing" in body["question"]
+    assert ".." not in body["question"]
     assert body["context"]["failed"] is True
     assert body["context"]["read_only"] is True
     assert body["remediation_plan"]["status"] == "not_created"
@@ -2997,6 +2998,8 @@ def test_change_record_packages_request_plan_safety_git_and_manifest(tmp_path: P
     record = client.get(f"/api/change/{change_id}/record")
     assert record.status_code == 200
     body = record.json()
+    assert body["rez_change_id"].startswith("REZ-CHG-")
+    assert body["rez_change_id"].endswith(change_id.replace("-", "").upper()[:12])
     assert body["request"]["change_type"] == "add_vlan"
     assert body["request"]["intent_yaml"]
     assert "vlan 90" in body["plan"]["commands"]

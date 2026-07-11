@@ -65,6 +65,15 @@ def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def change_audit_id(change_id: str | None, created_at: str | None = None) -> str:
+    """Return the stable customer-facing alias for a canonical change UUID."""
+    canonical = "".join(ch for ch in str(change_id or "") if ch.isalnum()).upper()
+    token = canonical[:12] or "UNKNOWN"
+    created_date = str(created_at or "").split("T", 1)[0]
+    date_token = "".join(ch for ch in created_date if ch.isdigit())
+    return f"REZ-CHG-{date_token}-{token}" if date_token else f"REZ-CHG-{token}"
+
+
 @dataclass(frozen=True)
 class ChangeRecord:
     id: str
@@ -367,6 +376,8 @@ class PlatformStore:
                     batch_size INTEGER NOT NULL,
                     requested_by TEXT NOT NULL,
                     created_by_user_id TEXT,
+                    parent_rollout_id TEXT,
+                    retry_scope TEXT,
                     halt_reason TEXT,
                     current_wave INTEGER NOT NULL DEFAULT 0,
                     created_at TEXT NOT NULL,
@@ -393,6 +404,8 @@ class PlatformStore:
             )
             self._ensure_column(conn, "rollouts", "approved_by", "TEXT")
             self._ensure_column(conn, "rollouts", "approved_at", "TEXT")
+            self._ensure_column(conn, "rollouts", "parent_rollout_id", "TEXT")
+            self._ensure_column(conn, "rollouts", "retry_scope", "TEXT")
             for table in ("changes", "jobs", "runners", "join_tokens"):
                 self._ensure_column(conn, table, "org_id", f"TEXT DEFAULT '{DEFAULT_ORG_ID}'")
             self._ensure_column(conn, "changes", "created_by_user_id", "TEXT")
@@ -1164,16 +1177,20 @@ class PlatformStore:
         requested_by: str = "netcode-user",
         org_id: str = DEFAULT_ORG_ID,
         created_by_user_id: str | None = None,
+        parent_rollout_id: str | None = None,
+        retry_scope: str | None = None,
     ) -> dict[str, Any]:
         rollout_id = str(uuid.uuid4())
         now = utc_now()
         with self._connect() as conn:
             conn.execute(
                 "INSERT INTO rollouts (id, org_id, description, change_type, values_json, status,"
-                " canary_size, batch_size, requested_by, created_by_user_id, halt_reason, current_wave, created_at, updated_at)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                " canary_size, batch_size, requested_by, created_by_user_id, parent_rollout_id, retry_scope,"
+                " halt_reason, current_wave, created_at, updated_at)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (rollout_id, org_id, description, change_type, json.dumps(values), "planned",
-                 canary_size, batch_size, requested_by, created_by_user_id, None, 0, now, now),
+                 canary_size, batch_size, requested_by, created_by_user_id, parent_rollout_id,
+                 retry_scope, None, 0, now, now),
             )
         return self.get_rollout(rollout_id)
 
@@ -1494,6 +1511,8 @@ def redact_secrets(value: Any) -> Any:
 
 def record_to_dict(record: ChangeRecord | JobRecord | WorkflowEventRecord) -> dict[str, Any]:
     data = record.__dict__.copy()
+    if isinstance(record, ChangeRecord):
+        data["rez_change_id"] = change_audit_id(record.id, record.created_at)
     if "payload" in data and data["payload"]:
         data["payload"] = redact_secrets(data["payload"])
     return data
