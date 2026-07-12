@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import time
 
 import pytest
 from fastapi.testclient import TestClient
@@ -140,3 +141,69 @@ def test_network_model_api_forces_principal_tenant_and_opens_no_devices(tmp_path
     assert entities.status_code == 200
     assert entities.json()["returned"] == 1
     assert entities.json()["device_connections_opened"] == 0
+
+
+def test_ten_thousand_device_queries_are_bounded_and_summary_skips_model_blob(tmp_path: Path):
+    repository = _repository(tmp_path)
+    document = _document("rev-10k")
+    document["model"]["devices"] = {
+        f"edge-{index:05d}": {
+            "site": f"site-{index // 100:03d}",
+            "role": "edge",
+            "platform": "arista_eos",
+        }
+        for index in range(10_000)
+    }
+    document["status"] = "approved"
+    document["approval"] = {
+        "status": "approved",
+        "approved_by": "marcus",
+        "approved_at": "2026-07-12T12:00:00Z",
+    }
+    repository.create_revision(document, created_by="marcus")
+    repository.activate_revision("org-default", "pilot-a", "rev-10k")
+
+    started = time.perf_counter()
+    page = repository.list_entities(
+        "org-default", "pilot-a", "rev-10k", entity_type="devices", limit=50
+    )
+    summary = repository.active_revision_summary("org-default", "pilot-a")
+    elapsed = time.perf_counter() - started
+
+    assert page["returned"] == 50
+    assert page["next_cursor"]
+    assert summary["revision_id"] == "rev-10k"
+    assert "model" not in summary
+    assert elapsed < 2.0
+
+
+def test_conflicts_are_tenant_scoped_resolvable_and_reject_secret_shaped_resolution(tmp_path: Path):
+    repository = _repository(tmp_path)
+    repository.record_conflict(
+        org_id="org-a",
+        environment_id="pilot-a",
+        conflict_id="identity-1",
+        domain="identity",
+        subject_id="edge-1",
+        severity="high",
+        details={"claimants": ["edge-1", "edge-one"]},
+    )
+    assert repository.list_conflicts("org-b", "pilot-a")["returned"] == 0
+    with pytest.raises(ValueError, match="credential-shaped"):
+        repository.resolve_conflict(
+            "org-a",
+            "pilot-a",
+            "identity-1",
+            resolved_by="marcus",
+            resolution={"password": "must-not-enter-model"},
+        )
+
+    resolved = repository.resolve_conflict(
+        "org-a",
+        "pilot-a",
+        "identity-1",
+        resolved_by="marcus",
+        resolution={"canonical_device_id": "edge-1"},
+    )
+    assert resolved["status"] == "resolved"
+    assert resolved["resolved_by"] == "marcus"

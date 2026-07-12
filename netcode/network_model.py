@@ -99,6 +99,11 @@ def _assert_no_secrets(value: Any, path: str = "document") -> None:
             _assert_no_secrets(item, f"{path}[{index}]")
 
 
+def assert_no_secrets(value: Any, path: str = "document") -> None:
+    """Public guard for auxiliary model records such as conflict resolutions."""
+    _assert_no_secrets(value, path)
+
+
 def validate_authority_bindings(value: Any, coverage: set[str]) -> dict[str, dict[str, str]]:
     """Validate domain-specific authority without imposing a provider catalog."""
     bindings = _dict(value)
@@ -190,6 +195,49 @@ def validate_model_revision(value: Mapping[str, Any]) -> dict[str, Any]:
 
     _assert_no_secrets(document)
     return document
+
+
+def prepare_reviewed_approval(
+    value: Mapping[str, Any],
+    *,
+    approved_by: str,
+    approved_at: str,
+) -> dict[str, Any]:
+    """Build the exact approved document produced by a human review action.
+
+    Discovery and telemetry remain observation-only.  Approving a proposal does
+    not pretend those collectors became authoritative; it records that a human
+    reviewed their proposal and accepted it as manual intent while retaining the
+    original source reference in the audit string.
+    """
+    revision = copy.deepcopy(_dict(value))
+    original_source = _dict(revision.get("source"))
+    original_type = str(original_source.get("type") or "").strip().lower()
+    original_reference = str(original_source.get("reference") or "").strip()
+    if original_type in OBSERVATION_ONLY_SOURCES:
+        revision["source"] = {
+            "type": "manual_review",
+            "reference": f"reviewed:{original_type}:{original_reference}",
+        }
+    revision["status"] = "approved"
+    revision["approval"] = {
+        "status": "approved",
+        "approved_by": str(approved_by or "").strip(),
+        "approved_at": str(approved_at or "").strip(),
+    }
+    revision["authority_bindings"] = {
+        domain: {
+            **binding,
+            "source": (
+                "manual_review"
+                if str(binding.get("source") or "").strip().lower() in OBSERVATION_ONLY_SOURCES
+                else str(binding.get("source") or "").strip().lower()
+            ),
+            "mode": "authoritative",
+        }
+        for domain, binding in _dict(revision.get("authority_bindings")).items()
+    }
+    return validate_model_revision(revision)
 
 
 def validate_observation(value: Mapping[str, Any]) -> dict[str, Any]:

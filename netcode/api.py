@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import os
 import re
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, TimeoutError
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from fastapi import Body, FastAPI, Header, HTTPException, Query, Request, Response, WebSocket, WebSocketDisconnect
@@ -108,7 +110,7 @@ from netcode.platform import platform_capabilities
 from netcode.scale import rollout_plan
 from netcode.shell_desktop import build_desktop_shell_profile
 from netcode.source_of_truth import netbox_sync, netbox_test, provider_catalog, source_of_truth
-from netcode.network_model import NetworkModelError
+from netcode.network_model import NETWORK_OBSERVATION_SCHEMA, NetworkModelError
 from netcode.network_model_store import NetworkModelRepository
 from netcode.network_model_import import (
     import_approved_network_design,
@@ -122,9 +124,14 @@ from netcode.network_model_compiler import (
 )
 from netcode.network_model_reconcile import reconcile_revision
 from netcode.network_model_lifecycle import (
+    activate_change_candidates,
     activate_verified_revision,
+    approve_change_candidates,
     approve_with_git,
+    create_candidate_for_change_intent,
+    create_candidate_for_change_set,
     create_candidate_from_change,
+    model_diff,
     rollback_active_revision,
 )
 from netcode.store import (
@@ -313,6 +320,8 @@ class FleetRolloutRequest(BaseModel):
     canary_size: int = 1
     batch_size: int = 3
     description: str = ""
+    environment_id: str = ""
+    model_revision_id: str = ""
 
 
 class FleetHaltRequest(BaseModel):
@@ -419,6 +428,8 @@ class RcaRemediationProposalRequest(BaseModel):
     evidence_refs: list[str] = []
     requested_by: str = "rez-rca"
     title: str = ""
+    environment_id: str = ""
+    model_revision_id: str = ""
 
 
 class LoginRequest(BaseModel):
@@ -617,6 +628,30 @@ def _typed_proposal_section(change_type: str, proposed: dict[str, object]) -> di
 
 def _intent_from_rca_proposal(request: RcaRemediationProposalRequest) -> dict[str, object]:
     proposed = _safe_proposal_dict(request.proposed_intent or {})
+    if request.root_atom_id.strip().upper() == "L1_INTERFACE_ADMIN_DOWN":
+        interface_section = proposed.get("interface") if isinstance(proposed.get("interface"), dict) else {}
+        values_section = proposed.get("values") if isinstance(proposed.get("values"), dict) else {}
+        interface_name = str(
+            interface_section.get("name") or values_section.get("interface") or ""
+        ).strip()
+        if not interface_name:
+            raise HTTPException(
+                status_code=400,
+                detail="Confirmed interface admin-state RCA is missing an exact interface identity.",
+            )
+        proposed = {
+            key: value for key, value in proposed.items() if key not in {"interface", "values"}
+        }
+        proposed["values"] = {
+            "interface": interface_name,
+            "enabled": True,
+            "apply_scope": "admin_state",
+        }
+        proposed["interface"] = {
+            "name": interface_name,
+            "enabled": True,
+            "apply_scope": "admin_state",
+        }
     requested_type = str(proposed.get("change_type") or request.suggested_pack or "custom_config").strip()
     change_type = requested_type if requested_type in _RCA_ALLOWED_CHANGE_TYPES else "custom_config"
     targets = _proposal_targets(request)
@@ -1049,6 +1084,19 @@ def desired_state_plan(request: DesiredStatePlanRequest, http_request: Request) 
         intent = load_intent(intent_path)
         result = run_static_pipeline(p, intent_path, org_id=principal.org_id)
         change = store.get_or_create_change(intent_path, request.device_id, requested_by=request.requested_by, org_id=principal.org_id, created_by_user_id=principal.user_id)
+        candidate = None
+        if model_context is not None and result.status == "pass":
+            candidate = create_candidate_for_change_intent(
+                NetworkModelRepository(store),
+                store,
+                org_id=principal.org_id,
+                environment_id=str(active_model["environment_id"]),
+                parent_revision_id=str(active_model["revision_id"]),
+                change_id=change.id,
+                intent=intent.model_dump(mode="json"),
+                device_id=str(model_context["device_id"]),
+                created_by=principal.email or principal.user_id or request.requested_by,
+            )
         workflow = state_after_static_validation(result.status == "pass")
         metadata = plan_metadata(intent)
         result_payload = result.model_dump()
@@ -1059,6 +1107,7 @@ def desired_state_plan(request: DesiredStatePlanRequest, http_request: Request) 
                 "device_id": model_context["device_id"],
                 "site_id": model_context["site_id"],
                 "coverage": model_context["coverage"],
+                "candidate_revision_id": candidate["revision_id"] if candidate else "",
             }
         store.update_change(
             change.id,
@@ -1229,6 +1278,38 @@ def api_network_model_get_revision(
     return {"ok": True, "revision": revision, "device_connections_opened": 0}
 
 
+@app.get("/api/network-model/revisions/{revision_id}/diff")
+def api_network_model_revision_diff(
+    request: Request,
+    revision_id: str,
+    environment_id: str = Query(..., min_length=1, max_length=128),
+    limit: int = Query(default=200, ge=1, le=1000),
+) -> dict[str, object]:
+    repository = NetworkModelRepository(PlatformStore(paths()))
+    try:
+        revision = repository.get_revision(
+            _request_principal(request).org_id, environment_id, revision_id
+        )
+        parent_model: dict[str, object] = {}
+        if revision.get("parent_revision_id"):
+            parent_model = repository.get_revision(
+                _request_principal(request).org_id,
+                environment_id,
+                str(revision["parent_revision_id"]),
+            )["model"]
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    changes = model_diff(parent_model, revision["model"])
+    return {
+        "ok": True,
+        "revision_id": revision_id,
+        "total": len(changes),
+        "changes": changes[:limit],
+        "truncated": len(changes) > limit,
+        "device_connections_opened": 0,
+    }
+
+
 @app.get("/api/network-model/entities")
 def api_network_model_entities(
     request: Request,
@@ -1240,7 +1321,13 @@ def api_network_model_entities(
     cursor: str = Query(default="", max_length=500),
     limit: int = Query(default=50, ge=1, le=100),
 ) -> dict[str, object]:
-    result = NetworkModelRepository(PlatformStore(paths())).list_entities(
+    repository = NetworkModelRepository(PlatformStore(paths()))
+    repository.ensure_materialized_entities(
+        _request_principal(request).org_id,
+        environment_id,
+        revision_id,
+    )
+    result = repository.list_entities(
         _request_principal(request).org_id,
         environment_id,
         revision_id,
@@ -1256,17 +1343,62 @@ def api_network_model_entities(
 @app.post("/api/network-model/import/catalog")
 def api_network_model_import_catalog(request: Request, payload: dict[str, object]) -> dict[str, object]:
     principal = _request_principal(request)
+    delegated_actor = str(payload.get("reviewed_by") or "").strip() if principal.has_role("admin") else ""
     try:
         result = import_catalog_candidate(
             PlatformStore(paths()),
             org_id=principal.org_id,
             environment_id=str(payload.get("environment_id") or "default"),
-            revision_id=str(payload.get("revision_id") or "catalog-import"),
-            created_by=principal.email or principal.user_id or "system",
+            revision_id=str(payload.get("revision_id") or f"catalog-{uuid.uuid4().hex[:12]}"),
+            created_by=delegated_actor or principal.email or principal.user_id or "system",
         )
     except (NetworkModelError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return {"ok": True, **result, "device_connections_opened": 0}
+
+
+@app.get("/api/network-model/conflicts")
+def api_network_model_conflicts(
+    request: Request,
+    environment_id: str = Query(..., min_length=1, max_length=128),
+    status: str = Query(default="open", max_length=32),
+    cursor: str = Query(default="", max_length=500),
+    limit: int = Query(default=50, ge=1, le=100),
+) -> dict[str, object]:
+    result = NetworkModelRepository(PlatformStore(paths())).list_conflicts(
+        _request_principal(request).org_id,
+        environment_id,
+        status=status,
+        cursor=cursor,
+        limit=limit,
+    )
+    return {"ok": True, **result, "device_connections_opened": 0}
+
+
+@app.post("/api/network-model/conflicts/{conflict_id}/resolve")
+def api_network_model_resolve_conflict(
+    request: Request,
+    conflict_id: str,
+    payload: dict[str, object],
+) -> dict[str, object]:
+    principal = _request_principal(request)
+    resolution = payload.get("resolution")
+    delegated_actor = str(payload.get("reviewed_by") or "").strip() if principal.has_role("admin") else ""
+    if not isinstance(resolution, dict) or not resolution:
+        raise HTTPException(status_code=400, detail="resolution is required")
+    try:
+        conflict = NetworkModelRepository(PlatformStore(paths())).resolve_conflict(
+            principal.org_id,
+            str(payload.get("environment_id") or ""),
+            conflict_id,
+            resolved_by=delegated_actor or principal.email or principal.user_id or "system",
+            resolution=resolution,
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"ok": True, "conflict": conflict, "device_connections_opened": 0}
 
 
 @app.post("/api/network-model/import/local-yaml")
@@ -1288,20 +1420,36 @@ def api_network_model_import_local_yaml(request: Request, payload: dict[str, obj
 @app.post("/api/network-model/import/approved-design")
 def api_network_model_import_approved_design(request: Request, payload: dict[str, object]) -> dict[str, object]:
     principal = _request_principal(request)
+    delegated_actor = str(payload.get("reviewed_by") or "").strip() if principal.has_role("admin") else ""
     design = payload.get("design")
     if not isinstance(design, dict):
         raise HTTPException(status_code=400, detail="design must be an approved network-design document")
     try:
+        repository = NetworkModelRepository(PlatformStore(paths()))
         result = import_approved_network_design(
-            NetworkModelRepository(PlatformStore(paths())),
+            repository,
             design,
             org_id=principal.org_id,
             environment_id=str(payload.get("environment_id") or design.get("namespace") or "default"),
-            created_by=principal.email or principal.user_id or "system",
+            created_by=delegated_actor or principal.email or principal.user_id or "system",
+        )
+        checkpoint = approve_with_git(
+            repository,
+            org_id=principal.org_id,
+            environment_id=str(payload.get("environment_id") or design.get("namespace") or "default"),
+            revision_id=result["revision"]["revision_id"],
+            approved_by=delegated_actor or principal.email or principal.user_id or "system",
+            git_root=paths().git_workspace,
         )
     except (NetworkModelError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    return {"ok": True, **result, "device_connections_opened": 0}
+    return {
+        "ok": True,
+        **result,
+        "revision": checkpoint["revision"],
+        "git": checkpoint["git"],
+        "device_connections_opened": 0,
+    }
 
 
 @app.get("/api/network-model/effective")
@@ -1444,13 +1592,39 @@ def api_network_model_from_change(request: Request, payload: dict[str, object]) 
 @app.post("/api/network-model/revisions/{revision_id}/approve")
 def api_network_model_approve(request: Request, revision_id: str, payload: dict[str, object]) -> dict[str, object]:
     principal = _request_principal(request)
+    delegated_actor = str(payload.get("reviewed_by") or "").strip() if principal.has_role("admin") else ""
+    environment_id = str(payload.get("environment_id") or "")
+    repository = NetworkModelRepository(PlatformStore(paths()))
+    cursor = ""
+    while True:
+        page = repository.list_conflicts(
+            principal.org_id,
+            environment_id,
+            status="",
+            cursor=cursor,
+            limit=100,
+        )
+        if any(
+            str(item.get("details", {}).get("revision_id") or "") == revision_id
+            for item in page["conflicts"]
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "This proposal contains identity or site conflicts. Correct the source, "
+                    "resolve the conflict record, and build a fresh proposal before approval."
+                ),
+            )
+        cursor = str(page.get("next_cursor") or "")
+        if not cursor:
+            break
     try:
         result = approve_with_git(
-            NetworkModelRepository(PlatformStore(paths())),
+            repository,
             org_id=principal.org_id,
-            environment_id=str(payload.get("environment_id") or ""),
+            environment_id=environment_id,
             revision_id=revision_id,
-            approved_by=principal.email or principal.user_id or "system",
+            approved_by=delegated_actor or principal.email or principal.user_id or "system",
             git_root=paths().git_workspace,
         )
     except (KeyError, NetworkModelError, ValueError) as exc:
@@ -1461,6 +1635,7 @@ def api_network_model_approve(request: Request, revision_id: str, payload: dict[
 @app.post("/api/network-model/revisions/{revision_id}/activate")
 def api_network_model_activate(request: Request, revision_id: str, payload: dict[str, object]) -> dict[str, object]:
     principal = _request_principal(request)
+    delegated_actor = str(payload.get("reviewed_by") or "").strip() if principal.has_role("admin") else ""
     store = PlatformStore(paths())
     try:
         result = activate_verified_revision(
@@ -1469,7 +1644,7 @@ def api_network_model_activate(request: Request, revision_id: str, payload: dict
             org_id=principal.org_id,
             environment_id=str(payload.get("environment_id") or ""),
             revision_id=revision_id,
-            actor=principal.email or principal.user_id or "system",
+            actor=delegated_actor or principal.email or principal.user_id or "system",
             git_root=paths().git_workspace,
             initial_baseline=bool(payload.get("initial_baseline")),
         )
@@ -1504,11 +1679,16 @@ def api_network_model_active(
     environment_id: str = Query(..., min_length=1, max_length=128),
     include_model: bool = Query(default=False),
 ) -> dict[str, object]:
-    revision = NetworkModelRepository(PlatformStore(paths())).active_revision(
-        _request_principal(request).org_id, environment_id
+    repository = NetworkModelRepository(PlatformStore(paths()))
+    revision = (
+        repository.active_revision(
+            _request_principal(request).org_id, environment_id
+        )
+        if include_model
+        else repository.active_revision_summary(
+            _request_principal(request).org_id, environment_id
+        )
     )
-    if revision is not None and not include_model:
-        revision = {key: value for key, value in revision.items() if key != "model"}
     return {"ok": True, "revision": revision, "device_connections_opened": 0}
 
 
@@ -2010,6 +2190,146 @@ def _runner_read(
     return {"ok": False, "error": f"No runner completed the {action} read within {int(timeout)}s. Is a runner online for this pool? (Setup → Runners)"}
 
 
+def _record_rez_refresh_observations(
+    store: PlatformStore,
+    *,
+    org_id: str,
+    environment_id: str,
+    runner_id: str,
+    result: dict[str, object],
+) -> int:
+    """Project fresh normalized state into observations without storing raw config."""
+    states = result.get("device_states")
+    if not isinstance(states, dict) or not environment_id or not runner_id:
+        return 0
+    repository = NetworkModelRepository(store)
+    recorded = 0
+    for raw_device_id, raw_state in states.items():
+        if not isinstance(raw_state, dict):
+            continue
+        device_id = PlatformStore.normalize_device_identifier(raw_device_id)
+        raw_observed_at = raw_state.get("_collected_at") or result.get("timestamp")
+        try:
+            observed = datetime.fromisoformat(str(raw_observed_at).replace("Z", "+00:00"))
+            if observed.tzinfo is None:
+                raise ValueError("runner timestamp must include a timezone")
+            observed = observed.astimezone(timezone.utc)
+        except (TypeError, ValueError):
+            observed = datetime.now(timezone.utc)
+        expires = observed + timedelta(minutes=10)
+        interfaces_source = raw_state.get("interfaces")
+        interfaces = interfaces_source if isinstance(interfaces_source, dict) else {}
+        safe_interfaces: dict[str, dict[str, object]] = {}
+        for raw_name, raw_interface in interfaces.items():
+            if not isinstance(raw_interface, dict):
+                continue
+            ip_prefixes_source = raw_interface.get("ip_prefixes")
+            ip_prefixes = ip_prefixes_source if isinstance(ip_prefixes_source, list) else []
+            safe_interfaces[str(raw_name)] = {
+                "admin_status": str(
+                    raw_interface.get("admin_state")
+                    or raw_interface.get("admin_status")
+                    or raw_interface.get("admin")
+                    or "unknown"
+                ),
+                "oper_status": str(
+                    raw_interface.get("oper_state")
+                    or raw_interface.get("oper_status")
+                    or raw_interface.get("status")
+                    or "unknown"
+                ),
+                "ip_prefixes": [str(item) for item in ip_prefixes if str(item).strip()][:32],
+            }
+        lldp_source = raw_state.get("lldp_neighbors")
+        lldp = lldp_source if isinstance(lldp_source, list) else []
+        safe_lldp = [
+            {
+                "neighbor_id": str(item.get("neighbor_id") or ""),
+                "local_interface": str(item.get("local_interface") or ""),
+                "neighbor_interface": str(item.get("neighbor_interface") or ""),
+            }
+            for item in lldp[:256]
+            if isinstance(item, dict)
+        ]
+        routing = raw_state.get("routing") if isinstance(raw_state.get("routing"), dict) else {}
+        routes = routing.get("entries") if isinstance(routing.get("entries"), list) else raw_state.get("routes")
+        route_rows = routes if isinstance(routes, list) else []
+        bgp_source = raw_state.get("bgp_neighbors")
+        bgp = bgp_source if isinstance(bgp_source, list) else []
+        ospf_source = raw_state.get("ospf_neighbors")
+        ospf = ospf_source if isinstance(ospf_source, list) else []
+        safe_bgp = [
+            {
+                "neighbor_ip": str(item.get("neighbor_ip") or item.get("neighbor") or ""),
+                "state": str(item.get("state") or "unknown"),
+                "remote_as": item.get("remote_as"),
+            }
+            for item in bgp[:512]
+            if isinstance(item, dict)
+        ]
+        safe_ospf = [
+            {
+                "neighbor_id": str(item.get("neighbor_id") or item.get("router_id") or ""),
+                "state": str(item.get("state") or "unknown"),
+                "interface": str(item.get("interface") or item.get("local_interface") or ""),
+            }
+            for item in ospf[:512]
+            if isinstance(item, dict)
+        ]
+        base = {
+            "schema": NETWORK_OBSERVATION_SCHEMA,
+            "org_id": org_id,
+            "environment_id": environment_id,
+            "source": "ssh_api_collection",
+            "collector_id": runner_id,
+            "observed_at": observed.isoformat().replace("+00:00", "Z"),
+            "expires_at": expires.isoformat().replace("+00:00", "Z"),
+            "validation_grade": "device_authoritative",
+            "subject_id": device_id,
+            "metadata": {
+                "privacy_policy": "rez_control_plane_policy",
+                "raw_configuration_stored": False,
+            },
+        }
+        for domain, facts in (
+            (
+                "topology",
+                {"actual": {"interfaces": safe_interfaces, "lldp_neighbors": safe_lldp}},
+            ),
+            (
+                "routing",
+                {
+                    "actual": {
+                        "route_count": len(route_rows),
+                        "bgp_neighbors": safe_bgp,
+                        "ospf_neighbors": safe_ospf,
+                    }
+                },
+            ),
+        ):
+            identity = json.dumps(
+                {
+                    "runner_id": runner_id,
+                    "observed_at": base["observed_at"],
+                    "device_id": device_id,
+                    "domain": domain,
+                    "facts": facts,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+            document = {
+                **base,
+                "observation_id": f"obs-{hashlib.sha256(identity).hexdigest()[:20]}",
+                "domain": domain,
+                "facts": facts,
+            }
+            stored = repository.record_observation(document)
+            if stored["created"]:
+                recorded += 1
+    return recorded
+
+
 @app.get("/api/local-connectors/{runner_id}/readiness")
 def api_local_connector_readiness(runner_id: str, request: Request) -> dict[str, object]:
     """Return connector-local capability metadata without opening a device session."""
@@ -2084,7 +2404,22 @@ def api_rez_runner_read(request: RunnerReadRequest, http_request: Request, autho
         payload.pop(secret_key, None)
     timeout = max(1.0, min(float(request.timeout or 60.0), 120.0))
     payload["_runner_timeout_seconds"] = timeout
-    return _runner_read(paths(), request.action, payload, _request_principal(http_request).org_id, timeout=timeout)
+    store = PlatformStore(paths())
+    principal = _request_principal(http_request)
+    result = _runner_read(paths(), request.action, payload, principal.org_id, timeout=timeout)
+    if request.action == "rez_refresh_targeted" and result.get("ok"):
+        result["network_model_observations_recorded"] = _record_rez_refresh_observations(
+            store,
+            org_id=principal.org_id,
+            environment_id=str(
+                payload.get("environment_id")
+                or os.environ.get("NETCODE_REZ_ENVIRONMENT_ID")
+                or ""
+            ),
+            runner_id=str(result.get("_runner_id") or ""),
+            result=result,
+        )
+    return result
 
 
 def _collect_rez_state_for_troubleshooting(device) -> dict[str, object]:  # noqa: ANN001
@@ -3140,13 +3475,16 @@ def _persist_intent_verification(
     change_id: str | None,
     verification: dict[str, object],
     passed: bool,
-) -> None:
+    actor: str = "system",
+) -> dict[str, object]:
     if not change_id:
-        return
+        return {"ok": True, "linked_revisions": []}
     try:
         change = store.get_change(change_id)
     except Exception:
-        return
+        return {"ok": True, "linked_revisions": []}
+    prior_state = change.workflow_state
+    prior_status = change.status
     result = dict(change.result or {})
     result["verify_proof"] = verification
     next_state = "verified" if passed else change.workflow_state
@@ -3164,6 +3502,76 @@ def _persist_intent_verification(
         str(verification.get("message") or ("Post-change verification passed." if passed else "Post-change verification failed.")),
         verification,
     )
+    if not passed:
+        return {"ok": True, "linked_revisions": []}
+
+    try:
+        activations = activate_change_candidates(
+            NetworkModelRepository(store),
+            store,
+            org_id=change.org_id,
+            change_id=change.id,
+            actor=actor,
+            git_root=store.paths.git_workspace,
+        )
+    except (KeyError, NetworkModelError, ValueError) as exc:
+        failed_result = dict(result)
+        failed_result["network_model_activation"] = {
+            "ok": False,
+            "error": str(exc),
+        }
+        store.update_change(
+            change.id,
+            prior_status,
+            failed_result,
+            workflow_state=prior_state,
+        )
+        store.record_workflow_event(
+            change.id,
+            "network_model_activation",
+            "verified",
+            prior_state,
+            "Live verification passed, but the Network Model checkpoint failed; the change remains unclosed.",
+            {"error": str(exc)},
+        )
+        return {"ok": False, "error": str(exc), "linked_revisions": []}
+
+    summaries = [
+        {
+            "environment_id": item["revision"]["environment_id"],
+            "revision_id": item["revision"]["revision_id"],
+            "status": item["revision"]["status"],
+            "pending_change_ids": list(item.get("pending_change_ids") or []),
+        }
+        for item in activations
+    ]
+    if summaries:
+        pending = any(item["pending_change_ids"] for item in summaries)
+        completed_result = dict(store.get_change(change.id).result or {})
+        completed_result["network_model_activation"] = {
+            "ok": True,
+            "revisions": summaries,
+            "pending": pending,
+        }
+        store.update_change(
+            change.id,
+            "completed",
+            completed_result,
+            workflow_state="verified",
+        )
+        store.record_workflow_event(
+            change.id,
+            "network_model_pending" if pending else "network_model_activation",
+            "verified",
+            "verified",
+            (
+                "Live verification passed; the shared model candidate is waiting for the remaining fleet targets."
+                if pending
+                else "Verified intended state promoted to the active Network Model."
+            ),
+            {"revisions": summaries},
+        )
+    return {"ok": True, "linked_revisions": summaries}
 
 
 @app.post("/api/verify/intent")
@@ -3180,12 +3588,24 @@ def api_verify_intent(request: IntentPathRequest, http_request: Request) -> dict
         result = _runner_read(p, "verify", payload, _request_principal(http_request).org_id)
         verification = dict(result.get("verification") or result)
         verification.setdefault("ok", result.get("ok"))
-        _persist_intent_verification(
+        model_lifecycle = _persist_intent_verification(
             PlatformStore(p),
             change_id=request.change_id,
             verification=verification,
             passed=bool(result.get("ok")),
+            actor=(
+                _request_principal(http_request).email
+                or _request_principal(http_request).user_id
+                or "system"
+            ),
         )
+        result["network_model"] = model_lifecycle
+        if not model_lifecycle.get("ok"):
+            result["ok"] = False
+            result["message"] = (
+                "Live verification passed, but the Network Model checkpoint failed: "
+                + str(model_lifecycle.get("error") or "unknown error")
+            )
         handoff = attach_verification_handoff(
             PlatformStore(p),
             change_id=request.change_id,
@@ -3219,12 +3639,20 @@ def api_verify_intent(request: IntentPathRequest, http_request: Request) -> dict
         "change_type": intent.change_type,
         "verification": verification.__dict__,
     }
-    _persist_intent_verification(
+    model_lifecycle = _persist_intent_verification(
         PlatformStore(p),
         change_id=request.change_id,
         verification={"ok": verification.status == "pass", **verification.__dict__},
         passed=verification.status == "pass",
+        actor=(
+            _request_principal(http_request).email
+            or _request_principal(http_request).user_id
+            or "system"
+        ),
     )
+    response["network_model"] = model_lifecycle
+    if not model_lifecycle.get("ok"):
+        response["ok"] = False
     handoff = attach_verification_handoff(
         PlatformStore(p),
         change_id=request.change_id,
@@ -3310,7 +3738,7 @@ def _rollout_or_404(rollout_id: str, org: str) -> dict[str, object]:
 def api_fleet_rollout_create(request: FleetRolloutRequest, http_request: Request) -> dict[str, object]:
     principal = _request_principal(http_request)
     try:
-        return plan_fleet_rollout(
+        rollout = plan_fleet_rollout(
             paths(),
             change_type=request.change_type, values=request.values,
             device_ids=request.device_ids, device_group=request.device_group,
@@ -3319,7 +3747,39 @@ def api_fleet_rollout_create(request: FleetRolloutRequest, http_request: Request
             requested_by=principal.email or "netcode-user",
             org_id=principal.org_id, created_by_user_id=principal.user_id,
         )
-    except ValueError as exc:
+        environment_id = request.environment_id.strip()
+        model_revision_id = request.model_revision_id.strip()
+        if bool(environment_id) != bool(model_revision_id):
+            raise ValueError("environment_id and model_revision_id must be supplied together")
+        if environment_id:
+            targets = [
+                target
+                for wave in rollout.get("waves", [])
+                for target in wave.get("targets", [])
+                if isinstance(target, dict)
+            ]
+            if not targets:
+                raise ValueError("rollout has no model candidate targets")
+            intent = load_intent(Path(str(targets[0]["intent_path"]))).model_dump(mode="json")
+            candidate = create_candidate_for_change_set(
+                NetworkModelRepository(PlatformStore(paths())),
+                PlatformStore(paths()),
+                org_id=principal.org_id,
+                environment_id=environment_id,
+                parent_revision_id=model_revision_id,
+                revision_id=f"rollout-{str(rollout['id']).lower()}",
+                change_ids=[str(target.get("change_id") or "") for target in targets],
+                intent=intent,
+                device_ids=[str(target.get("device_id") or "") for target in targets],
+                created_by=principal.email or principal.user_id or "netcode-user",
+            )
+            rollout["network_model"] = {
+                "environment_id": environment_id,
+                "parent_revision_id": model_revision_id,
+                "candidate_revision_id": candidate["revision_id"] if candidate else "",
+            }
+        return rollout
+    except (NetworkModelError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
@@ -3511,13 +3971,35 @@ def api_change_approve(change_id: str, request: ApproveRequest, http_request: Re
                             detail=f"Only a dry-run-proven change can be approved (state: {change.workflow_state}).")
     approver = _approver_identity(principal, request.approved_by, change.requested_by,
                                   getattr(principal, "user_id", None), change.created_by_user_id)
+    try:
+        model_approvals = approve_change_candidates(
+            NetworkModelRepository(store),
+            org_id=principal.org_id,
+            change_id=change_id,
+            approved_by=approver,
+            git_root=p.git_workspace,
+        )
+    except (KeyError, NetworkModelError, ValueError) as exc:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Network Model approval failed; the device change remains locked: {exc}",
+        ) from exc
     store.record_workflow_event(
         change_id, "approve", change.workflow_state, "approved",
         f"Approved by {approver} (requester: {change.requested_by}).",
-        {"approved_by": approver, "requested_by": change.requested_by},
+        {
+            "approved_by": approver,
+            "requested_by": change.requested_by,
+            "network_model_revisions": [
+                item["revision"]["revision_id"] for item in model_approvals
+            ],
+        },
     )
     return {"ok": True, "change": record_to_dict(store.get_change(change_id)),
             "approved_by": approver,
+            "network_model": {
+                "approved_revisions": [item["revision"]["revision_id"] for item in model_approvals]
+            },
             "message": f"Approved by {approver}. Apply is now unlocked."}
 
 
@@ -3847,8 +4329,23 @@ def api_fleet_rollout_approve(rollout_id: str, request: ApproveRequest, http_req
     approver = _approver_identity(principal, request.approved_by, str(rollout.get("requested_by") or ""),
                                   getattr(principal, "user_id", None), rollout.get("created_by_user_id"))
     try:
+        store = PlatformStore(paths())
+        target_change_ids = {
+            str(target.get("change_id") or "")
+            for wave in rollout.get("waves", [])
+            for target in wave.get("targets", [])
+            if isinstance(target, dict) and target.get("change_id")
+        }
+        for change_id in sorted(target_change_ids):
+            approve_change_candidates(
+                NetworkModelRepository(store),
+                org_id=principal.org_id,
+                change_id=change_id,
+                approved_by=approver,
+                git_root=paths().git_workspace,
+            )
         return approve_rollout(paths(), rollout_id, approver)
-    except ValueError as exc:
+    except (KeyError, NetworkModelError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
@@ -3972,6 +4469,13 @@ def api_change_from_rca(request: RcaRemediationProposalRequest, http_request: Re
         for item in ((intent.get("targets") or {}).get("device_ids") or [])
         if str(item).strip()
     ]
+    environment_id = request.environment_id.strip()
+    model_revision_id = request.model_revision_id.strip()
+    if bool(environment_id) != bool(model_revision_id):
+        raise HTTPException(
+            status_code=400,
+            detail="environment_id and model_revision_id must be supplied together.",
+        )
 
     if pipeline.status == "pass" and intent.get("change_type") == "routing_redistribution" and len(target_ids) > 1:
         redistribution = dict(intent.get("redistribution") or {})
@@ -4014,6 +4518,26 @@ def api_change_from_rca(request: RcaRemediationProposalRequest, http_request: Re
             for target in wave.get("targets", [])
             if isinstance(target, dict)
         ]
+        candidate = None
+        if environment_id:
+            change_ids = [str(target.get("change_id") or "") for target in target_rows]
+            candidate = create_candidate_for_change_set(
+                NetworkModelRepository(store),
+                store,
+                org_id=principal.org_id,
+                environment_id=environment_id,
+                parent_revision_id=model_revision_id,
+                revision_id=f"rollout-{str(rollout['id']).lower()}",
+                change_ids=change_ids,
+                intent=intent,
+                device_ids=target_ids,
+                created_by=principal.email or principal.user_id or requested_by,
+            )
+            rollout_evidence["network_model"] = {
+                "environment_id": environment_id,
+                "parent_revision_id": model_revision_id,
+                "candidate_revision_id": candidate["revision_id"] if candidate else "",
+            }
         for target in target_rows:
             change_id = str(target.get("change_id") or "")
             if not change_id:
@@ -4049,6 +4573,7 @@ def api_change_from_rca(request: RcaRemediationProposalRequest, http_request: Re
             "change": record_to_dict(canary_change) if canary_change else None,
             "intent_path": canary.get("intent_path") or str(intent_path),
             "intent": intent,
+            "network_model": rollout_evidence.get("network_model"),
         }
 
     change = store.create_change(
@@ -4058,6 +4583,19 @@ def api_change_from_rca(request: RcaRemediationProposalRequest, http_request: Re
         org_id=principal.org_id,
         created_by_user_id=principal.user_id,
     )
+    candidate = None
+    if environment_id and pipeline.status == "pass":
+        candidate = create_candidate_for_change_intent(
+            NetworkModelRepository(store),
+            store,
+            org_id=principal.org_id,
+            environment_id=environment_id,
+            parent_revision_id=model_revision_id,
+            change_id=change.id,
+            intent=intent,
+            device_id=target_ids[0] if target_ids else str(target_device or ""),
+            created_by=principal.email or principal.user_id or requested_by,
+        )
     evidence = {
         "source": "rez_rca",
         "draft_only": True,
@@ -4070,6 +4608,11 @@ def api_change_from_rca(request: RcaRemediationProposalRequest, http_request: Re
         "rationale": request.rationale,
         "confidence": request.confidence,
         "evidence_refs": request.evidence_refs,
+        "network_model": {
+            "environment_id": environment_id,
+            "parent_revision_id": model_revision_id,
+            "candidate_revision_id": candidate["revision_id"] if candidate else "",
+        },
         "pipeline": pipeline.model_dump(),
         "plan": {
             "commands": pipeline.render.config,
@@ -4106,6 +4649,7 @@ def api_change_from_rca(request: RcaRemediationProposalRequest, http_request: Re
         "intent_path": str(intent_path),
         "intent": intent,
         "workflow": workflow_snapshot(change.workflow_state).as_dict(),
+        "network_model": evidence["network_model"],
     }
 
 
@@ -4246,6 +4790,12 @@ def api_change_record(change_id: str, request: Request) -> dict[str, object]:
     validation = result.get("validation") or durable_validation
     render = result.get("render") or durable_render
     intent_info = result.get("intent") or durable_intent
+    rollback_value = plan.get("rollback") if isinstance(plan, dict) else None
+    rollback_plan = (
+        dict(rollback_value)
+        if isinstance(rollback_value, dict)
+        else {"commands": str(rollback_value or "")}
+    )
     jobs = [record_to_dict(j) for j in store.list_jobs(limit=200) if j.change_id == change_id]
     events = [record_to_dict(e) for e in store.list_workflow_events(change_id)]
 
@@ -4301,6 +4851,11 @@ def api_change_record(change_id: str, request: Request) -> dict[str, object]:
         evidence = {"available": False, "message": f"Git evidence unavailable: {exc}"}
     git_status = git_workspace_status(git_root)
     git_actions = [e for e in events if str(e.get("action", "")) in ("git_commit", "git_push")]
+    model_revisions = NetworkModelRepository(store).revisions_for_link(
+        change.org_id,
+        link_type="change",
+        external_id=change.id,
+    )
 
     return {
         "ok": True,
@@ -4322,7 +4877,7 @@ def api_change_record(change_id: str, request: Request) -> dict[str, object]:
             "commands": render.get("config") or "",
             "risk": plan.get("risk"),
             "blast_radius": plan.get("blast_radius") or {},
-            "rollback": plan.get("rollback") or {},
+            "rollback": rollback_plan,
             "checks": plan.get("checks") or {},
             "suggested_branch": plan.get("suggested_branch"),
             "lab_write_supported": plan.get("lab_write_supported"),
@@ -4345,6 +4900,17 @@ def api_change_record(change_id: str, request: Request) -> dict[str, object]:
         "verify_proof": verify_proof(),
         "rollback_record": proof_for("rollback"),
         "diagnostics_handoffs": list(result.get("diagnostics_handoffs") or []),
+        "network_model": {
+            "revisions": [
+                {
+                    "environment_id": revision["environment_id"],
+                    "revision_id": revision["revision_id"],
+                    "parent_revision_id": revision.get("parent_revision_id"),
+                    "status": revision["status"],
+                }
+                for revision in model_revisions
+            ]
+        },
         "git": {
             "workspace": str(git_root),
             "isolated_from_application": True,

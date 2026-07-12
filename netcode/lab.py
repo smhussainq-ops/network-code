@@ -564,6 +564,23 @@ class AristaEOSLabAdapter(ExecutionAdapter):
         )
 
     def _verify_interface(self, intent: InterfaceConfigIntent, present: bool) -> LabResult:
+        if intent.interface.apply_scope == "admin_state":
+            command = f"show interfaces {intent.interface.name}"
+            output = self.show(command)
+            administratively_down = "administratively down" in output.lower()
+            expected_enabled = intent.interface.enabled if present else not intent.interface.enabled
+            matched = not administratively_down if expected_enabled else administratively_down
+            return LabResult(
+                status="pass" if matched else "fail",
+                action="verify" if present else "verify_rollback",
+                device_id=self.device.id,
+                message=(
+                    f"Interface {intent.interface.name} administrative state "
+                    f"{'matches' if matched else 'does not match'} the expected "
+                    f"{'enabled' if expected_enabled else 'disabled'} state."
+                ),
+                evidence={"commands": {command: output}, "expected_enabled": expected_enabled},
+            )
         command = f"show running-config interfaces {intent.interface.name}"
         output = self.show(command)
         expected = f"interface {intent.interface.name}"

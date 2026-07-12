@@ -16,6 +16,12 @@ from netcode.inventory import Inventory
 from netcode.firewall_managers import ManagerJobRequest, WRITE_ACTIONS
 from netcode.lab import run_arista_end_to_end, run_lab_action
 from netcode.models import load_intent
+from netcode.network_model import NetworkModelError
+from netcode.network_model_lifecycle import (
+    assert_change_model_rollback_is_current,
+    rollback_change_candidates,
+)
+from netcode.network_model_store import NetworkModelRepository
 from netcode.paths import WorkspacePaths
 from netcode.rendering import render_intent
 from netcode.store import PlatformStore, record_to_dict
@@ -108,6 +114,12 @@ class JobRunner:
             }
         try:
             require_action_allowed(change.workflow_state, action)
+            if action == "rollback":
+                assert_change_model_rollback_is_current(
+                    NetworkModelRepository(self.store),
+                    org_id=change.org_id,
+                    change_id=change.id,
+                )
         except Exception as exc:
             blocked = {"status": "fail", "message": str(exc), "workflow_state": change.workflow_state}
             self.store.record_workflow_event(
@@ -187,9 +199,59 @@ class JobRunner:
                 str(result.get("message", "")),
                 {"job_id": job.id, "status": status},
             )
+            model_error = ""
+            if action == "rollback" and status == "completed":
+                try:
+                    model_rollbacks = rollback_change_candidates(
+                        NetworkModelRepository(self.store),
+                        self.store,
+                        org_id=change.org_id,
+                        change_id=change.id,
+                        actor="local-executor",
+                        git_root=self.paths.git_workspace,
+                    )
+                    result = dict(result)
+                    result["network_model_rollback"] = {
+                        "ok": True,
+                        "revisions": [
+                            item["revision"]["revision_id"] for item in model_rollbacks
+                        ],
+                    }
+                    self.store.update_change(
+                        change.id,
+                        status,
+                        result,
+                        workflow_state=workflow.state,
+                    )
+                    self.store.record_workflow_event(
+                        change.id,
+                        "network_model_rollback",
+                        workflow.state,
+                        workflow.state,
+                        "Verified device rollback restored the linked Network Model parent.",
+                        result["network_model_rollback"],
+                    )
+                except (KeyError, NetworkModelError, ValueError) as exc:
+                    model_error = str(exc)
+                    result = dict(result)
+                    result["network_model_rollback"] = {"ok": False, "error": model_error}
+                    self.store.update_change(
+                        change.id,
+                        "blocked",
+                        result,
+                        workflow_state=workflow.state,
+                    )
+                    self.store.record_workflow_event(
+                        change.id,
+                        "network_model_rollback",
+                        workflow.state,
+                        workflow.state,
+                        "Device rollback passed, but the Network Model checkpoint failed.",
+                        result["network_model_rollback"],
+                    )
             final_job = self.store.update_job(job.id, status, str(result.get("message", "")), result)
             return {
-                "ok": result.get("status") == "pass",
+                "ok": result.get("status") == "pass" and not model_error,
                 "change": record_to_dict(self.store.get_change(change.id)),
                 "job": record_to_dict(final_job),
                 "result": result,

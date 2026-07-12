@@ -134,6 +134,7 @@ def _build_interface(common: dict, values: dict, device_id: str) -> dict:
         "name": str(values.get("interface", "Ethernet1")),
         "description": str(values.get("description", "")),
         "enabled": bool(values.get("enabled", True)),
+        "apply_scope": str(values.get("apply_scope", "full")),
         "mode": str(values.get("mode", "access")),
         "access_vlan": int(values["access_vlan"]) if values.get("access_vlan") not in (None, "") else None,
         "trunk_allowed_vlans": trunk_vlans,
@@ -149,13 +150,32 @@ def _blast_interface(intent: InterfaceConfigIntent) -> list:
     return objects
 
 
+def _rollback_interface(intent: InterfaceConfigIntent) -> str:
+    if intent.interface.apply_scope == "admin_state":
+        inverse = "shutdown" if intent.interface.enabled else "no shutdown"
+        return f"interface {intent.interface.name}\n   {inverse}\n"
+    return f"default interface {intent.interface.name}\n"
+
+
+def _rollback_confidence_interface(intent: InterfaceConfigIntent) -> dict:
+    if intent.interface.apply_scope == "admin_state":
+        return {
+            "level": "high",
+            "reason": "Restores only the inverse administrative state without changing unrelated interface configuration.",
+        }
+    return {
+        "level": "medium",
+        "reason": "Resets the interface to defaults; full interface changes require explicit review of the generated rollback.",
+    }
+
+
 register(ChangeTypeSpec(
     key="interface_config", label="Interface Config", model=InterfaceConfigIntent, template="interface_config.j2",
     risk="Medium: interface behavior can affect connected hosts", lab_write=True, build=_build_interface,
     title=lambda i: f"Configure {i.interface.name}",
     slug=lambda i: f"{i.site}-interface-{safe_name(i.interface.name)}",
-    rollback=lambda i: f"default interface {i.interface.name}\n",
-    rollback_confidence=lambda i: {"level": "medium", "reason": "Resets the interface to defaults; does not restore captured pre-change state."},
+    rollback=_rollback_interface,
+    rollback_confidence=_rollback_confidence_interface,
     blast_objects=_blast_interface,
     checks=lambda i: {
         "pre": [{"id": "interface_exists", "description": f"Interface {i.interface.name} exists on the target device.", "executable": False, "note": "Live pre-check not wired yet."}],

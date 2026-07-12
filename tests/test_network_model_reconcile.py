@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -195,3 +196,78 @@ def test_user_cannot_forge_validated_live_observation_but_connector_can(tmp_path
     assert listed.status_code == 200
     assert listed.json()["returned"] == 1
     assert listed.json()["device_connections_opened"] == 0
+
+
+def test_rez_refresh_projects_only_safe_fresh_observations_and_replay_is_idempotent(tmp_path: Path):
+    workspace = WorkspacePaths(tmp_path)
+    init_workspace(workspace)
+    store = PlatformStore(workspace)
+    result = {
+        "ok": True,
+        "timestamp": "2026-07-12T12:00:00+00:00",
+        "device_states": {
+            "EDGE-1": {
+                "_collected_at": "2026-07-12T12:00:00+00:00",
+                "interfaces": {
+                    "Ethernet1": {
+                        "admin_state": "up",
+                        "oper_state": "up",
+                        "ip_prefixes": ["192.0.2.1/30"],
+                        "raw_command": "show running-config",
+                    },
+                    "Ethernet2": {
+                        "status": "down",
+                        "ip_prefixes": "must-not-be-split-into-characters",
+                    },
+                },
+                "routes": [{"prefix": "0.0.0.0/0"}],
+                "bgp_neighbors": [{"neighbor_ip": "192.0.2.2", "state": "Established", "remote_as": 65001}],
+                "ospf_neighbors": [{"neighbor_id": "10.0.0.2", "state": "FULL", "interface": "Ethernet1"}],
+                "lldp_neighbors": [
+                    {"neighbor_id": "core-1", "local_interface": "Ethernet1", "neighbor_interface": "Ethernet2"}
+                ],
+                "running_config": "username admin secret forbidden",
+                "password": "must-never-persist",
+            }
+        },
+    }
+
+    first = api._record_rez_refresh_observations(
+        store,
+        org_id="org-default",
+        environment_id="pilot-a",
+        runner_id="connector-1",
+        result=result,
+    )
+    replay = api._record_rez_refresh_observations(
+        store,
+        org_id="org-default",
+        environment_id="pilot-a",
+        runner_id="connector-1",
+        result=result,
+    )
+
+    assert first == 2
+    assert replay == 0
+    observations = NetworkModelRepository(store).list_observations(
+        "org-default", "pilot-a", subject_id="edge-1", limit=10
+    )["observations"]
+    assert len(observations) == 2
+    assert {item["domain"] for item in observations} == {"routing", "topology"}
+    for observation in observations:
+        assert observation["collector_id"] == "connector-1"
+        assert observation["validation_grade"] == "device_authoritative"
+        assert observation["observed_at"] == "2026-07-12T12:00:00Z"
+        assert observation["expires_at"] == "2026-07-12T12:10:00Z"
+        assert observation["metadata"] == {
+            "privacy_policy": "rez_control_plane_policy",
+            "raw_configuration_stored": False,
+        }
+    serialized = json.dumps(observations)
+    assert "must-never-persist" not in serialized
+    assert "username admin" not in serialized
+    assert "show running-config" not in serialized
+    topology = next(item for item in observations if item["domain"] == "topology")
+    assert topology["facts"]["actual"]["interfaces"]["Ethernet1"]["admin_status"] == "up"
+    assert topology["facts"]["actual"]["interfaces"]["Ethernet1"]["oper_status"] == "up"
+    assert topology["facts"]["actual"]["interfaces"]["Ethernet2"]["ip_prefixes"] == []

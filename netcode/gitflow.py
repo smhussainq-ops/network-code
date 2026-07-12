@@ -489,15 +489,11 @@ def setup_git_workspace(root: Path, repo_url: str = "", branch: str = "main") ->
     repo_url = repo_url.strip()
     steps: list[dict[str, Any]] = []
 
-    inside = subprocess.run(
-        ["git", "rev-parse", "--is-inside-work-tree"],
-        cwd=root,
-        check=False,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
-    if inside.returncode != 0 or inside.stdout.strip() != "true":
+    # A change-history directory commonly lives inside the Netcode source
+    # worktree.  `git rev-parse` would walk upward and mistake that parent for
+    # the audit repository, so require a Git directory rooted here.
+    local_git = root / ".git"
+    if not local_git.exists():
         steps.append(_run_git_step(root, ["init", "-b", branch]))
     else:
         current_branch = _run_git(root, ["branch", "--show-current"])

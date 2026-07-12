@@ -3,7 +3,9 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+from fastapi.testclient import TestClient
 
+from netcode import api
 from netcode.bootstrap import init_workspace
 from netcode.network_model import NetworkModelError
 from netcode.network_model_import import (
@@ -11,6 +13,7 @@ from netcode.network_model_import import (
     import_approved_network_design,
     import_catalog_candidate,
 )
+from netcode.network_model_lifecycle import approve_with_git
 from netcode.network_model_store import NetworkModelRepository
 from netcode.paths import WorkspacePaths
 from netcode.runner_hub import enroll_runner, mint_join_token
@@ -164,3 +167,120 @@ def test_approved_design_cannot_invent_manual_authority_when_source_is_missing(t
             environment_id="pilot-a",
             created_by="marcus",
         )
+
+
+def test_human_approval_converts_discovery_proposal_to_reviewed_intent(tmp_path: Path):
+    store = _store(tmp_path)
+    runner = _runner(store)
+    store.sync_runner_devices(runner, [_device(1)], revision="first")
+    imported = import_catalog_candidate(
+        store,
+        org_id="org_default",
+        environment_id="pilot-a",
+        revision_id="catalog-reviewed",
+        created_by="marcus",
+    )
+
+    approved = approve_with_git(
+        NetworkModelRepository(store),
+        org_id="org_default",
+        environment_id="pilot-a",
+        revision_id=imported["revision"]["revision_id"],
+        approved_by="marcus",
+        git_root=WorkspacePaths(tmp_path).git_workspace,
+    )["revision"]
+
+    assert approved["status"] == "approved"
+    assert approved["source"]["type"] == "manual_review"
+    assert approved["source"]["reference"].startswith("reviewed:discovery:device-catalog:")
+    assert approved["authority_bindings"]["identity"] == {
+        "source": "manual_review",
+        "mode": "authoritative",
+    }
+
+
+def test_catalog_import_records_conflicts_without_approving_ambiguous_identity(tmp_path: Path):
+    store = _store(tmp_path)
+    runner = _runner(store)
+    first = _device(1)
+    second = _device(2)
+    first["host"] = "duplicate.example.net"
+    second["host"] = "DUPLICATE.EXAMPLE.NET"
+    second.pop("site")
+    store.sync_runner_devices(runner, [first, second], revision="ambiguous")
+
+    imported = import_catalog_candidate(
+        store,
+        org_id="org_default",
+        environment_id="pilot-a",
+        revision_id="catalog-conflicts",
+        created_by="marcus",
+    )
+    conflicts = NetworkModelRepository(store).list_conflicts(
+        "org_default", "pilot-a", status="open"
+    )["conflicts"]
+
+    assert imported["revision"]["status"] == "proposed"
+    assert imported["conflicts"] == 2
+    assert {item["domain"] for item in conflicts} == {"identity", "sites"}
+    assert all(item["status"] == "open" for item in conflicts)
+    assert all("host" not in device for device in imported["revision"]["model"]["devices"].values())
+
+
+def test_catalog_api_generates_revision_and_preserves_delegated_reviewer(tmp_path: Path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    store = _store(tmp_path)
+    runner = _runner(store)
+    store.sync_runner_devices(runner, [_device(1)], revision="clean")
+    client = TestClient(api.app)
+
+    imported = client.post(
+        "/api/network-model/import/catalog",
+        json={"environment_id": "pilot-a", "reviewed_by": "marcus"},
+    )
+    assert imported.status_code == 200, imported.text
+    revision_id = imported.json()["revision"]["revision_id"]
+    assert revision_id.startswith("catalog-")
+
+    approved = client.post(
+        f"/api/network-model/revisions/{revision_id}/approve",
+        json={"environment_id": "pilot-a", "reviewed_by": "marcus"},
+    )
+    assert approved.status_code == 200, approved.text
+    assert approved.json()["revision"]["approval"]["approved_by"] == "marcus"
+
+
+def test_conflicted_catalog_revision_cannot_be_approved_even_after_acknowledgement(tmp_path: Path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    store = _store(tmp_path)
+    runner = _runner(store)
+    device = _device(1)
+    device.pop("site")
+    store.sync_runner_devices(runner, [device], revision="missing-site")
+    client = TestClient(api.app)
+
+    imported = client.post(
+        "/api/network-model/import/catalog",
+        json={"environment_id": "pilot-a", "revision_id": "catalog-needs-review"},
+    )
+    assert imported.status_code == 200
+    conflicts = client.get(
+        "/api/network-model/conflicts",
+        params={"environment_id": "pilot-a"},
+    ).json()["conflicts"]
+    assert len(conflicts) == 1
+    resolved = client.post(
+        f"/api/network-model/conflicts/{conflicts[0]['conflict_id']}/resolve",
+        json={
+            "environment_id": "pilot-a",
+            "resolution": {"action": "corrected_in_source"},
+        },
+    )
+    assert resolved.status_code == 200
+
+    blocked = client.post(
+        "/api/network-model/revisions/catalog-needs-review/approve",
+        json={"environment_id": "pilot-a"},
+    )
+    assert blocked.status_code == 409
+    assert "fresh proposal" in blocked.json()["detail"]

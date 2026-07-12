@@ -19,6 +19,7 @@ interface Vlan{{ vlan.id }}
 
 
 INTERFACE_CONFIG_TEMPLATE = """interface {{ interface.name }}
+{% if interface.apply_scope != "admin_state" %}
 {% if interface.description %}
    description {{ interface.description }}
 {% endif %}
@@ -33,6 +34,7 @@ INTERFACE_CONFIG_TEMPLATE = """interface {{ interface.name }}
 {% elif interface.mode == "routed" %}
    no switchport
    ip address {{ interface.ip_address }}
+{% endif %}
 {% endif %}
 {% if interface.enabled %}
    no shutdown

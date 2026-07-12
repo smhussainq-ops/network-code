@@ -20,6 +20,9 @@ import time
 import uuid
 from typing import Any
 
+from netcode.network_model import NetworkModelError
+from netcode.network_model_lifecycle import rollback_change_candidates
+from netcode.network_model_store import NetworkModelRepository
 from netcode.store import (
     JobRecord,
     PlatformStore,
@@ -326,6 +329,44 @@ def submit_job_result(
         str(result.get("message", "")),
         {"job_id": job.id, "status": status, "runner_id": runner.id, "signature_valid": True},
     )
+    model_error = ""
+    if transition_action == "rollback" and passed:
+        try:
+            model_rollbacks = rollback_change_candidates(
+                NetworkModelRepository(store),
+                store,
+                org_id=change.org_id,
+                change_id=change.id,
+                actor=f"local-connector:{runner.id}",
+                git_root=store.paths.git_workspace,
+            )
+            result = dict(result)
+            result["network_model_rollback"] = {
+                "ok": True,
+                "revisions": [item["revision"]["revision_id"] for item in model_rollbacks],
+            }
+            store.update_change(change.id, status, result, workflow_state=workflow.state)
+            store.record_workflow_event(
+                change.id,
+                "network_model_rollback",
+                workflow.state,
+                workflow.state,
+                "Verified device rollback restored the linked Network Model parent.",
+                result["network_model_rollback"],
+            )
+        except (KeyError, NetworkModelError, ValueError) as exc:
+            model_error = str(exc)
+            result = dict(result)
+            result["network_model_rollback"] = {"ok": False, "error": model_error}
+            store.update_change(change.id, "blocked", result, workflow_state=workflow.state)
+            store.record_workflow_event(
+                change.id,
+                "network_model_rollback",
+                workflow.state,
+                workflow.state,
+                "Device rollback passed, but the Network Model checkpoint failed.",
+                result["network_model_rollback"],
+            )
     final_job = store.update_job(job.id, status, str(result.get("message", "")), result)
     store.record_job_signature(job.id, signature)
     store.touch_runner(runner.id, status="online")
@@ -334,7 +375,11 @@ def submit_job_result(
         "job": record_to_dict(final_job),
         "change": record_to_dict(store.get_change(change.id)),
         "workflow_state": workflow.state,
-        "message": f"Result accepted; change moved to {workflow.state}.",
+        "message": (
+            f"Result accepted; change moved to {workflow.state}."
+            if not model_error
+            else "Device rollback was accepted, but Network Model reconciliation is blocked."
+        ),
     }
 
 

@@ -2,10 +2,27 @@
 
 **Date:** 2026-07-12
 
-**Status:** Proposed for review
+**Status:** Implemented and validated for the pilot foundation
 
 **Scope:** Netcode, Rez Diagnostics, Digital Twin, Shell, and the Local Connector
-**Implementation status:** Plan only; no runtime behavior is changed by this document
+**Implementation status:** Slices 1-8 are implemented across Netcode and Rez. The authority, repository, import, compiler, observation, Git lifecycle, native-consumer, UI, scale, rollback, and Marcus end-to-end gates are covered by tests and live proof. Optional NetBox, Infoblox, and controller-authority connectors remain deliberately deferred.
+
+## Implementation outcome
+
+The native Rezonance Network Model is now the shared operational authority for Netcode, Rez Diagnostics, Digital Twin, and Shell.
+
+| Slice | Outcome | Primary checkpoint |
+|---|---|---|
+| 1 | Domain authority, revision, observation, and no-secret contracts | `6bc2c63` |
+| 2 | Durable SQLite/PostgreSQL-ready model repository and bounded queries | `cb36613` |
+| 3 | Identity-safe, idempotent model imports and conflict handling | `d55ca6c` |
+| 4 | Deterministic effective-intent compiler with explicit unknown coverage | `6718948` |
+| 5 | Fresh observation ingestion and approved-versus-observed reconciliation | `4a77da3` |
+| 6 | Human approval, isolated Git history, verified activation, and model rollback | `7d55bbe` plus final lifecycle commit |
+| 7 | Model-scoped planning and native Rez/Digital Twin/Shell consumers | `3690721`, `c4ef697`, plus final consumer commits |
+| 8 | Network Model UI, RBAC, scale, Marcus E2E, and adversarial rollback recovery | final Netcode and Rez commits |
+
+Detailed evidence, exact IDs, test counts, and residual test debt are recorded in `REZONANCE_OPERATIONAL_SOURCE_OF_TRUTH_VALIDATION_2026-07-12.md`.
 
 ## Executive decision
 
@@ -494,6 +511,6 @@ The source-of-truth foundation is complete only when:
 - 10,000-device scale and tenant isolation tests pass;
 - the Marcus scenario passes end to end without lab-specific constants or manual scripting.
 
-## Recommended execution order
+## Completed execution and next boundary
 
-Approve this architecture first, then execute Slices 1-8 in order. Do not begin a NetBox or Infoblox connector before the native authority, revision, reconciliation, and consumer contracts are complete. Otherwise an external connector will only add another competing store and reproduce the current fragmentation.
+Slices 1-8 were executed in order and the native authority, revision, reconciliation, consumer, scale, and rollback contracts are now in place. Do not begin a NetBox or Infoblox connector until a customer requires it. Any future connector must enter through the same proposal, authority, conflict, approval, freshness, and audit contracts rather than becoming another competing store.

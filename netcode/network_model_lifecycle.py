@@ -6,13 +6,28 @@ import copy
 from typing import Any, Mapping, Sequence
 
 from netcode.gitflow import commit_change_artifacts, materialize_model_revision, setup_git_workspace
-from netcode.network_model import NETWORK_MODEL_SCHEMA, NetworkModelError, utc_now
+from netcode.network_model import (
+    NETWORK_MODEL_SCHEMA,
+    NetworkModelError,
+    prepare_reviewed_approval,
+    utc_now,
+)
 from netcode.network_model_store import NetworkModelRepository
 from netcode.store import PlatformStore
 
 
 VERIFIED_CHANGE_STATES = {"verified", "completed"}
-ROLLBACK_CHANGE_STATES = {"rolled_back", "verified", "completed"}
+ROLLBACK_CHANGE_STATES = {"rolled_back"}
+
+CHANGE_MODEL_DOMAINS = {
+    "add_vlan": "topology",
+    "interface_config": "topology",
+    "bgp_neighbor": "routing",
+    "acl_rule": "security_policy",
+    "site_device_intent": "identity",
+    "ntp_standardize": "golden_standards",
+    "routing_redistribution": "route_propagation",
+}
 
 
 def _dict(value: Any) -> dict[str, Any]:
@@ -44,6 +59,358 @@ def model_diff(before: Any, after: Any, path: str = "") -> list[dict[str, Any]]:
     if before != after:
         return [{"path": path or "model", "action": "replace", "before": before, "after": after}]
     return []
+
+
+def model_patch_from_intent(
+    intent: Mapping[str, Any],
+    *,
+    device_id: str,
+) -> tuple[dict[str, Any], list[str]]:
+    """Translate typed intent into model data without importing raw CLI.
+
+    Custom configuration intentionally has no mapping. A raw command blob is an
+    execution artifact, not approved operational intent.
+    """
+    change_type = str(intent.get("change_type") or "").strip()
+    domain = CHANGE_MODEL_DOMAINS.get(change_type)
+    site = str(intent.get("site") or "").strip()
+    if not domain or not site or not device_id:
+        return {}, []
+
+    if change_type == "add_vlan":
+        vlan = _dict(intent.get("vlan"))
+        identity = str(vlan.get("id") or vlan.get("vlan_id") or "").strip()
+        domain_intent = {"vlans": {identity: vlan}} if identity and vlan else {}
+    elif change_type == "interface_config":
+        interface = _dict(intent.get("interface"))
+        identity = str(interface.get("name") or "").strip()
+        domain_intent = {"interfaces": {identity: interface}} if identity and interface else {}
+    elif change_type == "bgp_neighbor":
+        bgp = _dict(intent.get("bgp"))
+        identity = str(bgp.get("neighbor_ip") or bgp.get("neighbor") or "").strip()
+        domain_intent = {"bgp_neighbors": {identity: bgp}} if identity and bgp else {}
+    elif change_type == "acl_rule":
+        acl = _dict(intent.get("acl"))
+        identity = str(acl.get("name") or acl.get("acl_name") or "").strip()
+        domain_intent = {"acl_rules": {identity: acl}} if identity and acl else {}
+    elif change_type == "site_device_intent":
+        device = _dict(intent.get("device"))
+        domain_intent = {"device": device} if device else {}
+    elif change_type == "ntp_standardize":
+        ntp = _dict(intent.get("ntp"))
+        domain_intent = {"ntp": ntp} if ntp else {}
+    elif change_type == "routing_redistribution":
+        redistribution = _dict(intent.get("redistribution"))
+        identity = ":".join(
+            str(redistribution.get(key) or "").strip().lower()
+            for key in ("from_protocol", "to_protocol", "target_process")
+        ).strip(":")
+        if not identity or not redistribution:
+            domain_intent = {}
+        else:
+            boundary = copy.deepcopy(redistribution)
+            if isinstance(intent.get("reverse_redistribution"), Mapping):
+                boundary["reverse_redistribution"] = _dict(intent.get("reverse_redistribution"))
+            if isinstance(intent.get("reachability_checks"), (list, tuple)):
+                boundary["reachability_checks"] = copy.deepcopy(list(intent["reachability_checks"]))
+            domain_intent = {"redistribution_boundaries": {identity: boundary}}
+    else:
+        domain_intent = {}
+
+    if not domain_intent:
+        return {}, []
+    return {
+        "sites": {
+            site: {
+                "devices": {
+                    device_id: {
+                        "intent": {domain: domain_intent},
+                    }
+                }
+            }
+        }
+    }, [domain]
+
+
+def create_candidate_for_change_intent(
+    repository: NetworkModelRepository,
+    platform_store: PlatformStore,
+    *,
+    org_id: str,
+    environment_id: str,
+    parent_revision_id: str,
+    change_id: str,
+    intent: Mapping[str, Any],
+    device_id: str,
+    created_by: str,
+) -> dict[str, Any] | None:
+    """Create one deterministic candidate for a typed change.
+
+    The explicit parent prevents a stale UI or Rez incident from attaching a
+    proposal to whichever environment happens to be active later.
+    """
+    active = repository.active_revision(org_id, environment_id)
+    if active is None:
+        raise NetworkModelError("a change candidate requires an active approved Network Model")
+    if active["revision_id"] != parent_revision_id:
+        raise NetworkModelError(
+            f"Network Model revision changed from {parent_revision_id} to {active['revision_id']}"
+        )
+    patch, domains = model_patch_from_intent(intent, device_id=device_id)
+    if not patch or not domains:
+        return None
+    revision_id = f"change-{change_id.lower()}"
+    try:
+        existing = repository.get_revision(org_id, environment_id, revision_id)
+    except KeyError:
+        existing = None
+    if existing is not None:
+        if str(existing.get("source", {}).get("reference") or "") != f"change:{change_id}":
+            raise NetworkModelError(f"revision {revision_id} is already owned by another source")
+        return existing
+    return create_candidate_from_change(
+        repository,
+        platform_store,
+        org_id=org_id,
+        environment_id=environment_id,
+        parent_revision_id=parent_revision_id,
+        revision_id=revision_id,
+        change_id=change_id,
+        domains=domains,
+        model_patch=patch,
+        created_by=created_by,
+    )
+
+
+def create_candidate_for_change_set(
+    repository: NetworkModelRepository,
+    platform_store: PlatformStore,
+    *,
+    org_id: str,
+    environment_id: str,
+    parent_revision_id: str,
+    revision_id: str,
+    change_ids: Sequence[str],
+    intent: Mapping[str, Any],
+    device_ids: Sequence[str],
+    created_by: str,
+) -> dict[str, Any] | None:
+    """Create one aggregate candidate linked to every per-device fleet change."""
+    changes = [str(item).strip() for item in change_ids if str(item).strip()]
+    devices = [str(item).strip() for item in device_ids if str(item).strip()]
+    if not changes or len(changes) != len(devices):
+        raise NetworkModelError("fleet model candidate requires one change ID per target device")
+    active = repository.active_revision(org_id, environment_id)
+    if active is None or active["revision_id"] != parent_revision_id:
+        current = active["revision_id"] if active else "none"
+        raise NetworkModelError(
+            f"Network Model revision changed from {parent_revision_id} to {current}"
+        )
+    combined: dict[str, Any] = {}
+    domains: set[str] = set()
+    for device_id in devices:
+        patch, patch_domains = model_patch_from_intent(intent, device_id=device_id)
+        combined = _deep_merge(combined, patch)
+        domains.update(patch_domains)
+    if not combined or not domains:
+        return None
+    try:
+        existing = repository.get_revision(org_id, environment_id, revision_id)
+    except KeyError:
+        existing = None
+    if existing is None:
+        existing = create_candidate_from_change(
+            repository,
+            platform_store,
+            org_id=org_id,
+            environment_id=environment_id,
+            parent_revision_id=parent_revision_id,
+            revision_id=revision_id,
+            change_id=changes[0],
+            domains=sorted(domains),
+            model_patch=combined,
+            created_by=created_by,
+        )
+    for change_id in changes[1:]:
+        change = platform_store.get_change(change_id)
+        if change.org_id != org_id:
+            raise NetworkModelError("fleet change and model revision must belong to the same organization")
+        repository.link_revision(
+            org_id,
+            environment_id,
+            revision_id,
+            link_type="change",
+            external_id=change_id,
+            metadata={"workflow_state": change.workflow_state, "fleet": True},
+        )
+    return existing
+
+
+def approve_change_candidates(
+    repository: NetworkModelRepository,
+    *,
+    org_id: str,
+    change_id: str,
+    approved_by: str,
+    git_root,
+) -> list[dict[str, Any]]:
+    linked = repository.revisions_for_link(org_id, link_type="change", external_id=change_id)
+    if len(linked) > 1:
+        raise NetworkModelError("a single-device change may link to only one Network Model candidate")
+    approved: list[dict[str, Any]] = []
+    for revision in linked:
+        status = str(revision.get("status") or "")
+        if status in {"proposed", "in_review"}:
+            approved.append(
+                approve_with_git(
+                    repository,
+                    org_id=org_id,
+                    environment_id=str(revision["environment_id"]),
+                    revision_id=str(revision["revision_id"]),
+                    approved_by=approved_by,
+                    git_root=git_root,
+                )
+            )
+        elif status in {"approved", "active"}:
+            approved.append({"revision": revision, "git": None})
+        else:
+            raise NetworkModelError(f"linked Network Model candidate is {status}, not reviewable")
+    return approved
+
+
+def activate_change_candidates(
+    repository: NetworkModelRepository,
+    platform_store: PlatformStore,
+    *,
+    org_id: str,
+    change_id: str,
+    actor: str,
+    git_root,
+) -> list[dict[str, Any]]:
+    linked = repository.revisions_for_link(org_id, link_type="change", external_id=change_id)
+    if len(linked) > 1:
+        raise NetworkModelError("a single-device change may link to only one Network Model candidate")
+    activated: list[dict[str, Any]] = []
+    for revision in linked:
+        status = str(revision.get("status") or "")
+        if status == "approved":
+            change_links = [
+                link
+                for link in repository.list_links(
+                    org_id,
+                    str(revision["environment_id"]),
+                    str(revision["revision_id"]),
+                )
+                if link["link_type"] == "change"
+            ]
+            pending = [
+                link["external_id"]
+                for link in change_links
+                if platform_store.get_change(link["external_id"]).workflow_state
+                not in VERIFIED_CHANGE_STATES
+            ]
+            if pending:
+                activated.append(
+                    {
+                        "revision": revision,
+                        "verification": None,
+                        "git": None,
+                        "pending_change_ids": pending,
+                    }
+                )
+                continue
+            activated.append(
+                activate_verified_revision(
+                    repository,
+                    platform_store,
+                    org_id=org_id,
+                    environment_id=str(revision["environment_id"]),
+                    revision_id=str(revision["revision_id"]),
+                    actor=actor,
+                    git_root=git_root,
+                )
+            )
+        elif status == "active":
+            activated.append({"revision": revision, "verification": None, "git": None})
+        else:
+            raise NetworkModelError(f"linked Network Model candidate is {status}, not approved")
+    return activated
+
+
+def assert_change_model_rollback_is_current(
+    repository: NetworkModelRepository,
+    *,
+    org_id: str,
+    change_id: str,
+) -> list[dict[str, Any]]:
+    """Block a stale device rollback before it can invalidate newer intent."""
+    linked = repository.revisions_for_link(
+        org_id,
+        link_type="change",
+        external_id=change_id,
+    )
+    if len(linked) > 1:
+        raise NetworkModelError("a device change may link to only one Network Model candidate")
+    for revision in linked:
+        if str(revision.get("status") or "") == "superseded":
+            raise NetworkModelError(
+                "this change belongs to a superseded Network Model revision; "
+                "build a new reviewed rollback plan from the current model"
+            )
+    return linked
+
+
+def rollback_change_candidates(
+    repository: NetworkModelRepository,
+    platform_store: PlatformStore,
+    *,
+    org_id: str,
+    change_id: str,
+    actor: str,
+    git_root,
+) -> list[dict[str, Any]]:
+    """Restore the direct parent when a linked, active change is rolled back.
+
+    Candidates that never became active require no model mutation. A
+    superseded candidate is rejected because reverting it would discard newer
+    approved intent.
+    """
+    linked = assert_change_model_rollback_is_current(
+        repository,
+        org_id=org_id,
+        change_id=change_id,
+    )
+    restored: list[dict[str, Any]] = []
+    for revision in linked:
+        status = str(revision.get("status") or "")
+        if status == "active":
+            parent_revision_id = str(revision.get("parent_revision_id") or "").strip()
+            if not parent_revision_id:
+                raise NetworkModelError("the active change revision has no rollback parent")
+            restored.append(
+                rollback_active_revision(
+                    repository,
+                    platform_store,
+                    org_id=org_id,
+                    environment_id=str(revision["environment_id"]),
+                    target_revision_id=parent_revision_id,
+                    rollback_change_id=change_id,
+                    actor=actor,
+                    git_root=git_root,
+                )
+            )
+        elif status in {"proposed", "in_review", "approved"}:
+            restored.append(
+                {
+                    "revision": revision,
+                    "verification": None,
+                    "git": None,
+                    "model_unchanged": True,
+                }
+            )
+        else:
+            raise NetworkModelError(f"linked Network Model candidate is {status}, not rollback-safe")
+    return restored
 
 
 def create_candidate_from_change(
@@ -109,17 +476,11 @@ def approve_with_git(
     existing_approval = _dict(current.get("approval"))
     approval_time = str(existing_approval.get("approved_at") or utc_now())
     approval_actor = str(existing_approval.get("approved_by") or approved_by)
-    preview = copy.deepcopy(current)
-    preview["status"] = "approved"
-    preview["approval"] = {
-        "status": "approved",
-        "approved_by": approval_actor,
-        "approved_at": approval_time,
-    }
-    preview["authority_bindings"] = {
-        domain: {**binding, "mode": "authoritative"}
-        for domain, binding in preview["authority_bindings"].items()
-    }
+    preview = prepare_reviewed_approval(
+        current,
+        approved_by=approval_actor,
+        approved_at=approval_time,
+    )
     parent_model: dict[str, Any] = {}
     if preview.get("parent_revision_id"):
         parent_model = repository.get_revision(
@@ -257,12 +618,22 @@ def rollback_active_revision(
     current = repository.active_revision(org_id, environment_id)
     if current is None or current["revision_id"] == target_revision_id:
         raise NetworkModelError("rollback requires a different currently active revision")
+    if str(current.get("parent_revision_id") or "") != target_revision_id:
+        raise NetworkModelError("rollback target must be the active revision's direct parent")
     target = repository.get_revision(org_id, environment_id, target_revision_id)
     if target["status"] != "superseded":
         raise NetworkModelError("rollback target must be a previously approved superseded revision")
     change = platform_store.get_change(rollback_change_id)
     if change.org_id != org_id or change.workflow_state not in ROLLBACK_CHANGE_STATES:
         raise NetworkModelError("rollback model activation requires a verified rollback change")
+    linked = repository.revisions_for_link(
+        org_id,
+        link_type="change",
+        external_id=rollback_change_id,
+        environment_id=environment_id,
+    )
+    if not any(str(item.get("revision_id") or "") == current["revision_id"] for item in linked):
+        raise NetworkModelError("rollback change is not linked to the currently active model revision")
     verification = {
         "schema": "rezonance.network-model-rollback.v1",
         "rolled_back_by": actor,

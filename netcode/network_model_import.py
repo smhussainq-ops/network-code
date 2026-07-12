@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import re
 from pathlib import Path
 from typing import Any, Mapping
@@ -129,9 +130,67 @@ def import_catalog_candidate(
         cursor = str(page.get("next_cursor") or "")
         if not cursor:
             break
-    public = _public_devices(devices, source_name="rezonance_catalog")
+    repository = NetworkModelRepository(store)
+    management_claims: dict[str, list[str]] = {}
+    normalized_devices: list[dict[str, Any]] = []
+    for raw in devices:
+        record = copy.deepcopy(dict(raw))
+        raw_id = record.get("canonical_id") or record.get("id") or record.get("hostname")
+        canonical_id = PlatformStore.normalize_device_identifier(str(raw_id or ""))
+        host = str(record.get("host") or "").strip().lower()
+        if host and canonical_id:
+            management_claims.setdefault(host, []).append(canonical_id)
+        normalized_devices.append(record)
+
+    ambiguous_hosts = {
+        host: sorted(set(claims))
+        for host, claims in management_claims.items()
+        if len(set(claims)) > 1
+    }
+    for host, claims in ambiguous_hosts.items():
+        digest = hashlib.sha256(f"identity:{host}:{','.join(claims)}".encode()).hexdigest()[:16]
+        repository.record_conflict(
+            org_id=org_id,
+            environment_id=_slug(environment_id, "default"),
+            conflict_id=f"identity-{digest}",
+            domain="identity",
+            subject_id=host,
+            severity="high",
+            details={
+                "kind": "management_identity_collision",
+                "revision_id": _slug(revision_id, "catalog-import"),
+                "management_identity": host,
+                "claimants": claims,
+                "required_action": "Choose the canonical device or correct the Local Connector inventory.",
+            },
+        )
+    for record in normalized_devices:
+        host = str(record.get("host") or "").strip().lower()
+        if host in ambiguous_hosts:
+            record.pop("host", None)
+            record.pop("management", None)
+
+    public = _public_devices(normalized_devices, source_name="rezonance_catalog")
     if not public:
         raise NetworkModelError("the device catalog is empty; discover or import devices first")
+    for device_id, device in public.items():
+        if str(device.get("site") or "").strip():
+            continue
+        digest = hashlib.sha256(f"sites:{device_id}".encode()).hexdigest()[:16]
+        repository.record_conflict(
+            org_id=org_id,
+            environment_id=_slug(environment_id, "default"),
+            conflict_id=f"site-{digest}",
+            domain="sites",
+            subject_id=device_id,
+            severity="medium",
+            details={
+                "kind": "site_assignment_missing",
+                "revision_id": _slug(revision_id, "catalog-import"),
+                "device_id": device_id,
+                "required_action": "Assign the device to a site, then build a new proposal.",
+            },
+        )
     document = {
         "schema": NETWORK_MODEL_SCHEMA,
         "org_id": org_id,
@@ -146,7 +205,11 @@ def import_catalog_candidate(
         },
         "model": {"devices": public, "sites": _sites_from_devices(public)},
     }
-    return persist_import(NetworkModelRepository(store), document, created_by=created_by)
+    result = persist_import(repository, document, created_by=created_by)
+    result["conflicts"] = len(ambiguous_hosts) + sum(
+        1 for device in public.values() if not str(device.get("site") or "").strip()
+    )
+    return result
 
 
 def import_local_yaml_candidate(

@@ -6,12 +6,21 @@ import base64
 import json
 from typing import Any, Iterable, Mapping
 
-from netcode.network_model import validate_model_revision, validate_observation
+from netcode.network_model import (
+    assert_no_secrets,
+    prepare_reviewed_approval,
+    validate_model_revision,
+    validate_observation,
+)
 from netcode.store import PlatformStore, utc_now
 
 
 MAX_MODEL_BYTES = 25 * 1024 * 1024
 MAX_PAGE_SIZE = 100
+_REVISION_SUMMARY_COLUMNS = (
+    "org_id, environment_id, revision_id, parent_revision_id, status, source_type, "
+    "source_reference, coverage_json, authority_json, approval_json, created_by, created_at, updated_at"
+)
 
 
 def _json(value: Any) -> str:
@@ -72,6 +81,42 @@ def _entity_rows(model: Mapping[str, Any]) -> Iterable[tuple[str, str, str, str,
                 or (entity_id if entity_type == "devices" else "")
             ).strip()
             yield entity_type, entity_id, site, device_id, record
+
+    # Approved Rez designs organize devices and dependencies beneath each site.
+    # Materialize those nested records into the same bounded serving index used
+    # by catalog-first models, while retaining the canonical document unchanged.
+    sites = model.get("sites") if isinstance(model.get("sites"), Mapping) else {}
+    has_top_level_devices = isinstance(model.get("devices"), Mapping)
+    for raw_site_id, raw_site in sites.items():
+        site_id = str(raw_site_id).strip()
+        site = dict(raw_site) if isinstance(raw_site, Mapping) else {}
+        if not site_id:
+            continue
+        if not has_top_level_devices:
+            nested_devices = site.get("devices") if isinstance(site.get("devices"), Mapping) else {}
+            for raw_device_id, raw_device in nested_devices.items():
+                device_id = str(raw_device_id).strip()
+                if not device_id:
+                    continue
+                record = dict(raw_device) if isinstance(raw_device, Mapping) else {}
+                record["site"] = site_id
+                yield "devices", device_id, site_id, device_id, record
+        for nested_type in (
+            "address_plan",
+            "routing_domains",
+            "redistribution_boundaries",
+            "reachability",
+            "operational_dependencies",
+        ):
+            values = site.get(nested_type)
+            if not isinstance(values, list):
+                continue
+            for index, raw_value in enumerate(values):
+                record = dict(raw_value) if isinstance(raw_value, Mapping) else {"value": raw_value}
+                local_id = str(record.get("id") or record.get("name") or index)
+                entity_id = f"{site_id}:{local_id}"
+                record["site"] = site_id
+                yield nested_type, entity_id, site_id, str(record.get("device_id") or ""), record
 
 
 class NetworkModelRepository:
@@ -220,6 +265,10 @@ class NetworkModelRepository:
                 """
             )
             conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_network_model_links_external "
+                "ON network_model_links (org_id, link_type, external_id, environment_id, revision_id)"
+            )
+            conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS network_model_reconciliations (
                     org_id TEXT NOT NULL,
@@ -337,7 +386,7 @@ class NetworkModelRepository:
         where = " AND ".join(clauses)
         with self.store._connect() as conn:
             rows = conn.execute(
-                f"SELECT * FROM network_model_revisions WHERE {where} "
+                f"SELECT {_REVISION_SUMMARY_COLUMNS} FROM network_model_revisions WHERE {where} "
                 "ORDER BY created_at DESC, revision_id DESC LIMIT ?",
                 (*params, size + 1),
             ).fetchall()
@@ -363,26 +412,22 @@ class NetworkModelRepository:
             return revision
         if revision["status"] not in {"proposed", "in_review"}:
             raise ValueError(f"revision {revision_id} cannot be approved from {revision['status']}")
-        revision["status"] = "approved"
-        revision["approval"] = {
-            "status": "approved",
-            "approved_by": str(approved_by),
-            "approved_at": str(approved_at),
-        }
-        revision["authority_bindings"] = {
-            domain: {**binding, "mode": "authoritative"}
-            for domain, binding in revision["authority_bindings"].items()
-        }
-        validated = validate_model_revision(revision)
+        validated = prepare_reviewed_approval(
+            revision,
+            approved_by=approved_by,
+            approved_at=approved_at,
+        )
         with self.store._connect() as conn:
             conn.execute(
                 """
                 UPDATE network_model_revisions
-                SET status = 'approved', approval_json = ?, authority_json = ?, updated_at = ?
+                SET status = 'approved', source_type = ?, source_reference = ?,
+                    approval_json = ?, authority_json = ?, updated_at = ?
                 WHERE org_id = ? AND environment_id = ? AND revision_id = ?
                   AND status IN ('proposed', 'in_review')
                 """,
                 (
+                    validated["source"]["type"], validated["source"]["reference"],
                     _json(validated["approval"]), _json(validated["authority_bindings"]), utc_now(),
                     org_id, environment_id, revision_id,
                 ),
@@ -439,6 +484,40 @@ class NetworkModelRepository:
             for row in rows
         ]
 
+    def revisions_for_link(
+        self,
+        org_id: str,
+        *,
+        link_type: str,
+        external_id: str,
+        environment_id: str = "",
+    ) -> list[dict[str, Any]]:
+        """Return bounded revision summaries linked to one tenant-owned record."""
+        clauses = ["l.org_id = ?", "l.link_type = ?", "l.external_id = ?"]
+        params: list[Any] = [org_id, link_type, external_id]
+        if environment_id:
+            clauses.append("l.environment_id = ?")
+            params.append(environment_id)
+        columns = ", ".join(
+            f"r.{column.strip()}" for column in _REVISION_SUMMARY_COLUMNS.split(",")
+        )
+        with self.store._connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT {columns}
+                FROM network_model_links l
+                JOIN network_model_revisions r
+                  ON r.org_id = l.org_id
+                 AND r.environment_id = l.environment_id
+                 AND r.revision_id = l.revision_id
+                WHERE {' AND '.join(clauses)}
+                ORDER BY r.created_at, r.revision_id
+                LIMIT 100
+                """,
+                params,
+            ).fetchall()
+        return [self._revision(row, include_model=False) for row in rows]
+
     def active_revision(self, org_id: str, environment_id: str) -> dict[str, Any] | None:
         with self.store._connect() as conn:
             row = conn.execute(
@@ -446,6 +525,127 @@ class NetworkModelRepository:
                 (org_id, environment_id),
             ).fetchone()
         return self.get_revision(org_id, environment_id, row["active_revision_id"]) if row else None
+
+    def active_revision_summary(self, org_id: str, environment_id: str) -> dict[str, Any] | None:
+        """Return active metadata without reading or decoding the model blob."""
+        with self.store._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT r.org_id, r.environment_id, r.revision_id, r.parent_revision_id,
+                       r.status, r.source_type, r.source_reference, r.coverage_json,
+                       r.authority_json, r.approval_json, r.created_by, r.created_at, r.updated_at
+                FROM network_model_heads h
+                JOIN network_model_revisions r
+                  ON r.org_id = h.org_id
+                 AND r.environment_id = h.environment_id
+                 AND r.revision_id = h.active_revision_id
+                WHERE h.org_id = ? AND h.environment_id = ?
+                """,
+                (org_id, environment_id),
+            ).fetchone()
+        return self._revision(row, include_model=False) if row else None
+
+    def record_conflict(
+        self,
+        *,
+        org_id: str,
+        environment_id: str,
+        conflict_id: str,
+        domain: str,
+        subject_id: str,
+        severity: str,
+        details: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        assert_no_secrets(details, "conflict.details")
+        now = utc_now()
+        with self.store._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO network_model_conflicts
+                (org_id, environment_id, conflict_id, domain, subject_id, status,
+                 severity, details_json, created_at, resolved_at, resolved_by)
+                VALUES (?, ?, ?, ?, ?, 'open', ?, ?, ?, NULL, NULL)
+                ON CONFLICT (org_id, environment_id, conflict_id)
+                DO UPDATE SET details_json = ?, severity = ?, status = 'open',
+                              resolved_at = NULL, resolved_by = NULL
+                """,
+                (
+                    org_id, environment_id, conflict_id, domain, subject_id,
+                    severity, _json(dict(details)), now, _json(dict(details)), severity,
+                ),
+            )
+        return self.get_conflict(org_id, environment_id, conflict_id)
+
+    def get_conflict(self, org_id: str, environment_id: str, conflict_id: str) -> dict[str, Any]:
+        with self.store._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM network_model_conflicts "
+                "WHERE org_id = ? AND environment_id = ? AND conflict_id = ?",
+                (org_id, environment_id, conflict_id),
+            ).fetchone()
+        if not row:
+            raise KeyError(f"Unknown network model conflict {conflict_id}")
+        return self._conflict(row)
+
+    def list_conflicts(
+        self,
+        org_id: str,
+        environment_id: str,
+        *,
+        status: str = "open",
+        cursor: str = "",
+        limit: int = 50,
+    ) -> dict[str, Any]:
+        size = max(1, min(int(limit), MAX_PAGE_SIZE))
+        clauses = ["org_id = ?", "environment_id = ?"]
+        params: list[Any] = [org_id, environment_id]
+        if status:
+            clauses.append("status = ?")
+            params.append(status)
+        parsed = _parse_cursor(cursor)
+        if parsed:
+            clauses.append("(created_at < ? OR (created_at = ? AND conflict_id < ?))")
+            params.extend([parsed[0], parsed[0], parsed[1]])
+        with self.store._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM network_model_conflicts WHERE " + " AND ".join(clauses)
+                + " ORDER BY created_at DESC, conflict_id DESC LIMIT ?",
+                (*params, size + 1),
+            ).fetchall()
+        page = rows[:size]
+        return {
+            "conflicts": [self._conflict(row) for row in page],
+            "returned": len(page),
+            "next_cursor": (
+                _cursor(page[-1]["created_at"], page[-1]["conflict_id"])
+                if len(rows) > size else None
+            ),
+        }
+
+    def resolve_conflict(
+        self,
+        org_id: str,
+        environment_id: str,
+        conflict_id: str,
+        *,
+        resolved_by: str,
+        resolution: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        conflict = self.get_conflict(org_id, environment_id, conflict_id)
+        assert_no_secrets(resolution, "conflict.resolution")
+        details = dict(conflict["details"])
+        details["resolution"] = dict(resolution)
+        now = utc_now()
+        with self.store._connect() as conn:
+            conn.execute(
+                """
+                UPDATE network_model_conflicts
+                SET status = 'resolved', details_json = ?, resolved_at = ?, resolved_by = ?
+                WHERE org_id = ? AND environment_id = ? AND conflict_id = ? AND status = 'open'
+                """,
+                (_json(details), now, str(resolved_by), org_id, environment_id, conflict_id),
+            )
+        return self.get_conflict(org_id, environment_id, conflict_id)
 
     def activate_revision(
         self,
@@ -534,6 +734,33 @@ class NetworkModelRepository:
             f"{page[-1]['entity_type']}:{page[-1]['entity_id']}" if len(rows) > size else None
         )
         return {"entities": entities, "returned": len(entities), "next_cursor": next_cursor}
+
+    def ensure_materialized_entities(
+        self,
+        org_id: str,
+        environment_id: str,
+        revision_id: str,
+    ) -> int:
+        """Idempotently rebuild derived indexes for revisions created by older code."""
+        revision = self.get_revision(org_id, environment_id, revision_id)
+        count = 0
+        with self.store._connect() as conn:
+            for entity_type, entity_id, site, device_id, record in _entity_rows(revision["model"]):
+                conn.execute(
+                    """
+                    INSERT INTO network_model_entities
+                    (org_id, environment_id, revision_id, entity_type, entity_id, site, device_id, data_json)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT (org_id, environment_id, revision_id, entity_type, entity_id)
+                    DO UPDATE SET site = ?, device_id = ?, data_json = ?
+                    """,
+                    (
+                        org_id, environment_id, revision_id, entity_type, entity_id, site, device_id,
+                        _json(record), site, device_id, _json(record),
+                    ),
+                )
+                count += 1
+        return count
 
     def record_observation(self, value: Mapping[str, Any]) -> dict[str, Any]:
         observation = validate_observation(value)
@@ -737,4 +964,18 @@ class NetworkModelRepository:
             "validation_grade": row["validation_grade"],
             "facts": _decode_json(row["facts_json"], {}),
             "metadata": _decode_json(row["metadata_json"], {}),
+        }
+
+    @staticmethod
+    def _conflict(row: Any) -> dict[str, Any]:
+        return {
+            "conflict_id": row["conflict_id"],
+            "domain": row["domain"],
+            "subject_id": row["subject_id"],
+            "status": row["status"],
+            "severity": row["severity"],
+            "details": _decode_json(row["details_json"], {}),
+            "created_at": row["created_at"],
+            "resolved_at": row["resolved_at"],
+            "resolved_by": row["resolved_by"],
         }

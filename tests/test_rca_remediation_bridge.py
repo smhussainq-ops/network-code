@@ -131,6 +131,7 @@ def test_site_context_interface_remediation_stays_typed_and_human_gated(tmp_path
     response = client.post(
         "/api/changes/from-rca",
         json=_confirmed_proposal({
+            "root_atom_id": "L1_INTERFACE_ADMIN_DOWN",
             "source": "rez",
             "incident_id": "INC-CAMPUS-ET2",
             "target_device": "v2-store1",
@@ -143,15 +144,14 @@ def test_site_context_interface_remediation_stays_typed_and_human_gated(tmp_path
                     "interface": "Ethernet2",
                     "mode": "routed",
                     "enabled": True,
+                    "description": "must not be applied",
                     "ip_address": "10.3.2.1/30",
                 },
                 "interface": {
                     "name": "Ethernet2",
-                    "description": "Restore intended operational dependency",
+                    "description": "must not be applied",
                     "enabled": True,
                     "mode": "routed",
-                    "access_vlan": None,
-                    "trunk_allowed_vlans": [],
                     "ip_address": "10.3.2.1/30",
                 },
             },
@@ -164,9 +164,12 @@ def test_site_context_interface_remediation_stays_typed_and_human_gated(tmp_path
     assert intent["change_type"] == "interface_config"
     assert intent["interface"]["name"] == "Ethernet2"
     assert intent["interface"]["enabled"] is True
+    assert intent["interface"]["apply_scope"] == "admin_state"
     assert intent["metadata"]["draft_only"] is True
     assert intent["metadata"]["human_approval_required"] is True
-    assert body["change"]["workflow_state"] in {"validated", "blocked"}
+    assert body["change"]["workflow_state"] == "validated"
+    assert body["change"]["result"]["plan"]["commands"] == "interface Ethernet2\n   no shutdown\n"
+    assert body["change"]["result"]["plan"]["rollback"] == "interface Ethernet2\n   shutdown\n"
 
 
 def test_site_context_redistribution_remediation_is_typed_validated_and_human_gated(

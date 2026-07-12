@@ -88,6 +88,7 @@ class InterfaceSpec(BaseModel):
     name: str
     description: str = ""
     enabled: bool = True
+    apply_scope: Literal["full", "admin_state"] = "full"
     mode: Literal["access", "trunk", "routed"] = "access"
     access_vlan: int | None = None
     trunk_allowed_vlans: list[int] = Field(default_factory=list)
@@ -103,6 +104,8 @@ class InterfaceSpec(BaseModel):
 
     @model_validator(mode="after")
     def validate_mode(self) -> "InterfaceSpec":
+        if self.apply_scope == "admin_state":
+            return self
         if self.mode == "access" and self.access_vlan is None:
             raise ValueError("access_vlan is required for access interfaces")
         if self.mode == "routed" and not self.ip_address:
