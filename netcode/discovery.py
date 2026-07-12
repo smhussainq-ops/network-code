@@ -54,6 +54,7 @@ def _extract_state_summary(state: Any, fallback_hostname: str, platform: str) ->
             "vlans": 0,
             "routes": 0,
             "bgp_neighbors": 0,
+            "serial": "",
         }
 
     device = state.get("device") if isinstance(state.get("device"), dict) else {}
@@ -76,6 +77,14 @@ def _extract_state_summary(state: Any, fallback_hostname: str, platform: str) ->
         "platform": _first_string(state.get("platform"), device.get("platform"), platform),
         "model": _first_string(device.get("model"), state.get("model")),
         "version": _first_string(device.get("version"), state.get("version")),
+        "serial": _first_string(
+            device.get("serial"),
+            device.get("serial_number"),
+            device.get("chassis_id"),
+            state.get("serial"),
+            state.get("serial_number"),
+            state.get("chassis_id"),
+        ),
         "interfaces": _count_collection(interfaces),
         "vlans": _count_collection(vlans),
         "routes": _count_collection(routes),
@@ -197,6 +206,8 @@ class DiscoveryService:
             "site": site or (existing.site if existing else "unassigned"),
             "groups": groups or (list(existing.groups) if existing else ["discovered"]),
             "port": effective_port,
+            "serial": str(state_summary.get("serial") or ""),
+            "aliases": sorted({host, str(hostname)} - {str(device_id or hostname)}),
         }
         source_yaml = dumps_yaml({"devices": [candidate]})
         return {
@@ -241,13 +252,57 @@ class DiscoveryService:
             "role": str(candidate.get("role") or ""),
             "groups": [str(group) for group in candidate.get("groups") or ["discovered"]],
             "port": int(candidate.get("port") or 22),
+            "serial": str(candidate.get("serial") or "").strip(),
+            "aliases": [str(alias).strip() for alias in candidate.get("aliases") or [] if str(alias).strip()],
         }
-        action = "added"
+        normalized_id = sanitized["id"].lower()
+        endpoint = (sanitized["host"].lower(), sanitized["port"])
+        matched_indexes: set[int] = set()
+        match_reasons: set[str] = set()
         for index, existing in enumerate(devices):
-            if str(existing.get("id")) == sanitized["id"] or str(existing.get("host")) == sanitized["host"]:
-                devices[index] = {**existing, **sanitized}
-                action = "updated"
-                break
+            existing_id = _safe_device_id(str(existing.get("id") or ""))
+            existing_endpoint = (
+                str(existing.get("host") or "").strip().lower(),
+                int(existing.get("port") or 22),
+            )
+            existing_serial = str(existing.get("serial") or existing.get("serial_number") or "").strip().lower()
+            if existing_id == normalized_id:
+                matched_indexes.add(index)
+                match_reasons.add("id")
+            if existing_endpoint == endpoint:
+                matched_indexes.add(index)
+                match_reasons.add("endpoint")
+            if sanitized["serial"] and existing_serial == sanitized["serial"].lower():
+                matched_indexes.add(index)
+                match_reasons.add("serial")
+        if len(matched_indexes) > 1:
+            return {
+                "ok": False,
+                "status": "conflict",
+                "source_of_truth_written": False,
+                "error": "Discovery identity evidence maps to multiple existing devices.",
+                "match_reasons": sorted(match_reasons),
+            }
+        action = "added"
+        if matched_indexes:
+            index = next(iter(matched_indexes))
+            existing = devices[index]
+            existing_serial = str(existing.get("serial") or existing.get("serial_number") or "").strip()
+            if existing_serial and sanitized["serial"] and existing_serial.lower() != sanitized["serial"].lower():
+                return {
+                    "ok": False,
+                    "status": "conflict",
+                    "source_of_truth_written": False,
+                    "error": "Discovery serial conflicts with the existing canonical device.",
+                    "match_reasons": sorted(match_reasons),
+                }
+            # A serial match may observe a hostname change. Preserve the approved
+            # canonical id and retain the new name as an alias for review.
+            if "serial" in match_reasons and existing.get("id") != sanitized["id"]:
+                sanitized["aliases"] = sorted(set(sanitized["aliases"] + [sanitized["id"]]))
+                sanitized["id"] = str(existing.get("id"))
+            devices[index] = {**existing, **sanitized}
+            action = "updated"
         else:
             devices.append(sanitized)
 

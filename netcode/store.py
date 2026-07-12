@@ -328,6 +328,7 @@ class PlatformStore:
                     host TEXT NOT NULL,
                     port INTEGER NOT NULL DEFAULT 22,
                     platform TEXT NOT NULL,
+                    serial TEXT NOT NULL DEFAULT '',
                     site TEXT,
                     role TEXT,
                     groups_json TEXT NOT NULL DEFAULT '[]',
@@ -342,6 +343,7 @@ class PlatformStore:
                 """
             )
             self._ensure_column(conn, "device_catalog", "management_json", "TEXT NOT NULL DEFAULT '{}'")
+            self._ensure_column(conn, "device_catalog", "serial", "TEXT NOT NULL DEFAULT ''")
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS device_aliases (
@@ -356,6 +358,7 @@ class PlatformStore:
             conn.execute("CREATE INDEX IF NOT EXISTS idx_device_catalog_site ON device_catalog (org_id, site, canonical_id)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_device_catalog_role ON device_catalog (org_id, role, canonical_id)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_device_catalog_platform ON device_catalog (org_id, platform, canonical_id)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_device_catalog_serial ON device_catalog (org_id, serial)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_device_aliases_canonical ON device_aliases (org_id, canonical_id)")
             conn.execute(
                 """
@@ -1073,6 +1076,7 @@ class PlatformStore:
             host = str(raw.get("host") or "").strip()
             port = int(raw.get("port") or 22)
             platform = str(raw.get("platform") or "unknown").strip().lower()
+            serial = str(raw.get("serial") or "").strip()
             groups = sorted({str(item).strip() for item in (raw.get("groups") or []) if str(item).strip()})
             management: dict[str, Any] = {}
             if raw.get("management"):
@@ -1098,6 +1102,7 @@ class PlatformStore:
                 "host": host,
                 "port": port,
                 "platform": platform,
+                "serial": serial,
                 "site": str(raw.get("site") or "").strip() or None,
                 "role": str(raw.get("role") or "").strip() or None,
                 "groups": groups,
@@ -1119,6 +1124,62 @@ class PlatformStore:
                     (runner.org_id, runner.id),
                 )
             for device in normalized.values():
+                if device["serial"]:
+                    serial_owner = conn.execute(
+                        "SELECT canonical_id, runner_id FROM device_catalog WHERE org_id = ? AND LOWER(serial) = LOWER(?) LIMIT 1",
+                        (runner.org_id, device["serial"]),
+                    ).fetchone()
+                    if serial_owner and str(serial_owner["canonical_id"]) != device["canonical_id"]:
+                        conflicts.append({
+                            "type": "serial_identity_conflict",
+                            "canonical_id": str(device["canonical_id"]),
+                            "existing_canonical_id": str(serial_owner["canonical_id"]),
+                            "serial": str(device["serial"]),
+                            "claiming_runner_id": runner.id,
+                        })
+                        if str(serial_owner["runner_id"]) != runner.id:
+                            continue
+                endpoint_owner = conn.execute(
+                    "SELECT canonical_id, runner_id FROM device_catalog WHERE org_id = ? AND LOWER(host) = LOWER(?) AND port = ? LIMIT 1",
+                    (runner.org_id, device["host"], device["port"]),
+                ).fetchone()
+                if endpoint_owner and str(endpoint_owner["canonical_id"]) != device["canonical_id"]:
+                    conflicts.append({
+                        "type": "endpoint_identity_conflict",
+                        "canonical_id": str(device["canonical_id"]),
+                        "existing_canonical_id": str(endpoint_owner["canonical_id"]),
+                        "endpoint": f"{device['host']}:{device['port']}",
+                        "claiming_runner_id": runner.id,
+                    })
+                    if str(endpoint_owner["runner_id"]) != runner.id:
+                        continue
+                alias_conflict = None
+                for alias in device["aliases"]:
+                    alias_owner = conn.execute(
+                        "SELECT a.canonical_id, d.runner_id FROM device_aliases a "
+                        "JOIN device_catalog d ON d.org_id = a.org_id AND d.canonical_id = a.canonical_id "
+                        "WHERE a.org_id = ? AND a.alias = ? LIMIT 1",
+                        (runner.org_id, alias),
+                    ).fetchone()
+                    if alias_owner and str(alias_owner["canonical_id"]) != device["canonical_id"]:
+                        alias_conflict = (alias, str(alias_owner["canonical_id"]))
+                        break
+                if alias_conflict:
+                    conflicts.append({
+                        "type": "alias_identity_conflict",
+                        "canonical_id": str(device["canonical_id"]),
+                        "existing_canonical_id": alias_conflict[1],
+                        "alias": alias_conflict[0],
+                        "claiming_runner_id": runner.id,
+                    })
+                    alias_owner = conn.execute(
+                        "SELECT d.runner_id FROM device_aliases a "
+                        "JOIN device_catalog d ON d.org_id = a.org_id AND d.canonical_id = a.canonical_id "
+                        "WHERE a.org_id = ? AND a.alias = ? LIMIT 1",
+                        (runner.org_id, alias_conflict[0]),
+                    ).fetchone()
+                    if alias_owner and str(alias_owner["runner_id"]) != runner.id:
+                        continue
                 existing = conn.execute(
                     "SELECT runner_id FROM device_catalog WHERE org_id = ? AND canonical_id = ?",
                     (runner.org_id, device["canonical_id"]),
@@ -1133,15 +1194,16 @@ class PlatformStore:
                 conn.execute(
                     """
                     INSERT INTO device_catalog
-                    (org_id, canonical_id, display_id, hostname, host, port, platform, site, role,
+                    (org_id, canonical_id, display_id, hostname, host, port, platform, serial, site, role,
                      groups_json, management_json, runner_id, runner_pool, source, last_seen, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'runner_inventory', ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'runner_inventory', ?, ?)
                     ON CONFLICT (org_id, canonical_id) DO UPDATE SET
                       display_id = excluded.display_id,
                       hostname = excluded.hostname,
                       host = excluded.host,
                       port = excluded.port,
                       platform = excluded.platform,
+                      serial = excluded.serial,
                       site = excluded.site,
                       role = excluded.role,
                       groups_json = excluded.groups_json,
@@ -1160,6 +1222,7 @@ class PlatformStore:
                         device["host"],
                         device["port"],
                         device["platform"],
+                        device["serial"],
                         device["site"],
                         device["role"],
                         json.dumps(device["groups"]),
@@ -1213,6 +1276,7 @@ class PlatformStore:
             "host": row["host"],
             "port": int(row["port"] or 22),
             "platform": row["platform"],
+            "serial": row["serial"],
             "site": row["site"],
             "role": row["role"],
             "groups": json.loads(raw_groups),

@@ -23,6 +23,7 @@ class Device:
     groups: tuple[str, ...]
     role: str | None = None
     aliases: tuple[str, ...] = ()
+    serial: str = ""
     # Public, non-secret ownership metadata for devices controlled by a native
     # manager such as FortiManager or Panorama.
     management: dict[str, Any] = field(default_factory=dict, repr=False, compare=False)
@@ -56,6 +57,7 @@ class Inventory:
             groups=tuple(raw.get("groups") or []),
             role=str(raw.get("role") or "").strip() or None,
             aliases=tuple(str(item).strip() for item in (raw.get("aliases") or []) if str(item).strip()),
+            serial=str(raw.get("serial") or raw.get("serial_number") or raw.get("chassis_id") or "").strip(),
             management=management,
             connection_options=self._connection_options(defaults, raw),
         )

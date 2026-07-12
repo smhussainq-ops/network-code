@@ -2006,7 +2006,7 @@ def api_runner_heartbeat(request: RunnerHeartbeatRequest, authorization: str | N
 
 
 _RUNNER_INVENTORY_FIELDS = {
-    "id", "hostname", "host", "port", "platform", "site", "role", "groups", "aliases", "management",
+    "id", "hostname", "host", "port", "platform", "site", "role", "groups", "aliases", "management", "serial",
 }
 _RUNNER_INVENTORY_SECRET_MARKERS = {
     "username", "password", "passwd", "pwd", "secret", "token", "credential",
@@ -2036,7 +2036,7 @@ def _sanitize_runner_inventory(devices: list[dict[str, object]]) -> list[dict[st
             )
         device_id = str(raw.get("id") or "").strip()
         host = str(raw.get("host") or "").strip()
-        scalar_fields = ("id", "hostname", "host", "port", "platform", "site", "role")
+        scalar_fields = ("id", "hostname", "host", "port", "platform", "site", "role", "serial")
         invalid_scalar = next(
             (field for field in scalar_fields if isinstance(raw.get(field), (dict, list, tuple, set))),
             None,
@@ -2076,6 +2076,7 @@ def _sanitize_runner_inventory(devices: list[dict[str, object]]) -> list[dict[st
             "role": str(raw.get("role") or "").strip(),
             "groups": [str(item).strip() for item in groups if str(item).strip()],
             "aliases": [str(item).strip() for item in aliases if str(item).strip()],
+            "serial": str(raw.get("serial") or "").strip(),
             "management": management,
         })
     return public
@@ -2124,6 +2125,11 @@ def _runner_route_for_payload(
         payload.get("device")
         or payload.get("device_id")
         or payload.get("host")
+        or (
+            str(payload.get("seed_node") or "").split(",", 1)[0].strip()
+            if not any(marker in str(payload.get("seed_node") or "") for marker in ("/", "-"))
+            else ""
+        )
         or ""
     ).strip()
     catalog_device = store.resolve_device(org_id, identifier) if identifier else None
@@ -2182,6 +2188,7 @@ def _runner_read(
         current = store.get_job(job.id)
         if current.status in ("completed", "failed"):
             result = dict(current.result or {"ok": current.status == "completed", "message": current.message})
+            result["_job_id"] = current.id
             result["_runner_id"] = current.claimed_by
             result["_runner_pool"] = current.pool
             return result
@@ -2395,6 +2402,7 @@ def api_rez_runner_read(request: RunnerReadRequest, http_request: Request, autho
         "rez_api_get_state",
         "rez_refresh_targeted",
         "rez_scan_device",
+        "rez_discover_network",
         "rez_server_listener_probe",
         "rez_http_flow_probe",
     }:
@@ -2402,11 +2410,23 @@ def api_rez_runner_read(request: RunnerReadRequest, http_request: Request, autho
     payload = dict(request.payload or {})
     for secret_key in ("username", "password", "passwd", "secret", "api_token", "private_key"):
         payload.pop(secret_key, None)
-    timeout = max(1.0, min(float(request.timeout or 60.0), 120.0))
+    timeout_ceiling = 900.0 if request.action == "rez_discover_network" else 120.0
+    timeout = max(1.0, min(float(request.timeout or 60.0), timeout_ceiling))
     payload["_runner_timeout_seconds"] = timeout
+    target_runner_id = str(payload.pop("connector_id", "") or "").strip() or None
     store = PlatformStore(paths())
     principal = _request_principal(http_request)
-    result = _runner_read(paths(), request.action, payload, principal.org_id, timeout=timeout)
+    if target_runner_id:
+        result = _runner_read(
+            paths(),
+            request.action,
+            payload,
+            principal.org_id,
+            timeout=timeout,
+            target_runner_id=target_runner_id,
+        )
+    else:
+        result = _runner_read(paths(), request.action, payload, principal.org_id, timeout=timeout)
     if request.action == "rez_refresh_targeted" and result.get("ok"):
         result["network_model_observations_recorded"] = _record_rez_refresh_observations(
             store,
@@ -2419,6 +2439,12 @@ def api_rez_runner_read(request: RunnerReadRequest, http_request: Request, autho
             runner_id=str(result.get("_runner_id") or ""),
             result=result,
         )
+    if request.action == "rez_discover_network":
+        result["candidate_disposition"] = {
+            "status": "review_required",
+            "source_of_truth_written": False,
+            "message": "Recursive discovery returns observations. Review identity conflicts and approve imports separately.",
+        }
     return result
 
 
@@ -2491,7 +2517,7 @@ def _import_runner_discovery_candidate(
             "error": "Runner discovery did not return a source_of_truth_candidate.",
         }
         return result
-    public_keys = {"id", "hostname", "host", "platform", "site", "role", "groups", "port"}
+    public_keys = {"id", "hostname", "host", "platform", "site", "role", "groups", "port", "aliases", "serial"}
     candidate = {key: value for key, value in candidate.items() if key in public_keys}
 
     source_result = DiscoveryService(p).import_candidate(candidate)

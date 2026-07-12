@@ -205,6 +205,7 @@ def _public_inventory_snapshot() -> dict[str, Any]:
                 "role": device.role or "",
                 "groups": list(device.groups),
                 "aliases": list(device.aliases),
+                "serial": device.serial,
                 "management": dict(device.management),
             }
             for device in Inventory(INVENTORY_FILE).devices
@@ -243,6 +244,8 @@ def _progress_reporter(
         phase = job_action.removeprefix("lab_")
     elif job_action == "read_verify":
         phase = "verify"
+    elif job_action == "read_rez_discover_network":
+        phase = "discovery"
     else:
         return None
     payload = job.get("payload") or {}
@@ -645,6 +648,7 @@ def _execute_ansible_pack(payload: dict[str, Any]) -> dict[str, Any]:
 READ_TIMEOUT_SECONDS = 30
 READINESS_TIMEOUT_SECONDS = 55  # multi-device sweep; still under the control plane's 60s poll
 MAX_READ_TIMEOUT_SECONDS = 120
+MAX_DISCOVERY_TIMEOUT_SECONDS = 900
 
 
 def _collapse_command(command: str) -> str:
@@ -1295,7 +1299,11 @@ def _execute_rez_refresh_targeted(payload: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _execute_rez_scan_device(payload: dict[str, Any]) -> dict[str, Any]:
+def _execute_rez_scan_device(
+    payload: dict[str, Any],
+    *,
+    persist_inventory: bool = True,
+) -> dict[str, Any]:
     from netcode.adapters.registry import AdapterRegistry
     from netcode.discovery import SSH_AUTODETECT_ORDER, _extract_state_summary, _safe_device_id
     from netcode.inventory import Device, Inventory
@@ -1385,23 +1393,32 @@ def _execute_rez_scan_device(payload: dict[str, Any]) -> dict[str, Any]:
             "site": site or (existing.site if existing else "unassigned"),
             "groups": groups or (list(existing.groups) if existing else ["discovered"]),
             "port": port,
+            "serial": str(state_summary.get("serial") or ""),
+            "aliases": sorted({host, hostname} - {str(device_id or hostname)}),
         }
-        inventory_data = dict(inventory.raw or {})
-        devices = list(inventory_data.get("devices") or [])
-        persisted = dict(candidate)
-        action_taken = "added"
-        for index, raw_device in enumerate(devices):
-            if not isinstance(raw_device, dict):
-                continue
-            if str(raw_device.get("id") or "") == str(candidate["id"]) or str(raw_device.get("host") or "") == host:
-                # Preserve any device-specific secrets already stored on the runner.
-                devices[index] = {**raw_device, **persisted}
-                action_taken = "updated"
-                break
-        else:
-            devices.append(persisted)
-        inventory_data["devices"] = devices
-        write_yaml(INVENTORY_FILE, inventory_data)
+        action_taken = "observed"
+        if persist_inventory:
+            inventory_data = dict(inventory.raw or {})
+            devices = list(inventory_data.get("devices") or [])
+            persisted = dict(candidate)
+            action_taken = "added"
+            for index, raw_device in enumerate(devices):
+                if not isinstance(raw_device, dict):
+                    continue
+                same_id = str(raw_device.get("id") or "").strip().lower() == str(candidate["id"]).strip().lower()
+                same_endpoint = (
+                    str(raw_device.get("host") or "") == host
+                    and int(raw_device.get("port") or inventory.defaults.get("port") or 22) == port
+                )
+                if same_id or same_endpoint:
+                    # Preserve any device-specific secrets already stored on the runner.
+                    devices[index] = {**raw_device, **persisted}
+                    action_taken = "updated"
+                    break
+            else:
+                devices.append(persisted)
+            inventory_data["devices"] = devices
+            write_yaml(INVENTORY_FILE, inventory_data)
         return {
             "ok": True,
             "status": "pass",
@@ -1419,6 +1436,7 @@ def _execute_rez_scan_device(payload: dict[str, Any]) -> dict[str, Any]:
                 "action": action_taken,
                 "device": candidate,
                 "inventory": str(INVENTORY_FILE),
+                "written": persist_inventory,
             },
             "tried_platforms": attempts,
             "supported_platforms": sorted(driver_map.keys()),
@@ -1449,6 +1467,201 @@ def _execute_rez_scan_device(payload: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _execute_rez_discover_network(
+    payload: dict[str, Any],
+    progress: Callable[[dict[str, Any]], None] | None = None,
+) -> dict[str, Any]:
+    """Run bounded, recursive discovery entirely on the Local Connector."""
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    from netcode.discovery_profile import (
+        DiscoveryProfile,
+        DiscoveryProfileError,
+        DiscoveryTarget,
+        discovery_neighbor_targets,
+    )
+    from netcode.inventory import Inventory
+
+    if not INVENTORY_FILE.exists():
+        return {
+            "ok": False,
+            "status": "fail",
+            "error": f"No Local Connector inventory at {INVENTORY_FILE}.",
+        }
+    inventory = Inventory(INVENTORY_FILE)
+    try:
+        profile = DiscoveryProfile.from_payload(payload, inventory)
+    except DiscoveryProfileError as exc:
+        return {"ok": False, "status": "fail", "error": str(exc), "scope_rejected": True}
+
+    started = time.monotonic()
+    event_log: list[dict[str, Any]] = []
+
+    def emit(event: dict[str, Any]) -> None:
+        safe = {
+            "stage": str(event.get("stage") or "discovery"),
+            "status": str(event.get("status") or "running"),
+            "message": str(event.get("message") or "")[:1000],
+            "device_id": str(event.get("device_id") or ""),
+            "host": str(event.get("host") or ""),
+            "depth": int(event.get("depth") or 0),
+        }
+        event_log.append(safe)
+        if progress:
+            progress(safe)
+
+    emit({
+        "stage": "scope_validated",
+        "status": "running",
+        "message": (
+            f"Approved {len(profile.seeds)} seed(s); max {profile.max_devices} devices, "
+            f"depth {profile.max_depth}, concurrency {profile.concurrency}."
+        ),
+    })
+
+    frontier: list[tuple[DiscoveryTarget, int]] = [(target, 0) for target in profile.seeds]
+    queued = {(target.host, target.port) for target in profile.seeds}
+    scanned: set[tuple[str, int]] = set()
+    states: dict[str, Any] = {}
+    candidates: list[dict[str, Any]] = []
+    results: list[dict[str, Any]] = []
+    failures: list[dict[str, Any]] = []
+
+    while frontier and len(scanned) < profile.max_devices:
+        current_depth = min(depth for _, depth in frontier)
+        if current_depth > profile.max_depth:
+            break
+        wave = [item for item in frontier if item[1] == current_depth]
+        frontier = [item for item in frontier if item[1] != current_depth]
+        remaining = profile.max_devices - len(scanned)
+        wave = wave[:remaining]
+        emit({
+            "stage": "wave_started",
+            "status": "running",
+            "depth": current_depth,
+            "message": f"Collecting depth {current_depth}: {len(wave)} device(s).",
+        })
+
+        def scan_target(target: DiscoveryTarget) -> tuple[DiscoveryTarget, dict[str, Any]]:
+            emit({
+                "stage": "device_started",
+                "status": "running",
+                "device_id": target.device_id,
+                "host": target.host,
+                "depth": current_depth,
+                "message": f"Collecting read-only state from {target.device_id or target.host}.",
+            })
+            return target, _execute_rez_scan_device(target.scan_payload(), persist_inventory=False)
+
+        completed: list[tuple[DiscoveryTarget, dict[str, Any]]] = []
+        with ThreadPoolExecutor(max_workers=min(profile.concurrency, max(1, len(wave)))) as executor:
+            futures = [executor.submit(scan_target, target) for target, _ in wave]
+            for future in as_completed(futures):
+                try:
+                    completed.append(future.result())
+                except Exception as exc:  # noqa: BLE001
+                    failures.append({"depth": current_depth, "error": f"collector_error:{type(exc).__name__}:{exc}"})
+
+        for target, result in sorted(completed, key=lambda item: (item[0].device_id or item[0].host).lower()):
+            target_key = (target.host, target.port)
+            scanned.add(target_key)
+            public_result = {
+                key: value
+                for key, value in result.items()
+                if key not in {"state", "source_of_truth_yaml"}
+            }
+            public_result["depth"] = current_depth
+            results.append(public_result)
+            if not result.get("ok") or not isinstance(result.get("state"), dict):
+                failure = {
+                    "device_id": target.device_id,
+                    "host": target.host,
+                    "port": target.port,
+                    "depth": current_depth,
+                    "error": str(result.get("error") or result.get("message") or "collection_failed"),
+                    "tried_platforms": result.get("tried_platforms") or [],
+                }
+                failures.append(failure)
+                emit({
+                    "stage": "device_failed",
+                    "status": "failed",
+                    "device_id": target.device_id,
+                    "host": target.host,
+                    "depth": current_depth,
+                    "message": failure["error"],
+                })
+                continue
+
+            state = dict(result["state"])
+            candidate = dict(result.get("source_of_truth_candidate") or {})
+            node_id = str(candidate.get("id") or target.device_id or target.host)
+            states[node_id] = state
+            candidates.append(candidate)
+            emit({
+                "stage": "device_collected",
+                "status": "passed",
+                "device_id": node_id,
+                "host": target.host,
+                "depth": current_depth,
+                "message": f"Collected normalized state from {node_id}.",
+            })
+
+            if current_depth >= profile.max_depth:
+                continue
+            for neighbor in discovery_neighbor_targets(state, inventory=inventory, profile=profile):
+                neighbor_key = (neighbor.host, neighbor.port)
+                if neighbor_key in scanned or neighbor_key in queued:
+                    continue
+                if len(queued) >= profile.max_devices:
+                    break
+                queued.add(neighbor_key)
+                frontier.append((neighbor, current_depth + 1))
+
+        emit({
+            "stage": "wave_completed",
+            "status": "running",
+            "depth": current_depth,
+            "message": f"Depth {current_depth} complete; {len(states)} device(s) collected.",
+        })
+
+    ok = bool(states)
+    partial = ok and bool(failures)
+    final_status = "partial" if partial else ("pass" if ok else "fail")
+    emit({
+        "stage": "discovery_completed" if ok else "discovery_failed",
+        "status": "passed" if ok and not partial else ("partial" if partial else "failed"),
+        "message": (
+            f"Discovery collected {len(states)} device(s); {len(failures)} failed."
+            if ok
+            else "Discovery did not collect any device state."
+        ),
+    })
+    return {
+        "ok": ok,
+        "status": final_status,
+        "partial": partial,
+        "provider": "rez-local-connector",
+        "profile": profile.public_dict(),
+        "device_states": states,
+        "source_of_truth_candidates": candidates,
+        "device_results": results,
+        "failures": failures,
+        "progress_events": event_log,
+        "requested": len(scanned),
+        "collected": len(states),
+        "failed": len(failures),
+        "elapsed_seconds": round(time.monotonic() - started, 3),
+        "safety": {
+            "device_writes": "none",
+            "credentials_returned": False,
+            "execution_location": "local_connector",
+            "scope_enforced": True,
+            "source_of_truth_written": False,
+        },
+        "runner_version": VERSION,
+    }
+
+
 def _read_deadline_seconds(action: str, payload: dict[str, Any]) -> float:
     if action == "connector_capabilities":
         return 15.0
@@ -1466,6 +1679,12 @@ def _read_deadline_seconds(action: str, payload: dict[str, Any]) -> float:
         except Exception:
             requested = float(READINESS_TIMEOUT_SECONDS)
         return max(1.0, min(requested, float(MAX_READ_TIMEOUT_SECONDS)))
+    if action == "rez_discover_network":
+        try:
+            requested = float(payload.get("_runner_timeout_seconds") or 300)
+        except Exception:
+            requested = 300.0
+        return max(1.0, min(requested, float(MAX_DISCOVERY_TIMEOUT_SECONDS)))
     return float(READ_TIMEOUT_SECONDS)
 
 
@@ -1753,6 +1972,9 @@ def _execute_read_inner(
 
     if action == "rez_scan_device":
         return _execute_rez_scan_device(payload)
+
+    if action == "rez_discover_network":
+        return _execute_rez_discover_network(payload, progress=progress)
 
     if action == "rez_server_listener_probe":
         return _execute_rez_server_listener_probe(payload)
