@@ -1921,7 +1921,13 @@ def test_pending_feature_endpoints(tmp_path: Path, monkeypatch):
     assert conformance.status_code == 200
     assert "conformance" in conformance.json()
     assert providers.status_code == 200
-    assert any(provider["id"] == "netbox" for provider in providers.json()["providers"])
+    provider_ids = {provider["id"] for provider in providers.json()["providers"]}
+    assert "nautobot" not in provider_ids
+    assert "netbox" not in provider_ids
+    assert "infoblox" in provider_ids
+    infoblox = next(provider for provider in providers.json()["providers"] if provider["id"] == "infoblox")
+    assert infoblox["status"] == "deferred"
+    assert infoblox["writes"] is False
     assert scale.status_code == 200
     assert scale.json()["controls"]["pause_on_failure"] is True
     assert assistant.status_code == 200
@@ -2689,6 +2695,97 @@ def test_runner_ansible_pack_reaudit_blocks_raw_shell_module(tmp_path: Path, mon
     assert result["ok"] is False
     assert result["message"] == "Local runner Ansible audit blocked execution."
     assert "high_risk_modules_forbidden" in result["evidence"]["plan"]["blockers"]
+
+
+def test_local_connector_capabilities_are_secret_free_and_open_no_device_sessions(tmp_path: Path, monkeypatch):
+    from netcode import runner_agent
+
+    inventory_file = tmp_path / "runner-inventory.yaml"
+    write_yaml(
+        inventory_file,
+        {
+            "defaults": {"username": "local-user", "password": "local-secret"},
+            "devices": [
+                {
+                    "id": "edge-01",
+                    "host": "192.0.2.10",
+                    "platform": "arista_eos",
+                }
+            ],
+        },
+    )
+    monkeypatch.setattr(runner_agent, "INVENTORY_FILE", inventory_file)
+    monkeypatch.setattr(
+        "shutil.which",
+        lambda binary: f"/usr/bin/{binary}" if binary in {"ansible-playbook", "ansible-galaxy"} else None,
+    )
+
+    class Completed:
+        returncode = 0
+        stdout = json.dumps(
+            {
+                "/collections": {
+                    "arista.eos": {"version": "10.0.0"},
+                    "cisco.ios": {"version": "9.1.0"},
+                }
+            }
+        )
+        stderr = ""
+
+    monkeypatch.setattr("subprocess.run", lambda *args, **kwargs: Completed())
+
+    result = runner_agent._execute_read_inner("connector_capabilities", {})
+    serialized = json.dumps(result).lower()
+
+    assert result["ok"] is True
+    assert result["connector"]["device_connections_opened"] == 0
+    assert result["inventory"]["device_count"] == 1
+    assert result["ansible"]["installed"] is True
+    assert next(item for item in result["ansible"]["collections"] if item["name"] == "arista.eos")["installed"] is True
+    assert result["safety"] == {
+        "device_writes": "none",
+        "credentials_returned": False,
+        "device_connections_opened": 0,
+    }
+    assert "local-secret" not in serialized
+    assert "local-user" not in serialized
+
+
+def test_local_connector_readiness_targets_selected_connector(tmp_path: Path, monkeypatch):
+    init_workspace(WorkspacePaths(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    client = TestClient(api.app)
+    join = client.post("/api/runners/join-token", json={"pool": "pilot"}).json()
+    enrolled = client.post(
+        "/api/runner/enroll",
+        json={"join_token": join["join_token"], "name": "branch-connector"},
+    ).json()
+    PlatformStore(WorkspacePaths(tmp_path)).touch_runner(enrolled["runner_id"], status="online")
+    captured: dict[str, object] = {}
+
+    def fake_read(paths, action, payload, org_id, timeout=60.0, *, change_id=None, target_runner_id=None):
+        captured.update({
+            "action": action,
+            "payload": payload,
+            "org_id": org_id,
+            "target_runner_id": target_runner_id,
+        })
+        return {
+            "ok": True,
+            "connector": {"device_connections_opened": 0},
+            "safety": {"credentials_returned": False, "device_connections_opened": 0},
+        }
+
+    monkeypatch.setattr(api, "_runner_read", fake_read)
+    response = client.get(f"/api/local-connectors/{enrolled['runner_id']}/readiness")
+    data = response.json()
+
+    assert response.status_code == 200
+    assert data["ok"] is True
+    assert captured["action"] == "connector_capabilities"
+    assert captured["payload"] == {}
+    assert captured["target_runner_id"] == enrolled["runner_id"]
+    assert data["connector"]["name"] == "branch-connector"
 
 
 def test_guided_ansible_builder_creates_yaml_without_python(tmp_path: Path, monkeypatch):

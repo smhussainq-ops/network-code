@@ -1,5 +1,10 @@
 # Netcode and Nautobot: differences and gap plan - 2026-07-12
 
+> Superseded for implementation by
+> `NETCODE_MARCUS_P0_P2_EXECUTION_PLAN_2026-07-12.md`. Nautobot/NetBox DCIM/IPAM
+> integration is no longer on the product roadmap; future address-management
+> integration is explicitly Infoblox-first and deferred until after pilot proof.
+
 ## Executive decision
 
 Netcode should not claim full Nautobot feature parity or rebuild Nautobot's mature

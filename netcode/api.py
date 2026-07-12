@@ -1513,12 +1513,22 @@ def _runner_read(
     timeout: float = 60.0,
     *,
     change_id: str | None = None,
+    target_runner_id: str | None = None,
 ) -> dict[str, object]:
     """Runner mode: queue a device-read job and wait for the on-prem runner to report.
     Keeps the browser API synchronous while the actual device I/O happens on the runner."""
     store = PlatformStore(p)
     effective_change_id = change_id or str(payload.get("_progress_change_id") or "") or None
-    pool, target_runner_id = _runner_route_for_payload(store, org_id, payload)
+    if target_runner_id:
+        try:
+            target_runner = store.get_runner(target_runner_id)
+        except ValueError:
+            return {"ok": False, "error": "Unknown Local Connector."}
+        if target_runner.org_id != org_id:
+            return {"ok": False, "error": "Unknown Local Connector."}
+        pool = target_runner.pool
+    else:
+        pool, target_runner_id = _runner_route_for_payload(store, org_id, payload)
     job = store.create_read_job(
         org_id,
         pool,
@@ -1551,6 +1561,45 @@ def _runner_read(
         time.sleep(0.4)
     store.cancel_job_if_queued(job.id, f"read deadline: {action} exceeded {int(timeout)}s")
     return {"ok": False, "error": f"No runner completed the {action} read within {int(timeout)}s. Is a runner online for this pool? (Setup → Runners)"}
+
+
+@app.get("/api/local-connectors/{runner_id}/readiness")
+def api_local_connector_readiness(runner_id: str, request: Request) -> dict[str, object]:
+    """Return connector-local capability metadata without opening a device session."""
+    store = PlatformStore(paths())
+    org_id = _request_principal(request).org_id
+    try:
+        runner = store.get_runner(runner_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail="Unknown Local Connector.") from exc
+    if runner.org_id != org_id:
+        raise HTTPException(status_code=404, detail="Unknown Local Connector.")
+    if str(runner.status or "").lower() != "online":
+        return {
+            "ok": False,
+            "connector": {"id": runner.id, "name": runner.name, "status": runner.status},
+            "message": "Local Connector is offline.",
+        }
+    result = _runner_read(
+        paths(),
+        "connector_capabilities",
+        {},
+        org_id,
+        timeout=20,
+        target_runner_id=runner.id,
+    )
+    return {
+        "ok": bool(result.get("ok")),
+        "connector": {
+            "id": runner.id,
+            "name": runner.name,
+            "pool": runner.pool,
+            "status": runner.status,
+            "version": runner.version,
+            "device_count": runner.device_count,
+        },
+        "readiness": result,
+    }
 
 
 def _reject_cloud_credentials_in_runner_mode(*values: str) -> None:

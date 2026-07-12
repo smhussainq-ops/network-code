@@ -78,26 +78,6 @@ def provider_catalog(netbox_configured: bool = False) -> list[dict[str, Any]]:
             "message": "Active provider for the current lab and demo slice.",
         },
         {
-            "id": "netbox",
-            "name": "NetBox",
-            "status": "configured" if netbox_configured else "available",
-            "capabilities": ["devices", "sites", "prefixes", "vlans", "tenants"],
-            "writes": False,
-            "message": (
-                "Configured. Test the connection, then sync devices into inventory."
-                if netbox_configured
-                else "Read-only device sync. Set source_of_truth.netbox.url + token to enable."
-            ),
-        },
-        {
-            "id": "nautobot",
-            "name": "Nautobot",
-            "status": "stub",
-            "capabilities": ["devices", "sites", "prefixes", "vlans", "jobs"],
-            "writes": False,
-            "message": "Provider contract reserved; configure API URL/token before enabling.",
-        },
-        {
             "id": "servicenow_cmdb",
             "name": "ServiceNow CMDB",
             "status": "stub",
@@ -106,12 +86,12 @@ def provider_catalog(netbox_configured: bool = False) -> list[dict[str, Any]]:
             "message": "Provider contract reserved for ownership and change context.",
         },
         {
-            "id": "ipam",
-            "name": "Enterprise IPAM",
-            "status": "stub",
-            "capabilities": ["prefix_allocation", "vlan_allocation", "reservation"],
+            "id": "infoblox",
+            "name": "Infoblox",
+            "status": "deferred",
+            "capabilities": ["prefixes", "ip_allocations", "dns", "dhcp", "reservation"],
             "writes": False,
-            "message": "Provider contract reserved for allocation authority.",
+            "message": "Later phase: read authoritative IPAM, DNS, and DHCP data first; governed reservations follow after pilot validation.",
         },
     ]
 

@@ -22,8 +22,11 @@ import hmac
 import ipaddress
 import json
 import os
+import platform
 import re
+import shutil
 import signal
+import subprocess
 import site
 import sys
 import threading
@@ -1447,6 +1450,8 @@ def _execute_rez_scan_device(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 def _read_deadline_seconds(action: str, payload: dict[str, Any]) -> float:
+    if action == "connector_capabilities":
+        return 15.0
     if action == "readiness":
         return float(READINESS_TIMEOUT_SECONDS)
     if action == "rez_refresh_targeted":
@@ -1504,6 +1509,95 @@ def _execute_read_inner(
     from netcode.inventory import Inventory
     from netcode.models import load_intent
     from netcode.yamlio import read_yaml, write_yaml
+
+    if action == "connector_capabilities":
+        expected_collections = (
+            "arista.eos",
+            "cisco.ios",
+            "cisco.nxos",
+            "junipernetworks.junos",
+            "fortinet.fortios",
+            "paloaltonetworks.panos",
+        )
+        ansible_playbook = shutil.which("ansible-playbook")
+        ansible_galaxy = shutil.which("ansible-galaxy")
+        installed_collections: dict[str, str] = {}
+        collection_error = ""
+        if ansible_galaxy:
+            try:
+                completed = subprocess.run(
+                    [ansible_galaxy, "collection", "list", "--format", "json"],
+                    capture_output=True,
+                    text=True,
+                    timeout=8,
+                    check=False,
+                )
+                if completed.returncode == 0:
+                    raw_collections = json.loads(completed.stdout or "{}")
+                    for collections in raw_collections.values() if isinstance(raw_collections, dict) else ():
+                        if not isinstance(collections, dict):
+                            continue
+                        for name, metadata in collections.items():
+                            version = str(metadata.get("version") or "installed") if isinstance(metadata, dict) else "installed"
+                            installed_collections[str(name)] = version
+                else:
+                    collection_error = "Ansible collection inventory was unavailable."
+            except Exception:
+                collection_error = "Ansible collection inventory was unavailable."
+
+        inventory_count = 0
+        inventory_platforms: list[str] = []
+        if INVENTORY_FILE.exists():
+            try:
+                local_inventory = Inventory(INVENTORY_FILE)
+                inventory_count = len(local_inventory.by_id)
+                inventory_platforms = sorted(
+                    {str(device.platform or "unknown") for device in local_inventory.by_id.values()}
+                )
+            except Exception:
+                collection_error = collection_error or "Local inventory could not be summarized."
+
+        collection_rows = [
+            {
+                "name": name,
+                "installed": name in installed_collections,
+                "version": installed_collections.get(name, ""),
+            }
+            for name in expected_collections
+        ]
+        return {
+            "ok": True,
+            "status": "pass",
+            "action": "connector_capabilities",
+            "connector": {
+                "version": VERSION,
+                "operating_system": platform.system() or "unknown",
+                "python_version": platform.python_version(),
+                "outbound_only": True,
+                "device_connections_opened": 0,
+            },
+            "device_access": {
+                "ssh": True,
+                "api": True,
+                "credentials": "local_only",
+            },
+            "inventory": {
+                "configured": INVENTORY_FILE.exists(),
+                "device_count": inventory_count,
+                "platforms": inventory_platforms,
+            },
+            "ansible": {
+                "installed": bool(ansible_playbook),
+                "collections": collection_rows,
+                "collection_inventory_complete": bool(ansible_galaxy) and not collection_error,
+                "message": collection_error,
+            },
+            "safety": {
+                "device_writes": "none",
+                "credentials_returned": False,
+                "device_connections_opened": 0,
+            },
+        }
 
     if action == "manual_device_add":
         candidate = dict(payload.get("candidate") or {})
