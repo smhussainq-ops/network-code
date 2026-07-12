@@ -108,6 +108,8 @@ from netcode.platform import platform_capabilities
 from netcode.scale import rollout_plan
 from netcode.shell_desktop import build_desktop_shell_profile
 from netcode.source_of_truth import netbox_sync, netbox_test, provider_catalog, source_of_truth
+from netcode.network_model import NetworkModelError
+from netcode.network_model_store import NetworkModelRepository
 from netcode.store import (
     DEFAULT_ORG_ID,
     PlatformStore,
@@ -1109,6 +1111,80 @@ def api_platform_capabilities() -> dict[str, object]:
 @app.get("/api/source-of-truth")
 def api_source_of_truth() -> dict[str, object]:
     return source_of_truth(paths())
+
+
+@app.post("/api/network-model/revisions")
+def api_network_model_create_revision(request: Request, payload: dict[str, object]) -> dict[str, object]:
+    principal = _request_principal(request)
+    document = dict(payload)
+    document["org_id"] = principal.org_id
+    try:
+        revision = NetworkModelRepository(PlatformStore(paths())).create_revision(
+            document,
+            created_by=principal.email or principal.user_id or "system",
+        )
+    except (NetworkModelError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"ok": True, "revision": revision}
+
+
+@app.get("/api/network-model/revisions")
+def api_network_model_list_revisions(
+    request: Request,
+    environment_id: str = Query(..., min_length=1, max_length=128),
+    status: str = Query(default="", max_length=32),
+    cursor: str = Query(default="", max_length=500),
+    limit: int = Query(default=25, ge=1, le=100),
+) -> dict[str, object]:
+    result = NetworkModelRepository(PlatformStore(paths())).list_revisions(
+        _request_principal(request).org_id,
+        environment_id,
+        status=status,
+        cursor=cursor,
+        limit=limit,
+    )
+    return {"ok": True, **result, "device_connections_opened": 0}
+
+
+@app.get("/api/network-model/revisions/{revision_id}")
+def api_network_model_get_revision(
+    request: Request,
+    revision_id: str,
+    environment_id: str = Query(..., min_length=1, max_length=128),
+) -> dict[str, object]:
+    try:
+        revision = NetworkModelRepository(PlatformStore(paths())).get_revision(
+            _request_principal(request).org_id,
+            environment_id,
+            revision_id,
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return {"ok": True, "revision": revision, "device_connections_opened": 0}
+
+
+@app.get("/api/network-model/entities")
+def api_network_model_entities(
+    request: Request,
+    environment_id: str = Query(..., min_length=1, max_length=128),
+    revision_id: str = Query(..., min_length=1, max_length=128),
+    entity_type: str = Query(default="", max_length=128),
+    site: str = Query(default="", max_length=160),
+    device_id: str = Query(default="", max_length=200),
+    cursor: str = Query(default="", max_length=500),
+    limit: int = Query(default=50, ge=1, le=100),
+) -> dict[str, object]:
+    result = NetworkModelRepository(PlatformStore(paths())).list_entities(
+        _request_principal(request).org_id,
+        environment_id,
+        revision_id,
+        entity_type=entity_type,
+        site=site,
+        device_id=device_id,
+        cursor=cursor,
+        limit=limit,
+    )
+    return {"ok": True, **result, "device_connections_opened": 0}
 
 
 @app.get("/api/devices")
