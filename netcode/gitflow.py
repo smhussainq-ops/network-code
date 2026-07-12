@@ -2,9 +2,81 @@
 
 from __future__ import annotations
 
+import json
+import re
+import shutil
 import subprocess
 from pathlib import Path
 from typing import Any
+
+
+_SAFE_PATH_PART = re.compile(r"[^A-Za-z0-9._-]+")
+_CHANGE_HISTORY_GITIGNORE = """# Netcode change-history repository
+# Only reviewed change records and their copied artifacts belong here.
+*
+!.gitignore
+!README.md
+!changes/
+!changes/**
+"""
+
+
+def _safe_path_part(value: object, fallback: str) -> str:
+    cleaned = _SAFE_PATH_PART.sub("-", str(value or "").strip()).strip("-.")
+    return cleaned or fallback
+
+
+def materialize_change_artifacts(
+    git_root: Path,
+    *,
+    workspace_root: Path,
+    change_id: str,
+    record: dict[str, Any],
+) -> dict[str, object]:
+    """Copy one change's durable artifacts into the isolated history repo."""
+    safe_change_id = _safe_path_part(change_id, "unknown-change")
+    change_dir = git_root / "changes" / safe_change_id
+    change_dir.mkdir(parents=True, exist_ok=True)
+    workspace = workspace_root.resolve()
+    copied: list[str] = []
+    for item in record.get("manifest") or []:
+        if not isinstance(item, dict) or not item.get("exists"):
+            continue
+        source = Path(str(item.get("path") or "")).resolve()
+        if source != workspace and workspace not in source.parents:
+            continue
+        artifact_name = _safe_path_part(item.get("artifact"), source.name)
+        suffix = source.suffix if not artifact_name.endswith(source.suffix) else ""
+        destination = change_dir / f"{artifact_name}{suffix}"
+        shutil.copy2(source, destination)
+        copied.append(str(destination.relative_to(git_root)))
+
+    audit_record = {
+        "schema": "netcode.change-history.v1",
+        "change_id": record.get("change_id") or change_id,
+        "rez_change_id": record.get("rez_change_id"),
+        "workflow_state": record.get("workflow_state"),
+        "status": record.get("status"),
+        "request": record.get("request") or {},
+        "plan": record.get("plan") or {},
+        "safety": record.get("safety") or {},
+        "lab_proof": record.get("lab_proof") or {},
+        "apply_proof": record.get("apply_proof") or {},
+        "verify_proof": record.get("verify_proof") or {},
+        "rollback_record": record.get("rollback_record") or {},
+    }
+    record_path = change_dir / "change-record.json"
+    record_path.write_text(
+        json.dumps(audit_record, indent=2, sort_keys=True, default=str) + "\n",
+        encoding="utf-8",
+    )
+    copied.append(str(record_path.relative_to(git_root)))
+    return {
+        "ok": True,
+        "change_id": change_id,
+        "change_directory": str(change_dir),
+        "paths": sorted(set(copied)),
+    }
 
 
 def _run_git(root: Path, args: list[str]) -> str:
@@ -271,9 +343,18 @@ def commit_change_artifacts(root: Path, message: str, add_paths: list[str] | Non
             "commit": None,
             "branch": None,
         }
+    if not add_paths:
+        return {
+            "ok": False,
+            "action": "blocked",
+            "message": "No reviewed change artifacts were supplied; refusing to stage the whole workspace.",
+            "steps": [],
+            "commit": None,
+            "branch": _run_git(root, ["branch", "--show-current"]) or None,
+        }
     branch = _run_git(root, ["branch", "--show-current"]) or None
     steps: list[dict[str, Any]] = []
-    add_args = ["add", "-A"] if not add_paths else ["add", *add_paths]
+    add_args = ["add", "--", *add_paths]
     steps.append(_run_git_step(root, add_args))
     staged_probe = subprocess.run(
         ["git", "diff", "--cached", "--quiet"],
@@ -379,7 +460,47 @@ def setup_git_workspace(root: Path, repo_url: str = "", branch: str = "main") ->
     if inside.returncode != 0 or inside.stdout.strip() != "true":
         steps.append(_run_git_step(root, ["init", "-b", branch]))
     else:
-        steps.append(_run_git_step(root, ["checkout", "-B", branch]))
+        current_branch = _run_git(root, ["branch", "--show-current"])
+        if current_branch != branch:
+            branch_probe = subprocess.run(
+                ["git", "show-ref", "--verify", "--quiet", f"refs/heads/{branch}"],
+                cwd=root,
+                check=False,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            checkout_args = (
+                ["checkout", branch]
+                if branch_probe.returncode == 0
+                else ["checkout", "-b", branch]
+            )
+            steps.append(_run_git_step(root, checkout_args))
+    gitignore = root / ".gitignore"
+    readme = root / "README.md"
+    if not gitignore.exists():
+        gitignore.write_text(_CHANGE_HISTORY_GITIGNORE, encoding="utf-8")
+    if not readme.exists():
+        readme.write_text(
+            "# Netcode change history\n\nReviewed network intent, command, validation, and rollback artifacts.\n",
+            encoding="utf-8",
+        )
+    steps.append(_run_git_step(root, ["add", "--", ".gitignore", "README.md"]))
+    staged_probe = subprocess.run(
+        ["git", "diff", "--cached", "--quiet"],
+        cwd=root,
+        check=False,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    if staged_probe.returncode != 0:
+        steps.append(
+            _run_git_step(
+                root,
+                [*_COMMIT_IDENTITY, "commit", "-m", "Initialize Netcode change history"],
+            )
+        )
     if repo_url:
         current_remote = _run_git(root, ["remote", "get-url", "origin"])
         if current_remote and "No such remote" not in current_remote:
@@ -390,7 +511,9 @@ def setup_git_workspace(root: Path, repo_url: str = "", branch: str = "main") ->
 
     status = git_workspace_status(root)
     return {
-        "ok": bool(status.get("available")) and all(step["ok"] for step in steps if step["command"] != "git status --short"),
+        "ok": bool(status.get("available")) and all(
+            step["ok"] for step in steps if step["command"] != "git status --short"
+        ),
         "workspace": str(root),
         "repo_url": repo_url,
         "branch": branch,

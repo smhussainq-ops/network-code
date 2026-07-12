@@ -44,6 +44,13 @@ class WorkspacePaths:
         return self.state / "netcode.db"
 
     @property
+    def git_workspace(self) -> Path:
+        configured = os.environ.get("NETCODE_GIT_WORKSPACE", "").strip()
+        if configured:
+            return Path(configured).expanduser().resolve()
+        return self.state / "change-history"
+
+    @property
     def static(self) -> Path:
         return self.root / "static"
 
@@ -57,6 +64,7 @@ class WorkspacePaths:
             self.rendered,
             self.reports,
             self.state,
+            self.git_workspace,
             self.static,
         ):
             path.mkdir(parents=True, exist_ok=True)

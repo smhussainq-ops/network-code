@@ -301,15 +301,26 @@ def submit_job_result(
             "message": f"Manager result accepted; change moved to {next_state}.",
         }
 
-    action = job.action.removeprefix("lab_")
+    if job.action.startswith("ansible_"):
+        ansible_mode = job.action.removeprefix("ansible_")
+        transition_action = {
+            "check": "dry-run",
+            "canary": "apply",
+            "apply": "apply",
+            "rollback": "rollback",
+        }.get(ansible_mode, "")
+        event_action = job.action
+    else:
+        event_action = job.action.removeprefix("lab_")
+        transition_action = event_action
     passed = result.get("status") == "pass"
     status = "completed" if passed else "failed"
     change = store.get_change(job.change_id)
-    workflow = state_after_lab_action(action, passed)
+    workflow = state_after_lab_action(transition_action, passed)
     store.update_change(change.id, status, result, workflow_state=workflow.state)
     store.record_workflow_event(
         change.id,
-        action,
+        event_action,
         change.workflow_state,
         workflow.state,
         str(result.get("message", "")),

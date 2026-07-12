@@ -24,6 +24,7 @@ import json
 import os
 import re
 import signal
+import site
 import sys
 import threading
 import time
@@ -381,6 +382,7 @@ def _write_ansible_inventory(devices: list[Any], destination: Path) -> None:
     from netcode.yamlio import write_yaml
 
     hosts: dict[str, dict[str, Any]] = {}
+    strict_host_keys = _ansible_host_key_checking_enabled()
     for device in devices:
         host_vars = {
             "ansible_host": device.host,
@@ -389,9 +391,71 @@ def _write_ansible_inventory(devices: list[Any], destination: Path) -> None:
             "ansible_password": device.password,
             **_ansible_network_vars(device.platform),
         }
+        if not strict_host_keys:
+            # Explicit lab-only override. Production omits these variables and
+            # retains Ansible's strict host-key defaults.
+            host_vars.update(
+                {
+                    "ansible_host_key_checking": False,
+                    "ansible_ssh_host_key_checking": False,
+                }
+            )
         hosts[device.id] = {key: value for key, value in host_vars.items() if value not in (None, "")}
     write_yaml(destination, {"all": {"hosts": hosts}})
     destination.chmod(0o600)
+
+
+def _ansible_host_key_checking_enabled() -> bool:
+    """Keep production strict; disposable labs must opt out explicitly."""
+    configured = os.environ.get("NETCODE_ANSIBLE_HOST_KEY_CHECKING", "true")
+    return configured.strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _ansible_subprocess_env(job_root: Path | None = None) -> dict[str, str]:
+    env = os.environ.copy()
+    strict_host_keys = _ansible_host_key_checking_enabled()
+    checking = "True" if strict_host_keys else "False"
+    auto_add = "False" if strict_host_keys else "True"
+    env.update(
+        {
+            "ANSIBLE_HOST_KEY_CHECKING": checking,
+            "ANSIBLE_SSH_HOST_KEY_CHECKING": checking,
+            "ANSIBLE_PARAMIKO_HOST_KEY_CHECKING": checking,
+            "ANSIBLE_HOST_KEY_AUTO_ADD": auto_add,
+            "ANSIBLE_PARAMIKO_HOST_KEY_AUTO_ADD": auto_add,
+        }
+    )
+    if not strict_host_keys and job_root is not None:
+        # Disposable labs regenerate SSH keys. Isolate their trust state from
+        # the runner account instead of deleting or weakening global known_hosts.
+        original_home = Path.home()
+        ansible_home = job_root / "ansible-home"
+        (ansible_home / ".ssh").mkdir(parents=True, exist_ok=True)
+        local_temp = job_root / "ansible-local-temp"
+        control_path = job_root / "ansible-pc"
+        local_temp.mkdir(parents=True, exist_ok=True)
+        control_path.mkdir(parents=True, exist_ok=True)
+        env["HOME"] = str(ansible_home)
+        env["ANSIBLE_LOCAL_TEMP"] = str(local_temp)
+        env["ANSIBLE_PERSISTENT_CONTROL_PATH_DIR"] = str(control_path)
+
+        user_site = site.getusersitepackages()
+        user_sites = [user_site] if isinstance(user_site, str) else list(user_site)
+        python_paths = [*user_sites]
+        if env.get("PYTHONPATH"):
+            python_paths.append(env["PYTHONPATH"])
+        env["PYTHONPATH"] = os.pathsep.join(item for item in python_paths if item)
+
+        if not env.get("ANSIBLE_COLLECTIONS_PATH"):
+            collection_paths = [
+                original_home / ".ansible" / "collections",
+                Path(sys.prefix) / "share" / "ansible" / "collections",
+                Path("/usr/share/ansible/collections"),
+            ]
+            env["ANSIBLE_COLLECTIONS_PATH"] = os.pathsep.join(
+                str(path) for path in collection_paths if path.exists()
+            )
+    return env
 
 
 def _execute_ansible_pack(payload: dict[str, Any]) -> dict[str, Any]:
@@ -410,27 +474,42 @@ def _execute_ansible_pack(payload: dict[str, Any]) -> dict[str, Any]:
 
     mode = str(payload.get("mode") or "check").strip().lower() or "check"
     targets = [str(item).strip() for item in (payload.get("targets") or []) if str(item).strip()]
-    playbook_path = str(payload.get("playbook_path") or "").strip()
-    rollback_playbook_path = str(payload.get("rollback_playbook_path") or "").strip()
+    playbook_content = str(payload.get("playbook_content") or "")
+    rollback_content = str(payload.get("rollback_playbook_content") or "")
     if not targets:
         return {"ok": False, "status": "fail", "action": "ansible_pack", "mode": mode, "message": "Explicit target device IDs are required."}
     if not INVENTORY_FILE.exists():
         return {"ok": False, "status": "fail", "action": "ansible_pack", "mode": mode, "message": f"No local inventory at {INVENTORY_FILE}."}
-
-    ws_root = Path(os.environ.get("NETCODE_RUNNER_WORKSPACE", "") or Path.cwd()).resolve()
-    try:
-        local_plan = build_ansible_pack_plan(
-            ws_root,
-            playbook_path=playbook_path,
-            rollback_playbook_path=rollback_playbook_path,
-            targets=targets,
-            mode=mode,
-            requested_by=str(payload.get("requested_by") or "runner"),
-        )
-    except Exception as exc:  # noqa: BLE001
-        return {"ok": False, "status": "fail", "action": "ansible_pack", "mode": mode, "message": f"Local runner Ansible audit failed: {exc}"}
-    if not local_plan.get("ok"):
-        return {"ok": False, "status": "fail", "action": "ansible_pack", "mode": mode, "message": "Local runner Ansible audit blocked execution.", "evidence": {"plan": local_plan}}
+    if not playbook_content:
+        return {
+            "ok": False,
+            "status": "fail",
+            "action": "ansible_pack",
+            "mode": mode,
+            "message": "Reviewed playbook content was not included in the runner job.",
+        }
+    expected_hash = str(payload.get("playbook_sha256") or "")
+    actual_hash = hashlib.sha256(playbook_content.encode("utf-8")).hexdigest()
+    if not expected_hash or not hmac.compare_digest(expected_hash, actual_hash):
+        return {
+            "ok": False,
+            "status": "fail",
+            "action": "ansible_pack",
+            "mode": mode,
+            "message": "Playbook integrity verification failed on the runner.",
+        }
+    if rollback_content:
+        rollback_hash = hashlib.sha256(rollback_content.encode("utf-8")).hexdigest()
+        if not hmac.compare_digest(
+            str(payload.get("rollback_playbook_sha256") or ""), rollback_hash
+        ):
+            return {
+                "ok": False,
+                "status": "fail",
+                "action": "ansible_pack",
+                "mode": mode,
+                "message": "Rollback playbook integrity verification failed on the runner.",
+            }
 
     inventory = Inventory(INVENTORY_FILE)
     devices = []
@@ -448,7 +527,7 @@ def _execute_ansible_pack(payload: dict[str, Any]) -> dict[str, Any]:
             "action": "ansible_pack",
             "mode": mode,
             "message": f"Target device(s) not in local runner inventory: {', '.join(missing)}",
-            "evidence": {"plan": local_plan, "missing_targets": missing},
+            "evidence": {"missing_targets": missing},
         }
 
     ansible_playbook = shutil.which("ansible-playbook")
@@ -459,15 +538,55 @@ def _execute_ansible_pack(payload: dict[str, Any]) -> dict[str, Any]:
             "action": "ansible_pack",
             "mode": mode,
             "message": "ansible-playbook is not installed on this runner.",
-            "evidence": {"plan": local_plan, "required_binary": "ansible-playbook"},
+            "evidence": {"required_binary": "ansible-playbook"},
         }
 
     with tempfile.TemporaryDirectory(prefix="netcode-ansible-") as tempdir:
-        generated_inventory = Path(tempdir) / "inventory.yaml"
+        ws_root = Path(tempdir).resolve()
+        playbook_name = Path(str(payload.get("playbook_name") or "playbook.yml")).name
+        playbook = ws_root / playbook_name
+        playbook.write_text(playbook_content, encoding="utf-8")
+        rollback_playbook_path = ""
+        if rollback_content:
+            rollback_name = Path(
+                str(payload.get("rollback_playbook_name") or "rollback.yml")
+            ).name
+            rollback_playbook = ws_root / rollback_name
+            rollback_playbook.write_text(rollback_content, encoding="utf-8")
+            rollback_playbook_path = rollback_name
+        try:
+            local_plan = build_ansible_pack_plan(
+                ws_root,
+                playbook_path=playbook_name,
+                rollback_playbook_path=rollback_playbook_path,
+                targets=targets,
+                mode=mode,
+                requested_by=str(payload.get("requested_by") or "runner"),
+            )
+        except Exception as exc:  # noqa: BLE001
+            return {
+                "ok": False,
+                "status": "fail",
+                "action": "ansible_pack",
+                "mode": mode,
+                "message": f"Local runner Ansible audit failed: {exc}",
+            }
+        if not local_plan.get("ok"):
+            return {
+                "ok": False,
+                "status": "fail",
+                "action": "ansible_pack",
+                "mode": mode,
+                "message": "Local runner Ansible audit blocked execution.",
+                "evidence": {"plan": local_plan},
+            }
+
+        generated_inventory = ws_root / "inventory.yaml"
         _write_ansible_inventory(devices, generated_inventory)
+        subprocess_env = _ansible_subprocess_env(ws_root)
         command = [
             ansible_playbook,
-            str(local_plan["playbook"]["path"]),
+            str(playbook),
             "--inventory",
             str(generated_inventory),
             "--limit",
@@ -484,6 +603,7 @@ def _execute_ansible_pack(payload: dict[str, Any]) -> dict[str, Any]:
                 text=True,
                 timeout=600,
                 check=False,
+                env=subprocess_env,
             )
         except subprocess.TimeoutExpired as exc:
             return {
@@ -507,6 +627,8 @@ def _execute_ansible_pack(payload: dict[str, Any]) -> dict[str, Any]:
         "runner_version": VERSION,
         "evidence": {
             "plan": local_plan,
+            "playbook_sha256": actual_hash,
+            "playbook_integrity_verified": True,
             "runner_local_inventory": True,
             "credentials_leave_runner": False,
             "command": [command[0], "<playbook>", "--inventory", "<runner-generated-inventory>", "--limit", ",".join(device.id for device in devices), *(["--check", "--diff"] if mode == "check" else [])],

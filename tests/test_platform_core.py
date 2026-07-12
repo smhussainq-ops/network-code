@@ -1,3 +1,4 @@
+import hashlib
 import json
 import subprocess
 import zipfile
@@ -2133,7 +2134,7 @@ def test_ansible_pack_plan_requires_rollback_for_apply(tmp_path: Path):
     }
 
 
-def test_ansible_pack_plan_flags_high_risk_modules_without_cloud_execution(tmp_path: Path):
+def test_ansible_pack_plan_blocks_high_risk_modules_without_cloud_execution(tmp_path: Path):
     from netcode.ansible_backend import build_ansible_pack_plan
 
     playbook = tmp_path / "site.yml"
@@ -2166,10 +2167,10 @@ def test_ansible_pack_plan_flags_high_risk_modules_without_cloud_execution(tmp_p
         targets=["Core-RTR-02"],
     )
 
-    assert plan["ok"] is True
-    assert plan["status"] == "review_required"
+    assert plan["ok"] is False
+    assert plan["status"] == "blocked"
     assert plan["playbook"]["high_risk_modules"] == ["shell"]
-    assert "peer_review_high_risk_modules" in plan["required_gates"]
+    assert "high_risk_modules_forbidden" in plan["blockers"]
     assert plan["execution"]["location"] == "runner"
     assert plan["execution"]["cloud_device_access"] is False
 
@@ -2280,10 +2281,72 @@ def test_ansible_pack_run_queues_check_on_runner_without_credentials(tmp_path: P
     assert payload["action"] == "ansible_pack"
     assert payload["mode"] == "check"
     assert payload["targets"] == ["Access-SW-01"]
+    assert "Preview approved NTP" in payload["playbook_content"]
+    assert len(payload["playbook_sha256"]) == 64
     serialized = json.dumps(payload).lower()
     assert "password" not in serialized
     assert "secret" not in serialized
     assert data["change"]["workflow_state"] == "validated"
+
+
+def test_ansible_runner_check_result_advances_to_dry_run_passed(tmp_path: Path, monkeypatch):
+    import hmac as hmac_mod
+
+    from netcode.runner_hub import canonical_json
+
+    init_workspace(WorkspacePaths(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("NETCODE_EXECUTION", "runner")
+    monkeypatch.setenv("NETCODE_RUNNER_POOL", "pilot")
+    playbook = tmp_path / "playbooks" / "show.yml"
+    playbook.parent.mkdir(parents=True)
+    playbook.write_text(
+        "- hosts: all\n  tasks:\n    - debug:\n        msg: reviewed\n",
+        encoding="utf-8",
+    )
+    client = TestClient(api.app)
+    join = client.post("/api/runners/join-token", json={"pool": "pilot"}).json()
+    enrolled = client.post(
+        "/api/runner/enroll",
+        json={"join_token": join["join_token"], "name": "unit-runner"},
+    ).json()
+    auth = {"Authorization": f"Bearer {enrolled['runner_token']}"}
+
+    queued = client.post(
+        "/api/workflow-packs/ansible/run",
+        json={
+            "playbook_path": "playbooks/show.yml",
+            "targets": ["Access-SW-01"],
+            "mode": "check",
+        },
+    ).json()
+    claimed = client.post(
+        "/api/runner/poll", json={"wait_seconds": 0}, headers=auth
+    ).json()["job"]
+    result = {
+        "ok": True,
+        "status": "pass",
+        "action": "ansible_pack",
+        "mode": "check",
+        "message": "Reviewed playbook check passed.",
+    }
+    signature = hmac_mod.new(
+        enrolled["hmac_secret"].encode(),
+        canonical_json(result).encode(),
+        hashlib.sha256,
+    ).hexdigest()
+
+    accepted = client.post(
+        f"/api/runner/jobs/{claimed['id']}/result",
+        json={"result": result, "signature": signature},
+        headers=auth,
+    ).json()
+
+    assert claimed["id"] == queued["job"]["id"]
+    assert accepted["ok"] is True
+    assert accepted["workflow_state"] == "dry_run_passed"
+    change = PlatformStore(WorkspacePaths(tmp_path)).get_change(queued["change"]["id"])
+    assert change.workflow_state == "dry_run_passed"
 
 
 def test_ansible_pack_run_apply_requires_approved_change(tmp_path: Path, monkeypatch):
@@ -2370,7 +2433,6 @@ def test_runner_ansible_pack_reaudits_locally_and_uses_generated_inventory(tmp_p
             ]
         },
     )
-    monkeypatch.setenv("NETCODE_RUNNER_WORKSPACE", str(workspace))
     monkeypatch.setattr(runner_agent, "INVENTORY_FILE", inventory_file)
     monkeypatch.setattr("shutil.which", lambda binary: "/usr/bin/ansible-playbook" if binary == "ansible-playbook" else None)
     captured: dict[str, object] = {}
@@ -2383,6 +2445,7 @@ def test_runner_ansible_pack_reaudits_locally_and_uses_generated_inventory(tmp_p
     def fake_run(command, **kwargs):
         captured["command"] = command
         captured["kwargs"] = kwargs
+        captured["playbook"] = Path(command[1]).read_text(encoding="utf-8")
         inventory_path = Path(command[command.index("--inventory") + 1])
         captured["inventory"] = read_yaml(inventory_path)
         return Completed()
@@ -2392,7 +2455,9 @@ def test_runner_ansible_pack_reaudits_locally_and_uses_generated_inventory(tmp_p
     result = runner_agent._execute_ansible_pack(
         {
             "mode": "check",
-            "playbook_path": "playbooks/ntp.yml",
+            "playbook_name": "ntp.yml",
+            "playbook_content": playbook.read_text(encoding="utf-8"),
+            "playbook_sha256": hashlib.sha256(playbook.read_bytes()).hexdigest(),
             "targets": ["Access-SW-01"],
         }
     )
@@ -2403,14 +2468,284 @@ def test_runner_ansible_pack_reaudits_locally_and_uses_generated_inventory(tmp_p
     assert isinstance(command, list)
     assert "--check" in command
     assert "--diff" in command
-    assert captured["kwargs"]["cwd"] == workspace
+    assert str(captured["kwargs"]["cwd"]).startswith("/private/") or str(
+        captured["kwargs"]["cwd"]
+    ).startswith("/tmp/")
     assert captured["kwargs"].get("shell") is not True
+    assert captured["kwargs"]["env"]["ANSIBLE_HOST_KEY_CHECKING"] == "True"
+    assert captured["kwargs"]["env"]["ANSIBLE_PARAMIKO_HOST_KEY_CHECKING"] == "True"
+    assert captured["kwargs"]["env"]["ANSIBLE_PARAMIKO_HOST_KEY_AUTO_ADD"] == "False"
+    assert "Preview approved NTP" in str(captured["playbook"])
     generated_inventory = captured["inventory"]
     assert generated_inventory["all"]["hosts"]["Access-SW-01"]["ansible_host"] == "192.0.2.10"
     assert generated_inventory["all"]["hosts"]["Access-SW-01"]["ansible_password"] == "local-only"
     serialized_result = json.dumps(result).lower()
     assert "local-only" not in serialized_result
     assert result["evidence"]["credentials_leave_runner"] is False
+    assert result["evidence"]["playbook_integrity_verified"] is True
+
+
+def test_runner_ansible_host_key_override_is_explicit_and_lab_scoped(tmp_path: Path, monkeypatch):
+    from netcode import runner_agent
+
+    monkeypatch.delenv("NETCODE_ANSIBLE_HOST_KEY_CHECKING", raising=False)
+    assert runner_agent._ansible_host_key_checking_enabled() is True
+    strict_env = runner_agent._ansible_subprocess_env()
+    assert strict_env["ANSIBLE_PARAMIKO_HOST_KEY_CHECKING"] == "True"
+    assert strict_env["ANSIBLE_PARAMIKO_HOST_KEY_AUTO_ADD"] == "False"
+
+    monkeypatch.setenv("NETCODE_ANSIBLE_HOST_KEY_CHECKING", "false")
+    assert runner_agent._ansible_host_key_checking_enabled() is False
+    lab_env = runner_agent._ansible_subprocess_env(tmp_path)
+    assert lab_env["ANSIBLE_PARAMIKO_HOST_KEY_CHECKING"] == "False"
+    assert lab_env["ANSIBLE_PARAMIKO_HOST_KEY_AUTO_ADD"] == "True"
+    assert lab_env["HOME"] == str(tmp_path / "ansible-home")
+    assert lab_env["ANSIBLE_PERSISTENT_CONTROL_PATH_DIR"] == str(tmp_path / "ansible-pc")
+
+
+def test_runner_ansible_lab_override_is_written_only_to_local_inventory(tmp_path: Path, monkeypatch):
+    from netcode import runner_agent
+    from netcode.yamlio import read_yaml
+
+    device = Device(
+        id="lab-edge-01",
+        host="192.0.2.20",
+        platform="arista_eos",
+        username="local-user",
+        password="local-password",
+        port=22,
+        hostname="lab-edge-01",
+        site="lab",
+        groups=(),
+    )
+    destination = tmp_path / "inventory.yaml"
+    monkeypatch.setenv("NETCODE_ANSIBLE_HOST_KEY_CHECKING", "false")
+
+    runner_agent._write_ansible_inventory([device], destination)
+
+    host = read_yaml(destination)["all"]["hosts"]["lab-edge-01"]
+    assert host["ansible_host_key_checking"] is False
+    assert host["ansible_ssh_host_key_checking"] is False
+
+
+def test_git_setup_explicit_blank_uses_local_community_repository(tmp_path: Path, monkeypatch):
+    p = WorkspacePaths(tmp_path)
+    init_workspace(p)
+    write_yaml(
+        p.state / "ui_config.yaml",
+        {"git": {"repo_url": "https://example.invalid/configured.git"}},
+    )
+    monkeypatch.chdir(tmp_path)
+
+    response = TestClient(api.app).post(
+        "/api/git/setup", json={"repo_url": "", "branch": "main"}
+    )
+
+    assert response.status_code == 200
+    assert response.json()["ok"] is True
+    remotes = subprocess.run(
+        ["git", "remote"],
+        cwd=p.git_workspace,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert remotes.stdout.strip() == ""
+
+
+def test_git_setup_preserves_existing_branch_tip(tmp_path: Path):
+    from netcode.gitflow import setup_git_workspace
+
+    history = tmp_path / "change-history"
+    initialized = setup_git_workspace(history, branch="main")
+    assert initialized["ok"] is True
+    main_commit = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=history,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    subprocess.run(
+        ["git", "checkout", "-b", "change/test"],
+        cwd=history,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    (history / "changes" / "test").mkdir(parents=True)
+    (history / "changes" / "test" / "change-record.json").write_text(
+        '{"change_id": "test"}\n',
+        encoding="utf-8",
+    )
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.email=netcode@localhost",
+            "-c",
+            "user.name=Netcode",
+            "-c",
+            "commit.gpgsign=false",
+            "add",
+            "--",
+            "changes/test/change-record.json",
+        ],
+        cwd=history,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.email=netcode@localhost",
+            "-c",
+            "user.name=Netcode",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-m",
+            "Add test change",
+        ],
+        cwd=history,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+
+    reconnected = setup_git_workspace(history, branch="main")
+    current_commit = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=history,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+
+    assert reconnected["ok"] is True
+    assert reconnected["status"]["branch"] == "main"
+    assert current_commit == main_commit
+
+
+def test_runner_ansible_pack_rejects_tampered_transport_content(tmp_path: Path, monkeypatch):
+    from netcode import runner_agent
+
+    inventory_file = tmp_path / "runner-inventory.yaml"
+    write_yaml(inventory_file, {"devices": []})
+    monkeypatch.setattr(runner_agent, "INVENTORY_FILE", inventory_file)
+
+    result = runner_agent._execute_ansible_pack(
+        {
+            "mode": "check",
+            "playbook_name": "show.yml",
+            "playbook_content": "- hosts: all\n  tasks: []\n",
+            "playbook_sha256": "0" * 64,
+            "targets": ["Access-SW-01"],
+        }
+    )
+
+    assert result["ok"] is False
+    assert "integrity verification failed" in result["message"]
+
+
+def test_runner_ansible_pack_reaudit_blocks_raw_shell_module(tmp_path: Path, monkeypatch):
+    from netcode import runner_agent
+
+    inventory_file = tmp_path / "runner-inventory.yaml"
+    write_yaml(
+        inventory_file,
+        {
+            "devices": [
+                {
+                    "id": "Access-SW-01",
+                    "host": "192.0.2.10",
+                    "platform": "arista_eos",
+                    "username": "runner-local",
+                    "password": "runner-local-secret",
+                }
+            ]
+        },
+    )
+    monkeypatch.setattr(runner_agent, "INVENTORY_FILE", inventory_file)
+    monkeypatch.setattr("shutil.which", lambda binary: "/usr/bin/ansible-playbook")
+    playbook = """- hosts: all
+  tasks:
+    - name: Unsafe arbitrary shell
+      ansible.builtin.shell: id
+"""
+
+    result = runner_agent._execute_ansible_pack(
+        {
+            "mode": "check",
+            "playbook_name": "unsafe.yml",
+            "playbook_content": playbook,
+            "playbook_sha256": hashlib.sha256(playbook.encode()).hexdigest(),
+            "targets": ["Access-SW-01"],
+        }
+    )
+
+    assert result["ok"] is False
+    assert result["message"] == "Local runner Ansible audit blocked execution."
+    assert "high_risk_modules_forbidden" in result["evidence"]["plan"]["blockers"]
+
+
+def test_guided_ansible_builder_creates_yaml_without_python(tmp_path: Path, monkeypatch):
+    init_workspace(WorkspacePaths(tmp_path))
+    monkeypatch.chdir(tmp_path)
+
+    response = TestClient(api.app).post(
+        "/api/workflow-packs/ansible/generate",
+        json={
+            "name": "Check edge BGP",
+            "platform": "arista_eos",
+            "operation": "show",
+            "commands": ["show ip bgp summary"],
+            "targets": ["v2-store1"],
+        },
+    )
+    data = response.json()
+
+    assert response.status_code == 200
+    assert data["ok"] is True
+    assert "arista.eos.eos_command" in data["playbook_yaml"]
+    assert "python" not in data["playbook_yaml"].lower()
+    assert data["plan"]["ok"] is True
+    assert data["rollback_playbook_path"] == ""
+
+
+def test_guided_ansible_config_requires_and_generates_rollback(tmp_path: Path, monkeypatch):
+    init_workspace(WorkspacePaths(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    client = TestClient(api.app)
+
+    blocked = client.post(
+        "/api/workflow-packs/ansible/generate",
+        json={
+            "name": "Standardize NTP",
+            "platform": "cisco_xe",
+            "operation": "config",
+            "commands": ["ntp server 10.10.10.20"],
+        },
+    )
+    created = client.post(
+        "/api/workflow-packs/ansible/generate",
+        json={
+            "name": "Standardize NTP",
+            "platform": "cisco_xe",
+            "operation": "config",
+            "commands": ["ntp server 10.10.10.20"],
+            "rollback_commands": ["no ntp server 10.10.10.20"],
+            "targets": ["branch-edge-01"],
+        },
+    )
+
+    assert blocked.status_code == 400
+    assert "rollback commands" in blocked.json()["detail"]
+    assert created.status_code == 200
+    assert "cisco.ios.ios_config" in created.json()["playbook_yaml"]
+    assert "no ntp server" in created.json()["rollback_yaml"]
 
 
 def test_shell_desktop_profile_is_native_and_secret_free():
@@ -2600,12 +2935,6 @@ def test_git_branch_endpoint_creates_and_switches_change_branch(tmp_path: Path, 
     assert "not a Git repository" in blocked.json()["message"]
 
     client.post("/api/git/setup", json={"repo_url": "https://example.invalid/network-code.git", "branch": "main"})
-    subprocess.run(
-        ["git", "-c", "user.email=test@netcode.local", "-c", "user.name=netcode-test", "-c", "commit.gpgsign=false", "commit", "--allow-empty", "-m", "init"],
-        cwd=tmp_path,
-        check=True,
-        capture_output=True,
-    )
 
     created = client.post("/api/git/branch", json={"name": "change/store-1842-add-vlan-90"})
     assert created.status_code == 200
@@ -2944,17 +3273,50 @@ def test_git_commit_and_push_endpoints_report_honestly(tmp_path: Path, monkeypat
     blocked = client.post("/api/git/commit", json={"message": "before repo"})
     assert blocked.status_code == 200
     assert blocked.json()["ok"] is False
-    assert "not a Git repository" in blocked.json()["message"]
+    assert "Select one reviewed change" in blocked.json()["message"]
 
     client.post("/api/git/setup", json={"repo_url": "https://example.invalid/network-code.git", "branch": "main"})
 
-    committed = client.post("/api/git/commit", json={"message": "Initial artifacts"})
+    plan = client.post(
+        "/api/desired-state/plan",
+        json={
+            "change_type": "add_vlan",
+            "site": "store-1842",
+            "device_id": "v2-store1",
+            "requested_by": "unit",
+            "values": {"vlan_id": 91, "name": "AUDIT", "subnet": "10.42.91.0/24", "purpose": "audit"},
+        },
+    ).json()
+    change_id = plan["change"]["id"]
+    (tmp_path / "unrelated-secret.txt").write_text(
+        "must never enter change history", encoding="utf-8"
+    )
+
+    committed = client.post(
+        "/api/git/commit",
+        json={"message": "Initial artifacts", "change_id": change_id},
+    )
     assert committed.status_code == 200
     assert committed.json()["ok"] is True
     assert committed.json()["action"] == "committed"
     assert committed.json()["commit"]
+    assert committed.json()["change_history_protected"] is True
+    assert str(tmp_path / ".netcode" / "change-history") == committed.json()["workspace"]
+    tracked = subprocess.run(
+        ["git", "ls-files"],
+        cwd=tmp_path / ".netcode" / "change-history",
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.splitlines()
+    assert "unrelated-secret.txt" not in tracked
+    assert all(not path.startswith("../") for path in tracked)
+    assert any(path.endswith("change-record.json") for path in tracked)
 
-    again = client.post("/api/git/commit", json={"message": "nothing new"})
+    again = client.post(
+        "/api/git/commit",
+        json={"message": "nothing new", "change_id": change_id},
+    )
     assert again.json()["ok"] is True
     assert again.json()["action"] == "nothing_to_commit"
 

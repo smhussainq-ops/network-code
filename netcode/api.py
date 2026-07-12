@@ -17,7 +17,11 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from netcode.ai_assistant import assistant_response
-from netcode.ansible_backend import build_ansible_pack_plan
+from netcode.ansible_backend import (
+    build_ansible_pack_plan,
+    build_guided_ansible_playbook,
+    package_ansible_playbooks,
+)
 from netcode.adapters.registry import AdapterRegistry
 from netcode.adapters.rez import READ_TRANSPORTS
 from netcode.bootstrap import init_workspace
@@ -51,6 +55,7 @@ from netcode.gitflow import (
     git_evidence,
     git_workspace_status,
     list_git_branches,
+    materialize_change_artifacts,
     push_current_branch,
     setup_git_workspace,
 )
@@ -148,6 +153,16 @@ class AnsiblePackPlanRequest(BaseModel):
     mode: str = "check"
     requested_by: str = "operator"
     change_id: str = ""
+
+
+class GuidedAnsibleRequest(BaseModel):
+    name: str = "Guided network workflow"
+    platform: str = "arista_eos"
+    operation: str = "show"
+    commands: list[str] = []
+    rollback_commands: list[str] = []
+    targets: list[str] = []
+    requested_by: str = "operator"
 
 
 class IntentPathRequest(BaseModel):
@@ -304,7 +319,7 @@ class UiConfigRequest(BaseModel):
 
 
 class GitSetupRequest(BaseModel):
-    repo_url: str = ""
+    repo_url: str | None = None
     branch: str = ""
 
 
@@ -814,6 +829,30 @@ def api_ansible_pack_plan(request: AnsiblePackPlanRequest) -> dict[str, object]:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
+@app.post("/api/workflow-packs/ansible/generate")
+def api_ansible_pack_generate(request: GuidedAnsibleRequest) -> dict[str, object]:
+    try:
+        generated = build_guided_ansible_playbook(
+            paths().root,
+            name=request.name,
+            platform=request.platform,
+            operation=request.operation,
+            commands=request.commands,
+            rollback_commands=request.rollback_commands,
+        )
+        generated["plan"] = build_ansible_pack_plan(
+            paths().root,
+            playbook_path=str(generated["playbook_path"]),
+            rollback_playbook_path=str(generated["rollback_playbook_path"]),
+            targets=request.targets,
+            mode="check",
+            requested_by=request.requested_by,
+        )
+        return generated
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 @app.post("/api/workflow-packs/ansible/run")
 def api_ansible_pack_run(request: AnsiblePackPlanRequest, http_request: Request) -> dict[str, object]:
     p = paths()
@@ -839,6 +878,14 @@ def api_ansible_pack_run(request: AnsiblePackPlanRequest, http_request: Request)
             "plan": plan,
             "message": "Ansible execution requires explicit target device IDs.",
         }
+    try:
+        playbook_bundle = package_ansible_playbooks(
+            p.root,
+            playbook_path=request.playbook_path,
+            rollback_playbook_path=request.rollback_playbook_path,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     if execution_mode() != "runner":
         return {
             "ok": False,
@@ -899,6 +946,7 @@ def api_ansible_pack_run(request: AnsiblePackPlanRequest, http_request: Request)
         "rollback_playbook_path": request.rollback_playbook_path,
         "targets": request.targets,
         "plan": plan,
+        **playbook_bundle,
     }
     job = store.queue_job(change.id, f"ansible_{mode}", runner_pool(), payload)
     store.record_workflow_event(
@@ -1126,7 +1174,7 @@ def api_netbox_sync(request: NetBoxRequest) -> dict[str, object]:
 
 @app.get("/api/git/status")
 def api_git_status() -> dict[str, object]:
-    return git_workspace_status(paths().root)
+    return git_workspace_status(paths().git_workspace)
 
 
 @app.post("/api/git/setup")
@@ -1134,19 +1182,25 @@ def api_git_setup(request: GitSetupRequest) -> dict[str, object]:
     p = paths()
     config = read_ui_config(p)
     git_config = config.get("git", {})
-    repo_url = request.repo_url or str(git_config.get("repo_url") or "")
+    # Omitted means use the configured remote; an explicit blank selects a
+    # local Community repository with no cloud dependency.
+    repo_url = (
+        str(git_config.get("repo_url") or "")
+        if request.repo_url is None
+        else request.repo_url.strip()
+    )
     branch = request.branch or str(git_config.get("branch") or "main")
-    return setup_git_workspace(p.root, repo_url=repo_url, branch=branch)
+    return setup_git_workspace(p.git_workspace, repo_url=repo_url, branch=branch)
 
 
 @app.get("/api/git/branches")
 def api_git_branches() -> dict[str, object]:
-    return list_git_branches(paths().root)
+    return list_git_branches(paths().git_workspace)
 
 
 @app.post("/api/git/branch")
 def api_git_branch(request: GitBranchRequest) -> dict[str, object]:
-    return create_change_branch(paths().root, name=request.name, base=request.base)
+    return create_change_branch(paths().git_workspace, name=request.name, base=request.base)
 
 
 def _record_git_event(p, change_id: str, action: str, result: dict[str, object]) -> dict[str, object]:
@@ -1175,11 +1229,51 @@ def _record_git_event(p, change_id: str, action: str, result: dict[str, object])
 
 
 @app.post("/api/git/commit")
-def api_git_commit(request: GitCommitRequest) -> dict[str, object]:
+def api_git_commit(request: GitCommitRequest, http_request: Request) -> dict[str, object]:
     p = paths()
+    if not request.change_id:
+        return {
+            "ok": False,
+            "action": "blocked",
+            "message": "Select one reviewed change before creating a history checkpoint.",
+            "change_event_recorded": False,
+        }
     config = read_ui_config(p)
     default_message = str((config.get("git") or {}).get("default_commit_message") or "Netcode network change")
-    result = commit_change_artifacts(p.root, message=request.message or default_message)
+    git_root = p.git_workspace
+    if not git_workspace_status(git_root).get("available"):
+        setup_git_workspace(git_root, branch="main")
+    branch_name = f"change/{request.change_id.replace('-', '')[:12].lower()}"
+    branch = create_change_branch(git_root, name=branch_name, base="main")
+    if not branch.get("ok"):
+        result = dict(branch)
+        result.update(_record_git_event(p, request.change_id, "git_commit", result))
+        return result
+    try:
+        record = api_change_record(request.change_id, http_request)
+        materialized = materialize_change_artifacts(
+            git_root,
+            workspace_root=p.root,
+            change_id=request.change_id,
+            record=record,
+        )
+    except Exception as exc:
+        result = {
+            "ok": False,
+            "action": "blocked",
+            "message": f"Could not prepare reviewed change artifacts: {exc}",
+            "branch": branch.get("current"),
+        }
+        result.update(_record_git_event(p, request.change_id, "git_commit", result))
+        return result
+    result = commit_change_artifacts(
+        git_root,
+        message=request.message or default_message,
+        add_paths=list(materialized.get("paths") or []),
+    )
+    result["workspace"] = str(git_root)
+    result["change_directory"] = materialized.get("change_directory")
+    result["change_history_protected"] = True
     result.update(_record_git_event(p, request.change_id, "git_commit", result))
     return result
 
@@ -1187,7 +1281,7 @@ def api_git_commit(request: GitCommitRequest) -> dict[str, object]:
 @app.post("/api/git/push")
 def api_git_push(request: GitPushRequest) -> dict[str, object]:
     p = paths()
-    result = push_current_branch(p.root)
+    result = push_current_branch(p.git_workspace)
     result.update(_record_git_event(p, request.change_id, "git_push", result))
     return result
 
@@ -3660,11 +3754,20 @@ def api_change_record(change_id: str, request: Request) -> dict[str, object]:
     manifest_entry("report.md", p.reports / f"{slug}.md")
     manifest_entry("validation_report.json", p.reports / f"{slug}.json")
 
+    git_root = p.git_workspace
+    archived_intent = git_root / "changes" / change_id / "intent.yaml"
     try:
-        evidence = git_evidence(p.root, intent_path)
+        evidence = (
+            git_evidence(git_root, archived_intent)
+            if archived_intent.exists()
+            else {
+                "available": False,
+                "message": "No change-history checkpoint has been created for this change yet.",
+            }
+        )
     except Exception as exc:
         evidence = {"available": False, "message": f"Git evidence unavailable: {exc}"}
-    git_status = git_workspace_status(p.root)
+    git_status = git_workspace_status(git_root)
     git_actions = [e for e in events if str(e.get("action", "")) in ("git_commit", "git_push")]
 
     return {
@@ -3711,6 +3814,8 @@ def api_change_record(change_id: str, request: Request) -> dict[str, object]:
         "rollback_record": proof_for("rollback"),
         "diagnostics_handoffs": list(result.get("diagnostics_handoffs") or []),
         "git": {
+            "workspace": str(git_root),
+            "isolated_from_application": True,
             "branch": git_status.get("branch"),
             "upstream": git_status.get("upstream"),
             "ahead": git_status.get("ahead"),
