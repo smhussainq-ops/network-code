@@ -29,6 +29,14 @@ from netcode.adapters.rez import READ_TRANSPORTS
 from netcode.bootstrap import init_workspace
 from netcode.discovery import DiscoveryService
 from netcode.diagnostics_handoff import attach_verification_handoff, build_verification_handoff
+from netcode.entitlements import (
+    EntitlementError,
+    enforce_capacity,
+    enforcement_enabled,
+    get_entitlements,
+    job_requires_production_writes,
+    require_production_writes,
+)
 from netcode.cross_domain import (
     CheckEvidence,
     CrossDomainPlan,
@@ -449,6 +457,16 @@ TROUBLESHOOT_READ_TIMEOUT_SECONDS = 20
 app = FastAPI(title="Netcode Platform", version="0.1.0")
 
 
+@app.exception_handler(EntitlementError)
+async def _entitlement_error(_request: Request, exc: EntitlementError) -> JSONResponse:
+    message = str(exc)
+    unavailable = "unavailable" in message.lower() or "not configured" in message.lower()
+    return JSONResponse(
+        status_code=503 if unavailable else 403,
+        content={"error": "entitlement_unavailable" if unavailable else "plan_limit_reached", "message": message},
+    )
+
+
 @app.on_event("startup")
 def _startup() -> None:
     init_workspace(paths())
@@ -466,6 +484,8 @@ def _startup() -> None:
             set_drift_watch(paths(), DEFAULT_ORG_ID, minutes, load_intent)
     except Exception:  # noqa: BLE001
         pass
+    if os.environ.get("NETCODE_ENV", "").strip().lower() == "production" and not enforcement_enabled():
+        raise RuntimeError("NETCODE_LICENSE_ENFORCEMENT must be enabled in production.")
 
 
 def _bootstrap_admin() -> None:
@@ -477,6 +497,23 @@ def _bootstrap_admin() -> None:
     password = os.environ.get("NETCODE_BOOTSTRAP_ADMIN_PASSWORD", "").strip()
     if email and password and not store.user_exists(DEFAULT_ORG_ID, email):
         store.create_user(DEFAULT_ORG_ID, email, hash_password(password), role="admin")
+
+
+def _enforce_catalog_growth(
+    store: PlatformStore,
+    org_id: str,
+    device_ids: list[str],
+    *,
+    replace_runner_id: str | None = None,
+) -> None:
+    normalized = {store.normalize_device_identifier(value) for value in device_ids if str(value).strip()}
+    if replace_runner_id:
+        current = store.catalog_device_count(org_id) - store.catalog_device_count(org_id, runner_id=replace_runner_id)
+        additional = len(normalized)
+    else:
+        current = store.catalog_device_count(org_id)
+        additional = sum(1 for device_id in normalized if store.resolve_device(org_id, device_id) is None)
+    enforce_capacity("devices", current=current, additional=additional)
 
 
 # ── RBAC middleware (M5) ──────────────────────────────────────────────────
@@ -771,11 +808,16 @@ def _lab_summary(status: dict[str, object]) -> dict[str, object]:
 @app.get("/api/health")
 def health() -> dict[str, object]:
     p = paths()
+    try:
+        entitlement_status: dict[str, object] = {"ok": True, **get_entitlements().as_dict()}
+    except EntitlementError as exc:
+        entitlement_status = {"ok": False, "enforced": enforcement_enabled(), "error": str(exc)}
     return {
         "ok": True,
         "workspace": str(p.root),
         "lab": _lab_summary(lab_status()),
         "execution": {"mode": execution_mode(), "pool": runner_pool()},
+        "entitlements": entitlement_status,
     }
 
 
@@ -938,6 +980,8 @@ def api_ansible_pack_run(request: AnsiblePackPlanRequest, http_request: Request)
     if not plan.get("ok"):
         return {"ok": False, "queued": False, "status": "blocked", "plan": plan, "message": "Ansible plan is blocked."}
     mode = str(plan.get("mode") or "check")
+    if mode in {"canary", "apply", "rollback"}:
+        require_production_writes()
     if not request.targets:
         return {
             "ok": False,
@@ -1179,6 +1223,7 @@ def api_lab_dry_run(request: IntentPathRequest) -> dict[str, object]:
 
 @app.post("/api/lab/apply")
 def api_lab_apply(request: IntentPathRequest) -> dict[str, object]:
+    require_production_writes()
     try:
         result = JobRunner(paths()).run_lab_action(Path(request.intent_path), "apply", request.device_id, request.change_id)
         change = result.get("change")
@@ -1193,6 +1238,7 @@ def api_lab_apply(request: IntentPathRequest) -> dict[str, object]:
 
 @app.post("/api/lab/rollback")
 def api_lab_rollback(request: IntentPathRequest) -> dict[str, object]:
+    require_production_writes()
     try:
         result = JobRunner(paths()).run_lab_action(Path(request.intent_path), "rollback", request.device_id, request.change_id)
         change = result.get("change")
@@ -1207,6 +1253,7 @@ def api_lab_rollback(request: IntentPathRequest) -> dict[str, object]:
 
 @app.post("/api/lab/full-run")
 def api_lab_full_run(request: IntentPathRequest) -> dict[str, object]:
+    require_production_writes()
     try:
         return JobRunner(paths()).run_full_arista(Path(request.intent_path), request.device_id, apply=True)
     except Exception as exc:
@@ -1953,7 +2000,9 @@ def api_mint_join_token(request: JoinTokenRequest, http_request: Request, author
     if not auth_enabled():
         _admin_guard(authorization)
     principal = _request_principal(http_request)
-    return mint_join_token(PlatformStore(paths()), request.pool, org_id=principal.org_id)
+    store = PlatformStore(paths())
+    enforce_capacity("connectors", current=len(store.list_runners(org_id=principal.org_id)), additional=1)
+    return mint_join_token(store, request.pool, org_id=principal.org_id)
 
 
 @app.get("/api/runners")
@@ -1963,7 +2012,9 @@ def api_list_runners(request: Request) -> dict[str, object]:
 
 @app.post("/api/runner/enroll")
 def api_runner_enroll(request: RunnerEnrollRequest) -> dict[str, object]:
-    return enroll_runner(PlatformStore(paths()), request.join_token, request.name)
+    store = PlatformStore(paths())
+    enforce_capacity("connectors", current=len(store.list_runners()), additional=1)
+    return enroll_runner(store, request.join_token, request.name)
 
 
 @app.post("/api/runner/poll")
@@ -1973,6 +2024,17 @@ def api_runner_poll(request: RunnerPollRequest, authorization: str | None = Head
     job = poll_for_job(store, runner, request.wait_seconds)
     if job is None:
         return Response(status_code=204)
+    if job_requires_production_writes(job.action):
+        try:
+            require_production_writes()
+        except EntitlementError as exc:
+            store.update_job(
+                job.id,
+                "failed",
+                f"Blocked before runner execution by platform entitlement: {exc}",
+                {"error": "production_write_not_entitled", "message": str(exc)},
+            )
+            return Response(status_code=204)
     return {"ok": True, "job": record_to_dict(job)}
 
 
@@ -2090,6 +2152,12 @@ def api_runner_inventory_sync(
     store = PlatformStore(paths())
     runner = _require_runner(store, authorization)
     public = _sanitize_runner_inventory(list(request.devices))
+    _enforce_catalog_growth(
+        store,
+        runner.org_id,
+        [str(item.get("id") or "") for item in public],
+        replace_runner_id=runner.id if request.replace else None,
+    )
     synced = store.sync_runner_devices(runner, public, revision=request.revision.strip(), replace=request.replace)
     return {"ok": True, "runner_id": runner.id, "pool": runner.pool, **synced}
 
@@ -2486,6 +2554,7 @@ def _catalog_runner_candidate(
     if runner.org_id != org_id:
         return {"ok": False, "error": "Runner and device belong to different organizations."}
     public = _sanitize_runner_inventory([candidate])
+    _enforce_catalog_growth(store, org_id, [str(candidate.get("id") or "")])
     synced = store.sync_runner_devices(
         runner,
         public,
@@ -2519,6 +2588,8 @@ def _import_runner_discovery_candidate(
         return result
     public_keys = {"id", "hostname", "host", "platform", "site", "role", "groups", "port", "aliases", "serial"}
     candidate = {key: value for key, value in candidate.items() if key in public_keys}
+
+    _enforce_catalog_growth(PlatformStore(p), org_id, [str(candidate.get("id") or "")])
 
     source_result = DiscoveryService(p).import_candidate(candidate)
     result["source_of_truth"] = source_result
@@ -2653,6 +2724,9 @@ def api_discovery_scan(request: DiscoveryScanRequest, http_request: Request) -> 
                    "site": request.site, "groups": request.groups}
         discovery_result = _runner_read(p, "discovery", payload, _request_principal(http_request).org_id)
         return _import_runner_discovery_candidate(p, discovery_result, _request_principal(http_request).org_id)
+    inventory = Inventory(configured_inventory_path(p))
+    identifier = request.device_id or request.host
+    enforce_capacity("devices", current=len(inventory.devices), additional=0 if inventory.find_device(identifier) else 1)
     return DiscoveryService(p).scan(
         host=request.host,
         username=request.username,
@@ -2667,6 +2741,9 @@ def api_discovery_scan(request: DiscoveryScanRequest, http_request: Request) -> 
 
 @app.post("/api/source-of-truth/devices/import")
 def api_source_of_truth_import_device(request: SourceOfTruthDeviceImportRequest) -> dict[str, object]:
+    candidate_id = str(request.candidate.get("id") or request.candidate.get("hostname") or "")
+    inventory = Inventory(configured_inventory_path(paths()))
+    enforce_capacity("devices", current=len(inventory.devices), additional=0 if inventory.find_device(candidate_id) else 1)
     return DiscoveryService(paths()).import_candidate(request.candidate)
 
 
@@ -2679,6 +2756,8 @@ def api_shell_manual_device(request: ShellManualDeviceRequest, http_request: Req
     next shell session can connect without the browser ever handling SSH.
     """
     p = paths()
+    inventory = Inventory(configured_inventory_path(p))
+    enforce_capacity("devices", current=len(inventory.devices), additional=0 if inventory.find_device(request.device_id) else 1)
     _reject_cloud_credentials_in_runner_mode(request.username, request.password)
     groups = request.groups or ["manual"]
     public_candidate = {
@@ -2690,6 +2769,12 @@ def api_shell_manual_device(request: ShellManualDeviceRequest, http_request: Req
         "groups": groups,
         "port": request.port,
     }
+    if execution_mode() == "runner":
+        _enforce_catalog_growth(
+            PlatformStore(p),
+            _request_principal(http_request).org_id,
+            [request.device_id],
+        )
     source_result = DiscoveryService(p).import_candidate(public_candidate)
     if not source_result.get("ok"):
         return {"ok": False, "source_of_truth": source_result, "message": source_result.get("error") or "Source of truth update failed."}
@@ -3904,6 +3989,7 @@ def api_fleet_rollout_activity(
 
 @app.post("/api/fleet/rollouts/{rollout_id}/start")
 def api_fleet_rollout_start(rollout_id: str, request: Request) -> dict[str, object]:
+    require_production_writes()
     _rollout_or_404(rollout_id, _request_principal(request).org_id)
     try:
         return start_rollout(paths(), rollout_id)
@@ -3934,6 +4020,7 @@ def api_fleet_rollout_retry(
     retry: FleetRetryRequest,
     request: Request,
 ) -> dict[str, object]:
+    require_production_writes()
     principal = _request_principal(request)
     _rollout_or_404(rollout_id, principal.org_id)
     actor = principal.email or principal.user_id or "netcode-user"
@@ -4106,6 +4193,8 @@ def api_cross_domain_manager_action(
     }
     if action not in allowed:
         raise HTTPException(status_code=400, detail=f"Unsupported manager action {action}")
+    if action in WRITE_ACTIONS:
+        require_production_writes()
     principal = _request_principal(http_request)
     store = PlatformStore(paths())
     try:

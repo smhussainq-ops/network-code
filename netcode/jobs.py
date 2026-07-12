@@ -14,6 +14,7 @@ from pathlib import Path
 
 from netcode.inventory import Inventory
 from netcode.firewall_managers import ManagerJobRequest, WRITE_ACTIONS
+from netcode.entitlements import require_production_writes
 from netcode.lab import run_arista_end_to_end, run_lab_action
 from netcode.models import load_intent
 from netcode.network_model import NetworkModelError
@@ -70,6 +71,8 @@ class JobRunner:
         self.store = store or PlatformStore(paths)
 
     def run_full_arista(self, intent_path: Path, device_id: str | None, apply: bool = True) -> dict[str, object]:
+        if apply:
+            require_production_writes()
         change = self.store.create_change(intent_path, device_id)
         job = self.store.create_job(change.id, "arista_full_run")
         self.store.update_job(job.id, "running", "Running static validation and Arista lab phases")
@@ -97,6 +100,8 @@ class JobRunner:
             }
 
     def run_lab_action(self, intent_path: Path, action: str, device_id: str | None, change_id: str | None = None) -> dict[str, object]:
+        if action in {"apply", "rollback"}:
+            require_production_writes()
         change = self.store.get_change(change_id) if change_id else self.store.get_or_create_change(intent_path, device_id)
         intrinsic_gate = intrinsic_approval_required(intent_path)
         needs_approval = approval_required() or intrinsic_gate
@@ -281,6 +286,7 @@ class JobRunner:
         events = self.store.list_workflow_events(change.id)
         approvals = [event for event in events if event.action in {"approve", "approve_manager", "approve_rollback"}]
         if request.action in WRITE_ACTIONS:
+            require_production_writes()
             if not approvals:
                 raise ValueError("manager write is blocked: no durable human approval event exists")
             approved_by = str((approvals[-1].evidence or {}).get("approved_by") or "")

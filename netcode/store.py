@@ -1053,6 +1053,20 @@ class PlatformStore:
                 rows = conn.execute("SELECT * FROM runners WHERE org_id = ? ORDER BY created_at DESC", (org_id,)).fetchall()
         return [self._runner(row) for row in rows]
 
+    def catalog_device_count(self, org_id: str, *, runner_id: str | None = None) -> int:
+        with self._connect() as conn:
+            if runner_id is None:
+                row = conn.execute(
+                    "SELECT COUNT(*) AS count FROM device_catalog WHERE org_id = ?",
+                    (org_id,),
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    "SELECT COUNT(*) AS count FROM device_catalog WHERE org_id = ? AND runner_id = ?",
+                    (org_id, runner_id),
+                ).fetchone()
+        return int(row["count"] if row else 0)
+
     @staticmethod
     def normalize_device_identifier(value: Any) -> str:
         return str(value or "").strip().lower()
