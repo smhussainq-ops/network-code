@@ -115,6 +115,11 @@ from netcode.network_model_import import (
     import_catalog_candidate,
     import_local_yaml_candidate,
 )
+from netcode.network_model_compiler import (
+    compile_effective_device,
+    compile_site_context,
+    to_rez_network_design,
+)
 from netcode.store import (
     DEFAULT_ORG_ID,
     PlatformStore,
@@ -1241,6 +1246,58 @@ def api_network_model_import_approved_design(request: Request, payload: dict[str
     except (NetworkModelError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return {"ok": True, **result, "device_connections_opened": 0}
+
+
+@app.get("/api/network-model/effective")
+def api_network_model_effective(
+    request: Request,
+    environment_id: str = Query(..., min_length=1, max_length=128),
+    revision_id: str = Query(..., min_length=1, max_length=128),
+    device_id: str = Query(default="", max_length=200),
+    site_id: str = Query(default="", max_length=160),
+    required_domains: str = Query(default="", max_length=1000),
+    preview: bool = Query(default=False),
+) -> dict[str, object]:
+    if bool(device_id) == bool(site_id):
+        raise HTTPException(status_code=400, detail="provide exactly one of device_id or site_id")
+    repository = NetworkModelRepository(PlatformStore(paths()))
+    try:
+        revision = repository.get_revision(
+            _request_principal(request).org_id, environment_id, revision_id
+        )
+        domains = [item.strip() for item in required_domains.split(",") if item.strip()]
+        context = (
+            compile_effective_device(
+                revision, device_id, required_domains=domains, require_approved=not preview
+            )
+            if device_id
+            else compile_site_context(
+                revision, site_id, required_domains=domains, require_approved=not preview
+            )
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except NetworkModelError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"ok": True, "context": context, "device_connections_opened": 0}
+
+
+@app.get("/api/network-model/rez-design")
+def api_network_model_rez_design(
+    request: Request,
+    environment_id: str = Query(..., min_length=1, max_length=128),
+    revision_id: str = Query(..., min_length=1, max_length=128),
+) -> dict[str, object]:
+    try:
+        revision = NetworkModelRepository(PlatformStore(paths())).get_revision(
+            _request_principal(request).org_id, environment_id, revision_id
+        )
+        design = to_rez_network_design(revision)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except NetworkModelError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"ok": True, "design": design, "device_connections_opened": 0}
 
 
 @app.get("/api/devices")
