@@ -18,6 +18,8 @@ _CHANGE_HISTORY_GITIGNORE = """# Netcode change-history repository
 !README.md
 !changes/
 !changes/**
+!network-model/
+!network-model/**
 """
 
 
@@ -76,6 +78,44 @@ def materialize_change_artifacts(
         "change_id": change_id,
         "change_directory": str(change_dir),
         "paths": sorted(set(copied)),
+    }
+
+
+def materialize_model_revision(
+    git_root: Path,
+    *,
+    revision: dict[str, Any],
+    diff: list[dict[str, Any]],
+    verification: dict[str, Any] | None = None,
+) -> dict[str, object]:
+    """Write one reviewed model revision without staging unrelated workspace files."""
+    gitignore = git_root / ".gitignore"
+    current_ignore = gitignore.read_text(encoding="utf-8") if gitignore.exists() else ""
+    model_rules = "!network-model/\n!network-model/**\n"
+    if "!network-model/**" not in current_ignore:
+        gitignore.write_text(current_ignore.rstrip() + "\n" + model_rules, encoding="utf-8")
+    environment = _safe_path_part(revision.get("environment_id"), "default")
+    revision_id = _safe_path_part(revision.get("revision_id"), "unknown-revision")
+    root = git_root / "network-model" / environment
+    revision_dir = root / "revisions" / revision_id
+    revision_dir.mkdir(parents=True, exist_ok=True)
+    paths: list[str] = [str(gitignore.relative_to(git_root))]
+    artifacts = {
+        "model.json": revision,
+        "diff.json": {"schema": "rezonance.network-model-diff.v1", "changes": diff},
+        "approval.json": revision.get("approval") or {},
+    }
+    if verification is not None:
+        artifacts["verification.json"] = verification
+    for name, payload in artifacts.items():
+        destination = revision_dir / name
+        destination.write_text(json.dumps(payload, indent=2, sort_keys=True, default=str) + "\n", encoding="utf-8")
+        paths.append(str(destination.relative_to(git_root)))
+    return {
+        "ok": True,
+        "environment_id": revision.get("environment_id"),
+        "revision_id": revision.get("revision_id"),
+        "paths": paths,
     }
 
 

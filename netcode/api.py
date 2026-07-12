@@ -121,6 +121,12 @@ from netcode.network_model_compiler import (
     to_rez_network_design,
 )
 from netcode.network_model_reconcile import reconcile_revision
+from netcode.network_model_lifecycle import (
+    activate_verified_revision,
+    approve_with_git,
+    create_candidate_from_change,
+    rollback_active_revision,
+)
 from netcode.store import (
     DEFAULT_ORG_ID,
     PlatformStore,
@@ -1358,6 +1364,100 @@ def api_network_model_reconcile(request: Request, payload: dict[str, object]) ->
     except NetworkModelError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return {"ok": True, "reconciliation": result, "device_connections_opened": 0}
+
+
+@app.post("/api/network-model/revisions/from-change")
+def api_network_model_from_change(request: Request, payload: dict[str, object]) -> dict[str, object]:
+    principal = _request_principal(request)
+    model_patch = payload.get("model_patch")
+    domains = payload.get("domains")
+    if not isinstance(model_patch, dict) or not isinstance(domains, list):
+        raise HTTPException(status_code=400, detail="model_patch and domains are required")
+    store = PlatformStore(paths())
+    try:
+        revision = create_candidate_from_change(
+            NetworkModelRepository(store),
+            store,
+            org_id=principal.org_id,
+            environment_id=str(payload.get("environment_id") or ""),
+            parent_revision_id=str(payload.get("parent_revision_id") or ""),
+            revision_id=str(payload.get("revision_id") or ""),
+            change_id=str(payload.get("change_id") or ""),
+            domains=[str(item) for item in domains],
+            model_patch=model_patch,
+            created_by=principal.email or principal.user_id or "system",
+        )
+    except (KeyError, NetworkModelError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"ok": True, "revision": revision, "device_connections_opened": 0}
+
+
+@app.post("/api/network-model/revisions/{revision_id}/approve")
+def api_network_model_approve(request: Request, revision_id: str, payload: dict[str, object]) -> dict[str, object]:
+    principal = _request_principal(request)
+    try:
+        result = approve_with_git(
+            NetworkModelRepository(PlatformStore(paths())),
+            org_id=principal.org_id,
+            environment_id=str(payload.get("environment_id") or ""),
+            revision_id=revision_id,
+            approved_by=principal.email or principal.user_id or "system",
+            git_root=paths().git_workspace,
+        )
+    except (KeyError, NetworkModelError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"ok": True, **result, "device_connections_opened": 0}
+
+
+@app.post("/api/network-model/revisions/{revision_id}/activate")
+def api_network_model_activate(request: Request, revision_id: str, payload: dict[str, object]) -> dict[str, object]:
+    principal = _request_principal(request)
+    store = PlatformStore(paths())
+    try:
+        result = activate_verified_revision(
+            NetworkModelRepository(store),
+            store,
+            org_id=principal.org_id,
+            environment_id=str(payload.get("environment_id") or ""),
+            revision_id=revision_id,
+            actor=principal.email or principal.user_id or "system",
+            git_root=paths().git_workspace,
+            initial_baseline=bool(payload.get("initial_baseline")),
+        )
+    except (KeyError, NetworkModelError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"ok": True, **result, "device_connections_opened": 0}
+
+
+@app.post("/api/network-model/rollback")
+def api_network_model_rollback(request: Request, payload: dict[str, object]) -> dict[str, object]:
+    principal = _request_principal(request)
+    store = PlatformStore(paths())
+    try:
+        result = rollback_active_revision(
+            NetworkModelRepository(store),
+            store,
+            org_id=principal.org_id,
+            environment_id=str(payload.get("environment_id") or ""),
+            target_revision_id=str(payload.get("target_revision_id") or ""),
+            rollback_change_id=str(payload.get("rollback_change_id") or ""),
+            actor=principal.email or principal.user_id or "system",
+            git_root=paths().git_workspace,
+        )
+    except (KeyError, NetworkModelError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"ok": True, **result, "device_connections_opened": 0}
+
+
+@app.get("/api/network-model/active")
+def api_network_model_active(
+    request: Request,
+    environment_id: str = Query(..., min_length=1, max_length=128),
+) -> dict[str, object]:
+    revision = NetworkModelRepository(PlatformStore(paths())).active_revision(
+        _request_principal(request).org_id, environment_id
+    )
+    return {"ok": True, "revision": revision, "device_connections_opened": 0}
 
 
 @app.get("/api/devices")

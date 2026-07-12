@@ -349,6 +349,147 @@ class NetworkModelRepository:
             "next_cursor": next_cursor,
         }
 
+    def approve_revision(
+        self,
+        org_id: str,
+        environment_id: str,
+        revision_id: str,
+        *,
+        approved_by: str,
+        approved_at: str,
+    ) -> dict[str, Any]:
+        revision = self.get_revision(org_id, environment_id, revision_id)
+        if revision["status"] in {"approved", "active", "superseded"}:
+            return revision
+        if revision["status"] not in {"proposed", "in_review"}:
+            raise ValueError(f"revision {revision_id} cannot be approved from {revision['status']}")
+        revision["status"] = "approved"
+        revision["approval"] = {
+            "status": "approved",
+            "approved_by": str(approved_by),
+            "approved_at": str(approved_at),
+        }
+        revision["authority_bindings"] = {
+            domain: {**binding, "mode": "authoritative"}
+            for domain, binding in revision["authority_bindings"].items()
+        }
+        validated = validate_model_revision(revision)
+        with self.store._connect() as conn:
+            conn.execute(
+                """
+                UPDATE network_model_revisions
+                SET status = 'approved', approval_json = ?, authority_json = ?, updated_at = ?
+                WHERE org_id = ? AND environment_id = ? AND revision_id = ?
+                  AND status IN ('proposed', 'in_review')
+                """,
+                (
+                    _json(validated["approval"]), _json(validated["authority_bindings"]), utc_now(),
+                    org_id, environment_id, revision_id,
+                ),
+            )
+        return self.get_revision(org_id, environment_id, revision_id)
+
+    def link_revision(
+        self,
+        org_id: str,
+        environment_id: str,
+        revision_id: str,
+        *,
+        link_type: str,
+        external_id: str,
+        metadata: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        self.get_revision(org_id, environment_id, revision_id)
+        now = utc_now()
+        with self.store._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO network_model_links
+                (org_id, environment_id, revision_id, link_type, external_id, metadata_json, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT (org_id, environment_id, revision_id, link_type, external_id)
+                DO UPDATE SET metadata_json = ?
+                """,
+                (
+                    org_id, environment_id, revision_id, link_type, external_id,
+                    _json(dict(metadata or {})), now, _json(dict(metadata or {})),
+                ),
+            )
+        return {
+            "revision_id": revision_id,
+            "link_type": link_type,
+            "external_id": external_id,
+            "metadata": dict(metadata or {}),
+        }
+
+    def list_links(self, org_id: str, environment_id: str, revision_id: str) -> list[dict[str, Any]]:
+        with self.store._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM network_model_links WHERE org_id = ? AND environment_id = ? AND revision_id = ? "
+                "ORDER BY link_type, external_id",
+                (org_id, environment_id, revision_id),
+            ).fetchall()
+        return [
+            {
+                "link_type": row["link_type"],
+                "external_id": row["external_id"],
+                "metadata": _decode_json(row["metadata_json"], {}),
+                "created_at": row["created_at"],
+            }
+            for row in rows
+        ]
+
+    def active_revision(self, org_id: str, environment_id: str) -> dict[str, Any] | None:
+        with self.store._connect() as conn:
+            row = conn.execute(
+                "SELECT active_revision_id FROM network_model_heads WHERE org_id = ? AND environment_id = ?",
+                (org_id, environment_id),
+            ).fetchone()
+        return self.get_revision(org_id, environment_id, row["active_revision_id"]) if row else None
+
+    def activate_revision(
+        self,
+        org_id: str,
+        environment_id: str,
+        revision_id: str,
+        *,
+        allow_superseded: bool = False,
+    ) -> dict[str, Any]:
+        revision = self.get_revision(org_id, environment_id, revision_id)
+        allowed = {"approved", "superseded"} if allow_superseded else {"approved"}
+        if revision["status"] == "active":
+            return revision
+        if revision["status"] not in allowed:
+            raise ValueError(f"revision {revision_id} cannot become active from {revision['status']}")
+        now = utc_now()
+        with self.store._connect() as conn:
+            head = conn.execute(
+                "SELECT active_revision_id FROM network_model_heads WHERE org_id = ? AND environment_id = ?",
+                (org_id, environment_id),
+            ).fetchone()
+            prior = str(head["active_revision_id"]) if head else ""
+            if prior and prior != revision_id:
+                conn.execute(
+                    "UPDATE network_model_revisions SET status = 'superseded', updated_at = ? "
+                    "WHERE org_id = ? AND environment_id = ? AND revision_id = ?",
+                    (now, org_id, environment_id, prior),
+                )
+            conn.execute(
+                "UPDATE network_model_revisions SET status = 'active', updated_at = ? "
+                "WHERE org_id = ? AND environment_id = ? AND revision_id = ?",
+                (now, org_id, environment_id, revision_id),
+            )
+            conn.execute(
+                """
+                INSERT INTO network_model_heads (org_id, environment_id, active_revision_id, updated_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT (org_id, environment_id)
+                DO UPDATE SET active_revision_id = ?, updated_at = ?
+                """,
+                (org_id, environment_id, revision_id, now, revision_id, now),
+            )
+        return self.get_revision(org_id, environment_id, revision_id)
+
     def list_entities(
         self,
         org_id: str,
