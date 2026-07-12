@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any
 
 from netcode.paths import WorkspacePaths
+from netcode.yamlio import read_yaml
 
 
 DEFAULT_ORG_ID = "org_default"
@@ -76,6 +77,29 @@ def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _change_index_metadata(intent_path: Path) -> dict[str, str]:
+    """Extract non-secret search fields from a desired-change document."""
+    try:
+        intent = read_yaml(intent_path)
+    except (OSError, ValueError):
+        intent = {}
+    metadata = intent.get("metadata") if isinstance(intent.get("metadata"), dict) else {}
+    custom = intent.get("custom") if isinstance(intent.get("custom"), dict) else {}
+    raw_source = str(metadata.get("source") or "").strip().lower()
+    normalized_source = {
+        "netcode_ansible": "ansible",
+        "rez": "rez_rca",
+    }.get(raw_source, raw_source)
+    if not normalized_source:
+        normalized_source = "ansible" if "ansible" in {part.lower() for part in intent_path.parts} else "netcode"
+    return {
+        "title": str(metadata.get("title") or custom.get("description") or intent_path.name).strip()[:240],
+        "source": normalized_source[:80],
+        "site": str(intent.get("site") or "").strip()[:160],
+        "workflow_type": str(intent.get("change_type") or "").strip()[:120],
+    }
+
+
 def change_audit_id(change_id: str | None, created_at: str | None = None) -> str:
     """Return the stable customer-facing alias for a canonical change UUID."""
     canonical = "".join(ch for ch in str(change_id or "") if ch.isalnum()).upper()
@@ -99,6 +123,10 @@ class ChangeRecord:
     result: dict[str, Any] | None
     org_id: str = DEFAULT_ORG_ID
     created_by_user_id: str | None = None
+    title: str = ""
+    source: str = ""
+    site: str = ""
+    workflow_type: str = ""
 
 
 @dataclass(frozen=True)
@@ -473,6 +501,17 @@ class PlatformStore:
             for table in ("changes", "jobs", "runners", "join_tokens"):
                 self._ensure_column(conn, table, "org_id", f"TEXT DEFAULT '{DEFAULT_ORG_ID}'")
             self._ensure_column(conn, "changes", "created_by_user_id", "TEXT")
+            self._ensure_column(conn, "changes", "title", "TEXT NOT NULL DEFAULT ''")
+            self._ensure_column(conn, "changes", "source", "TEXT NOT NULL DEFAULT ''")
+            self._ensure_column(conn, "changes", "site", "TEXT NOT NULL DEFAULT ''")
+            self._ensure_column(conn, "changes", "workflow_type", "TEXT NOT NULL DEFAULT ''")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_changes_org_created ON changes (org_id, created_at)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_changes_org_state ON changes (org_id, workflow_state, created_at)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_changes_org_device ON changes (org_id, device_id, created_at)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_changes_org_requester ON changes (org_id, requested_by, created_at)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_changes_org_source ON changes (org_id, source, created_at)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_changes_org_site ON changes (org_id, site, created_at)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_changes_org_workflow ON changes (org_id, workflow_type, created_at)")
             # Seed the default org idempotently so pre-flag data always has an owner.
             conn.execute(
                 "INSERT INTO orgs (id, name, slug, created_at) SELECT ?, ?, ?, ? "
@@ -502,14 +541,20 @@ class PlatformStore:
     ) -> ChangeRecord:
         now = utc_now()
         change_id = str(uuid.uuid4())
+        index = _change_index_metadata(intent_path)
         with self._connect() as conn:
             conn.execute(
                 """
                 INSERT INTO changes
-                (id, status, workflow_state, intent_path, device_id, requested_by, created_at, updated_at, last_job_id, result_json, org_id, created_by_user_id)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                (id, status, workflow_state, intent_path, device_id, requested_by, created_at, updated_at,
+                 last_job_id, result_json, org_id, created_by_user_id, title, source, site, workflow_type)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (change_id, "draft", "draft", str(intent_path), device_id, requested_by, now, now, None, None, org_id, created_by_user_id),
+                (
+                    change_id, "draft", "draft", str(intent_path), device_id, requested_by, now, now,
+                    None, None, org_id, created_by_user_id, index["title"], index["source"],
+                    index["site"], index["workflow_type"],
+                ),
             )
         return self.get_change(change_id)
 
@@ -572,16 +617,30 @@ class PlatformStore:
     def update_change(self, change_id: str, status: str, result: dict[str, Any] | None = None, workflow_state: str | None = None) -> ChangeRecord:
         now = utc_now()
         result_json = json.dumps(result) if result is not None else None
+        result = result or {}
+        title = str(result.get("title") or "").strip()[:240]
+        raw_source = str(result.get("source") or "").strip().lower()
+        source = {"netcode_ansible": "ansible", "rez": "rez_rca"}.get(raw_source, raw_source)[:80]
+        workflow_type = str(result.get("change_type") or "").strip()[:120]
         with self._connect() as conn:
             if workflow_state is None:
                 conn.execute(
-                    "UPDATE changes SET status = ?, updated_at = ?, result_json = ? WHERE id = ?",
-                    (status, now, result_json, change_id),
+                    "UPDATE changes SET status = ?, updated_at = ?, result_json = ?, "
+                    "title = CASE WHEN ? <> '' THEN ? ELSE title END, "
+                    "source = CASE WHEN ? <> '' THEN ? ELSE source END, "
+                    "workflow_type = CASE WHEN ? <> '' THEN ? ELSE workflow_type END WHERE id = ?",
+                    (status, now, result_json, title, title, source, source, workflow_type, workflow_type, change_id),
                 )
             else:
                 conn.execute(
-                    "UPDATE changes SET status = ?, workflow_state = ?, updated_at = ?, result_json = ? WHERE id = ?",
-                    (status, workflow_state, now, result_json, change_id),
+                    "UPDATE changes SET status = ?, workflow_state = ?, updated_at = ?, result_json = ?, "
+                    "title = CASE WHEN ? <> '' THEN ? ELSE title END, "
+                    "source = CASE WHEN ? <> '' THEN ? ELSE source END, "
+                    "workflow_type = CASE WHEN ? <> '' THEN ? ELSE workflow_type END WHERE id = ?",
+                    (
+                        status, workflow_state, now, result_json, title, title, source, source,
+                        workflow_type, workflow_type, change_id,
+                    ),
                 )
         return self.get_change(change_id)
 
@@ -642,6 +701,96 @@ class PlatformStore:
                     "SELECT * FROM changes WHERE org_id = ? ORDER BY created_at DESC LIMIT ?", (org_id, limit)
                 ).fetchall()
         return [self._change(row) for row in rows]
+
+    def search_changes(
+        self,
+        *,
+        org_id: str,
+        query: str = "",
+        device_id: str = "",
+        state: str = "",
+        requested_by: str = "",
+        source: str = "",
+        site: str = "",
+        workflow_type: str = "",
+        created_from: str = "",
+        created_to: str = "",
+        limit: int = 25,
+        offset: int = 0,
+    ) -> tuple[list[ChangeRecord], int]:
+        """Return one tenant-scoped, bounded page of durable change history."""
+        clauses = ["org_id = ?"]
+        params: list[Any] = [org_id]
+
+        def contains(column: str, value: str) -> None:
+            normalized = value.strip().lower()
+            if normalized:
+                clauses.append(f"LOWER(COALESCE({column}, '')) LIKE ?")
+                params.append(f"%{normalized}%")
+
+        contains("device_id", device_id)
+        contains("requested_by", requested_by)
+        contains("site", site)
+        contains("workflow_type", workflow_type)
+        if state.strip():
+            clauses.append("(LOWER(status) = ? OR LOWER(workflow_state) = ?)")
+            normalized_state = state.strip().lower()
+            params.extend([normalized_state, normalized_state])
+        if source.strip():
+            normalized_source = source.strip().lower()
+            if normalized_source == "rez_rca":
+                clauses.append(
+                    "(LOWER(COALESCE(source, '')) = ? OR "
+                    "(COALESCE(source, '') = '' AND "
+                    "(LOWER(COALESCE(result_json, '')) LIKE ? OR LOWER(intent_path) LIKE ?)))"
+                )
+                params.extend([normalized_source, "%rez_rca%", "%/rca/%"])
+            elif normalized_source == "ansible":
+                clauses.append(
+                    "(LOWER(COALESCE(source, '')) = ? OR "
+                    "(COALESCE(source, '') = '' AND "
+                    "(LOWER(COALESCE(result_json, '')) LIKE ? OR LOWER(intent_path) LIKE ?)))"
+                )
+                params.extend([normalized_source, "%ansible%", "%/ansible/%"])
+            elif normalized_source == "netcode":
+                clauses.append(
+                    "(LOWER(COALESCE(source, '')) = ? OR "
+                    "(COALESCE(source, '') = '' AND LOWER(COALESCE(result_json, '')) NOT LIKE ? "
+                    "AND LOWER(COALESCE(result_json, '')) NOT LIKE ? AND LOWER(intent_path) NOT LIKE ? "
+                    "AND LOWER(intent_path) NOT LIKE ?))"
+                )
+                params.extend([normalized_source, "%rez_rca%", "%ansible%", "%/rca/%", "%/ansible/%"])
+            else:
+                clauses.append("LOWER(COALESCE(source, '')) = ?")
+                params.append(normalized_source)
+        if created_from.strip():
+            clauses.append("created_at >= ?")
+            params.append(created_from.strip())
+        if created_to.strip():
+            clauses.append("created_at <= ?")
+            params.append(created_to.strip())
+        if query.strip():
+            needle = f"%{query.strip().lower()}%"
+            clauses.append(
+                "(LOWER(id) LIKE ? OR LOWER(COALESCE(title, '')) LIKE ? OR "
+                "LOWER(COALESCE(device_id, '')) LIKE ? OR LOWER(requested_by) LIKE ? OR "
+                "LOWER(intent_path) LIKE ? OR LOWER(COALESCE(result_json, '')) LIKE ? OR "
+                "LOWER(COALESCE(source, '')) LIKE ? OR LOWER(COALESCE(site, '')) LIKE ? OR "
+                "LOWER(COALESCE(workflow_type, '')) LIKE ?)"
+            )
+            params.extend([needle] * 9)
+
+        where = " AND ".join(clauses)
+        bounded_limit = max(1, min(int(limit), 100))
+        bounded_offset = max(0, min(int(offset), 1_000_000))
+        with self._connect() as conn:
+            count_row = conn.execute(f"SELECT COUNT(*) AS total FROM changes WHERE {where}", params).fetchone()
+            rows = conn.execute(
+                f"SELECT * FROM changes WHERE {where} ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
+                [*params, bounded_limit, bounded_offset],
+            ).fetchall()
+        total = int(count_row["total"]) if count_row else 0
+        return [self._change(row) for row in rows], total
 
     def list_jobs(self, limit: int = 50, org_id: str | None = None) -> list[JobRecord]:
         with self._connect() as conn:
@@ -778,6 +927,10 @@ class PlatformStore:
             result=result,
             org_id=self._col(row, "org_id") or DEFAULT_ORG_ID,
             created_by_user_id=self._col(row, "created_by_user_id"),
+            title=str(self._col(row, "title") or ""),
+            source=str(self._col(row, "source") or ""),
+            site=str(self._col(row, "site") or ""),
+            workflow_type=str(self._col(row, "workflow_type") or ""),
         )
 
     @staticmethod
@@ -1810,3 +1963,37 @@ def record_to_dict(
     if "payload" in data and data["payload"]:
         data["payload"] = redact_secrets(data["payload"])
     return data
+
+
+def change_summary_to_dict(record: ChangeRecord) -> dict[str, Any]:
+    """Serialize a bounded list row; full evidence stays on the record endpoint."""
+    result = record.result if isinstance(record.result, dict) else {}
+    source = record.source or str(result.get("source") or "").strip().lower()
+    path_parts = {part.lower() for part in Path(record.intent_path).parts}
+    if not source:
+        source = "rez_rca" if "rca" in path_parts else "ansible" if "ansible" in path_parts else "netcode"
+    source = {"netcode_ansible": "ansible", "rez": "rez_rca"}.get(source, source)
+    title = record.title or str(result.get("title") or "").strip() or Path(record.intent_path).name
+    workflow_type = record.workflow_type or str(result.get("change_type") or "").strip()
+    return {
+        "id": record.id,
+        "rez_change_id": change_audit_id(record.id, record.created_at),
+        "status": record.status,
+        "workflow_state": record.workflow_state,
+        "intent_name": Path(record.intent_path).name,
+        "device_id": record.device_id,
+        "requested_by": record.requested_by,
+        "created_at": record.created_at,
+        "updated_at": record.updated_at,
+        "last_job_id": record.last_job_id,
+        "org_id": record.org_id,
+        "title": title[:240],
+        "source": source[:80],
+        "site": record.site,
+        "workflow_type": workflow_type[:120],
+        "result": {
+            "source": source[:80],
+            "title": title[:240],
+            "change_type": workflow_type[:120],
+        },
+    }

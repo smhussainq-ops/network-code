@@ -56,12 +56,31 @@ confirmed that an unknown connector fails closed and cannot enqueue work.
 | Separate duties | Operator, approver, auditor, workflow author, administrator | Basic RBAC/tenant isolation exists; role depth pending |
 | Plan upgrades | Approved versions, EOL/EOS, image readiness, compatibility | OS-upgrade workflow exists; lifecycle authority pending |
 | Prove compliance | Golden standard, differences, exceptions, remediation history | Basic compliance exists; reporting depth pending |
-| Search history | Device/site/change/workflow/engineer/date/result/RCA filters | Change history exists; indexed UX pending |
+| Search history | Device/site/change/workflow/engineer/date/result/RCA filters | Implemented and live-proven in this slice; bounded summaries keep full evidence on the per-change record only |
 | Reuse successful work | Versioned team templates | Change templates exist; version lifecycle pending |
 | Start from alerts | Monitoring/failed automation to read-only Rez RCA | Existing trigger contract; integration polish pending |
 
 No P1 feature may be represented as available until its backend, permissions,
 audit trail, and failure behavior have executable tests.
+
+### P1 role-depth design
+
+The production role model is capability-based rather than a simple numeric
+hierarchy:
+
+| Role | May do | Must not do |
+|---|---|---|
+| Observer | View inventory, Digital Twin, status, and non-sensitive history | Create or execute work |
+| Auditor | Read and export approved change records, transcripts, and compliance history | Edit desired changes, approve, or push |
+| Workflow author | Create templates, Git-backed desired changes, and Ansible workflows; run static validation | Approve or push production changes |
+| Operator | Discover, plan, dry-run, run first-device tests, and push an already-approved change | Approve their own request or bypass policy |
+| Approver | Review, approve, reject, or halt work | Modify the reviewed commands or approve their own request |
+| Administrator | Manage users, policy, Local Connectors, retention, and integrations | Bypass requester-not-approver or erase immutable audit events |
+
+The existing viewer/operator/admin model remains the only implemented model.
+The deeper model cannot ship safely until the unified Rez shell forwards a
+signed user, role, organization, method, and path to Netcode. A shared service
+token alone must never become an administrator-equivalent identity.
 
 ## P2 - enterprise platform
 
@@ -76,11 +95,23 @@ audit trail, and failure behavior have executable tests.
 | Report outcomes | Change, rollback, RCA, compliance, and trend reports | Core records exist; reporting product pending |
 | Prove scale | 10,000-device catalog plus durable large rollout execution | Catalog gate exists; distributed execution certification pending |
 
+### P2 foundation audit
+
+- Organization-scoped records and cross-tenant 404 behavior are executable
+  today and remain covered by regression tests.
+- Local Connector credentials and inventory stay local; readiness returns only
+  public capability metadata and opens zero device sessions.
+- The 10,000-device catalog/search/rollout-planning gate is executable today.
+- Single-worker service state, local user sessions, and non-distributed job
+  execution remain pilot constraints, not enterprise claims.
+- Infoblox remains intentionally absent. No Nautobot or NetBox DCIM/IPAM
+  dependency is introduced by this plan.
+
 ## Execution order
 
 1. Marcus language and Local Connector readiness.
 2. P0 browser validation and regression gates.
-3. Searchable production change history and role-depth design.
+3. Searchable production change history (complete) and signed role-depth implementation (pending unified identity propagation).
 4. Scheduling and lifecycle authority.
 5. AWX/AAP integration against a real controller.
 6. HA, SSO, deployment isolation, and distributed scale.

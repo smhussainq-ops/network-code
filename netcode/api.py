@@ -108,7 +108,14 @@ from netcode.platform import platform_capabilities
 from netcode.scale import rollout_plan
 from netcode.shell_desktop import build_desktop_shell_profile
 from netcode.source_of_truth import netbox_sync, netbox_test, provider_catalog, source_of_truth
-from netcode.store import DEFAULT_ORG_ID, PlatformStore, change_audit_id, record_to_dict, utc_now
+from netcode.store import (
+    DEFAULT_ORG_ID,
+    PlatformStore,
+    change_audit_id,
+    change_summary_to_dict,
+    record_to_dict,
+    utc_now,
+)
 from netcode.troubleshooting import troubleshoot_state
 from netcode.ui_config import (
     configured_inventory_path,
@@ -3447,10 +3454,46 @@ def api_assistant(request: AssistantRequest) -> dict[str, object]:
 
 
 @app.get("/api/changes")
-def api_changes(request: Request) -> dict[str, object]:
+def api_changes(
+    request: Request,
+    q: str = Query(default="", max_length=240),
+    device_id: str = Query(default="", max_length=240),
+    state: str = Query(default="", max_length=80),
+    requested_by: str = Query(default="", max_length=320),
+    source: str = Query(default="", max_length=80),
+    site: str = Query(default="", max_length=160),
+    workflow_type: str = Query(default="", max_length=120),
+    created_from: str = Query(default="", max_length=64),
+    created_to: str = Query(default="", max_length=64),
+    limit: int = Query(default=50, ge=1, le=100),
+    offset: int = Query(default=0, ge=0, le=1_000_000),
+) -> dict[str, object]:
     store = PlatformStore(paths())
     org = _request_principal(request).org_id
-    return {"changes": [record_to_dict(record) for record in store.list_changes(org_id=org)]}
+    records, total = store.search_changes(
+        org_id=org,
+        query=q,
+        device_id=device_id,
+        state=state,
+        requested_by=requested_by,
+        source=source,
+        site=site,
+        workflow_type=workflow_type,
+        created_from=created_from,
+        created_to=created_to,
+        limit=limit,
+        offset=offset,
+    )
+    returned = len(records)
+    return {
+        "changes": [change_summary_to_dict(record) for record in records],
+        "total": total,
+        "returned": returned,
+        "limit": limit,
+        "offset": offset,
+        "next_offset": offset + returned if offset + returned < total else None,
+        "device_connections_opened": 0,
+    }
 
 
 @app.post("/api/changes/from-rca")

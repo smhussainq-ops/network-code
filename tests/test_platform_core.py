@@ -43,6 +43,95 @@ def test_platform_store_persists_changes_and_jobs(tmp_path: Path):
     assert jobs[0].result == {"status": "pass"}
 
 
+def test_change_history_search_is_indexed_bounded_and_tenant_scoped(tmp_path: Path, monkeypatch):
+    workspace = WorkspacePaths(tmp_path)
+    init_workspace(workspace)
+    monkeypatch.chdir(tmp_path)
+    store = PlatformStore(workspace)
+
+    netcode_intent = workspace.intents / "history" / "campus-vlan.yaml"
+    rez_intent = workspace.intents / "history" / "hq-rca.yaml"
+    other_intent = workspace.intents / "history" / "other.yaml"
+    for path, payload in (
+        (
+            netcode_intent,
+            {
+                "change_type": "add_vlan",
+                "site": "campus",
+                "targets": {"device_ids": ["campus-edge-1"]},
+                "vlan": {"id": 210, "name": "APP", "subnet": "10.210.0.0/24"},
+                "metadata": {"requested_by": "marcus@example.com", "source": "netcode"},
+            },
+        ),
+        (
+            rez_intent,
+            {
+                "change_type": "routing_redistribution",
+                "site": "hq",
+                "targets": {"device_ids": ["hq-edge-1"]},
+                "metadata": {"requested_by": "rez-rca", "source": "rez_rca", "title": "Restore HQ exchange"},
+            },
+        ),
+        (
+            other_intent,
+            {
+                "change_type": "custom_config",
+                "site": "private",
+                "targets": {"device_ids": ["other-device"]},
+                "metadata": {"requested_by": "other@example.com", "source": "netcode"},
+            },
+        ),
+    ):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        write_yaml(path, payload)
+
+    vlan = store.create_change(netcode_intent, "campus-edge-1", requested_by="marcus@example.com")
+    rca = store.create_change(rez_intent, "hq-edge-1", requested_by="rez-rca")
+    store.update_change(rca.id, "validated", {"source": "rez_rca", "title": "Restore HQ exchange"}, workflow_state="validated")
+    store.create_change(other_intent, "other-device", requested_by="other@example.com", org_id="org_other")
+
+    rows, total = store.search_changes(org_id="org_default", site="camp", workflow_type="add_vlan")
+    assert total == 1
+    assert rows[0].id == vlan.id
+    assert rows[0].source == "netcode"
+    assert rows[0].site == "campus"
+
+    rows, total = store.search_changes(org_id="org_default", query="Restore HQ", source="rez_rca", state="validated")
+    assert total == 1
+    assert rows[0].id == rca.id
+    assert rows[0].title == "Restore HQ exchange"
+
+    # Records created before indexed metadata existed remain discoverable after
+    # an upgrade; compatibility does not rewrite their audit payloads.
+    with store._connect() as conn:
+        conn.execute("UPDATE changes SET source = '' WHERE id = ?", (rca.id,))
+    rows, total = store.search_changes(org_id="org_default", source="rez_rca")
+    assert total == 1
+    assert rows[0].id == rca.id
+
+    rows, total = store.search_changes(org_id="org_default", requested_by="marcus", limit=1, offset=0)
+    assert total == 1
+    assert len(rows) == 1
+    assert all(row.org_id == "org_default" for row in rows)
+
+    response = TestClient(api.app).get(
+        "/api/changes",
+        params={"q": "hq", "source": "rez_rca", "limit": 1, "offset": 0},
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["total"] == 1
+    assert body["returned"] == 1
+    assert body["next_offset"] is None
+    assert body["device_connections_opened"] == 0
+    assert body["changes"][0]["id"] == rca.id
+    serialized = json.dumps(body["changes"][0])
+    assert "intent_yaml" not in serialized
+    assert "rendered_config" not in serialized
+    assert str(tmp_path) not in serialized
+    assert len(serialized) < 2_500
+
+
 def test_rez_bridge_degrades_cleanly_when_unavailable(tmp_path: Path):
     bridge = RezAdapterBridge(root=tmp_path / "missing-rez")
 
