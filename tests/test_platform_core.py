@@ -2993,9 +2993,16 @@ def test_windows_runner_package_contains_install_scripts_and_no_secrets():
 
     assert {
         "README.md",
+        "preflight.ps1",
         "install-runner.ps1",
         "start-runner.ps1",
         "import-inventory.ps1",
+        "diagnose-runner.ps1",
+        "uninstall-runner.ps1",
+        "build-windows-executable.ps1",
+        "windows-entrypoint.py",
+        "package-info.json",
+        "SHA256SUMS.txt",
         "sample-inventory.yaml",
         "netcode-shell-profile.json",
         "rez-runtime/drivers/collector.py",
@@ -3013,6 +3020,18 @@ def test_windows_runner_package_contains_install_scripts_and_no_secrets():
     assert "inventory-import $InventoryPath" in combined
     assert "import-inventory --file" not in combined
     assert 'Join-Path $PSScriptRoot "runner-source"' in combined
+    assert 'Join-Path $env:ProgramData "Rezonance\\LocalConnector"' in combined
+    assert 'New-ScheduledTaskPrincipal -UserId "SYSTEM"' in combined
+    assert "NETCODE_RUNNER_HOME" in combined
+    assert "machine-scoped DPAPI" in combined
+    assert "AllowInsecureHttpForLab" in combined
+    assert "ControlPlaneUrl" in combined
+
+    with zipfile.ZipFile(BytesIO(package), "r") as archive:
+        checksums = archive.read("SHA256SUMS.txt").decode("utf-8").splitlines()
+        for line in checksums:
+            expected, name = line.split("  ", 1)
+            assert hashlib.sha256(archive.read(name)).hexdigest() == expected
 
 
 def test_windows_runner_download_endpoint_returns_zip(tmp_path: Path, monkeypatch):
@@ -3025,8 +3044,11 @@ def test_windows_runner_download_endpoint_returns_zip(tmp_path: Path, monkeypatc
     response = client.get("/api/runner/download/windows")
 
     assert manifest["ok"] is True
-    assert manifest["platform"] == "windows"
+    assert manifest["platform"] == "windows-x64"
     assert manifest["runner_pool"] == "pilot"
+    assert manifest["artifact_kind"] == "pilot_zip"
+    assert manifest["credentials"] == "windows_dpapi_machine_scope_and_restricted_acl"
+    assert manifest["production_code_signing_complete"] is False
     assert manifest["rez_adapter_bundle"]["included"] is True
     assert manifest["runner_source_bundle"]["included"] is True
     assert response.status_code == 200

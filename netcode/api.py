@@ -2932,7 +2932,7 @@ def api_windows_runner_download(request: Request) -> Response:
     return Response(
         content=package,
         media_type="application/zip",
-        headers={"Content-Disposition": 'attachment; filename="netcode-windows-runner.zip"'},
+        headers={"Content-Disposition": 'attachment; filename="rezonance-local-connector-windows-pilot.zip"'},
     )
 
 

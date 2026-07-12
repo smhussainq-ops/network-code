@@ -1,12 +1,13 @@
-"""Windows runner package generation.
+"""Build the Windows Local Connector pilot package.
 
-The package is intentionally thin: it installs the same Python runner, enrolls
-it to the control plane, imports runner-local inventory, and optionally registers
-an auto-start scheduled task. It never contains tokens or device credentials.
+The archive never contains enrollment tokens or device credentials.  It can use
+the bundled source on a pilot machine, or build a self-contained Windows binary
+on Windows for the clean-machine certification gate.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 from io import BytesIO
 from pathlib import Path
@@ -17,8 +18,11 @@ from zipfile import ZIP_DEFLATED, ZipFile
 from netcode.shell_desktop import build_desktop_shell_profile
 
 
+PACKAGE_VERSION = "0.2.0-pilot"
+
+
 def _rez_runtime_files() -> dict[str, bytes]:
-    """Return the device-driver-only Rez runtime for the local runner."""
+    """Return the device-driver-only Rez runtime for the Local Connector."""
     try:
         from netcode.adapters.rez import RezAdapterBridge
 
@@ -41,7 +45,7 @@ def _rez_runtime_files() -> dict[str, bytes]:
 
 
 def _runner_source_files() -> dict[str, bytes]:
-    """Bundle the exact runner source so pilot installs do not depend on PyPI."""
+    """Bundle the exact Local Connector source so pilots do not depend on PyPI."""
     package_dir = Path(__file__).resolve().parent
     project_root = package_dir.parent
     pyproject = project_root / "pyproject.toml"
@@ -54,106 +58,277 @@ def _runner_source_files() -> dict[str, bytes]:
     return files
 
 
-def _install_runner_ps1(control_plane_url: str) -> str:
+def _preflight_ps1(control_plane_url: str) -> str:
     return dedent(
-        f"""
+        fr"""
         param(
-          [Parameter(Mandatory=$true)][string]$JoinToken,
-          [string]$RunnerName = $env:COMPUTERNAME,
-          [string]$PackageSpec = "",
-          [switch]$RegisterStartupTask
+          [string]$ControlPlaneUrl = "{control_plane_url}",
+          [switch]$AllowInsecureHttpForLab
         )
 
         $ErrorActionPreference = "Stop"
-        $Root = Join-Path $env:ProgramData "NetcodeRunner"
+        $Failures = @()
+        if (-not [Environment]::Is64BitOperatingSystem) {{ $Failures += "64-bit Windows is required." }}
+        try {{ $Uri = [Uri]$ControlPlaneUrl }} catch {{ $Failures += "ControlPlaneUrl is invalid." }}
+        if ($Uri -and $Uri.Scheme -ne "https" -and -not $AllowInsecureHttpForLab) {{
+          $Failures += "HTTPS is required. Use -AllowInsecureHttpForLab only for a private GNS3 pilot."
+        }}
+        $BundledExe = Join-Path $PSScriptRoot "bin\RezonanceLocalConnector\RezonanceLocalConnector.exe"
+        $HasPython = [bool](Get-Command py -ErrorAction SilentlyContinue)
+        if (-not (Test-Path $BundledExe) -and -not $HasPython) {{
+          $Failures += "This pilot archive needs Python 3.10+ or a Windows-built connector binary."
+        }}
+        if ($Failures.Count -gt 0) {{
+          $Failures | ForEach-Object {{ Write-Error $_ }}
+          exit 1
+        }}
+        Write-Host "Preflight passed: Windows $([Environment]::OSVersion.Version), control plane $ControlPlaneUrl"
+        """
+    ).strip() + "\n"
+
+
+def _install_runner_ps1(control_plane_url: str) -> str:
+    return dedent(
+        fr"""
+        param(
+          [Parameter(Mandatory=$true)][string]$JoinToken,
+          [string]$RunnerName = $env:COMPUTERNAME,
+          [string]$ControlPlaneUrl = "{control_plane_url}",
+          [string]$PackageSpec = "",
+          [string]$ProxyUrl = "",
+          [string]$CaBundle = "",
+          [switch]$AllowInsecureHttpForLab,
+          [switch]$RegisterStartupTask,
+          [switch]$StartNow
+        )
+
+        $ErrorActionPreference = "Stop"
+        & (Join-Path $PSScriptRoot "preflight.ps1") -ControlPlaneUrl $ControlPlaneUrl -AllowInsecureHttpForLab:$AllowInsecureHttpForLab
+
+        $Root = Join-Path $env:ProgramData "Rezonance\LocalConnector"
+        $DataRoot = Join-Path $Root "data"
+        $ScriptsRoot = Join-Path $Root "scripts"
         $Venv = Join-Path $Root ".venv"
-        $Python = Join-Path $Venv "Scripts\\python.exe"
+        $Python = Join-Path $Venv "Scripts\python.exe"
         $RezSource = Join-Path $PSScriptRoot "rez-runtime"
         $RezRoot = Join-Path $Root "rez-runtime"
-        New-Item -ItemType Directory -Force -Path $Root | Out-Null
+        $BundledSource = Join-Path $PSScriptRoot "runner-source"
+        $BundledExeRoot = Join-Path $PSScriptRoot "bin\RezonanceLocalConnector"
+        $InstalledExeRoot = Join-Path $Root "bin\RezonanceLocalConnector"
+        New-Item -ItemType Directory -Force -Path $Root,$DataRoot,$ScriptsRoot | Out-Null
 
-        if (-not (Get-Command py -ErrorAction SilentlyContinue)) {{
-          throw "Python launcher 'py' was not found. Install Python 3.10+ for Windows first."
+        foreach ($Script in @("start-runner.ps1", "import-inventory.ps1", "diagnose-runner.ps1", "uninstall-runner.ps1")) {{
+          Copy-Item -Force (Join-Path $PSScriptRoot $Script) (Join-Path $ScriptsRoot $Script)
         }}
-
-        if (-not (Test-Path $Python)) {{
-          py -3 -m venv $Venv
-        }}
-
-        & $Python -m pip install --upgrade pip
-        if ($PackageSpec) {{
-          & $Python -m pip install --upgrade $PackageSpec
-        }} else {{
-          $BundledSource = Join-Path $PSScriptRoot "runner-source"
-          if (-not (Test-Path (Join-Path $BundledSource "pyproject.toml"))) {{
-            throw "The bundled Netcode runner source is missing. Download a fresh runner package."
-          }}
-          & $Python -m pip install --upgrade $BundledSource
-        }}
-        if (-not (Test-Path (Join-Path $RezSource "drivers\\collector.py"))) {{
-          throw "The Rez multi-vendor adapter bundle is missing. Download a fresh runner package."
+        if (-not (Test-Path (Join-Path $RezSource "drivers\collector.py"))) {{
+          throw "The Rez multi-vendor adapter bundle is missing. Download a fresh package."
         }}
         New-Item -ItemType Directory -Force -Path $RezRoot | Out-Null
         Copy-Item -Path (Join-Path $RezSource "*") -Destination $RezRoot -Recurse -Force
-        $env:NETCODE_REZ_ROOT = $RezRoot
-        & $Python -m netcode.runner_agent enroll --server "{control_plane_url}" --join-token $JoinToken --name $RunnerName
 
-        if ($RegisterStartupTask) {{
-          $StartScript = Join-Path $PSScriptRoot "start-runner.ps1"
-          $Action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$StartScript`""
-          $Trigger = New-ScheduledTaskTrigger -AtStartup
-          Register-ScheduledTask -TaskName "NetcodeRunner" -Action $Action -Trigger $Trigger -Description "Netcode outbound local runner" -RunLevel Highest -Force | Out-Null
-          Write-Host "Registered startup task: NetcodeRunner"
+        $Executable = Join-Path $InstalledExeRoot "RezonanceLocalConnector.exe"
+        if (Test-Path (Join-Path $BundledExeRoot "RezonanceLocalConnector.exe")) {{
+          New-Item -ItemType Directory -Force -Path (Split-Path $InstalledExeRoot) | Out-Null
+          Copy-Item -Path $BundledExeRoot -Destination (Split-Path $InstalledExeRoot) -Recurse -Force
+        }} else {{
+          if (-not (Test-Path $Python)) {{ py -3 -m venv $Venv }}
+          & $Python -m pip install --disable-pip-version-check --upgrade pip
+          if ($PackageSpec) {{
+            & $Python -m pip install --upgrade $PackageSpec
+          }} else {{
+            if (-not (Test-Path (Join-Path $BundledSource "pyproject.toml"))) {{
+              throw "The bundled Local Connector source is missing."
+            }}
+            & $Python -m pip install --upgrade $BundledSource
+          }}
         }}
 
-        Write-Host "Netcode runner installed and enrolled."
-        Write-Host "Next: .\\import-inventory.ps1 -InventoryPath .\\sample-inventory.yaml"
+        if ($CaBundle -and -not (Test-Path $CaBundle)) {{ throw "CA bundle not found: $CaBundle" }}
+        @{{
+          control_plane_url = $ControlPlaneUrl
+          proxy_url = $ProxyUrl
+          ca_bundle = $CaBundle
+          package_version = "{PACKAGE_VERSION}"
+        }} | ConvertTo-Json | Set-Content -Encoding UTF8 (Join-Path $Root "connector-settings.json")
+
+        $env:NETCODE_RUNNER_HOME = $DataRoot
+        $env:NETCODE_REZ_ROOT = $RezRoot
+        if ($ProxyUrl) {{ $env:HTTPS_PROXY = $ProxyUrl; $env:HTTP_PROXY = $ProxyUrl; $env:WSS_PROXY = $ProxyUrl }}
+        if ($CaBundle) {{ $env:SSL_CERT_FILE = $CaBundle; $env:REQUESTS_CA_BUNDLE = $CaBundle }}
+        if (Test-Path $Executable) {{
+          & $Executable enroll --server $ControlPlaneUrl --join-token $JoinToken --name $RunnerName
+        }} else {{
+          & $Python -m netcode.runner_agent enroll --server $ControlPlaneUrl --join-token $JoinToken --name $RunnerName
+        }}
+        if ($LASTEXITCODE -ne 0) {{ throw "Connector enrollment failed." }}
+
+        # SYSTEM runs the startup task and DPAPI uses machine scope. Restrict the
+        # ProgramData tree so other local users cannot read connector data.
+        & icacls.exe $Root /inheritance:r /grant:r "SYSTEM:(OI)(CI)F" "BUILTIN\Administrators:(OI)(CI)F" | Out-Null
+
+        $TaskName = "RezonanceLocalConnector"
+        $InstalledStart = Join-Path $ScriptsRoot "start-runner.ps1"
+        if ($RegisterStartupTask) {{
+          $Action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$InstalledStart`""
+          $Trigger = New-ScheduledTaskTrigger -AtStartup
+          $Principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
+          Register-ScheduledTask -TaskName $TaskName -Action $Action -Trigger $Trigger -Principal $Principal -Description "Rezonance outbound-only Local Connector" -Force | Out-Null
+          Write-Host "Registered startup task: $TaskName"
+        }}
+        if ($StartNow) {{
+          if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {{
+            Start-ScheduledTask -TaskName $TaskName
+          }} else {{
+            Start-Process powershell.exe -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$InstalledStart`"" -WindowStyle Hidden
+          }}
+        }}
+
+        Write-Host "Rezonance Local Connector installed and enrolled."
+        Write-Host "Next: .\import-inventory.ps1 -InventoryPath .\sample-inventory.yaml"
         """
     ).strip() + "\n"
 
 
 def _start_runner_ps1() -> str:
     return dedent(
-        """
+        r"""
         $ErrorActionPreference = "Stop"
-        $Root = Join-Path $env:ProgramData "NetcodeRunner"
-        $Python = Join-Path $Root ".venv\\Scripts\\python.exe"
+        $Root = Join-Path $env:ProgramData "Rezonance\LocalConnector"
+        $DataRoot = Join-Path $Root "data"
+        $SettingsPath = Join-Path $Root "connector-settings.json"
+        $Python = Join-Path $Root ".venv\Scripts\python.exe"
+        $Executable = Join-Path $Root "bin\RezonanceLocalConnector\RezonanceLocalConnector.exe"
+        $env:NETCODE_RUNNER_HOME = $DataRoot
         $env:NETCODE_REZ_ROOT = Join-Path $Root "rez-runtime"
+        if (Test-Path $SettingsPath) {
+          $Settings = Get-Content -Raw $SettingsPath | ConvertFrom-Json
+          if ($Settings.proxy_url) { $env:HTTPS_PROXY = $Settings.proxy_url; $env:HTTP_PROXY = $Settings.proxy_url; $env:WSS_PROXY = $Settings.proxy_url }
+          if ($Settings.ca_bundle) { $env:SSL_CERT_FILE = $Settings.ca_bundle; $env:REQUESTS_CA_BUNDLE = $Settings.ca_bundle }
+        }
         $LogDir = Join-Path $Root "logs"
         New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
-        $LogFile = Join-Path $LogDir ("runner-" + (Get-Date -Format "yyyyMMdd") + ".log")
-
-        if (-not (Test-Path $Python)) {
-          throw "Runner virtual environment not found. Run install-runner.ps1 first."
+        $LogFile = Join-Path $LogDir ("connector-" + (Get-Date -Format "yyyyMMdd") + ".log")
+        if (Test-Path $Executable) {
+          & $Executable run *>> $LogFile
+        } elseif (Test-Path $Python) {
+          & $Python -m netcode.runner_agent run *>> $LogFile
+        } else {
+          throw "Local Connector runtime not found. Run install-runner.ps1 first."
         }
-
-        & $Python -m netcode.runner_agent run *>> $LogFile
         """
     ).strip() + "\n"
 
 
 def _import_inventory_ps1() -> str:
     return dedent(
-        """
-        param(
-          [Parameter(Mandatory=$true)][string]$InventoryPath
-        )
-
+        r"""
+        param([Parameter(Mandatory=$true)][string]$InventoryPath)
         $ErrorActionPreference = "Stop"
-        $Root = Join-Path $env:ProgramData "NetcodeRunner"
-        $Python = Join-Path $Root ".venv\\Scripts\\python.exe"
-
-        if (-not (Test-Path $Python)) {
-          throw "Runner virtual environment not found. Run install-runner.ps1 first."
+        $Root = Join-Path $env:ProgramData "Rezonance\LocalConnector"
+        $Python = Join-Path $Root ".venv\Scripts\python.exe"
+        $Executable = Join-Path $Root "bin\RezonanceLocalConnector\RezonanceLocalConnector.exe"
+        $env:NETCODE_RUNNER_HOME = Join-Path $Root "data"
+        $env:NETCODE_REZ_ROOT = Join-Path $Root "rez-runtime"
+        if (-not (Test-Path $InventoryPath)) { throw "Inventory file not found: $InventoryPath" }
+        if (Test-Path $Executable) {
+          & $Executable inventory-import $InventoryPath
+        } elseif (Test-Path $Python) {
+          & $Python -m netcode.runner_agent inventory-import $InventoryPath
+        } else {
+          throw "Local Connector runtime not found. Run install-runner.ps1 first."
         }
-        if (-not (Test-Path $InventoryPath)) {
-          throw "Inventory file not found: $InventoryPath"
-        }
-
-        & $Python -m netcode.runner_agent inventory-import $InventoryPath
-        Write-Host "Inventory imported into the runner-local credential store."
+        if ($LASTEXITCODE -ne 0) { throw "Inventory import failed." }
+        Write-Host "Inventory imported. On Windows, connector identity and inventory are protected with machine-scoped DPAPI and restricted NTFS ACLs."
         """
     ).strip() + "\n"
+
+
+def _diagnose_runner_ps1() -> str:
+    return dedent(
+        r"""
+        $ErrorActionPreference = "Continue"
+        $Root = Join-Path $env:ProgramData "Rezonance\LocalConnector"
+        $Python = Join-Path $Root ".venv\Scripts\python.exe"
+        $Executable = Join-Path $Root "bin\RezonanceLocalConnector\RezonanceLocalConnector.exe"
+        $env:NETCODE_RUNNER_HOME = Join-Path $Root "data"
+        $env:NETCODE_REZ_ROOT = Join-Path $Root "rez-runtime"
+        $Task = Get-ScheduledTask -TaskName "RezonanceLocalConnector" -ErrorAction SilentlyContinue
+        if ($Task) { Write-Host "Startup task: $($Task.State)" } else { Write-Warning "Startup task is not registered." }
+        if (Test-Path $Executable) {
+          & $Executable doctor
+        } elseif (Test-Path $Python) {
+          & $Python -m netcode.runner_agent doctor
+        } else {
+          Write-Error "Local Connector runtime not found."
+          exit 1
+        }
+        $DoctorExit = $LASTEXITCODE
+        $LatestLog = Get-ChildItem (Join-Path $Root "logs\connector-*.log") -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+        if ($LatestLog) { Write-Host "Latest log: $($LatestLog.FullName)" }
+        exit $DoctorExit
+        """
+    ).strip() + "\n"
+
+
+def _uninstall_runner_ps1() -> str:
+    return dedent(
+        r"""
+        param([switch]$PurgeLocalData)
+        $ErrorActionPreference = "Stop"
+        $Root = Join-Path $env:ProgramData "Rezonance\LocalConnector"
+        $TaskName = "RezonanceLocalConnector"
+        if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
+          Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+          Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false
+        }
+        if ($PurgeLocalData) {
+          Remove-Item -Recurse -Force $Root -ErrorAction SilentlyContinue
+          Write-Host "Local Connector and all local identity, inventory, and logs were removed."
+        } else {
+          foreach ($Name in @(".venv", "bin", "rez-runtime", "scripts", "connector-settings.json")) {
+            Remove-Item -Recurse -Force (Join-Path $Root $Name) -ErrorAction SilentlyContinue
+          }
+          Write-Host "Runtime removed. Protected data and logs remain at $Root. Use -PurgeLocalData to remove them."
+        }
+        """
+    ).strip() + "\n"
+
+
+def _build_executable_ps1() -> str:
+    return dedent(
+        r"""
+        param([switch]$Clean)
+        $ErrorActionPreference = "Stop"
+        if (-not (Get-Command py -ErrorAction SilentlyContinue)) { throw "Python 3.10+ is required only to build the Windows executable." }
+        $BuildRoot = Join-Path $env:TEMP "rezonance-local-connector-build"
+        if ($Clean) { Remove-Item -Recurse -Force $BuildRoot -ErrorAction SilentlyContinue }
+        New-Item -ItemType Directory -Force -Path $BuildRoot | Out-Null
+        $Venv = Join-Path $BuildRoot ".venv"
+        if (-not (Test-Path (Join-Path $Venv "Scripts\python.exe"))) { py -3 -m venv $Venv }
+        $Python = Join-Path $Venv "Scripts\python.exe"
+        & $Python -m pip install --disable-pip-version-check --upgrade pip pyinstaller
+        & $Python -m pip install --upgrade (Join-Path $PSScriptRoot "runner-source")
+        Push-Location $BuildRoot
+        try {
+          & $Python -m PyInstaller --noconfirm --clean --onedir --name RezonanceLocalConnector `
+            --collect-all netcode --collect-all netmiko --collect-all ntc_templates --collect-all textfsm --collect-all yaml `
+            (Join-Path $PSScriptRoot "windows-entrypoint.py")
+          if ($LASTEXITCODE -ne 0) { throw "PyInstaller build failed." }
+          $Destination = Join-Path $PSScriptRoot "bin\RezonanceLocalConnector"
+          Remove-Item -Recurse -Force $Destination -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force -Path (Split-Path $Destination) | Out-Null
+          Copy-Item -Recurse -Force (Join-Path $BuildRoot "dist\RezonanceLocalConnector") $Destination
+          $Exe = Join-Path $Destination "RezonanceLocalConnector.exe"
+          $Hash = (Get-FileHash -Algorithm SHA256 $Exe).Hash.ToLowerInvariant()
+          Set-Content -Encoding ASCII (Join-Path $PSScriptRoot "WINDOWS-EXE-SHA256.txt") "$Hash  RezonanceLocalConnector.exe"
+          Write-Host "Built $Exe"
+        } finally { Pop-Location }
+        """
+    ).strip() + "\n"
+
+
+def _windows_entrypoint() -> str:
+    return "from netcode.runner_agent import main\n\nraise SystemExit(main())\n"
 
 
 def _sample_inventory_yaml() -> str:
@@ -170,87 +345,107 @@ def _sample_inventory_yaml() -> str:
             host: 192.0.2.10
             platform: arista_eos
             site: gns3-lab
-            groups:
-              - lab
-              - core
+            role: core
+            groups: [lab, core]
 
-        # Hybrid SSH + API example. These values remain on the local runner:
+        # SSH + API devices use the same local inventory. These values are
+        # encrypted with DPAPI after import and never sent to the control plane.
         # - id: edge-fw-01
         #   hostname: edge-fw-01
         #   host: 192.0.2.20
         #   platform: fortinet
         #   username: admin
         #   password: replace-me
-        #   port: 22
         #   connection:
         #     transport: api
-        #     ssh_port: 22
         #     api_port: 443
         #     api_token: replace-me
-        #     verify_ssl: false
+        #     verify_ssl: true
         """
     ).strip() + "\n"
 
 
 def _readme(control_plane_url: str) -> str:
     return dedent(
-        f"""
-        # Netcode Windows Runner
+        fr"""
+        # Rezonance Local Connector for Windows
 
-        This package installs the outbound-only Netcode local runner for Windows.
-        It is the component that can reach your lab or enterprise devices. The
-        control plane at `{control_plane_url}` does not receive SSH/API
-        credentials and does not open inbound connections to this machine.
+        This pilot package installs the same outbound-only connector used by
+        Netcode Automation, Rez Diagnostics, Digital Twin discovery, and Shell.
+        No LLM or MCP server runs on the Windows connector.
 
-        ## Install
+        ## Pilot install
 
         Open PowerShell as Administrator:
 
         ```powershell
         Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope Process
-        .\\install-runner.ps1 -JoinToken "<single-use-token>" -RunnerName "windows-gns3-runner" -RegisterStartupTask
-        .\\import-inventory.ps1 -InventoryPath .\\sample-inventory.yaml
-        .\\start-runner.ps1
+        .\preflight.ps1 -ControlPlaneUrl "{control_plane_url}"
+        .\install-runner.ps1 -JoinToken "<single-use-token>" -RunnerName "windows-gns3-connector" -RegisterStartupTask -StartNow
+        .\import-inventory.ps1 -InventoryPath .\sample-inventory.yaml
+        .\diagnose-runner.ps1
         ```
 
-        ## Network model
+        To point a Windows/GNS3 pilot at a Mac control plane, pass the Mac LAN
+        URL explicitly and permit HTTP only on that private test network:
 
-        - Outbound HTTPS/WSS only from the runner to the control plane.
-        - No inbound listener is opened by the runner.
-        - Device credentials are stored in the runner-local inventory.
-        - The package includes the lightweight Rez driver runtime for 11 active
-          platforms; no LLM, MCP server, Chat-v2 backend, or math engine runs on
-          the customer runner.
-        - SSH-capable devices can use Netcode Shell. API-only controllers use
-          discovery, live state, diagnostics, and verification without a Shell.
-        - Rez Diagnostics uses read-only runner jobs.
-        - Netcode writes require plan, dry-run/canary, human approval, apply,
-          and verification gates.
-
-        ## Logs
-
-        Logs are written to:
-
-        ```text
-        C:\\ProgramData\\NetcodeRunner\\logs
+        ```powershell
+        .\install-runner.ps1 -JoinToken "<single-use-token>" -ControlPlaneUrl "http://MAC-LAN-IP:8095" -AllowInsecureHttpForLab -RegisterStartupTask -StartNow
         ```
+
+        ## Security model
+
+        - Outbound HTTPS/WSS only in production; no inbound listener is opened.
+        - Device access uses SSH/API from this connector to the local network.
+        - Windows identity and inventory files use machine-scoped DPAPI.
+        - NTFS access is restricted to SYSTEM and local administrators.
+        - The control plane receives public inventory facts and signed job results, never credentials.
+        - Rez jobs are read-only. Netcode writes remain plan-, approval-, and verification-gated.
+        - Proxy and custom enterprise CA paths can be supplied during install.
+
+        ## Clean-machine executable
+
+        The source ZIP remains a pilot/developer artifact. On the Windows test
+        machine, run `build-windows-executable.ps1 -Clean`, then rebuild/download
+        the release artifact. The generated `bin` runtime removes the Python
+        prerequisite. Production distribution still requires code signing.
+
+        Logs are under `C:\ProgramData\Rezonance\LocalConnector\logs`.
         """
     ).strip() + "\n"
 
 
 def build_windows_runner_package(control_plane_url: str, *, runner_pool: str = "default") -> bytes:
-    """Return a ZIP package suitable for download from the control plane."""
+    """Return a secret-free Windows Local Connector pilot ZIP."""
     profile = build_desktop_shell_profile(control_plane_url, runner_pool=runner_pool)
     files: dict[str, str | bytes] = {
         "README.md": _readme(control_plane_url),
+        "preflight.ps1": _preflight_ps1(control_plane_url),
         "install-runner.ps1": _install_runner_ps1(control_plane_url),
         "start-runner.ps1": _start_runner_ps1(),
         "import-inventory.ps1": _import_inventory_ps1(),
+        "diagnose-runner.ps1": _diagnose_runner_ps1(),
+        "uninstall-runner.ps1": _uninstall_runner_ps1(),
+        "build-windows-executable.ps1": _build_executable_ps1(),
+        "windows-entrypoint.py": _windows_entrypoint(),
         "sample-inventory.yaml": _sample_inventory_yaml(),
         "netcode-shell-profile.json": json.dumps(profile, indent=2) + "\n",
+        "package-info.json": json.dumps({
+            "product": "Rezonance Local Connector",
+            "version": PACKAGE_VERSION,
+            "platform": "windows-x64",
+            "runner_pool": runner_pool,
+            "control_plane_url": control_plane_url.rstrip("/"),
+            "contains_secrets": False,
+        }, indent=2) + "\n",
     }
     files.update(_rez_runtime_files())
     files.update(_runner_source_files())
+    checksums = []
+    for name, content in sorted(files.items()):
+        raw = content.encode("utf-8") if isinstance(content, str) else content
+        checksums.append(f"{hashlib.sha256(raw).hexdigest()}  {name}")
+    files["SHA256SUMS.txt"] = "\n".join(checksums) + "\n"
 
     buffer = BytesIO()
     with ZipFile(buffer, "w", compression=ZIP_DEFLATED) as archive:
@@ -264,19 +459,23 @@ def package_manifest(control_plane_url: str, *, runner_pool: str = "default") ->
     runner_files = _runner_source_files()
     return {
         "ok": True,
-        "platform": "windows",
+        "product": "Rezonance Local Connector",
+        "version": PACKAGE_VERSION,
+        "platform": "windows-x64",
+        "artifact_kind": "pilot_zip",
         "control_plane_url": control_plane_url.rstrip("/"),
         "runner_pool": runner_pool,
-        "files": [
-            "README.md",
-            "install-runner.ps1",
-            "start-runner.ps1",
-            "import-inventory.ps1",
-            "sample-inventory.yaml",
-            "netcode-shell-profile.json",
-        ],
         "network": "outbound_https_wss_only",
-        "credentials": "runner_local_only",
+        "credentials": "windows_dpapi_machine_scope_and_restricted_acl",
+        "startup": "system_scheduled_task",
+        "python_required": True,
+        "standalone_executable_build_script": True,
+        "production_code_signing_complete": False,
+        "files": [
+            "README.md", "preflight.ps1", "install-runner.ps1", "start-runner.ps1",
+            "import-inventory.ps1", "diagnose-runner.ps1", "uninstall-runner.ps1",
+            "build-windows-executable.ps1", "SHA256SUMS.txt", "sample-inventory.yaml",
+        ],
         "rez_adapter_bundle": {
             "included": bool(rez_files),
             "file_count": len(rez_files),
@@ -285,6 +484,6 @@ def package_manifest(control_plane_url: str, *, runner_pool: str = "default") ->
         "runner_source_bundle": {
             "included": bool(runner_files),
             "file_count": len(runner_files),
-            "scope": "outbound runner and local execution modules",
+            "scope": "outbound connector and local execution modules",
         },
     }

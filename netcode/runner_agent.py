@@ -38,9 +38,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
-IDENTITY_DIR = Path.home() / ".netcode-runner"
-IDENTITY_FILE = IDENTITY_DIR / "identity.json"
-INVENTORY_FILE = IDENTITY_DIR / "inventory.yaml"
+IDENTITY_DIR = Path(os.getenv("NETCODE_RUNNER_HOME") or (Path.home() / ".netcode-runner")).expanduser()
+_WINDOWS_DPAPI = os.name == "nt" and os.getenv("NETCODE_DISABLE_DPAPI", "").strip() != "1"
+IDENTITY_FILE = IDENTITY_DIR / ("identity.dpapi" if _WINDOWS_DPAPI else "identity.json")
+INVENTORY_FILE = IDENTITY_DIR / ("inventory.dpapi" if _WINDOWS_DPAPI else "inventory.yaml")
 POLICY_FILE = IDENTITY_DIR / "policy.yaml"
 MANAGER_LEDGER_FILE = IDENTITY_DIR / "manager-operations.json"
 VERSION = "0.4.0-execution-events"
@@ -133,6 +134,13 @@ def _post(server: str, path: str, body: dict[str, Any], token: str | None = None
         raise RuntimeError(f"HTTP {exc.code} from {path}: {detail}") from exc
 
 
+def _get(server: str, path: str, timeout: float = 10.0) -> dict[str, Any]:
+    url = server.rstrip("/") + path
+    request = urllib.request.Request(url, method="GET")
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
 def enroll(args: argparse.Namespace) -> int:
     resp = _post(args.server, "/api/runner/enroll", {"join_token": args.join_token, "name": args.name})
     if not resp or not resp.get("ok"):
@@ -147,8 +155,14 @@ def enroll(args: argparse.Namespace) -> int:
         "pool": resp["pool"],
         "name": args.name,
     }
-    IDENTITY_FILE.write_text(json.dumps(identity, indent=2), encoding="utf-8")
-    IDENTITY_FILE.chmod(0o600)
+    serialized = json.dumps(identity, indent=2).encode("utf-8")
+    if IDENTITY_FILE.suffix.lower() == ".dpapi":
+        from netcode.windows_security import protect_machine
+
+        IDENTITY_FILE.write_bytes(protect_machine(serialized))
+    else:
+        IDENTITY_FILE.write_bytes(serialized)
+        IDENTITY_FILE.chmod(0o600)
     print(f"[runner] Enrolled '{args.name}' into pool '{resp['pool']}'. Identity saved to {IDENTITY_FILE}")
     if not INVENTORY_FILE.exists():
         print(f"[runner] NOTE: put your device inventory (with credentials) at {INVENTORY_FILE}")
@@ -158,12 +172,17 @@ def enroll(args: argparse.Namespace) -> int:
 def _load_identity() -> dict[str, Any]:
     if not IDENTITY_FILE.exists():
         raise SystemExit(f"[runner] Not enrolled. Run: netcode-runner enroll --server ... --join-token ...")
-    return json.loads(IDENTITY_FILE.read_text(encoding="utf-8"))
+    serialized = IDENTITY_FILE.read_bytes()
+    if IDENTITY_FILE.suffix.lower() == ".dpapi":
+        from netcode.windows_security import unprotect_machine
+
+        serialized = unprotect_machine(serialized)
+    return json.loads(serialized.decode("utf-8"))
 
 
 def import_inventory(args: argparse.Namespace) -> int:
     """Install a credentialed device inventory on the local runner only."""
-    from netcode.yamlio import read_yaml
+    from netcode.yamlio import read_yaml, write_yaml
 
     source = Path(args.file).expanduser()
     if not source.exists():
@@ -180,11 +199,83 @@ def import_inventory(args: argparse.Namespace) -> int:
         return 1
 
     IDENTITY_DIR.mkdir(parents=True, exist_ok=True)
-    INVENTORY_FILE.write_text(source.read_text(encoding="utf-8"), encoding="utf-8")
-    INVENTORY_FILE.chmod(0o600)
+    write_yaml(INVENTORY_FILE, data)
+    if INVENTORY_FILE.suffix.lower() != ".dpapi":
+        INVENTORY_FILE.chmod(0o600)
     print(f"[runner] Imported {len(devices)} device(s) into {INVENTORY_FILE}")
     print("[runner] Credentials stay on this runner. They are not sent to the control plane.")
     return 0
+
+
+def doctor(args: argparse.Namespace) -> int:
+    """Report Local Connector readiness without revealing local credentials."""
+    checks: list[dict[str, Any]] = []
+    identity: dict[str, Any] = {}
+    if IDENTITY_FILE.exists():
+        try:
+            identity = _load_identity()
+            checks.append({"id": "identity", "status": "pass", "message": "Connector is enrolled."})
+        except Exception as exc:  # noqa: BLE001
+            checks.append({"id": "identity", "status": "fail", "message": f"Identity cannot be read: {exc}"})
+    else:
+        checks.append({"id": "identity", "status": "fail", "message": "Connector is not enrolled."})
+
+    inventory_summary: dict[str, Any] = {"configured": False, "device_count": 0, "sites": [], "platforms": []}
+    if INVENTORY_FILE.exists():
+        try:
+            from netcode.inventory import Inventory
+
+            inventory = Inventory(INVENTORY_FILE)
+            inventory_summary = {
+                "configured": True,
+                "device_count": len(inventory.devices),
+                "sites": sorted({str(device.site) for device in inventory.devices if device.site}),
+                "platforms": sorted({device.platform for device in inventory.devices}),
+            }
+            status = "pass" if inventory.devices else "fail"
+            checks.append({
+                "id": "inventory",
+                "status": status,
+                "message": f"{len(inventory.devices)} device record(s) are available locally.",
+            })
+        except Exception as exc:  # noqa: BLE001
+            checks.append({"id": "inventory", "status": "fail", "message": f"Inventory cannot be read: {exc}"})
+    else:
+        checks.append({"id": "inventory", "status": "fail", "message": "No local device inventory is installed."})
+
+    server = str(identity.get("server") or "")
+    if server:
+        try:
+            manifest = _get(server, "/api/runner/download/windows/manifest", timeout=float(args.timeout))
+            reachable = bool(manifest.get("ok"))
+            checks.append({
+                "id": "control_plane",
+                "status": "pass" if reachable else "fail",
+                "message": "Control plane is reachable." if reachable else "Control plane returned an invalid manifest.",
+            })
+        except Exception as exc:  # noqa: BLE001
+            checks.append({"id": "control_plane", "status": "fail", "message": f"Control plane is unreachable: {exc}"})
+    else:
+        checks.append({"id": "control_plane", "status": "fail", "message": "No enrolled control-plane URL is available."})
+
+    failed = [check for check in checks if check["status"] == "fail"]
+    payload = {
+        "ok": not failed,
+        "status": "pass" if not failed else "fail",
+        "connector_version": VERSION,
+        "platform": platform.platform(),
+        "python": platform.python_version(),
+        "home": str(IDENTITY_DIR),
+        "security": {
+            "dpapi_machine_scope": IDENTITY_FILE.suffix.lower() == ".dpapi",
+            "credentials_returned": False,
+            "inbound_listener": False,
+        },
+        "inventory": inventory_summary,
+        "checks": checks,
+    }
+    print(json.dumps(payload, indent=2))
+    return 0 if payload["ok"] else 1
 
 
 def _public_inventory_snapshot() -> dict[str, Any]:
@@ -2346,6 +2437,9 @@ def main(argv: list[str] | None = None) -> int:
     p_import = sub.add_parser("inventory-import", help="Install credentialed device inventory on this runner.")
     p_import.add_argument("file", help="Path to inventory YAML with local device credentials.")
     p_import.set_defaults(func=import_inventory)
+    p_doctor = sub.add_parser("doctor", help="Check enrollment, inventory, and outbound control-plane reachability.")
+    p_doctor.add_argument("--timeout", type=float, default=10.0)
+    p_doctor.set_defaults(func=doctor)
     p_run = sub.add_parser("run", help="Poll for and execute jobs.")
     p_run.set_defaults(func=run)
     args = parser.parse_args(argv)

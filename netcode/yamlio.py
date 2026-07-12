@@ -9,8 +9,14 @@ import yaml
 
 
 def read_yaml(path: Path) -> dict[str, Any]:
-    with path.open("r", encoding="utf-8") as handle:
-        data = yaml.safe_load(handle) or {}
+    if path.suffix.lower() == ".dpapi":
+        from netcode.windows_security import unprotect_machine
+
+        text = unprotect_machine(path.read_bytes()).decode("utf-8")
+        data = yaml.safe_load(text) or {}
+    else:
+        with path.open("r", encoding="utf-8") as handle:
+            data = yaml.safe_load(handle) or {}
     if not isinstance(data, dict):
         raise ValueError(f"{path} must contain a YAML mapping")
     return data
@@ -18,8 +24,13 @@ def read_yaml(path: Path) -> dict[str, Any]:
 
 def write_yaml(path: Path, data: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as handle:
-        yaml.safe_dump(data, handle, sort_keys=False, default_flow_style=False)
+    text = yaml.safe_dump(data, sort_keys=False, default_flow_style=False)
+    if path.suffix.lower() == ".dpapi":
+        from netcode.windows_security import protect_machine
+
+        path.write_bytes(protect_machine(text.encode("utf-8")))
+    else:
+        path.write_text(text, encoding="utf-8")
 
 
 def dumps_yaml(data: dict[str, Any]) -> str:
