@@ -110,6 +110,11 @@ from netcode.shell_desktop import build_desktop_shell_profile
 from netcode.source_of_truth import netbox_sync, netbox_test, provider_catalog, source_of_truth
 from netcode.network_model import NetworkModelError
 from netcode.network_model_store import NetworkModelRepository
+from netcode.network_model_import import (
+    import_approved_network_design,
+    import_catalog_candidate,
+    import_local_yaml_candidate,
+)
 from netcode.store import (
     DEFAULT_ORG_ID,
     PlatformStore,
@@ -1184,6 +1189,57 @@ def api_network_model_entities(
         cursor=cursor,
         limit=limit,
     )
+    return {"ok": True, **result, "device_connections_opened": 0}
+
+
+@app.post("/api/network-model/import/catalog")
+def api_network_model_import_catalog(request: Request, payload: dict[str, object]) -> dict[str, object]:
+    principal = _request_principal(request)
+    try:
+        result = import_catalog_candidate(
+            PlatformStore(paths()),
+            org_id=principal.org_id,
+            environment_id=str(payload.get("environment_id") or "default"),
+            revision_id=str(payload.get("revision_id") or "catalog-import"),
+            created_by=principal.email or principal.user_id or "system",
+        )
+    except (NetworkModelError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"ok": True, **result, "device_connections_opened": 0}
+
+
+@app.post("/api/network-model/import/local-yaml")
+def api_network_model_import_local_yaml(request: Request, payload: dict[str, object]) -> dict[str, object]:
+    principal = _request_principal(request)
+    try:
+        result = import_local_yaml_candidate(
+            paths(),
+            org_id=principal.org_id,
+            environment_id=str(payload.get("environment_id") or "default"),
+            revision_id=str(payload.get("revision_id") or "yaml-import"),
+            created_by=principal.email or principal.user_id or "system",
+        )
+    except (NetworkModelError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"ok": True, **result, "device_connections_opened": 0}
+
+
+@app.post("/api/network-model/import/approved-design")
+def api_network_model_import_approved_design(request: Request, payload: dict[str, object]) -> dict[str, object]:
+    principal = _request_principal(request)
+    design = payload.get("design")
+    if not isinstance(design, dict):
+        raise HTTPException(status_code=400, detail="design must be an approved network-design document")
+    try:
+        result = import_approved_network_design(
+            NetworkModelRepository(PlatformStore(paths())),
+            design,
+            org_id=principal.org_id,
+            environment_id=str(payload.get("environment_id") or design.get("namespace") or "default"),
+            created_by=principal.email or principal.user_id or "system",
+        )
+    except (NetworkModelError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     return {"ok": True, **result, "device_connections_opened": 0}
 
 
