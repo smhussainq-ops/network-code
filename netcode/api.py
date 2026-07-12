@@ -59,6 +59,7 @@ from netcode.fleet import (
     approve_rollout,
     cancel_rollout,
     create_remediation_rollouts,
+    device_audit_ref,
     drift_watch_status,
     fleet_drift_snapshot,
     plan_fleet_rollout,
@@ -93,6 +94,7 @@ from netcode.runner_hub import (
     mint_join_token,
     poll_for_job,
     runner_summary,
+    submit_job_progress,
     submit_job_result,
 )
 from netcode.orchestrator import create_add_vlan_intent, create_desired_state_intent, run_static_pipeline
@@ -101,7 +103,7 @@ from netcode.platform import platform_capabilities
 from netcode.scale import rollout_plan
 from netcode.shell_desktop import build_desktop_shell_profile
 from netcode.source_of_truth import netbox_sync, netbox_test, provider_catalog, source_of_truth
-from netcode.store import DEFAULT_ORG_ID, PlatformStore, record_to_dict, utc_now
+from netcode.store import DEFAULT_ORG_ID, PlatformStore, change_audit_id, record_to_dict, utc_now
 from netcode.troubleshooting import troubleshoot_state
 from netcode.ui_config import (
     configured_inventory_path,
@@ -335,6 +337,11 @@ class RunnerPollRequest(BaseModel):
 
 class RunnerResultRequest(BaseModel):
     result: dict[str, object]
+    signature: str = ""
+
+
+class RunnerProgressRequest(BaseModel):
+    event: dict[str, object]
     signature: str = ""
 
 
@@ -1272,6 +1279,20 @@ def api_runner_job_result(job_id: str, request: RunnerResultRequest, authorizati
     return submit_job_result(store, runner, job_id, dict(request.result), request.signature)
 
 
+@app.post("/api/runner/jobs/{job_id}/progress")
+def api_runner_job_progress(
+    job_id: str,
+    request: RunnerProgressRequest,
+    authorization: str | None = Header(default=None),
+) -> dict[str, object]:
+    store = PlatformStore(paths())
+    runner = _require_runner(store, authorization)
+    result = submit_job_progress(store, runner, job_id, dict(request.event), request.signature)
+    if not result.get("ok"):
+        raise HTTPException(status_code=400, detail=str(result.get("message") or "Progress rejected."))
+    return result
+
+
 @app.post("/api/runner/heartbeat")
 def api_runner_heartbeat(request: RunnerHeartbeatRequest, authorization: str | None = Header(default=None)) -> dict[str, object]:
     store = PlatformStore(paths())
@@ -1281,7 +1302,7 @@ def api_runner_heartbeat(request: RunnerHeartbeatRequest, authorization: str | N
 
 
 _RUNNER_INVENTORY_FIELDS = {
-    "id", "hostname", "host", "port", "platform", "site", "role", "groups", "aliases",
+    "id", "hostname", "host", "port", "platform", "site", "role", "groups", "aliases", "management",
 }
 _RUNNER_INVENTORY_SECRET_MARKERS = {
     "username", "password", "passwd", "pwd", "secret", "token", "credential",
@@ -1331,8 +1352,11 @@ def _sanitize_runner_inventory(devices: list[dict[str, object]]) -> list[dict[st
             raise HTTPException(status_code=400, detail=f"Runner inventory item {index} has an invalid port.")
         groups = raw.get("groups") or []
         aliases = raw.get("aliases") or []
+        management = raw.get("management") or {}
         if not isinstance(groups, list) or not isinstance(aliases, list):
             raise HTTPException(status_code=400, detail=f"Runner inventory item {index} groups and aliases must be lists.")
+        if not isinstance(management, dict):
+            raise HTTPException(status_code=400, detail=f"Runner inventory item {index} management must be a mapping.")
         if any(not isinstance(item, str) for item in [*groups, *aliases]):
             raise HTTPException(
                 status_code=400,
@@ -1348,6 +1372,7 @@ def _sanitize_runner_inventory(devices: list[dict[str, object]]) -> list[dict[st
             "role": str(raw.get("role") or "").strip(),
             "groups": [str(item).strip() for item in groups if str(item).strip()],
             "aliases": [str(item).strip() for item in aliases if str(item).strip()],
+            "management": management,
         })
     return public
 
@@ -1386,10 +1411,19 @@ def _runner_route_for_payload(
     return str(catalog_device["runner_pool"]), str(catalog_device["runner_id"])
 
 
-def _runner_read(p, action: str, payload: dict, org_id: str, timeout: float = 60.0) -> dict[str, object]:
+def _runner_read(
+    p,
+    action: str,
+    payload: dict,
+    org_id: str,
+    timeout: float = 60.0,
+    *,
+    change_id: str | None = None,
+) -> dict[str, object]:
     """Runner mode: queue a device-read job and wait for the on-prem runner to report.
     Keeps the browser API synchronous while the actual device I/O happens on the runner."""
     store = PlatformStore(p)
+    effective_change_id = change_id or str(payload.get("_progress_change_id") or "") or None
     pool, target_runner_id = _runner_route_for_payload(store, org_id, payload)
     job = store.create_read_job(
         org_id,
@@ -1397,7 +1431,21 @@ def _runner_read(p, action: str, payload: dict, org_id: str, timeout: float = 60
         action,
         payload,
         target_runner_id=target_runner_id,
+        change_id=effective_change_id or "__read__",
     )
+    if effective_change_id:
+        store.record_execution_event(
+            event_id=str(uuid.uuid4()),
+            job_id=job.id,
+            change_id=effective_change_id,
+            org_id=org_id,
+            device_id=str(payload.get("device_id") or ""),
+            phase=action,
+            stage="queued",
+            status="queued",
+            message=f"Queued {action} on the assigned runner.",
+            sequence=0,
+        )
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         current = store.get_job(job.id)
@@ -2533,7 +2581,12 @@ def api_verify_intent(request: IntentPathRequest, http_request: Request) -> dict
     p = paths()
     if execution_mode() == "runner":
         intent_yaml = Path(request.intent_path).read_text(encoding="utf-8")
-        payload = {"intent_yaml": intent_yaml, "device_id": request.device_id, "present": True}
+        payload = {
+            "intent_yaml": intent_yaml,
+            "device_id": request.device_id,
+            "present": True,
+            "_progress_change_id": request.change_id,
+        }
         result = _runner_read(p, "verify", payload, _request_principal(http_request).org_id)
         verification = dict(result.get("verification") or result)
         verification.setdefault("ok", result.get("ok"))
@@ -2702,6 +2755,75 @@ def api_fleet_rollouts(request: Request) -> dict[str, object]:
 def api_fleet_rollout(rollout_id: str, request: Request) -> dict[str, object]:
     _rollout_or_404(rollout_id, _request_principal(request).org_id)
     return rollout_status(paths(), rollout_id)
+
+
+@app.get("/api/fleet/rollouts/{rollout_id}/activity")
+def api_fleet_rollout_activity(
+    rollout_id: str,
+    request: Request,
+    q: str = Query(default="", max_length=200),
+    status: str = Query(default="all"),
+    limit: int = Query(default=50, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
+    include_events: bool = Query(default=False),
+) -> dict[str, object]:
+    principal = _request_principal(request)
+    rollout = _rollout_or_404(rollout_id, principal.org_id)
+    store = PlatformStore(paths())
+    try:
+        targets, filtered_total = store.list_rollout_targets_page(
+            rollout_id,
+            query=q,
+            category=status,
+            limit=limit,
+            offset=offset,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    counts = store.rollout_target_counts(rollout_id)
+    category_counts = {
+        "all": sum(counts.values()),
+        "running": sum(counts.get(key, 0) for key in ("running", "in_progress", "in-progress")),
+        "passed": sum(counts.get(key, 0) for key in ("passed", "completed", "verified", "success")),
+        "failed": sum(counts.get(key, 0) for key in ("failed", "blocked", "error")),
+        "untouched": sum(counts.get(key, 0) for key in ("pending", "planned", "queued", "skipped", "cancelled")),
+    }
+    enriched_targets = [
+        {**target, "audit_ref": device_audit_ref(str(target.get("change_id") or ""))}
+        for target in targets
+    ]
+    events_by_device: dict[str, list[dict[str, object]]] = {}
+    if include_events:
+        change_ids = [str(target.get("change_id") or "") for target in enriched_targets]
+        # One device lifecycle is currently under 60 milestones. Keep a bounded
+        # 100-event history so "All activity" includes dry-run through rollback
+        # without loading events for devices outside the current page.
+        grouped = store.list_execution_events_for_changes(change_ids, per_change=100)
+        for target in enriched_targets:
+            change_id = str(target.get("change_id") or "")
+            events_by_device[str(target.get("device_id") or "")] = [
+                record_to_dict(event) for event in grouped.get(change_id, [])
+            ]
+    compact_rollout = {
+        **rollout,
+        "target_counts": counts,
+        "category_counts": category_counts,
+        "device_count": category_counts["all"],
+        "waves": store.rollout_wave_counts(rollout_id),
+    }
+    return {
+        "ok": True,
+        "rollout": compact_rollout,
+        "targets": enriched_targets,
+        "events_by_device": events_by_device,
+        "page": {
+            "limit": limit,
+            "offset": offset,
+            "returned": len(enriched_targets),
+            "filtered_total": filtered_total,
+            "has_more": offset + len(enriched_targets) < filtered_total,
+        },
+    }
 
 
 @app.post("/api/fleet/rollouts/{rollout_id}/start")
@@ -3427,6 +3549,32 @@ def _job_transcript(job: dict[str, object]) -> list[dict[str, object]]:
         return []
     transcript = evidence.get("transcript") or (evidence.get("session") or {}).get("transcript", [])
     return transcript if isinstance(transcript, list) else []
+
+
+@app.get("/api/change/{change_id}/activity")
+def api_change_activity(
+    change_id: str,
+    request: Request,
+    limit: int = Query(default=500, ge=1, le=1000),
+) -> dict[str, object]:
+    store = PlatformStore(paths())
+    try:
+        change = store.get_change(change_id)
+    except Exception as exc:
+        raise HTTPException(status_code=404, detail=f"Unknown change {change_id}") from exc
+    if change.org_id != _request_principal(request).org_id:
+        raise HTTPException(status_code=404, detail=f"Unknown change {change_id}")
+    jobs = [job for job in store.list_jobs(limit=500, org_id=change.org_id) if job.change_id == change_id]
+    active_job = next((job for job in jobs if job.status in {"queued", "running"}), None)
+    return {
+        "ok": True,
+        "change_id": change_id,
+        "rez_change_id": change_audit_id(change.id, change.created_at),
+        "device_id": change.device_id,
+        "workflow_state": change.workflow_state,
+        "active_job": record_to_dict(active_job) if active_job else None,
+        "events": [record_to_dict(event) for event in store.list_execution_events(change_id, limit=limit)],
+    }
 
 
 @app.get("/api/change/{change_id}/record")

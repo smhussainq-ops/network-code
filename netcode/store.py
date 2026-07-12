@@ -22,6 +22,17 @@ from netcode.paths import WorkspacePaths
 DEFAULT_ORG_ID = "org_default"
 
 
+def execution_phase_for_job(action: str) -> str:
+    normalized = str(action or "").strip().lower()
+    if normalized.startswith("lab_"):
+        return normalized.removeprefix("lab_")
+    if normalized == "read_verify":
+        return "verify"
+    if normalized.startswith("manager_"):
+        return normalized.removeprefix("manager_")
+    return ""
+
+
 def database_url(paths: WorkspacePaths) -> str:
     """SQLite by default (paths.database stays the source of truth); Postgres via DATABASE_URL."""
     return os.environ.get("DATABASE_URL", "").strip() or f"sqlite:///{paths.database}"
@@ -144,6 +155,24 @@ class WorkflowEventRecord:
     evidence: dict[str, Any] | None
 
 
+@dataclass(frozen=True)
+class ExecutionEventRecord:
+    id: str
+    job_id: str
+    change_id: str
+    org_id: str
+    device_id: str
+    phase: str
+    stage: str
+    status: str
+    message: str
+    sequence: int
+    current_step: int | None
+    total_steps: int | None
+    command: str | None
+    created_at: str
+
+
 class PlatformStore:
     def __init__(self, paths: WorkspacePaths):
         self.paths = paths
@@ -214,6 +243,35 @@ class PlatformStore:
                     FOREIGN KEY(change_id) REFERENCES changes(id)
                 )
                 """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS execution_events (
+                    id TEXT PRIMARY KEY,
+                    job_id TEXT NOT NULL,
+                    change_id TEXT NOT NULL,
+                    org_id TEXT NOT NULL,
+                    device_id TEXT NOT NULL DEFAULT '',
+                    phase TEXT NOT NULL,
+                    stage TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    message TEXT NOT NULL,
+                    sequence INTEGER NOT NULL,
+                    current_step INTEGER,
+                    total_steps INTEGER,
+                    command TEXT,
+                    created_at TEXT NOT NULL,
+                    UNIQUE(job_id, sequence)
+                )
+                """
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_execution_events_change "
+                "ON execution_events (org_id, change_id, created_at, sequence)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_execution_events_job "
+                "ON execution_events (job_id, sequence)"
             )
             conn.execute(
                 """
@@ -403,6 +461,10 @@ class PlatformStore:
                     FOREIGN KEY(rollout_id) REFERENCES rollouts(id)
                 )
                 """
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_rollout_targets_activity "
+                "ON rollout_targets (rollout_id, status, wave_index, device_id)"
             )
             self._ensure_column(conn, "rollouts", "approved_by", "TEXT")
             self._ensure_column(conn, "rollouts", "approved_at", "TEXT")
@@ -598,6 +660,108 @@ class PlatformStore:
                 (change_id, limit),
             ).fetchall()
         return [self._workflow_event(row) for row in rows]
+
+    def record_execution_event(
+        self,
+        *,
+        event_id: str,
+        job_id: str,
+        change_id: str,
+        org_id: str,
+        device_id: str,
+        phase: str,
+        stage: str,
+        status: str,
+        message: str,
+        sequence: int,
+        current_step: int | None = None,
+        total_steps: int | None = None,
+        command: str | None = None,
+    ) -> ExecutionEventRecord:
+        """Persist one idempotent runner milestone without changing workflow state."""
+        now = utc_now()
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO execution_events
+                (id, job_id, change_id, org_id, device_id, phase, stage, status,
+                 message, sequence, current_step, total_steps, command, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT (job_id, sequence) DO NOTHING
+                """,
+                (
+                    event_id,
+                    job_id,
+                    change_id,
+                    org_id,
+                    device_id,
+                    phase,
+                    stage,
+                    status,
+                    message,
+                    int(sequence),
+                    current_step,
+                    total_steps,
+                    command,
+                    now,
+                ),
+            )
+            row = conn.execute(
+                "SELECT * FROM execution_events WHERE job_id = ? AND sequence = ?",
+                (job_id, int(sequence)),
+            ).fetchone()
+        if not row:
+            raise RuntimeError(f"Execution event {job_id}:{sequence} was not persisted")
+        return self._execution_event(row)
+
+    def next_execution_sequence(self, job_id: str) -> int:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT MAX(sequence) AS max_sequence FROM execution_events WHERE job_id = ?",
+                (job_id,),
+            ).fetchone()
+        maximum = int(row["max_sequence"]) if row and row["max_sequence"] is not None else -1
+        return maximum + 1
+
+    def last_execution_event(self, job_id: str) -> ExecutionEventRecord | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM execution_events WHERE job_id = ? ORDER BY sequence DESC LIMIT 1",
+                (job_id,),
+            ).fetchone()
+        return self._execution_event(row) if row else None
+
+    def list_execution_events(self, change_id: str, limit: int = 500) -> list[ExecutionEventRecord]:
+        bounded = max(1, min(int(limit), 1000))
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM execution_events WHERE change_id = ? "
+                "ORDER BY created_at ASC, job_id ASC, sequence ASC LIMIT ?",
+                (change_id, bounded),
+            ).fetchall()
+        return [self._execution_event(row) for row in rows]
+
+    def list_execution_events_for_changes(
+        self,
+        change_ids: list[str],
+        *,
+        per_change: int = 30,
+    ) -> dict[str, list[ExecutionEventRecord]]:
+        ids = list(dict.fromkeys(str(item) for item in change_ids if str(item)))
+        if not ids:
+            return {}
+        marks = ", ".join("?" for _ in ids)
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"SELECT * FROM execution_events WHERE change_id IN ({marks}) "
+                "ORDER BY created_at ASC, job_id ASC, sequence ASC",
+                ids,
+            ).fetchall()
+        grouped: dict[str, list[ExecutionEventRecord]] = {change_id: [] for change_id in ids}
+        for row in rows:
+            grouped.setdefault(str(row["change_id"]), []).append(self._execution_event(row))
+        bounded = max(1, min(int(per_change), 100))
+        return {change_id: events[-bounded:] for change_id, events in grouped.items()}
 
     def _change(self, row: sqlite3.Row) -> ChangeRecord:
         result = json.loads(row["result_json"]) if row["result_json"] else None
@@ -1316,6 +1480,82 @@ class PlatformStore:
             ).fetchall()
         return [dict(row) for row in rows]
 
+    def rollout_target_counts(self, rollout_id: str) -> dict[str, int]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT LOWER(status) AS status, COUNT(*) AS count "
+                "FROM rollout_targets WHERE rollout_id = ? GROUP BY LOWER(status)",
+                (rollout_id,),
+            ).fetchall()
+        return {str(row["status"]): int(row["count"]) for row in rows}
+
+    def rollout_wave_counts(self, rollout_id: str) -> list[dict[str, Any]]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT wave_index, LOWER(status) AS status, COUNT(*) AS count "
+                "FROM rollout_targets WHERE rollout_id = ? "
+                "GROUP BY wave_index, LOWER(status) ORDER BY wave_index ASC",
+                (rollout_id,),
+            ).fetchall()
+        grouped: dict[int, dict[str, Any]] = {}
+        for row in rows:
+            index = int(row["wave_index"])
+            wave = grouped.setdefault(index, {
+                "index": index,
+                "label": "Canary" if index == 0 else f"Batch {index}",
+                "target_counts": {},
+                "total": 0,
+            })
+            count = int(row["count"])
+            wave["target_counts"][str(row["status"])] = count
+            wave["total"] += count
+        return [grouped[index] for index in sorted(grouped)]
+
+    def list_rollout_targets_page(
+        self,
+        rollout_id: str,
+        *,
+        query: str = "",
+        category: str = "all",
+        limit: int = 50,
+        offset: int = 0,
+    ) -> tuple[list[dict[str, Any]], int]:
+        categories = {
+            "all": (),
+            "running": ("running", "in_progress", "in-progress"),
+            "passed": ("passed", "completed", "verified", "success"),
+            "failed": ("failed", "blocked", "error"),
+            "untouched": ("pending", "planned", "queued", "skipped", "cancelled"),
+        }
+        normalized_category = str(category or "all").strip().lower()
+        if normalized_category not in categories:
+            raise ValueError(f"Unknown rollout target category {category!r}")
+        clauses = ["rollout_id = ?"]
+        params: list[Any] = [rollout_id]
+        search = str(query or "").strip().lower()
+        if search:
+            clauses.append("(LOWER(device_id) LIKE ? OR LOWER(message) LIKE ?)")
+            params.extend([f"%{search}%", f"%{search}%"])
+        statuses = categories[normalized_category]
+        if statuses:
+            marks = ", ".join("?" for _ in statuses)
+            clauses.append(f"LOWER(status) IN ({marks})")
+            params.extend(statuses)
+        where = " AND ".join(clauses)
+        bounded_limit = max(1, min(int(limit), 100))
+        bounded_offset = max(0, int(offset))
+        with self._connect() as conn:
+            count_row = conn.execute(
+                f"SELECT COUNT(*) AS count FROM rollout_targets WHERE {where}",
+                params,
+            ).fetchone()
+            rows = conn.execute(
+                f"SELECT * FROM rollout_targets WHERE {where} "
+                "ORDER BY wave_index ASC, device_id ASC LIMIT ? OFFSET ?",
+                (*params, bounded_limit, bounded_offset),
+            ).fetchall()
+        return [dict(row) for row in rows], int(count_row["count"] if count_row else 0)
+
     def update_rollout_target(
         self, rollout_id: str, device_id: str, *,
         status: str | None = None, stage: str | None = None,
@@ -1353,6 +1593,7 @@ class PlatformStore:
         payload: dict[str, Any],
         *,
         target_runner_id: str | None = None,
+        change_id: str = "__read__",
     ) -> JobRecord:
         """Queue a device-READ job for a runner. Not tied to a change (uses the '__read__'
         sentinel), so submitting its result never advances a change workflow."""
@@ -1365,7 +1606,7 @@ class PlatformStore:
                 " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     job_id,
-                    "__read__",
+                    change_id,
                     f"read_{action}",
                     "queued",
                     f"Queued read '{action}' for pool {pool}",
@@ -1407,6 +1648,23 @@ class PlatformStore:
         # therefore never leaves the credential at rest in the control plane —
         # the previous scrub-on-successful-result missed exactly that case.
         claimed = self.get_job(row["id"])
+        phase = execution_phase_for_job(claimed.action)
+        if claimed.change_id != "__read__" and phase:
+            payload = claimed.payload or {}
+            device = payload.get("device") if isinstance(payload.get("device"), dict) else {}
+            device_id = str(payload.get("device_id") or device.get("id") or "")
+            self.record_execution_event(
+                event_id=str(uuid.uuid4()),
+                job_id=claimed.id,
+                change_id=claimed.change_id,
+                org_id=claimed.org_id,
+                device_id=device_id,
+                phase=phase,
+                stage="claimed",
+                status="running",
+                message=f"Runner {runner_id} claimed the job.",
+                sequence=1,
+            )
         self.scrub_job_payload_secrets(claimed.id)
         return claimed
 
@@ -1500,6 +1758,24 @@ class PlatformStore:
             evidence=evidence,
         )
 
+    def _execution_event(self, row: sqlite3.Row) -> ExecutionEventRecord:
+        return ExecutionEventRecord(
+            id=row["id"],
+            job_id=row["job_id"],
+            change_id=row["change_id"],
+            org_id=row["org_id"],
+            device_id=row["device_id"],
+            phase=row["phase"],
+            stage=row["stage"],
+            status=row["status"],
+            message=row["message"],
+            sequence=int(row["sequence"]),
+            current_step=int(row["current_step"]) if row["current_step"] is not None else None,
+            total_steps=int(row["total_steps"]) if row["total_steps"] is not None else None,
+            command=row["command"],
+            created_at=row["created_at"],
+        )
+
 
 _SENSITIVE_PAYLOAD_KEYS = (
     "password", "passwd", "pwd", "secret", "token", "credential", "enable_secret",
@@ -1525,7 +1801,9 @@ def redact_secrets(value: Any) -> Any:
     return value
 
 
-def record_to_dict(record: ChangeRecord | JobRecord | WorkflowEventRecord) -> dict[str, Any]:
+def record_to_dict(
+    record: ChangeRecord | JobRecord | WorkflowEventRecord | ExecutionEventRecord,
+) -> dict[str, Any]:
     data = record.__dict__.copy()
     if isinstance(record, ChangeRecord):
         data["rez_change_id"] = change_audit_id(record.id, record.created_at)

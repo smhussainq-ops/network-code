@@ -9,7 +9,7 @@ import time
 from difflib import unified_diff
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Callable, Literal
 
 from netcode.adapters.execution import ExecutionAdapter, ExecutionAdapterMetadata
 from netcode.adapters.registry import AdapterRegistry
@@ -35,6 +35,42 @@ class LabResult:
     session_name: str = ""
     evidence: dict[str, object] = field(default_factory=dict)
     dry_run_kind: str = ""
+
+
+ProgressCallback = Callable[[dict[str, Any]], None]
+
+
+def _emit_progress(
+    callback: ProgressCallback | None,
+    *,
+    phase: str,
+    stage: str,
+    message: str,
+    status: str = "running",
+    current_step: int | None = None,
+    total_steps: int | None = None,
+    command: str | None = None,
+) -> None:
+    if callback is None:
+        return
+    event: dict[str, Any] = {
+        "phase": phase,
+        "stage": stage,
+        "status": status,
+        "message": message,
+    }
+    if current_step is not None:
+        event["current_step"] = current_step
+    if total_steps is not None:
+        event["total_steps"] = total_steps
+    if command:
+        event["command"] = command
+    try:
+        callback(event)
+    except Exception:
+        # Telemetry is display-only. Losing a progress frame must never change
+        # whether a reviewed network operation succeeds or fails.
+        return
 
 
 DRY_RUN_CAPABILITIES: dict[str, dict[str, str]] = {
@@ -116,10 +152,23 @@ class AristaEOSLabAdapter(ExecutionAdapter):
         production_ready=False,
     )
 
-    def __init__(self, device: Device, timeout: int = 45):
+    def __init__(
+        self,
+        device: Device,
+        timeout: int = 45,
+        *,
+        progress: ProgressCallback | None = None,
+        operation: str = "execution",
+    ):
         self.device = device
         self.timeout = timeout
         self._conn = None
+        self.progress = progress
+        self.operation = operation
+        self._verify_current = 0
+        self._verify_total = 0
+        self._verify_phase = "verify"
+        self._verify_stage = "check_completed"
 
     def connect(self) -> None:
         try:
@@ -146,6 +195,12 @@ class AristaEOSLabAdapter(ExecutionAdapter):
             if self._cli_error(enable_output):
                 raise RuntimeError(f"Could not enter privileged mode: {enable_output}")
         self._send("terminal length 0")
+        _emit_progress(
+            self.progress,
+            phase=self.operation,
+            stage="connected",
+            message=f"Connected to {self.device.id} through the local runner.",
+        )
 
     def disconnect(self) -> None:
         if self._conn:
@@ -179,23 +234,56 @@ class AristaEOSLabAdapter(ExecutionAdapter):
         return output
 
     def show(self, command: str) -> str:
-        return self._send(command)
+        output = self._send(command)
+        if self._verify_total:
+            self._verify_current += 1
+            _emit_progress(
+                self.progress,
+                phase=self._verify_phase,
+                stage=self._verify_stage,
+                message=f"Completed live check {self._verify_current} of {self._verify_total}.",
+                current_step=self._verify_current,
+                total_steps=self._verify_total,
+                command=command,
+            )
+        return output
 
     def dry_run(self, intent: Intent, render) -> LabResult:
+        self.operation = "dry-run"
         self.connect()
         try:
-            return self.config_session(render.config, "dry-run")
+            result = self.config_session(render.config, "dry-run")
+            _emit_progress(
+                self.progress,
+                phase="dry-run",
+                stage="passed" if result.status == "pass" else "failed",
+                status="passed" if result.status == "pass" else "failed",
+                message=result.message,
+            )
+            return result
         finally:
             self.disconnect()
 
     def apply(self, intent: Intent, render) -> LabResult:
+        self.operation = "apply"
         self.connect()
         try:
             session = self.config_session(render.config, "apply")
             if session.status != "pass":
                 return session
-            verify = self.verify_intent(intent, present=True)
-            return LabResult(
+            _emit_progress(
+                self.progress,
+                phase="apply",
+                stage="safety_check_started",
+                message="Commit accepted; running the immediate post-change safety check.",
+            )
+            verify = self.verify_intent(
+                intent,
+                present=True,
+                progress_phase="apply",
+                progress_stage="safety_check",
+            )
+            result = LabResult(
                 status="pass" if verify.status == "pass" else "fail",
                 action="apply",
                 device_id=self.device.id,
@@ -203,10 +291,19 @@ class AristaEOSLabAdapter(ExecutionAdapter):
                 session_name=session.session_name,
                 evidence={"session": session.evidence, "verification": verify.evidence},
             )
+            _emit_progress(
+                self.progress,
+                phase="apply",
+                stage="passed" if result.status == "pass" else "failed",
+                status="passed" if result.status == "pass" else "failed",
+                message=result.message,
+            )
+            return result
         finally:
             self.disconnect()
 
     def rollback(self, intent: Intent, render) -> LabResult:
+        self.operation = "rollback"
         self.connect()
         try:
             rollback = rollback_config(intent)
@@ -220,8 +317,13 @@ class AristaEOSLabAdapter(ExecutionAdapter):
             session = self.config_session(rollback, "rollback")
             if session.status != "pass":
                 return session
-            verify = self.verify_intent(intent, present=False)
-            return LabResult(
+            verify = self.verify_intent(
+                intent,
+                present=False,
+                progress_phase="rollback",
+                progress_stage="previous_state_check",
+            )
+            result = LabResult(
                 status="pass" if verify.status == "pass" else "fail",
                 action="rollback",
                 device_id=self.device.id,
@@ -229,22 +331,60 @@ class AristaEOSLabAdapter(ExecutionAdapter):
                 session_name=session.session_name,
                 evidence={"session": session.evidence, "verification": verify.evidence},
             )
+            _emit_progress(
+                self.progress,
+                phase="rollback",
+                stage="passed" if result.status == "pass" else "failed",
+                status="passed" if result.status == "pass" else "failed",
+                message=result.message,
+            )
+            return result
         finally:
             self.disconnect()
 
     def config_session(self, config: str, action: Literal["dry-run", "apply", "rollback"]) -> LabResult:
         session_name = f"netcode_{int(time.time())}"
         transcript: list[dict[str, str]] = []
+        commands = [line for line in config.splitlines() if line.strip()]
         try:
             transcript.append({"command": f"configure session {session_name}", "output": self._send_checked(f"configure session {session_name}")})
-            for line in config.splitlines():
-                if line.strip():
-                    transcript.append({"command": line, "output": self._send_checked(line)})
+            _emit_progress(
+                self.progress,
+                phase=action,
+                stage="session_created",
+                message=f"Created candidate configuration session {session_name}.",
+            )
+            command_stage = "commands_staged" if action == "dry-run" else "reverse_commands_applied" if action == "rollback" else "commands_applied"
+            for index, line in enumerate(commands, start=1):
+                transcript.append({"command": line, "output": self._send_checked(line)})
+                _emit_progress(
+                    self.progress,
+                    phase=action,
+                    stage=command_stage,
+                    message=f"Accepted command {index} of {len(commands)} into the candidate session.",
+                    current_step=index,
+                    total_steps=len(commands),
+                    command=line,
+                )
             diff = self._send_checked("show session-config diffs")
             transcript.append({"command": "show session-config diffs", "output": diff})
+            _emit_progress(
+                self.progress,
+                phase=action,
+                stage="diff_generated",
+                message="Generated the candidate-versus-running configuration diff.",
+                command="show session-config diffs",
+            )
             if action == "dry-run":
                 final = self._send_checked("abort")
                 transcript.append({"command": "abort", "output": final})
+                _emit_progress(
+                    self.progress,
+                    phase=action,
+                    stage="session_aborted",
+                    message="Aborted the candidate session; no configuration was written.",
+                    command="abort",
+                )
                 capability = dry_run_capability(self.device.platform)
                 return LabResult(
                     status="pass",
@@ -255,8 +395,22 @@ class AristaEOSLabAdapter(ExecutionAdapter):
                     evidence={"diff": diff, "transcript": transcript, "dry_run_capability": capability},
                     dry_run_kind="native_session",
                 )
+            _emit_progress(
+                self.progress,
+                phase=action,
+                stage="commit_started",
+                message="Submitting the reviewed candidate session for commit.",
+                command="commit",
+            )
             final = self._send_checked("commit")
             transcript.append({"command": "commit", "output": final})
+            _emit_progress(
+                self.progress,
+                phase=action,
+                stage="commit_accepted",
+                message="The device accepted the commit.",
+                command="commit",
+            )
             return LabResult(
                 status="pass",
                 action=action,
@@ -271,6 +425,13 @@ class AristaEOSLabAdapter(ExecutionAdapter):
                 transcript.append({"command": "abort", "output": abort})
             except Exception:
                 pass
+            _emit_progress(
+                self.progress,
+                phase=action,
+                stage="failed",
+                status="failed",
+                message=f"Configuration session failed: {exc}",
+            )
             return LabResult(
                 status="fail",
                 action=action,
@@ -340,10 +501,56 @@ class AristaEOSLabAdapter(ExecutionAdapter):
             evidence={"commands": outputs},
         )
 
-    def verify_intent(self, intent: Intent, present: bool = True) -> LabResult:
+    def verify_intent(
+        self,
+        intent: Intent,
+        present: bool = True,
+        *,
+        progress_phase: str = "verify",
+        progress_stage: str = "check_completed",
+    ) -> LabResult:
         # The registry names the verify method per change type; a new type adds a
         # _verify_* method here and points its spec at it — no ladder to edit.
-        return getattr(self, spec_for(intent).verify_method)(intent, present)
+        if isinstance(intent, AddVlanIntent):
+            total = 2
+        elif isinstance(intent, RoutingRedistributionIntent):
+            total = max(1, len(redistribution_items(intent)))
+        else:
+            total = 1
+        self._verify_current = 0
+        self._verify_total = total
+        self._verify_phase = progress_phase
+        self._verify_stage = progress_stage
+        _emit_progress(
+            self.progress,
+            phase=progress_phase,
+            stage="checks_started" if progress_phase == "verify" else progress_stage,
+            message=f"Running {total} live verification check{'s' if total != 1 else ''}.",
+            current_step=0,
+            total_steps=total,
+        )
+        try:
+            result = getattr(self, spec_for(intent).verify_method)(intent, present)
+        finally:
+            self._verify_total = 0
+        _emit_progress(
+            self.progress,
+            phase=progress_phase,
+            stage="expected_actual",
+            status="passed" if result.status == "pass" else "failed",
+            message=result.message,
+            current_step=total,
+            total_steps=total,
+        )
+        if progress_phase == "verify":
+            _emit_progress(
+                self.progress,
+                phase="verify",
+                stage="passed" if result.status == "pass" else "failed",
+                status="passed" if result.status == "pass" else "failed",
+                message=result.message,
+            )
+        return result
 
     def _verify_add_vlan(self, intent: AddVlanIntent, present: bool) -> LabResult:
         return self.verify_vlan(intent.vlan.id, intent.vlan.name) if present else self.verify_vlan_absent(intent.vlan.id)
@@ -593,7 +800,14 @@ def _offline_preconditions(rendered_config: str, running_config: str) -> list[di
     return checks
 
 
-def offline_dry_run(device: Device, intent: Intent, render, running_config: str | None = None) -> LabResult:
+def offline_dry_run(
+    device: Device,
+    intent: Intent,
+    render,
+    running_config: str | None = None,
+    *,
+    progress: ProgressCallback | None = None,
+) -> LabResult:
     capability = dry_run_capability(device.platform)
     try:
         current_config = running_config if running_config is not None else _collect_running_config(device)
@@ -606,7 +820,23 @@ def offline_dry_run(device: Device, intent: Intent, render, running_config: str 
             evidence={"dry_run_capability": capability, "collection_error": str(exc)},
             dry_run_kind="offline_validation",
         )
+    _emit_progress(
+        progress,
+        phase="dry-run",
+        stage="live_state_collected",
+        message="Collected running configuration for offline validation.",
+    )
     checks = _offline_preconditions(render.config, current_config)
+    for index, check in enumerate(checks, start=1):
+        _emit_progress(
+            progress,
+            phase="dry-run",
+            stage="check_completed",
+            status="passed" if check["status"] in {"pass", "warning"} else "failed",
+            message=str(check.get("message") or check.get("title") or f"Offline check {index}"),
+            current_step=index,
+            total_steps=len(checks),
+        )
     passed = all(check["status"] in {"pass", "warning"} for check in checks)
     proposed = (current_config.rstrip() + "\n" + render.config.strip() + "\n") if current_config.strip() else render.config.strip() + "\n"
     diff = "\n".join(
@@ -618,7 +848,13 @@ def offline_dry_run(device: Device, intent: Intent, render, running_config: str 
             lineterm="",
         )
     )
-    return LabResult(
+    _emit_progress(
+        progress,
+        phase="dry-run",
+        stage="diff_generated",
+        message="Generated the offline candidate-versus-running diff.",
+    )
+    result = LabResult(
         status="pass" if passed else "fail",
         action="dry-run",
         device_id=device.id,
@@ -635,16 +871,31 @@ def offline_dry_run(device: Device, intent: Intent, render, running_config: str 
         },
         dry_run_kind="offline_validation",
     )
+    _emit_progress(
+        progress,
+        phase="dry-run",
+        stage="passed" if result.status == "pass" else "failed",
+        status="passed" if result.status == "pass" else "failed",
+        message=result.message,
+    )
+    return result
 
 
-def run_lab_action_for_device(device: Device, intent: Intent, render, action: Literal["dry-run", "apply", "rollback"]) -> LabResult:
+def run_lab_action_for_device(
+    device: Device,
+    intent: Intent,
+    render,
+    action: Literal["dry-run", "apply", "rollback"],
+    *,
+    progress: ProgressCallback | None = None,
+) -> LabResult:
     platform = normalize_platform(device.platform)
     if action == "dry-run":
         if platform == "arista_eos":
-            return AristaEOSLabAdapter(device).dry_run(intent, render)
+            return AristaEOSLabAdapter(device, progress=progress, operation=action).dry_run(intent, render)
         capability = dry_run_capability(platform)
         if capability["dry_run_kind"] == "offline_validation":
-            return offline_dry_run(device, intent, render)
+            return offline_dry_run(device, intent, render, progress=progress)
         return LabResult(
             status="fail",
             action=action,
@@ -661,7 +912,7 @@ def run_lab_action_for_device(device: Device, intent: Intent, render, action: Li
             message=f"{action} is not implemented for {platform} in this runner yet.",
             evidence={"platform": platform, "write_supported": False},
         )
-    adapter = AristaEOSLabAdapter(device)
+    adapter = AristaEOSLabAdapter(device, progress=progress, operation=action)
     if action == "apply":
         return adapter.apply(intent, render)
     if action == "rollback":

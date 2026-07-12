@@ -437,7 +437,7 @@ def test_fleet_verify_failure_attaches_rez_handoff(tmp_path: Path, monkeypatch):
     monkeypatch.setattr(
         fleet,
         "_read_and_wait",
-        lambda store, org_id, action, payload: {"ok": False, "message": "VLAN 210 missing after canary"},
+        lambda store, org_id, action, payload, **_kwargs: {"ok": False, "message": "VLAN 210 missing after canary"},
     )
 
     ok, message = fleet._verify_device(paths, store, intent_path, "sw1", change.id)

@@ -29,16 +29,17 @@ import threading
 import time
 import urllib.error
 import urllib.request
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 IDENTITY_DIR = Path.home() / ".netcode-runner"
 IDENTITY_FILE = IDENTITY_DIR / "identity.json"
 INVENTORY_FILE = IDENTITY_DIR / "inventory.yaml"
 POLICY_FILE = IDENTITY_DIR / "policy.yaml"
 MANAGER_LEDGER_FILE = IDENTITY_DIR / "manager-operations.json"
-VERSION = "0.3.0-manager-transactions"
+VERSION = "0.4.0-execution-events"
 
 _stop = False
 _SHELL_ADAPTERS: dict[str, dict[str, Any]] = {}
@@ -226,7 +227,58 @@ def _sync_inventory_catalog(server: str, token: str, previous_revision: str = ""
     return revision
 
 
-def _execute_job(job: dict[str, Any]) -> dict[str, Any]:
+def _progress_reporter(
+    server: str,
+    token: str,
+    secret: str,
+    job: dict[str, Any],
+) -> Callable[[dict[str, Any]], None] | None:
+    job_id = str(job.get("id") or "")
+    job_action = str(job.get("action") or "").strip().lower()
+    if job_action.startswith("lab_"):
+        phase = job_action.removeprefix("lab_")
+    elif job_action == "read_verify":
+        phase = "verify"
+    else:
+        return None
+    payload = job.get("payload") or {}
+    device = payload.get("device") if isinstance(payload.get("device"), dict) else {}
+    device_id = str(payload.get("device_id") or device.get("id") or "")
+    sequence = 1
+
+    def report(raw: dict[str, Any]) -> None:
+        nonlocal sequence
+        sequence += 1
+        event = {
+            **raw,
+            "event_id": str(uuid.uuid4()),
+            "sequence": sequence,
+            "phase": phase,
+            "device_id": str(raw.get("device_id") or device_id),
+        }
+        signature = hmac.new(
+            secret.encode("utf-8"),
+            _canonical(event).encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
+        try:
+            _post(
+                server,
+                f"/api/runner/jobs/{job_id}/progress",
+                {"event": event, "signature": signature},
+                token=token,
+                timeout=8,
+            )
+        except Exception as exc:  # noqa: BLE001
+            print(f"[runner] Progress frame {job_id}:{sequence} was not delivered: {exc}", file=sys.stderr)
+
+    return report
+
+
+def _execute_job(
+    job: dict[str, Any],
+    progress: Callable[[dict[str, Any]], None] | None = None,
+) -> dict[str, Any]:
     """Run one lab job locally: re-validate (fail-closed), resolve local creds, execute via the shared adapter."""
     # Imports are local so `enroll` works even without the full netcode package installed.
     import tempfile
@@ -239,7 +291,7 @@ def _execute_job(job: dict[str, Any]) -> dict[str, Any]:
     payload = job.get("payload") or {}
     job_action = str(job.get("action") or "")
     if job_action.startswith("read_"):
-        return _execute_read(job_action[len("read_"):], payload)
+        return _execute_read(job_action[len("read_"):], payload, progress=progress)
     if job_action.startswith("manager_"):
         from netcode.manager_execution import execute_manager_job
 
@@ -280,6 +332,12 @@ def _execute_job(job: dict[str, Any]) -> dict[str, Any]:
             "message": f"Blocked by local runner policy: {gate['message']}",
             "evidence": {"local_policy": gate},
         }
+    if progress:
+        progress({
+            "stage": "policy_gate_passed",
+            "status": "running",
+            "message": "Runner-local policy and credential safety checks passed.",
+        })
 
     # Credentials come ONLY from the runner's local inventory, never from the cloud payload.
     if not INVENTORY_FILE.exists():
@@ -293,7 +351,7 @@ def _execute_job(job: dict[str, Any]) -> dict[str, Any]:
 
     if action not in {"dry-run", "apply", "rollback"}:
         return {"status": "fail", "action": action, "device_id": device_id, "message": f"Unknown action {action}."}
-    lab = run_lab_action_for_device(device, intent, render, action)
+    lab = run_lab_action_for_device(device, intent, render, action, progress=progress)
     result = lab.__dict__ if hasattr(lab, "__dict__") else dict(lab)
     result.setdefault("action", action)
     result.setdefault("device_id", device_id)
@@ -1284,7 +1342,11 @@ def _read_deadline_seconds(action: str, payload: dict[str, Any]) -> float:
     return float(READ_TIMEOUT_SECONDS)
 
 
-def _execute_read(action: str, payload: dict[str, Any]) -> dict[str, Any]:
+def _execute_read(
+    action: str,
+    payload: dict[str, Any],
+    progress: Callable[[dict[str, Any]], None] | None = None,
+) -> dict[str, Any]:
     """Fail-closed wrapper: a hung device read must never wedge the runner's
     sequential job loop (a dead container / unreachable device can otherwise
     block every later job and stop heartbeats). Reads get a hard deadline."""
@@ -1293,7 +1355,11 @@ def _execute_read(action: str, payload: dict[str, Any]) -> dict[str, Any]:
 
     deadline = _read_deadline_seconds(action, payload)
     executor = ThreadPoolExecutor(max_workers=1)
-    future = executor.submit(_execute_read_inner, action, payload)
+    future = (
+        executor.submit(_execute_read_inner, action, payload)
+        if progress is None
+        else executor.submit(_execute_read_inner, action, payload, progress)
+    )
     try:
         return future.result(timeout=deadline)
     except FuturesTimeout:
@@ -1304,7 +1370,11 @@ def _execute_read(action: str, payload: dict[str, Any]) -> dict[str, Any]:
         executor.shutdown(wait=False, cancel_futures=True)
 
 
-def _execute_read_inner(action: str, payload: dict[str, Any]) -> dict[str, Any]:
+def _execute_read_inner(
+    action: str,
+    payload: dict[str, Any],
+    progress: Callable[[dict[str, Any]], None] | None = None,
+) -> dict[str, Any]:
     """Device READ actions executed on the runner (next to the devices), using the
     runner's LOCAL credentialed inventory. Mirrors the control-plane read logic so
     the browser renders results identically whether local or runner mode."""
@@ -1511,7 +1581,7 @@ def _execute_read_inner(action: str, payload: dict[str, Any]) -> dict[str, Any]:
         device = inv.find_device(str(device_id or ""))
         if not device:
             return {"ok": False, "error": f"Device {device_id} not in runner inventory."}
-        adapter = AristaEOSLabAdapter(device)
+        adapter = AristaEOSLabAdapter(device, progress=progress, operation="verify")
         try:
             adapter.connect()
             verification = adapter.verify_intent(intent, present=bool(payload.get("present", True)))
@@ -1702,8 +1772,9 @@ def run(args: argparse.Namespace) -> int:
         job_id = job.get("id")
         action = (job.get("payload") or {}).get("action")
         print(f"[runner] Claimed job {job_id} ({action}).")
+        progress = _progress_reporter(server, token, secret, job)
         try:
-            result = _execute_job(job)
+            result = _execute_job(job, progress=progress)
         except Exception as exc:  # noqa: BLE001
             result = {"status": "fail", "message": f"Runner execution error: {type(exc).__name__}: {exc}"}
         signature = hmac.new(secret.encode("utf-8"), _canonical(result).encode("utf-8"), hashlib.sha256).hexdigest()

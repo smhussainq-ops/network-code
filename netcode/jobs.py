@@ -9,6 +9,7 @@ and then QUEUED for an on-prem runner instead of executed locally.
 from __future__ import annotations
 
 import os
+import uuid
 from pathlib import Path
 
 from netcode.inventory import Inventory
@@ -139,6 +140,18 @@ class JobRunner:
                 pool,
                 payload,
                 target_runner_id=target_runner_id,
+            )
+            self.store.record_execution_event(
+                event_id=str(uuid.uuid4()),
+                job_id=job.id,
+                change_id=change.id,
+                org_id=change.org_id,
+                device_id=str(device_id or ""),
+                phase=action,
+                stage="queued",
+                status="queued",
+                message=f"Queued for runner pool {pool}.",
+                sequence=0,
             )
             self.store.record_workflow_event(
                 change.id,

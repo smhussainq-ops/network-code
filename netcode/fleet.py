@@ -17,6 +17,7 @@ import json
 import threading
 import time
 import traceback
+import uuid
 from pathlib import Path
 from typing import Any, Callable
 
@@ -646,7 +647,14 @@ def _verify_device(
     if execution_mode() == "runner":
         payload = {"intent_yaml": intent_path.read_text(encoding="utf-8"),
                    "device_id": device_id, "present": True}
-        result = _read_and_wait(store, org_id, "verify", payload)
+        result = _read_and_wait(
+            store,
+            org_id,
+            "verify",
+            payload,
+            change_id=change_id,
+            device_id=device_id,
+        )
     else:
         from netcode.lab import AristaEOSLabAdapter  # local mode only (tests/lab-first)
         inventory = Inventory(configured_inventory_path(p))
@@ -692,8 +700,35 @@ def _verify_device(
     return ok, message
 
 
-def _read_and_wait(store: PlatformStore, org_id: str, action: str, payload: dict[str, Any]) -> dict[str, Any]:
-    job = store.create_read_job(org_id, runner_pool(), action, payload)
+def _read_and_wait(
+    store: PlatformStore,
+    org_id: str,
+    action: str,
+    payload: dict[str, Any],
+    *,
+    change_id: str | None = None,
+    device_id: str = "",
+) -> dict[str, Any]:
+    job = store.create_read_job(
+        org_id,
+        runner_pool(),
+        action,
+        payload,
+        change_id=change_id or "__read__",
+    )
+    if change_id:
+        store.record_execution_event(
+            event_id=str(uuid.uuid4()),
+            job_id=job.id,
+            change_id=change_id,
+            org_id=org_id,
+            device_id=device_id,
+            phase=action,
+            stage="queued",
+            status="queued",
+            message="Queued live verification on the runner.",
+            sequence=0,
+        )
     deadline = time.monotonic() + READ_WAIT_SECONDS
     while time.monotonic() < deadline:
         current = store.get_job(job.id)

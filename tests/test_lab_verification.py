@@ -7,7 +7,7 @@ class _Render:
         self.config = config
 
 
-def _adapter(outputs):
+def _adapter(outputs, progress=None):
     device = Device(
         id="v2-store1",
         host="172.100.1.41",
@@ -19,7 +19,7 @@ def _adapter(outputs):
         site="store-1842",
         groups=("stores",),
     )
-    adapter = AristaEOSLabAdapter(device)
+    adapter = AristaEOSLabAdapter(device, progress=progress)
     adapter.show = lambda command: outputs[command]  # type: ignore[method-assign]
     return adapter
 
@@ -60,6 +60,35 @@ def test_eos_dry_run_records_native_session_kind():
     assert result.status == "pass"
     assert result.dry_run_kind == "native_session"
     assert result.evidence["dry_run_capability"]["dry_run_kind"] == "native_session"
+
+
+def test_eos_dry_run_progress_is_driven_by_accepted_commands():
+    events = []
+    adapter = _adapter({}, progress=events.append)
+
+    def fake_send_checked(command: str) -> str:
+        return {
+            "configure session netcode_1": "ok",
+            "vlan 90": "ok",
+            "name GUEST_WIFI": "ok",
+            "show session-config diffs": "+vlan 90",
+            "abort": "aborted",
+        }.get(command, "ok")
+
+    adapter._send_checked = fake_send_checked  # type: ignore[method-assign]
+    result = adapter.config_session("vlan 90\n name GUEST_WIFI", "dry-run")
+
+    assert result.status == "pass"
+    assert [event["stage"] for event in events] == [
+        "session_created",
+        "commands_staged",
+        "commands_staged",
+        "diff_generated",
+        "session_aborted",
+    ]
+    assert events[1]["current_step"] == 1
+    assert events[1]["total_steps"] == 2
+    assert events[2]["command"] == " name GUEST_WIFI"
 
 
 def test_cisco_xe_offline_dry_run_produces_diff_without_native_claim():
