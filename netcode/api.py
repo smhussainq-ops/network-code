@@ -120,6 +120,7 @@ from netcode.network_model_compiler import (
     compile_site_context,
     to_rez_network_design,
 )
+from netcode.network_model_reconcile import reconcile_revision
 from netcode.store import (
     DEFAULT_ORG_ID,
     PlatformStore,
@@ -1300,6 +1301,65 @@ def api_network_model_rez_design(
     return {"ok": True, "design": design, "device_connections_opened": 0}
 
 
+@app.post("/api/network-model/observations")
+def api_network_model_observation(request: Request, payload: dict[str, object]) -> dict[str, object]:
+    principal = _request_principal(request)
+    document = dict(payload)
+    document["org_id"] = principal.org_id
+    document["source"] = "manual_review"
+    document["collector_id"] = f"user:{principal.user_id or 'system'}"
+    document["validation_grade"] = "unknown"
+    try:
+        result = NetworkModelRepository(PlatformStore(paths())).record_observation(document)
+    except (NetworkModelError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"ok": True, **result, "device_connections_opened": 0}
+
+
+@app.get("/api/network-model/observations")
+def api_network_model_observations(
+    request: Request,
+    environment_id: str = Query(..., min_length=1, max_length=128),
+    domain: str = Query(default="", max_length=128),
+    subject_id: str = Query(default="", max_length=200),
+    cursor: str = Query(default="", max_length=500),
+    limit: int = Query(default=50, ge=1, le=100),
+) -> dict[str, object]:
+    result = NetworkModelRepository(PlatformStore(paths())).list_observations(
+        _request_principal(request).org_id,
+        environment_id,
+        domain=domain,
+        subject_id=subject_id,
+        cursor=cursor,
+        limit=limit,
+    )
+    return {"ok": True, **result, "device_connections_opened": 0}
+
+
+@app.post("/api/network-model/reconcile")
+def api_network_model_reconcile(request: Request, payload: dict[str, object]) -> dict[str, object]:
+    environment_id = str(payload.get("environment_id") or "")
+    revision_id = str(payload.get("revision_id") or "")
+    if not environment_id or not revision_id:
+        raise HTTPException(status_code=400, detail="environment_id and revision_id are required")
+    repository = NetworkModelRepository(PlatformStore(paths()))
+    try:
+        revision = repository.get_revision(
+            _request_principal(request).org_id, environment_id, revision_id
+        )
+        result = reconcile_revision(
+            repository,
+            revision,
+            site_id=str(payload.get("site_id") or ""),
+            device_id=str(payload.get("device_id") or ""),
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except NetworkModelError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"ok": True, "reconciliation": result, "device_connections_opened": 0}
+
+
 @app.get("/api/devices")
 def api_devices(
     request: Request,
@@ -1677,6 +1737,23 @@ def api_runner_inventory_sync(
     public = _sanitize_runner_inventory(list(request.devices))
     synced = store.sync_runner_devices(runner, public, revision=request.revision.strip(), replace=request.replace)
     return {"ok": True, "runner_id": runner.id, "pool": runner.pool, **synced}
+
+
+@app.post("/api/runner/network-model/observations")
+def api_runner_network_model_observation(
+    payload: dict[str, object],
+    authorization: str | None = Header(default=None),
+) -> dict[str, object]:
+    store = PlatformStore(paths())
+    runner = _require_runner(store, authorization)
+    document = dict(payload)
+    document["org_id"] = runner.org_id
+    document["collector_id"] = runner.id
+    try:
+        result = NetworkModelRepository(store).record_observation(document)
+    except (NetworkModelError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"ok": True, "runner_id": runner.id, **result}
 
 
 def _runner_route_for_payload(

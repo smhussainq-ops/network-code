@@ -6,7 +6,7 @@ import base64
 import json
 from typing import Any, Iterable, Mapping
 
-from netcode.network_model import validate_model_revision
+from netcode.network_model import validate_model_revision, validate_observation
 from netcode.store import PlatformStore, utc_now
 
 
@@ -172,6 +172,19 @@ class NetworkModelRepository:
             )
             conn.execute(
                 """
+                CREATE TABLE IF NOT EXISTS network_model_observation_heads (
+                    org_id TEXT NOT NULL,
+                    environment_id TEXT NOT NULL,
+                    domain TEXT NOT NULL,
+                    subject_id TEXT NOT NULL,
+                    observation_id TEXT NOT NULL,
+                    observed_at TEXT NOT NULL,
+                    PRIMARY KEY (org_id, environment_id, domain, subject_id)
+                )
+                """
+            )
+            conn.execute(
+                """
                 CREATE TABLE IF NOT EXISTS network_model_conflicts (
                     org_id TEXT NOT NULL,
                     environment_id TEXT NOT NULL,
@@ -205,6 +218,27 @@ class NetworkModelRepository:
                     PRIMARY KEY (org_id, environment_id, revision_id, link_type, external_id)
                 )
                 """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS network_model_reconciliations (
+                    org_id TEXT NOT NULL,
+                    environment_id TEXT NOT NULL,
+                    reconciliation_id TEXT NOT NULL,
+                    revision_id TEXT NOT NULL,
+                    site_id TEXT NOT NULL DEFAULT '',
+                    device_id TEXT NOT NULL DEFAULT '',
+                    status TEXT NOT NULL,
+                    summary_json TEXT NOT NULL,
+                    findings_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    PRIMARY KEY (org_id, environment_id, reconciliation_id)
+                )
+                """
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_model_reconciliations_revision "
+                "ON network_model_reconciliations (org_id, environment_id, revision_id, created_at)"
             )
 
     def create_revision(self, value: Mapping[str, Any], *, created_by: str) -> dict[str, Any]:
@@ -360,6 +394,171 @@ class NetworkModelRepository:
         )
         return {"entities": entities, "returned": len(entities), "next_cursor": next_cursor}
 
+    def record_observation(self, value: Mapping[str, Any]) -> dict[str, Any]:
+        observation = validate_observation(value)
+        key = (observation["org_id"], observation["environment_id"], observation["observation_id"])
+        now = utc_now()
+        with self.store._connect() as conn:
+            existing = conn.execute(
+                "SELECT * FROM network_model_observations "
+                "WHERE org_id = ? AND environment_id = ? AND observation_id = ?",
+                key,
+            ).fetchone()
+            if existing:
+                current = self._observation(existing)
+                comparable = {field: current.get(field) for field in observation}
+                if comparable != observation:
+                    raise ValueError(
+                        f"observation {observation['observation_id']} already exists with different content"
+                    )
+                return {"created": False, "observation": current}
+            conn.execute(
+                """
+                INSERT INTO network_model_observations
+                (org_id, environment_id, observation_id, domain, subject_id, source, collector_id,
+                 observed_at, expires_at, validation_grade, facts_json, metadata_json, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    observation["org_id"], observation["environment_id"], observation["observation_id"],
+                    observation["domain"], observation["subject_id"], observation["source"],
+                    observation["collector_id"], observation["observed_at"], observation.get("expires_at"),
+                    observation["validation_grade"], _json(observation["facts"]),
+                    _json(observation.get("metadata") or {}), now,
+                ),
+            )
+            conn.execute(
+                """
+                INSERT INTO network_model_observation_heads
+                (org_id, environment_id, domain, subject_id, observation_id, observed_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT (org_id, environment_id, domain, subject_id)
+                DO UPDATE SET observation_id = ?, observed_at = ?
+                WHERE ? > network_model_observation_heads.observed_at
+                """,
+                (
+                    observation["org_id"], observation["environment_id"], observation["domain"],
+                    observation["subject_id"], observation["observation_id"], observation["observed_at"],
+                    observation["observation_id"], observation["observed_at"], observation["observed_at"],
+                ),
+            )
+        return {"created": True, "observation": self.get_observation(*key)}
+
+    def get_observation(self, org_id: str, environment_id: str, observation_id: str) -> dict[str, Any]:
+        with self.store._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM network_model_observations "
+                "WHERE org_id = ? AND environment_id = ? AND observation_id = ?",
+                (org_id, environment_id, observation_id),
+            ).fetchone()
+        if not row:
+            raise KeyError(f"Unknown network model observation {observation_id}")
+        return self._observation(row)
+
+    def list_observations(
+        self,
+        org_id: str,
+        environment_id: str,
+        *,
+        domain: str = "",
+        subject_id: str = "",
+        cursor: str = "",
+        limit: int = 50,
+    ) -> dict[str, Any]:
+        size = max(1, min(int(limit), MAX_PAGE_SIZE))
+        clauses = ["org_id = ?", "environment_id = ?"]
+        params: list[Any] = [org_id, environment_id]
+        for column, value in (("domain", domain), ("subject_id", subject_id)):
+            if value:
+                clauses.append(f"{column} = ?")
+                params.append(value)
+        parsed = _parse_cursor(cursor)
+        if parsed:
+            clauses.append("(observed_at < ? OR (observed_at = ? AND observation_id < ?))")
+            params.extend([parsed[0], parsed[0], parsed[1]])
+        with self.store._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM network_model_observations WHERE " + " AND ".join(clauses)
+                + " ORDER BY observed_at DESC, observation_id DESC LIMIT ?",
+                (*params, size + 1),
+            ).fetchall()
+        page = rows[:size]
+        next_cursor = (
+            _cursor(page[-1]["observed_at"], page[-1]["observation_id"])
+            if len(rows) > size
+            else None
+        )
+        return {
+            "observations": [self._observation(row) for row in page],
+            "returned": len(page),
+            "next_cursor": next_cursor,
+        }
+
+    def current_observations(
+        self,
+        org_id: str,
+        environment_id: str,
+        subjects: list[tuple[str, str]],
+    ) -> dict[tuple[str, str], dict[str, Any]]:
+        unique = sorted({(str(domain), str(subject)) for domain, subject in subjects if domain and subject})
+        found: dict[tuple[str, str], dict[str, Any]] = {}
+        for offset in range(0, len(unique), 200):
+            chunk = unique[offset : offset + 200]
+            clauses = ["(h.domain = ? AND h.subject_id = ?)" for _ in chunk]
+            params: list[Any] = [org_id, environment_id]
+            for domain, subject in chunk:
+                params.extend([domain, subject])
+            with self.store._connect() as conn:
+                rows = conn.execute(
+                    "SELECT o.* FROM network_model_observation_heads h "
+                    "JOIN network_model_observations o ON o.org_id = h.org_id "
+                    "AND o.environment_id = h.environment_id AND o.observation_id = h.observation_id "
+                    "WHERE h.org_id = ? AND h.environment_id = ? AND (" + " OR ".join(clauses) + ")",
+                    tuple(params),
+                ).fetchall()
+            for row in rows:
+                item = self._observation(row)
+                found[(item["domain"], item["subject_id"])] = item
+        return found
+
+    def save_reconciliation(
+        self,
+        *,
+        org_id: str,
+        environment_id: str,
+        reconciliation_id: str,
+        revision_id: str,
+        site_id: str,
+        device_id: str,
+        status: str,
+        summary: Mapping[str, Any],
+        findings: list[Mapping[str, Any]],
+    ) -> dict[str, Any]:
+        now = utc_now()
+        with self.store._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO network_model_reconciliations
+                (org_id, environment_id, reconciliation_id, revision_id, site_id, device_id,
+                 status, summary_json, findings_json, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    org_id, environment_id, reconciliation_id, revision_id, site_id, device_id,
+                    status, _json(dict(summary)), _json(findings), now,
+                ),
+            )
+        return {
+            "reconciliation_id": reconciliation_id,
+            "revision_id": revision_id,
+            "site_id": site_id,
+            "device_id": device_id,
+            "status": status,
+            "summary": dict(summary),
+            "findings": [dict(item) for item in findings],
+            "created_at": now,
+        }
+
     @staticmethod
     def _revision(row: Any, *, include_model: bool) -> dict[str, Any]:
         value = {
@@ -380,3 +579,21 @@ class NetworkModelRepository:
         if include_model:
             value["model"] = _decode_json(row["model_json"], {})
         return value
+
+    @staticmethod
+    def _observation(row: Any) -> dict[str, Any]:
+        return {
+            "schema": "rezonance.network-observation.v1",
+            "org_id": row["org_id"],
+            "environment_id": row["environment_id"],
+            "observation_id": row["observation_id"],
+            "domain": row["domain"],
+            "subject_id": row["subject_id"],
+            "source": row["source"],
+            "collector_id": row["collector_id"],
+            "observed_at": row["observed_at"],
+            "expires_at": row["expires_at"],
+            "validation_grade": row["validation_grade"],
+            "facts": _decode_json(row["facts_json"], {}),
+            "metadata": _decode_json(row["metadata_json"], {}),
+        }

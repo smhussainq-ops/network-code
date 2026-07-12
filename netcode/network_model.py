@@ -57,6 +57,19 @@ def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
+def _timestamp(value: Any, field: str) -> str:
+    text = str(value or "").strip()
+    if not text:
+        raise NetworkModelError(f"{field} is required")
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise NetworkModelError(f"{field} must be an ISO-8601 timestamp") from exc
+    if parsed.tzinfo is None:
+        raise NetworkModelError(f"{field} must include a timezone")
+    return parsed.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
 def _dict(value: Any) -> dict[str, Any]:
     return dict(value) if isinstance(value, Mapping) else {}
 
@@ -189,13 +202,19 @@ def validate_observation(value: Mapping[str, Any]) -> dict[str, Any]:
     observation["observation_id"] = _identifier(observation.get("observation_id"), "observation_id")
     observation["domain"] = _identifier(observation.get("domain"), "domain")
     observation["source"] = _identifier(observation.get("source"), "source")
+    observation["subject_id"] = str(observation.get("subject_id") or "").strip()
     if observation.get("status") in APPROVED_STATUSES or observation.get("approval"):
         raise NetworkModelError("observations cannot carry model approval or an approved lifecycle state")
-    if not str(observation.get("observed_at") or "").strip():
-        raise NetworkModelError("observed_at is required")
+    observation["observed_at"] = _timestamp(observation.get("observed_at"), "observed_at")
+    if observation.get("expires_at"):
+        observation["expires_at"] = _timestamp(observation.get("expires_at"), "expires_at")
+        if observation["expires_at"] <= observation["observed_at"]:
+            raise NetworkModelError("expires_at must be later than observed_at")
     if not str(observation.get("collector_id") or "").strip():
         raise NetworkModelError("collector_id is required")
     if not _dict(observation.get("facts")):
         raise NetworkModelError("facts must contain at least one normalized observation")
+    observation["validation_grade"] = str(observation.get("validation_grade") or "unknown").strip().lower()
+    observation["metadata"] = _dict(observation.get("metadata"))
     _assert_no_secrets(observation)
     return observation
