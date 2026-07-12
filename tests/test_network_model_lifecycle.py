@@ -3,7 +3,9 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+from fastapi.testclient import TestClient
 
+from netcode import api
 from netcode.bootstrap import init_workspace
 from netcode.network_model import NETWORK_MODEL_SCHEMA, NetworkModelError
 from netcode.network_model_lifecycle import (
@@ -182,3 +184,69 @@ def test_verified_change_promotes_and_verified_rollback_restores_previous_model(
     )
     assert restored["revision"]["revision_id"] == "baseline-001"
     assert repository.active_revision("org_default", "pilot-a")["revision_id"] == "baseline-001"
+
+
+def test_active_model_drives_scoped_plan_without_returning_full_model_on_summary(tmp_path: Path, monkeypatch):
+    workspace, store, repository = _setup(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    baseline = _baseline()
+    baseline["model"]["organization_standard"] = {"topology": {"enabled": True}}
+    baseline["coverage"]["domains"].append("topology")
+    baseline["authority_bindings"]["topology"] = {
+        "source": "manual_review",
+        "mode": "propose",
+    }
+    repository.create_revision(baseline, created_by="marcus")
+    approve_with_git(
+        repository,
+        org_id="org_default",
+        environment_id="pilot-a",
+        revision_id="baseline-001",
+        approved_by="marcus",
+        git_root=workspace.git_workspace,
+    )
+    activate_verified_revision(
+        repository,
+        store,
+        org_id="org_default",
+        environment_id="pilot-a",
+        revision_id="baseline-001",
+        actor="marcus",
+        git_root=workspace.git_workspace,
+        initial_baseline=True,
+    )
+    client = TestClient(api.app)
+
+    summary = client.get("/api/network-model/active", params={"environment_id": "pilot-a"})
+    assert summary.status_code == 200
+    assert summary.json()["revision"]["revision_id"] == "baseline-001"
+    assert "model" not in summary.json()["revision"]
+
+    plan = client.post(
+        "/api/desired-state/plan",
+        json={
+            "change_type": "interface_config",
+            "site": "site-101",
+            "device_id": "edge-1",
+            "requested_by": "marcus",
+            "environment_id": "pilot-a",
+            "model_revision_id": "baseline-001",
+            "values": {
+                "name": "Ethernet1",
+                "description": "WAN uplink",
+                "enabled": True,
+                "mode": "routed",
+                "ip_address": "192.0.2.1/30",
+            },
+        },
+    )
+    assert plan.status_code == 200, plan.text
+    assert plan.json()["network_model"]["revision_id"] == "baseline-001"
+    assert plan.json()["network_model"]["device_id"] == "edge-1"
+
+
+def test_rez_bridge_token_can_read_model_but_cannot_approve_it(monkeypatch):
+    monkeypatch.setenv("NETCODE_REZ_BRIDGE_TOKEN", "bridge-secret")
+    authorization = "Bearer bridge-secret"
+    assert api._is_rez_bridge_request("/api/network-model/active/rez-design", authorization) is True
+    assert api._is_rez_bridge_request("/api/network-model/revisions/rev-1/approve", authorization) is False

@@ -170,6 +170,8 @@ class DesiredStatePlanRequest(BaseModel):
     device_id: str = "v2-store1"
     requested_by: str = "lab-engineer"
     values: dict[str, object] = {}
+    environment_id: str = ""
+    model_revision_id: str = ""
 
 
 class AnsiblePackPlanRequest(BaseModel):
@@ -477,7 +479,12 @@ _ADMIN_PATHS = {"/api/runners/join-token"}
 
 def _is_rez_bridge_request(path: str, authorization: str | None) -> bool:
     token = os.environ.get("NETCODE_REZ_BRIDGE_TOKEN", "").strip()
-    return bool(token) and path == "/api/rez/runner-read" and authorization == f"Bearer {token}"
+    read_only_paths = {
+        "/api/rez/runner-read",
+        "/api/network-model/active",
+        "/api/network-model/active/rez-design",
+    }
+    return bool(token) and path in read_only_paths and authorization == f"Bearer {token}"
 
 
 def _request_principal(request: Request) -> Principal:
@@ -997,6 +1004,40 @@ def desired_state_plan(request: DesiredStatePlanRequest, http_request: Request) 
     p = paths()
     try:
         principal = _request_principal(http_request)
+        store = PlatformStore(p)
+        model_context: dict[str, object] | None = None
+        if request.environment_id.strip():
+            active_model = NetworkModelRepository(store).active_revision(
+                principal.org_id, request.environment_id.strip()
+            )
+            if active_model is None:
+                raise ValueError("No active Network Model exists for the selected environment.")
+            if request.model_revision_id.strip() and request.model_revision_id.strip() != active_model["revision_id"]:
+                raise ValueError(
+                    f"Network Model revision changed from {request.model_revision_id} "
+                    f"to {active_model['revision_id']}; refresh the plan."
+                )
+            catalog_device = store.resolve_device(principal.org_id, request.device_id)
+            canonical_device_id = str(catalog_device.get("canonical_id")) if catalog_device else request.device_id
+            domain_by_change = {
+                "add_vlan": "topology",
+                "interface_config": "topology",
+                "bgp_neighbor": "routing",
+                "routing_redistribution": "route_propagation",
+                "acl_rule": "security_policy",
+                "ntp_standardize": "golden_standards",
+            }
+            required_domain = domain_by_change.get(request.change_type, "")
+            model_context = compile_effective_device(
+                active_model,
+                canonical_device_id,
+                required_domains=[required_domain] if required_domain else [],
+            )
+            if not model_context["operationally_usable"]:
+                raise ValueError(
+                    "The active Network Model does not cover the domain required by this change: "
+                    + ", ".join(model_context["missing_coverage"])
+                )
         intent_path = create_desired_state_intent(
             p,
             change_type=request.change_type,
@@ -1007,12 +1048,18 @@ def desired_state_plan(request: DesiredStatePlanRequest, http_request: Request) 
         )
         intent = load_intent(intent_path)
         result = run_static_pipeline(p, intent_path, org_id=principal.org_id)
-        store = PlatformStore(p)
         change = store.get_or_create_change(intent_path, request.device_id, requested_by=request.requested_by, org_id=principal.org_id, created_by_user_id=principal.user_id)
         workflow = state_after_static_validation(result.status == "pass")
         metadata = plan_metadata(intent)
         result_payload = result.model_dump()
         result_payload["plan"] = metadata
+        if model_context is not None:
+            result_payload["network_model"] = {
+                "revision_id": model_context["revision_id"],
+                "device_id": model_context["device_id"],
+                "site_id": model_context["site_id"],
+                "coverage": model_context["coverage"],
+            }
         store.update_change(
             change.id,
             "validated" if result.status == "pass" else "blocked",
@@ -1031,6 +1078,7 @@ def desired_state_plan(request: DesiredStatePlanRequest, http_request: Request) 
                 "checks": len(result.validation.checks),
                 "lab_write_supported": lab_write_supported(intent),
                 "production_write_supported": production_write_supported(intent),
+                "network_model_revision": model_context["revision_id"] if model_context else "",
             },
         )
         return {
@@ -1039,6 +1087,7 @@ def desired_state_plan(request: DesiredStatePlanRequest, http_request: Request) 
             "intent_path": str(intent_path),
             "pipeline": result.model_dump(),
             "plan": metadata,
+            "network_model": result_payload.get("network_model"),
             "workflow": workflow.as_dict(),
         }
     except Exception as exc:
@@ -1453,11 +1502,36 @@ def api_network_model_rollback(request: Request, payload: dict[str, object]) -> 
 def api_network_model_active(
     request: Request,
     environment_id: str = Query(..., min_length=1, max_length=128),
+    include_model: bool = Query(default=False),
 ) -> dict[str, object]:
     revision = NetworkModelRepository(PlatformStore(paths())).active_revision(
         _request_principal(request).org_id, environment_id
     )
+    if revision is not None and not include_model:
+        revision = {key: value for key, value in revision.items() if key != "model"}
     return {"ok": True, "revision": revision, "device_connections_opened": 0}
+
+
+@app.get("/api/network-model/active/rez-design")
+def api_network_model_active_rez_design(
+    request: Request,
+    environment_id: str = Query(..., min_length=1, max_length=128),
+) -> dict[str, object]:
+    revision = NetworkModelRepository(PlatformStore(paths())).active_revision(
+        _request_principal(request).org_id, environment_id
+    )
+    if revision is None:
+        raise HTTPException(status_code=404, detail="No active Network Model revision exists for this environment")
+    try:
+        design = to_rez_network_design(revision)
+    except NetworkModelError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {
+        "ok": True,
+        "revision_id": revision["revision_id"],
+        "design": design,
+        "device_connections_opened": 0,
+    }
 
 
 @app.get("/api/devices")
