@@ -2414,7 +2414,7 @@ def run(args: argparse.Namespace) -> int:
     print(f"[runner] Polling {server} for pool '{pool}' as {identity['name']} (v{VERSION}). Ctrl-C to stop.")
     _start_interactive_channel(server, token)  # persistent outbound WS for the interactive shell
     try:
-        _post(server, "/api/runner/heartbeat", {"version": VERSION}, token=token)
+        _post(server, "/api/runner/heartbeat", {"version": VERSION, "state": "online"}, token=token)
     except Exception as exc:  # noqa: BLE001
         print(f"[runner] Heartbeat failed (continuing): {exc}", file=sys.stderr)
     inventory_revision = ""
@@ -2438,6 +2438,7 @@ def run(args: argparse.Namespace) -> int:
             time.sleep(5)
             continue
         if not resp:
+            time.sleep(1)
             continue  # 204: no job, poll again
         job = resp.get("job") or {}
         job_id = job.get("id")
@@ -2468,6 +2469,10 @@ def run(args: argparse.Namespace) -> int:
             print(f"[runner] Failed to report job {job_id}: {exc}", file=sys.stderr)
         finally:
             lease.stop()
+    try:
+        _post(server, "/api/runner/heartbeat", {"version": VERSION, "state": "draining"}, token=token)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[runner] Final drain heartbeat failed: {exc}", file=sys.stderr)
     print("[runner] Stopped.")
     return 0
 

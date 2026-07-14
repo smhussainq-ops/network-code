@@ -101,6 +101,9 @@ def poll_for_job(store: PlatformStore, runner: RunnerRecord, wait_seconds: float
     deadline = time.monotonic() + wait_seconds
     store.touch_runner(runner.id, status="online")
     while True:
+        current = store.get_runner(runner.id)
+        if current.drain_requested:
+            return None
         job = store.claim_next_job(runner.org_id, runner.pool, runner.id)
         if job is not None:
             return job
@@ -484,4 +487,7 @@ def submit_job_result(
 
 def runner_summary(store: PlatformStore, org_id: str | None = None) -> dict[str, Any]:
     runners = [record_to_dict(runner) for runner in store.list_runners(org_id=org_id)]
-    return {"ok": True, "runners": runners, "count": len(runners)}
+    summary: dict[str, Any] = {"ok": True, "runners": runners, "count": len(runners)}
+    if org_id:
+        summary["queue"] = store.queue_metrics(org_id)
+    return summary

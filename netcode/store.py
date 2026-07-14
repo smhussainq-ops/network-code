@@ -28,6 +28,26 @@ DEFAULT_ORG_ID = "org_default"
 TERMINAL_JOB_STATUSES = frozenset({"completed", "failed", "cancelled", "reconcile_required"})
 
 
+class JobQueueFullError(RuntimeError):
+    pass
+
+
+def job_queue_limit() -> int:
+    try:
+        configured = int(os.environ.get("NETCODE_MAX_QUEUED_JOBS", "20000") or "20000")
+    except ValueError:
+        configured = 20_000
+    return max(100, min(configured, 100_000))
+
+
+def queue_age_alert_seconds() -> int:
+    try:
+        configured = int(os.environ.get("NETCODE_QUEUE_AGE_ALERT_SECONDS", "300") or "300")
+    except ValueError:
+        configured = 300
+    return max(30, min(configured, 86_400))
+
+
 _RETRY_SAFE_JOB_ACTIONS = frozenset(
     {
         "lab_verify",
@@ -304,6 +324,8 @@ class RunnerRecord:
     org_id: str = DEFAULT_ORG_ID
     inventory_revision: str = ""
     device_count: int = 0
+    drain_requested: bool = False
+    draining_at: str | None = None
 
 
 @dataclass(frozen=True)
@@ -462,6 +484,8 @@ class PlatformStore:
             )
             self._ensure_column(conn, "runners", "inventory_revision", "TEXT NOT NULL DEFAULT ''")
             self._ensure_column(conn, "runners", "device_count", "INTEGER NOT NULL DEFAULT 0")
+            self._ensure_column(conn, "runners", "drain_requested", "INTEGER NOT NULL DEFAULT 0")
+            self._ensure_column(conn, "runners", "draining_at", "TEXT")
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS device_catalog (
@@ -525,7 +549,8 @@ class PlatformStore:
                     transcript_path TEXT NOT NULL,
                     command_count INTEGER NOT NULL DEFAULT 0,
                     output_bytes INTEGER NOT NULL DEFAULT 0,
-                    device_touched INTEGER NOT NULL DEFAULT 0
+                    device_touched INTEGER NOT NULL DEFAULT 0,
+                    end_reason TEXT
                 )
                 """
             )
@@ -537,6 +562,7 @@ class PlatformStore:
                 "CREATE INDEX IF NOT EXISTS idx_shell_sessions_device "
                 "ON shell_sessions (org_id, device_id, last_activity DESC)"
             )
+            self._ensure_column(conn, "shell_sessions", "end_reason", "TEXT")
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS join_tokens (
@@ -1157,6 +1183,8 @@ class PlatformStore:
             org_id=self._col(row, "org_id") or DEFAULT_ORG_ID,
             inventory_revision=str(self._col(row, "inventory_revision") or ""),
             device_count=int(self._col(row, "device_count") or 0),
+            drain_requested=bool(self._col(row, "drain_requested") or False),
+            draining_at=self._col(row, "draining_at"),
         )
 
     # ── Runner registry & job queue (Phase 0 SaaS split) ──────────────────
@@ -1212,14 +1240,53 @@ class PlatformStore:
         return row["hmac_secret"]
 
     def touch_runner(self, runner_id: str, status: str = "online", version: str | None = None) -> None:
+        """Update liveness without overriding an administrator-requested drain."""
         with self._connect() as conn:
             if version is None:
-                conn.execute("UPDATE runners SET status = ?, last_seen = ? WHERE id = ?", (status, utc_now(), runner_id))
+                conn.execute(
+                    "UPDATE runners SET status = CASE WHEN drain_requested = 1 THEN 'draining' ELSE ? END, "
+                    "last_seen = ? WHERE id = ?",
+                    (status, utc_now(), runner_id),
+                )
             else:
                 conn.execute(
-                    "UPDATE runners SET status = ?, version = ?, last_seen = ? WHERE id = ?",
+                    "UPDATE runners SET status = CASE WHEN drain_requested = 1 THEN 'draining' ELSE ? END, "
+                    "version = ?, last_seen = ? WHERE id = ?",
                     (status, version, utc_now(), runner_id),
                 )
+
+    def heartbeat_runner(self, runner_id: str, *, version: str = "", state: str = "online") -> RunnerRecord:
+        normalized = str(state or "online").strip().lower()
+        if normalized not in {"online", "draining"}:
+            raise ValueError("Runner heartbeat state must be online or draining")
+        now = utc_now()
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE runners SET status = CASE WHEN drain_requested = 1 THEN 'draining' ELSE ? END, "
+                "version = ?, last_seen = ?, draining_at = CASE "
+                "WHEN drain_requested = 1 OR ? = 'draining' THEN COALESCE(draining_at, ?) ELSE NULL END "
+                "WHERE id = ?",
+                (normalized, version, now, normalized, now, runner_id),
+            )
+        return self.get_runner(runner_id)
+
+    def set_runner_drain(self, runner_id: str, org_id: str, *, requested: bool) -> RunnerRecord:
+        now = utc_now()
+        with self._connect() as conn:
+            cursor = conn.execute(
+                "UPDATE runners SET drain_requested = ?, status = ?, draining_at = ?, last_seen = last_seen "
+                "WHERE id = ? AND org_id = ?",
+                (
+                    int(requested),
+                    "draining" if requested else "enrolled",
+                    now if requested else None,
+                    runner_id,
+                    org_id,
+                ),
+            )
+        if cursor.rowcount != 1:
+            raise ValueError(f"Unknown runner {runner_id}")
+        return self.get_runner(runner_id)
 
     def list_runners(self, org_id: str | None = None) -> list[RunnerRecord]:
         with self._connect() as conn:
@@ -1228,6 +1295,37 @@ class PlatformStore:
             else:
                 rows = conn.execute("SELECT * FROM runners WHERE org_id = ? ORDER BY created_at DESC", (org_id,)).fetchall()
         return [self._runner(row) for row in rows]
+
+    def queue_metrics(self, org_id: str) -> dict[str, Any]:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) AS queued, MIN(created_at) AS oldest FROM jobs "
+                "WHERE org_id = ? AND status = 'queued'",
+                (org_id,),
+            ).fetchone()
+        queued = int(row["queued"] if row else 0)
+        oldest = str(row["oldest"] or "") if row else ""
+        age_seconds = 0
+        if oldest:
+            try:
+                parsed = datetime.fromisoformat(oldest)
+                if parsed.tzinfo is None:
+                    parsed = parsed.replace(tzinfo=timezone.utc)
+                age_seconds = max(
+                    0,
+                    int((datetime.now(timezone.utc) - parsed).total_seconds()),
+                )
+            except (TypeError, ValueError):
+                age_seconds = 0
+        threshold = queue_age_alert_seconds()
+        return {
+            "queued": queued,
+            "limit": job_queue_limit(),
+            "oldest_created_at": oldest or None,
+            "oldest_age_seconds": age_seconds,
+            "age_alert_seconds": threshold,
+            "age_alert": bool(queued and age_seconds >= threshold),
+        }
 
     def catalog_device_count(self, org_id: str, *, runner_id: str | None = None) -> int:
         with self._connect() as conn:
@@ -1631,6 +1729,7 @@ class PlatformStore:
             "command_count": int(row["command_count"] or 0),
             "output_bytes": int(row["output_bytes"] or 0),
             "device_touched": bool(row["device_touched"]),
+            "end_reason": str(PlatformStore._col(row, "end_reason") or ""),
         }
 
     def create_shell_session(
@@ -1688,6 +1787,7 @@ class PlatformStore:
         output_bytes_delta: int = 0,
         device_touched: bool | None = None,
         ended: bool = False,
+        end_reason: str | None = None,
     ) -> dict[str, Any] | None:
         now = utc_now()
         touched_value = None if device_touched is None else int(device_touched)
@@ -1701,16 +1801,47 @@ class PlatformStore:
                     output_bytes = output_bytes + ?,
                     device_touched = CASE WHEN ? IS NULL THEN device_touched ELSE ? END,
                     last_activity = ?,
-                    ended_at = CASE WHEN ? = 1 THEN ? ELSE ended_at END
+                    ended_at = CASE WHEN ? = 1 THEN ? ELSE ended_at END,
+                    end_reason = COALESCE(?, end_reason)
                 WHERE id = ?
                 """,
                 (
                     status, change_id, max(0, int(command_delta)),
                     max(0, int(output_bytes_delta)), touched_value, touched_value,
-                    now, int(ended), now, session_id,
+                    now, int(ended), now, end_reason, session_id,
                 ),
             )
         return self.get_shell_session(session_id)
+
+    def terminate_active_shell_sessions(
+        self,
+        *,
+        reason: str,
+        runner_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        clauses = ["status IN ('opened', 'active')"]
+        params: list[Any] = []
+        if runner_id:
+            clauses.append("runner_id = ?")
+            params.append(runner_id)
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM shell_sessions WHERE " + " AND ".join(clauses),
+                tuple(params),
+            ).fetchall()
+            if rows:
+                now = utc_now()
+                conn.execute(
+                    "UPDATE shell_sessions SET status = 'terminated', ended_at = ?, last_activity = ?, "
+                    "end_reason = ? WHERE " + " AND ".join(clauses),
+                    (now, now, reason, *params),
+                )
+        terminated: list[dict[str, Any]] = []
+        for row in rows:
+            session = self.get_shell_session(str(row["id"]))
+            if session is not None:
+                terminated.append(session)
+        return terminated
 
     def get_shell_session(self, session_id: str) -> dict[str, Any] | None:
         with self._connect() as conn:
@@ -1781,26 +1912,34 @@ class PlatformStore:
                 device_id=canonical_device,
                 payload=payload,
             )
-            conn.execute(
-                "INSERT INTO jobs (id, change_id, action, status, message, created_at, updated_at, "
-                "result_json, org_id, pool, payload_json, target_runner_id, device_id, idempotency_key) "
-                "VALUES (?, ?, ?, 'queued', ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?) "
-                "ON CONFLICT DO NOTHING",
-                (
-                    job_id,
-                    change_id,
-                    action,
-                    f"Queued for runner pool {pool}",
-                    now,
-                    now,
-                    org_id,
-                    pool,
-                    json.dumps(payload),
-                    target_runner_id,
-                    canonical_device,
-                    operation_key,
-                ),
-            )
+            if self.engine == "postgres":
+                conn.execute("SELECT id FROM orgs WHERE id = ? FOR UPDATE", (org_id,)).fetchone()
+            existing = conn.execute(
+                "SELECT id FROM jobs WHERE org_id = ? AND idempotency_key = ?",
+                (org_id, operation_key),
+            ).fetchone()
+            if not existing:
+                self._enforce_queue_capacity(conn, org_id)
+                conn.execute(
+                    "INSERT INTO jobs (id, change_id, action, status, message, created_at, updated_at, "
+                    "result_json, org_id, pool, payload_json, target_runner_id, device_id, idempotency_key) "
+                    "VALUES (?, ?, ?, 'queued', ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?) "
+                    "ON CONFLICT DO NOTHING",
+                    (
+                        job_id,
+                        change_id,
+                        action,
+                        f"Queued for runner pool {pool}",
+                        now,
+                        now,
+                        org_id,
+                        pool,
+                        json.dumps(payload),
+                        target_runner_id,
+                        canonical_device,
+                        operation_key,
+                    ),
+                )
             row = conn.execute(
                 "SELECT id, change_id, action, device_id, payload_json FROM jobs "
                 "WHERE org_id = ? AND idempotency_key = ?",
@@ -1823,6 +1962,18 @@ class PlatformStore:
                 (actual_job_id, now, change_id),
             )
         return self.get_job(actual_job_id)
+
+    def _enforce_queue_capacity(self, conn: _EngineConn, org_id: str) -> None:
+        row = conn.execute(
+            "SELECT COUNT(*) AS count FROM jobs WHERE org_id = ? AND status = 'queued'",
+            (org_id,),
+        ).fetchone()
+        queued = int(row["count"] if row else 0)
+        limit = job_queue_limit()
+        if queued >= limit:
+            raise JobQueueFullError(
+                f"Organization job queue is full ({queued}/{limit}); wait for work to drain before submitting more."
+            )
 
     # ── Fleet rollouts ────────────────────────────────────────────────────
 
@@ -1934,6 +2085,44 @@ class PlatformStore:
                 (f"Cancelled: {reason}", now, job_id),
             )
             return bool(cursor.rowcount)
+
+    def cancel_job_for_org(self, job_id: str, org_id: str, *, actor: str, reason: str) -> JobRecord:
+        """Cancel only work that has not crossed the connector claim boundary."""
+        now = utc_now()
+        message = f"Cancelled by {actor}: {str(reason or 'operator request').strip()[:300]}"
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM jobs WHERE id = ? AND org_id = ?",
+                (job_id, org_id),
+            ).fetchone()
+            if not row:
+                raise ValueError(f"Unknown job {job_id}")
+            if str(row["status"]) != "queued":
+                raise RuntimeError(
+                    f"Job {job_id} is {row['status']}; claimed or terminal work cannot be cancelled blindly."
+                )
+            cursor = conn.execute(
+                "UPDATE jobs SET status = 'cancelled', message = ?, updated_at = ? "
+                "WHERE id = ? AND org_id = ? AND status = 'queued'",
+                (message, now, job_id, org_id),
+            )
+            if cursor.rowcount != 1:
+                raise RuntimeError(f"Job {job_id} crossed the claim boundary before cancellation completed.")
+        job = self.get_job(job_id)
+        if job.change_id != "__read__":
+            try:
+                change = self.get_change(job.change_id)
+            except ValueError:
+                return job
+            self.record_workflow_event(
+                change.id,
+                "cancel_queued_job",
+                change.workflow_state,
+                change.workflow_state,
+                message,
+                {"job_id": job.id, "actor": actor, "reason": reason, "device_id": job.device_id},
+            )
+        return job
 
     def list_rollouts_in_status(self, statuses: tuple[str, ...]) -> list[dict[str, Any]]:
         marks = ", ".join("?" for _ in statuses)
@@ -2083,34 +2272,56 @@ class PlatformStore:
         canonical_device = job_device_id(payload)
         operation_key = str(idempotency_key or "").strip() or None
         with self._connect() as conn:
-            conn.execute(
-                "INSERT INTO jobs (id, change_id, action, status, message, created_at, updated_at, result_json, "
-                "org_id, pool, payload_json, target_runner_id, device_id, idempotency_key)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING",
-                (
-                    job_id,
-                    change_id,
-                    f"read_{action}",
-                    "queued",
-                    f"Queued read '{action}' for pool {pool}",
-                    now,
-                    now,
-                    None,
-                    org_id,
-                    pool,
-                    json.dumps(payload),
-                    target_runner_id,
-                    canonical_device,
-                    operation_key,
-                ),
-            )
+            if self.engine == "sqlite":
+                conn.execute("BEGIN IMMEDIATE")
+            else:
+                conn.execute("SELECT id FROM orgs WHERE id = ? FOR UPDATE", (org_id,)).fetchone()
+            existing = None
+            if operation_key:
+                existing = conn.execute(
+                    "SELECT id FROM jobs WHERE org_id = ? AND idempotency_key = ?",
+                    (org_id, operation_key),
+                ).fetchone()
+            if not existing:
+                self._enforce_queue_capacity(conn, org_id)
+                conn.execute(
+                    "INSERT INTO jobs (id, change_id, action, status, message, created_at, updated_at, result_json, "
+                    "org_id, pool, payload_json, target_runner_id, device_id, idempotency_key)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING",
+                    (
+                        job_id,
+                        change_id,
+                        f"read_{action}",
+                        "queued",
+                        f"Queued read '{action}' for pool {pool}",
+                        now,
+                        now,
+                        None,
+                        org_id,
+                        pool,
+                        json.dumps(payload),
+                        target_runner_id,
+                        canonical_device,
+                        operation_key,
+                    ),
+                )
             if operation_key:
                 row = conn.execute(
-                    "SELECT id FROM jobs WHERE org_id = ? AND idempotency_key = ?",
+                    "SELECT id, change_id, action, device_id, payload_json FROM jobs "
+                    "WHERE org_id = ? AND idempotency_key = ?",
                     (org_id, operation_key),
                 ).fetchone()
                 if not row:
                     raise RuntimeError("Failed to queue or resolve the idempotent read operation")
+                existing_payload = json.loads(row["payload_json"] or "{}")
+                if (
+                    str(row["change_id"]) != change_id
+                    or str(row["action"]) != f"read_{action}"
+                    or str(row["device_id"] or "") != canonical_device
+                    or json.dumps(existing_payload, sort_keys=True, separators=(",", ":"), default=str)
+                    != json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
+                ):
+                    raise ValueError("Idempotency key is already bound to a different read operation")
                 job_id = str(row["id"])
         return self.get_job(job_id)
 

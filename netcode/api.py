@@ -149,6 +149,7 @@ from netcode.network_model_lifecycle import (
 )
 from netcode.store import (
     DEFAULT_ORG_ID,
+    JobQueueFullError,
     TERMINAL_JOB_STATUSES,
     PlatformStore,
     change_audit_id,
@@ -421,6 +422,11 @@ class RunnerLeaseRequest(BaseModel):
 
 class RunnerHeartbeatRequest(BaseModel):
     version: str = ""
+    state: str = "online"
+
+
+class JobCancelRequest(BaseModel):
+    reason: str = "operator request"
 
 
 class RunnerInventorySyncRequest(BaseModel):
@@ -496,6 +502,15 @@ async def _entitlement_error(_request: Request, exc: EntitlementError) -> JSONRe
     )
 
 
+@app.exception_handler(JobQueueFullError)
+async def _job_queue_full(_request: Request, exc: JobQueueFullError) -> JSONResponse:
+    return JSONResponse(
+        status_code=429,
+        content={"error": "job_queue_full", "message": str(exc)},
+        headers={"Retry-After": "30"},
+    )
+
+
 @app.on_event("startup")
 def _startup() -> None:
     workspace = paths()
@@ -505,7 +520,14 @@ def _startup() -> None:
         raise RuntimeError("Netcode production configuration is not ready: " + "; ".join(issues))
     init_workspace(workspace, include_examples=not is_production_environment(os.environ))
     _bootstrap_admin()
-    PlatformStore(workspace).recover_expired_jobs()
+    store = PlatformStore(workspace)
+    store.recover_expired_jobs()
+    for session in store.terminate_active_shell_sessions(reason="control_plane_restarted"):
+        _shell_append(
+            workspace,
+            str(session["id"]),
+            {"event": "session_terminated", "reason": "control_plane_restarted"},
+        )
     # Rollout orchestrator threads die with the process: fail any orphaned
     # running rollouts closed (halted + queued jobs cancelled) at boot.
     try:
@@ -2211,6 +2233,38 @@ def api_list_runners(request: Request) -> dict[str, object]:
     return runner_summary(PlatformStore(paths()), org_id=_request_principal(request).org_id)
 
 
+def _admin_runner_for_request(runner_id: str, request: Request) -> tuple[PlatformStore, object]:
+    principal = _request_principal(request)
+    if not principal.has_role("admin"):
+        raise HTTPException(status_code=403, detail="This action requires the 'admin' role.")
+    store = PlatformStore(paths())
+    try:
+        runner = store.get_runner(runner_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=f"Unknown runner {runner_id}") from exc
+    if runner.org_id != principal.org_id:
+        raise HTTPException(status_code=404, detail=f"Unknown runner {runner_id}")
+    return store, runner
+
+
+@app.post("/api/runners/{runner_id}/drain")
+def api_runner_drain(runner_id: str, request: Request) -> dict[str, object]:
+    store, _runner = _admin_runner_for_request(runner_id, request)
+    runner = store.set_runner_drain(runner_id, _request_principal(request).org_id, requested=True)
+    return {
+        "ok": True,
+        "runner": record_to_dict(runner),
+        "message": "Connector is draining; its active job may finish, but no new work will be claimed.",
+    }
+
+
+@app.post("/api/runners/{runner_id}/resume")
+def api_runner_resume(runner_id: str, request: Request) -> dict[str, object]:
+    store, _runner = _admin_runner_for_request(runner_id, request)
+    runner = store.set_runner_drain(runner_id, _request_principal(request).org_id, requested=False)
+    return {"ok": True, "runner": record_to_dict(runner), "message": "Connector resumed."}
+
+
 @app.post("/api/runner/enroll")
 def api_runner_enroll(request: RunnerEnrollRequest) -> dict[str, object]:
     store = PlatformStore(paths())
@@ -2300,8 +2354,17 @@ def api_runner_job_progress(
 def api_runner_heartbeat(request: RunnerHeartbeatRequest, authorization: str | None = Header(default=None)) -> dict[str, object]:
     store = PlatformStore(paths())
     runner = _require_runner(store, authorization)
-    store.touch_runner(runner.id, status="online", version=request.version)
-    return {"ok": True, "runner_id": runner.id, "pool": runner.pool}
+    try:
+        runner = store.heartbeat_runner(runner.id, version=request.version, state=request.state)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {
+        "ok": True,
+        "runner_id": runner.id,
+        "pool": runner.pool,
+        "status": runner.status,
+        "drain_requested": runner.drain_requested,
+    }
 
 
 _RUNNER_INVENTORY_FIELDS = {
@@ -3452,6 +3515,12 @@ def api_shell_open(request: ShellOpenRequest, http_request: Request) -> dict[str
                 status_code=409,
                 detail=f"Local connector for {catalog_device['id']} is offline. Start it and retry.",
             )
+        assigned_runner = PlatformStore(p).get_runner(runner_id)
+        if assigned_runner.drain_requested:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Local connector for {catalog_device['id']} is in maintenance drain.",
+            )
         device_id = str(catalog_device["canonical_id"])
         display_id = str(catalog_device["id"])
         platform = str(catalog_device["platform"])
@@ -3617,6 +3686,22 @@ _RUNNER_CHANNEL_POOLS: dict[str, str] = {}           # runner_id -> pool
 _BROWSER_SOCKETS: dict[str, WebSocket] = {}          # session_id -> browser WS
 
 
+async def _terminate_shells_for_runner(runner_id: str, reason: str) -> None:
+    store = PlatformStore(paths())
+    sessions = store.terminate_active_shell_sessions(reason=reason, runner_id=runner_id)
+    for stored in sessions:
+        sid = str(stored["id"])
+        _SHELL_SESSIONS.pop(sid, None)
+        _shell_append(paths(), sid, {"event": "session_terminated", "reason": reason, "runner_id": runner_id})
+        browser = _BROWSER_SOCKETS.pop(sid, None)
+        if browser is not None:
+            try:
+                await browser.send_json({"t": "status", "s": "terminated", "m": reason})
+                await browser.close(code=1012)
+            except Exception:  # noqa: BLE001 - browser may already be gone.
+                pass
+
+
 @app.websocket("/api/runner/stream")
 async def ws_runner_stream(ws: WebSocket) -> None:
     """Persistent outbound control channel from a runner. The runner authenticates,
@@ -3629,7 +3714,18 @@ async def ws_runner_stream(ws: WebSocket) -> None:
         token = str(auth.get("token", ""))
         store = PlatformStore(paths())
         runner = authenticate_runner(store, token)
+        if runner is None:
+            await ws.close(code=4401)
+            return
         runner_id = runner.id
+        previous = _RUNNER_CHANNELS.pop(runner.id, None)
+        _RUNNER_CHANNEL_POOLS.pop(runner.id, None)
+        if previous is not None and previous is not ws:
+            await _terminate_shells_for_runner(runner.id, "connector_channel_replaced")
+            try:
+                await previous.close(code=1012)
+            except Exception:  # noqa: BLE001
+                pass
         _RUNNER_CHANNELS[runner.id] = ws
         _RUNNER_CHANNEL_POOLS[runner.id] = runner.pool
         await ws.send_json({"t": "ready", "runner_id": runner.id, "pool": runner.pool})
@@ -3677,6 +3773,7 @@ async def ws_runner_stream(ws: WebSocket) -> None:
         if runner_id and _RUNNER_CHANNELS.get(runner_id) is ws:
             _RUNNER_CHANNELS.pop(runner_id, None)
             _RUNNER_CHANNEL_POOLS.pop(runner_id, None)
+            await _terminate_shells_for_runner(runner_id, "connector_disconnected")
 
 
 def _runner_channel_for_session(session: dict[str, object]) -> tuple[str, WebSocket | None]:
@@ -3812,16 +3909,26 @@ async def ws_shell_session(ws: WebSocket, session_id: str) -> None:
             except Exception:  # noqa: BLE001
                 pass
         final_state = dict(session.get("state") or {})
-        _shell_append(paths(), session_id, {
-            "event": "session_closed",
-            "device_touched": bool(final_state.get("device_touched")),
-        })
-        PlatformStore(paths()).update_shell_session(
-            session_id,
-            status="closed",
-            device_touched=bool(final_state.get("device_touched")),
-            ended=True,
-        )
+        shell_store = PlatformStore(paths())
+        stored = shell_store.get_shell_session(session_id)
+        if stored and stored.get("status") == "terminated":
+            _shell_append(paths(), session_id, {
+                "event": "session_transport_closed",
+                "reason": stored.get("end_reason") or "connector_terminated",
+                "device_touched": bool(final_state.get("device_touched")),
+            })
+        else:
+            _shell_append(paths(), session_id, {
+                "event": "session_closed",
+                "device_touched": bool(final_state.get("device_touched")),
+            })
+            shell_store.update_shell_session(
+                session_id,
+                status="closed",
+                device_touched=bool(final_state.get("device_touched")),
+                ended=True,
+                end_reason="browser_disconnected",
+            )
 
 
 @app.get("/api/shell/sessions")
@@ -5140,6 +5247,25 @@ def api_job(job_id: str, request: Request) -> dict[str, object]:
     if job.org_id != org:  # 404 (not 403) so job existence never leaks across tenants
         raise HTTPException(status_code=404, detail=f"Unknown job {job_id}")
     return record_to_dict(job)
+
+
+@app.post("/api/jobs/{job_id}/cancel")
+def api_cancel_job(job_id: str, request: Request, payload: JobCancelRequest) -> dict[str, object]:
+    principal = _request_principal(request)
+    actor = principal.email or principal.user_id or "netcode-operator"
+    store = PlatformStore(paths())
+    try:
+        job = store.cancel_job_for_org(
+            job_id,
+            principal.org_id,
+            actor=actor,
+            reason=payload.reason,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=f"Unknown job {job_id}") from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return {"ok": True, "job": record_to_dict(job), "message": job.message}
 
 
 @app.get("/api/audit/sessions")
