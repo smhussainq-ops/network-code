@@ -20,6 +20,7 @@ import time
 import uuid
 from typing import Any
 
+from netcode.entitlements import EntitlementError, enforce_capacity
 from netcode.network_model import NetworkModelError
 from netcode.network_model_lifecycle import rollback_change_candidates
 from netcode.network_model_store import NetworkModelRepository
@@ -63,6 +64,15 @@ def enroll_runner(store: PlatformStore, join_token: str, name: str) -> dict[str,
     if claim is None:
         return {"ok": False, "message": "Join token is invalid or already used. Mint a new one."}
     pool, org_id = claim["pool"], claim["org_id"]
+    try:
+        enforce_capacity(
+            "connectors",
+            current=len(store.list_runners(org_id=org_id)),
+            additional=1,
+            org_id=org_id,
+        )
+    except EntitlementError as exc:
+        return {"ok": False, "message": str(exc), "error": "connector_limit_reached"}
     runner_token = f"nrt_{secrets.token_urlsafe(32)}"
     hmac_secret = secrets.token_urlsafe(32)
     # The runner's tenant is decided exactly once, here, from the join token's org.

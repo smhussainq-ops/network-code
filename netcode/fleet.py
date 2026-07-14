@@ -615,7 +615,14 @@ def _lab_action_and_wait(
     p: WorkspacePaths, store: PlatformStore, intent_path: Path,
     action: str, device_id: str, change_id: str,
 ) -> tuple[bool, str]:
-    outcome = JobRunner(p).run_lab_action(intent_path, action, device_id, change_id)
+    change = store.get_change(change_id)
+    outcome = JobRunner(p, store=store).run_lab_action(
+        intent_path,
+        action,
+        device_id,
+        change_id,
+        org_id=change.org_id,
+    )
     if not outcome.get("queued"):
         result = outcome.get("result") or {}
         return bool(outcome.get("ok")), str(result.get("message") or result.get("error") or "")

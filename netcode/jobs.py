@@ -25,7 +25,7 @@ from netcode.network_model_lifecycle import (
 from netcode.network_model_store import NetworkModelRepository
 from netcode.paths import WorkspacePaths
 from netcode.rendering import render_intent
-from netcode.store import PlatformStore, record_to_dict
+from netcode.store import DEFAULT_ORG_ID, PlatformStore, record_to_dict
 from netcode.ui_config import configured_inventory_path, configured_policy_path
 from netcode.workflow import require_action_allowed, state_after_lab_action
 from netcode.yamlio import read_yaml
@@ -70,10 +70,17 @@ class JobRunner:
         self.paths = paths
         self.store = store or PlatformStore(paths)
 
-    def run_full_arista(self, intent_path: Path, device_id: str | None, apply: bool = True) -> dict[str, object]:
+    def run_full_arista(
+        self,
+        intent_path: Path,
+        device_id: str | None,
+        apply: bool = True,
+        *,
+        org_id: str = DEFAULT_ORG_ID,
+    ) -> dict[str, object]:
         if apply:
-            require_production_writes()
-        change = self.store.create_change(intent_path, device_id)
+            require_production_writes(org_id=org_id)
+        change = self.store.create_change(intent_path, device_id, org_id=org_id)
         job = self.store.create_job(change.id, "arista_full_run")
         self.store.update_job(job.id, "running", "Running static validation and Arista lab phases")
         try:
@@ -99,10 +106,24 @@ class JobRunner:
                 "result": error,
             }
 
-    def run_lab_action(self, intent_path: Path, action: str, device_id: str | None, change_id: str | None = None) -> dict[str, object]:
+    def run_lab_action(
+        self,
+        intent_path: Path,
+        action: str,
+        device_id: str | None,
+        change_id: str | None = None,
+        *,
+        org_id: str = DEFAULT_ORG_ID,
+    ) -> dict[str, object]:
+        change = (
+            self.store.get_change(change_id)
+            if change_id
+            else self.store.get_or_create_change(intent_path, device_id, org_id=org_id)
+        )
+        if change.org_id != org_id:
+            raise ValueError("Change does not belong to the requesting organization")
         if action in {"apply", "rollback"}:
-            require_production_writes()
-        change = self.store.get_change(change_id) if change_id else self.store.get_or_create_change(intent_path, device_id)
+            require_production_writes(org_id=change.org_id)
         intrinsic_gate = intrinsic_approval_required(intent_path)
         needs_approval = approval_required() or intrinsic_gate
         if action == "apply" and needs_approval and change.workflow_state != "approved":
@@ -286,7 +307,7 @@ class JobRunner:
         events = self.store.list_workflow_events(change.id)
         approvals = [event for event in events if event.action in {"approve", "approve_manager", "approve_rollback"}]
         if request.action in WRITE_ACTIONS:
-            require_production_writes()
+            require_production_writes(org_id=change.org_id)
             if not approvals:
                 raise ValueError("manager write is blocked: no durable human approval event exists")
             approved_by = str((approvals[-1].evidence or {}).get("approved_by") or "")

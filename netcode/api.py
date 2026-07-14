@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
+import hmac
 import json
 import os
 import re
@@ -32,6 +34,7 @@ from netcode.discovery import DiscoveryService
 from netcode.diagnostics_handoff import attach_verification_handoff, build_verification_handoff
 from netcode.entitlements import (
     EntitlementError,
+    canonical_org_id,
     enforce_capacity,
     enforcement_enabled,
     get_entitlements,
@@ -167,7 +170,7 @@ from netcode.ui_config import (
 from netcode.verification import verify_state, verify_vlan_state
 from netcode.windows_runner_package import build_windows_runner_package, package_manifest
 from netcode.workflow import state_after_lab_action, state_after_static_validation, workflow_snapshot
-from netcode.workflow_packs import workflow_pack_catalog
+from netcode.workflow_packs import entitled_change_types, workflow_pack_catalog
 from netcode.yamlio import write_yaml
 
 
@@ -544,7 +547,7 @@ def _enforce_catalog_growth(
     else:
         current = store.catalog_device_count(org_id)
         additional = sum(1 for device_id in normalized if store.resolve_device(org_id, device_id) is None)
-    enforce_capacity("devices", current=current, additional=additional)
+    enforce_capacity("devices", current=current, additional=additional, org_id=org_id)
 
 
 # ── RBAC middleware (M5) ──────────────────────────────────────────────────
@@ -570,6 +573,37 @@ def _is_rez_bridge_request(path: str, authorization: str | None) -> bool:
 
 def _request_principal(request: Request) -> Principal:
     return getattr(request.state, "principal", SYSTEM_PRINCIPAL)
+
+
+def _trusted_rez_service_principal(headers, authorization: str | None) -> Principal:
+    """Resolve the Rez proxy identity only inside the private admin-token envelope."""
+    expected = os.environ.get("NETCODE_ADMIN_TOKEN", "").strip()
+    supplied = (authorization or "").removeprefix("Bearer ").strip()
+    if not expected or not supplied or not hmac.compare_digest(supplied, expected):
+        raise PermissionError("Trusted Rez service token is invalid.")
+    org_id = canonical_org_id(headers.get("x-rezonance-org-id"))
+    role = str(headers.get("x-rezonance-role") or "viewer").strip().lower()
+    if role == "user":
+        role = "operator"
+    if role not in {"viewer", "operator", "admin"}:
+        role = "viewer"
+    actor = str(headers.get("x-rezonance-user") or "rez-user").strip()[:160] or "rez-user"
+    return Principal(kind="system", org_id=org_id, role=role, email=actor)
+
+
+def _websocket_principal(ws: WebSocket) -> Principal:
+    if ws.headers.get("x-rezonance-org-id"):
+        try:
+            return _trusted_rez_service_principal(ws.headers, ws.headers.get("authorization"))
+        except (EntitlementError, PermissionError):
+            return Principal(kind="anon", org_id=DEFAULT_ORG_ID, role=None)
+    if not auth_enabled():
+        return SYSTEM_PRINCIPAL
+    authorization = ws.headers.get("authorization")
+    cookie_token = (ws.cookies.get("netcode_session") or "").strip()
+    if not authorization and cookie_token:
+        authorization = f"Bearer {cookie_token}"
+    return resolve_principal(PlatformStore(paths()), authorization)
 
 
 _RCA_ALLOWED_CHANGE_TYPES = {
@@ -790,7 +824,15 @@ async def _rbac(request: Request, call_next):
     using_cookie_auth = not authorization and bool(cookie_token)
     if not authorization and cookie_token:
         authorization = f"Bearer {cookie_token}"
-    if auth_enabled():
+    service_scoped = bool(request.headers.get("x-rezonance-org-id"))
+    if service_scoped:
+        try:
+            request.state.principal = _trusted_rez_service_principal(request.headers, authorization)
+        except PermissionError:
+            return JSONResponse({"detail": "Trusted Rez service token is invalid."}, status_code=401)
+        except EntitlementError as exc:
+            return JSONResponse({"detail": str(exc)}, status_code=403)
+    elif auth_enabled():
         request.state.principal = resolve_principal(PlatformStore(paths()), authorization)
     else:
         request.state.principal = SYSTEM_PRINCIPAL
@@ -958,6 +1000,7 @@ def wizard_add_vlan(request: AddVlanRequest, http_request: Request) -> dict[str,
     p = paths()
     try:
         principal = _request_principal(http_request)
+        _require_entitled_change_type(principal.org_id, "add_vlan")
         intent_path = create_add_vlan_intent(
             p,
             site=request.site,
@@ -990,21 +1033,38 @@ def wizard_add_vlan(request: AddVlanRequest, http_request: Request) -> dict[str,
             "plan": plan_metadata(load_intent(intent_path)),
             "workflow": workflow.as_dict(),
         }
+    except EntitlementError:
+        raise
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
+def _require_entitled_change_type(org_id: str, change_type: str) -> None:
+    entitlements = get_entitlements(org_id=org_id)
+    if change_type not in entitled_change_types(entitlements.max_workflow_packs):
+        raise EntitlementError(
+            f"Change type '{change_type}' is not included in the {entitlements.plan_id} workflow pack allowance."
+        )
+
+
 @app.get("/api/desired-state/catalog")
-def desired_state_catalog() -> dict[str, object]:
+def desired_state_catalog(request: Request) -> dict[str, object]:
+    entitlements = get_entitlements(org_id=_request_principal(request).org_id)
+    allowed = entitled_change_types(entitlements.max_workflow_packs)
     return {
-        "change_types": desired_state_catalog_from_config(read_ui_config(paths())),
+        "change_types": [
+            item
+            for item in desired_state_catalog_from_config(read_ui_config(paths()))
+            if str(item.get("id") or "") in allowed
+        ],
         "config_path": str(ui_config_path(paths())),
     }
 
 
 @app.get("/api/workflow-packs")
-def api_workflow_packs() -> dict[str, object]:
-    return workflow_pack_catalog()
+def api_workflow_packs(request: Request) -> dict[str, object]:
+    entitlements = get_entitlements(org_id=_request_principal(request).org_id)
+    return workflow_pack_catalog(entitlements.max_workflow_packs)
 
 
 @app.post("/api/workflow-packs/ansible/plan")
@@ -1064,7 +1124,7 @@ def api_ansible_pack_run(request: AnsiblePackPlanRequest, http_request: Request)
         return {"ok": False, "queued": False, "status": "blocked", "plan": plan, "message": "Ansible plan is blocked."}
     mode = str(plan.get("mode") or "check")
     if mode in {"canary", "apply", "rollback"}:
-        require_production_writes()
+        require_production_writes(org_id=_request_principal(http_request).org_id)
     if not request.targets:
         return {
             "ok": False,
@@ -1166,6 +1226,7 @@ def desired_state_plan(request: DesiredStatePlanRequest, http_request: Request) 
     p = paths()
     try:
         principal = _request_principal(http_request)
+        _require_entitled_change_type(principal.org_id, request.change_type)
         store = PlatformStore(p)
         model_context: dict[str, object] | None = None
         if request.environment_id.strip():
@@ -1266,6 +1327,8 @@ def desired_state_plan(request: DesiredStatePlanRequest, http_request: Request) 
             "network_model": result_payload.get("network_model"),
             "workflow": workflow.as_dict(),
         }
+    except EntitlementError:
+        raise
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -1291,9 +1354,15 @@ def api_lab_status() -> dict[str, object]:
 
 
 @app.post("/api/lab/dry-run")
-def api_lab_dry_run(request: IntentPathRequest) -> dict[str, object]:
+def api_lab_dry_run(request: IntentPathRequest, http_request: Request) -> dict[str, object]:
     try:
-        result = JobRunner(paths()).run_lab_action(Path(request.intent_path), "dry-run", request.device_id, request.change_id)
+        result = JobRunner(paths()).run_lab_action(
+            Path(request.intent_path),
+            "dry-run",
+            request.device_id,
+            request.change_id,
+            org_id=_request_principal(http_request).org_id,
+        )
         change = result.get("change")
         if isinstance(change, dict) and change.get("workflow_state"):
             result["workflow"] = workflow_snapshot(str(change["workflow_state"])).as_dict()  # type: ignore[arg-type]
@@ -1305,10 +1374,16 @@ def api_lab_dry_run(request: IntentPathRequest) -> dict[str, object]:
 
 
 @app.post("/api/lab/apply")
-def api_lab_apply(request: IntentPathRequest) -> dict[str, object]:
-    require_production_writes()
+def api_lab_apply(request: IntentPathRequest, http_request: Request) -> dict[str, object]:
+    require_production_writes(org_id=_request_principal(http_request).org_id)
     try:
-        result = JobRunner(paths()).run_lab_action(Path(request.intent_path), "apply", request.device_id, request.change_id)
+        result = JobRunner(paths()).run_lab_action(
+            Path(request.intent_path),
+            "apply",
+            request.device_id,
+            request.change_id,
+            org_id=_request_principal(http_request).org_id,
+        )
         change = result.get("change")
         if isinstance(change, dict) and change.get("workflow_state"):
             result["workflow"] = workflow_snapshot(str(change["workflow_state"])).as_dict()  # type: ignore[arg-type]
@@ -1320,10 +1395,16 @@ def api_lab_apply(request: IntentPathRequest) -> dict[str, object]:
 
 
 @app.post("/api/lab/rollback")
-def api_lab_rollback(request: IntentPathRequest) -> dict[str, object]:
-    require_production_writes()
+def api_lab_rollback(request: IntentPathRequest, http_request: Request) -> dict[str, object]:
+    require_production_writes(org_id=_request_principal(http_request).org_id)
     try:
-        result = JobRunner(paths()).run_lab_action(Path(request.intent_path), "rollback", request.device_id, request.change_id)
+        result = JobRunner(paths()).run_lab_action(
+            Path(request.intent_path),
+            "rollback",
+            request.device_id,
+            request.change_id,
+            org_id=_request_principal(http_request).org_id,
+        )
         change = result.get("change")
         if isinstance(change, dict) and change.get("workflow_state"):
             result["workflow"] = workflow_snapshot(str(change["workflow_state"])).as_dict()  # type: ignore[arg-type]
@@ -1335,10 +1416,15 @@ def api_lab_rollback(request: IntentPathRequest) -> dict[str, object]:
 
 
 @app.post("/api/lab/full-run")
-def api_lab_full_run(request: IntentPathRequest) -> dict[str, object]:
-    require_production_writes()
+def api_lab_full_run(request: IntentPathRequest, http_request: Request) -> dict[str, object]:
+    require_production_writes(org_id=_request_principal(http_request).org_id)
     try:
-        return JobRunner(paths()).run_full_arista(Path(request.intent_path), request.device_id, apply=True)
+        return JobRunner(paths()).run_full_arista(
+            Path(request.intent_path),
+            request.device_id,
+            apply=True,
+            org_id=_request_principal(http_request).org_id,
+        )
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -2102,7 +2188,12 @@ def api_mint_join_token(request: JoinTokenRequest, http_request: Request, author
         _admin_guard(authorization)
     principal = _request_principal(http_request)
     store = PlatformStore(paths())
-    enforce_capacity("connectors", current=len(store.list_runners(org_id=principal.org_id)), additional=1)
+    enforce_capacity(
+        "connectors",
+        current=len(store.list_runners(org_id=principal.org_id)),
+        additional=1,
+        org_id=principal.org_id,
+    )
     return mint_join_token(store, request.pool, org_id=principal.org_id)
 
 
@@ -2114,7 +2205,6 @@ def api_list_runners(request: Request) -> dict[str, object]:
 @app.post("/api/runner/enroll")
 def api_runner_enroll(request: RunnerEnrollRequest) -> dict[str, object]:
     store = PlatformStore(paths())
-    enforce_capacity("connectors", current=len(store.list_runners()), additional=1)
     return enroll_runner(store, request.join_token, request.name)
 
 
@@ -2122,12 +2212,14 @@ def api_runner_enroll(request: RunnerEnrollRequest) -> dict[str, object]:
 def api_runner_poll(request: RunnerPollRequest, authorization: str | None = Header(default=None)):
     store = PlatformStore(paths())
     runner = _require_runner(store, authorization)
+    # Check before claim so suspension never converts queued work to running.
+    get_entitlements(org_id=runner.org_id)
     job = poll_for_job(store, runner, request.wait_seconds)
     if job is None:
         return Response(status_code=204)
     if job_requires_production_writes(job.action):
         try:
-            require_production_writes()
+            require_production_writes(org_id=runner.org_id)
         except EntitlementError as exc:
             store.update_job(
                 job.id,
@@ -2849,16 +2941,22 @@ def api_readiness_devices(
 @app.post("/api/discovery/scan")
 def api_discovery_scan(request: DiscoveryScanRequest, http_request: Request) -> dict[str, object]:
     p = paths()
+    principal = _request_principal(http_request)
     if execution_mode() == "runner":
         _reject_cloud_credentials_in_runner_mode(request.username, request.password)
         payload = {"host": request.host,
                    "platform": request.platform, "port": request.port, "device_id": request.device_id,
                    "site": request.site, "groups": request.groups}
-        discovery_result = _runner_read(p, "discovery", payload, _request_principal(http_request).org_id)
-        return _import_runner_discovery_candidate(p, discovery_result, _request_principal(http_request).org_id)
+        discovery_result = _runner_read(p, "discovery", payload, principal.org_id)
+        return _import_runner_discovery_candidate(p, discovery_result, principal.org_id)
     inventory = Inventory(configured_inventory_path(p))
     identifier = request.device_id or request.host
-    enforce_capacity("devices", current=len(inventory.devices), additional=0 if inventory.find_device(identifier) else 1)
+    enforce_capacity(
+        "devices",
+        current=len(inventory.devices),
+        additional=0 if inventory.find_device(identifier) else 1,
+        org_id=principal.org_id,
+    )
     return DiscoveryService(p).scan(
         host=request.host,
         username=request.username,
@@ -2872,10 +2970,18 @@ def api_discovery_scan(request: DiscoveryScanRequest, http_request: Request) -> 
 
 
 @app.post("/api/source-of-truth/devices/import")
-def api_source_of_truth_import_device(request: SourceOfTruthDeviceImportRequest) -> dict[str, object]:
+def api_source_of_truth_import_device(
+    request: SourceOfTruthDeviceImportRequest,
+    http_request: Request,
+) -> dict[str, object]:
     candidate_id = str(request.candidate.get("id") or request.candidate.get("hostname") or "")
     inventory = Inventory(configured_inventory_path(paths()))
-    enforce_capacity("devices", current=len(inventory.devices), additional=0 if inventory.find_device(candidate_id) else 1)
+    enforce_capacity(
+        "devices",
+        current=len(inventory.devices),
+        additional=0 if inventory.find_device(candidate_id) else 1,
+        org_id=_request_principal(http_request).org_id,
+    )
     return DiscoveryService(paths()).import_candidate(request.candidate)
 
 
@@ -2889,7 +2995,13 @@ def api_shell_manual_device(request: ShellManualDeviceRequest, http_request: Req
     """
     p = paths()
     inventory = Inventory(configured_inventory_path(p))
-    enforce_capacity("devices", current=len(inventory.devices), additional=0 if inventory.find_device(request.device_id) else 1)
+    principal = _request_principal(http_request)
+    enforce_capacity(
+        "devices",
+        current=len(inventory.devices),
+        additional=0 if inventory.find_device(request.device_id) else 1,
+        org_id=principal.org_id,
+    )
     _reject_cloud_credentials_in_runner_mode(request.username, request.password)
     groups = request.groups or ["manual"]
     public_candidate = {
@@ -2904,7 +3016,7 @@ def api_shell_manual_device(request: ShellManualDeviceRequest, http_request: Req
     if execution_mode() == "runner":
         _enforce_catalog_growth(
             PlatformStore(p),
-            _request_principal(http_request).org_id,
+            principal.org_id,
             [request.device_id],
         )
     source_result = DiscoveryService(p).import_candidate(public_candidate)
@@ -3282,6 +3394,7 @@ def api_shell_open(request: ShellOpenRequest, http_request: Request) -> dict[str
     """Open a CLI session against a device."""
     p = paths()
     org = _request_principal(http_request).org_id
+    get_entitlements(org_id=org)
     if execution_mode() == "runner":
         catalog_device = PlatformStore(p).resolve_device(org, request.device_id)
         if not catalog_device:
@@ -3533,6 +3646,45 @@ def _runner_channel_for_session(session: dict[str, object]) -> tuple[str, WebSoc
     return "", None
 
 
+def _shell_entitlement_recheck_seconds() -> int:
+    try:
+        configured = int(os.environ.get("NETCODE_SHELL_ENTITLEMENT_RECHECK_SECONDS", "60"))
+    except ValueError:
+        configured = 60
+    return max(5, min(configured, 300))
+
+
+async def _shell_entitlement_watchdog(
+    ws: WebSocket,
+    org_id: str,
+    *,
+    interval_seconds: float | None = None,
+) -> None:
+    """Close an active PTY when its organization loses platform entitlement."""
+    interval = (
+        float(_shell_entitlement_recheck_seconds())
+        if interval_seconds is None
+        else max(0.0, float(interval_seconds))
+    )
+    while True:
+        await asyncio.sleep(interval)
+        try:
+            await asyncio.to_thread(get_entitlements, org_id=org_id, force=True)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - an active privileged session fails closed.
+            try:
+                await ws.send_json({
+                    "t": "status",
+                    "s": "license_suspended",
+                    "m": "This Shell session ended because the organization license is not active.",
+                })
+                await ws.close(code=4403)
+            except Exception:  # noqa: BLE001 - socket may already be closing.
+                pass
+            return
+
+
 @app.websocket("/api/shell/session/{session_id}")
 async def ws_shell_session(ws: WebSocket, session_id: str) -> None:
     """Browser terminal socket for one governed interactive session. Opens the
@@ -3543,6 +3695,21 @@ async def ws_shell_session(ws: WebSocket, session_id: str) -> None:
         await ws.send_json({"t": "status", "s": "error", "m": "Unknown or expired session."})
         await ws.close()
         return
+    principal = _websocket_principal(ws)
+    if not principal.authenticated:
+        await ws.send_json({"t": "status", "s": "error", "m": "Authentication required."})
+        await ws.close(code=4401)
+        return
+    if principal.org_id != session.get("org_id"):
+        await ws.send_json({"t": "status", "s": "error", "m": "Unknown or expired session."})
+        await ws.close(code=4404)
+        return
+    try:
+        get_entitlements(org_id=principal.org_id)
+    except EntitlementError as exc:
+        await ws.send_json({"t": "status", "s": "error", "m": str(exc)})
+        await ws.close(code=4403)
+        return
     runner_id, runner_ws = _runner_channel_for_session(session)
     if runner_ws is None:
         await ws.send_json({"t": "status", "s": "error", "m": "The assigned local connector is offline."})
@@ -3550,11 +3717,15 @@ async def ws_shell_session(ws: WebSocket, session_id: str) -> None:
         return
     _BROWSER_SOCKETS[session_id] = ws
     state = session.get("state") or {}
+    entitlement_watchdog: asyncio.Task | None = None
     try:
         await runner_ws.send_json({"t": "open", "sid": session_id,
                                    "device_id": session["device_id"], "state": state})
         _shell_append(paths(), session_id, {"event": "interactive_opened", "device_id": session["device_id"]})
         PlatformStore(paths()).update_shell_session(session_id, status="active")
+        entitlement_watchdog = asyncio.create_task(
+            _shell_entitlement_watchdog(ws, principal.org_id)
+        )
         while True:
             frame = await ws.receive_json()
             kind = frame.get("t")
@@ -3586,6 +3757,9 @@ async def ws_shell_session(ws: WebSocket, session_id: str) -> None:
     except Exception:  # noqa: BLE001
         pass
     finally:
+        if entitlement_watchdog is not None:
+            entitlement_watchdog.cancel()
+            await asyncio.gather(entitlement_watchdog, return_exceptions=True)
         _BROWSER_SOCKETS.pop(session_id, None)
         current = _RUNNER_CHANNELS.get(runner_id)
         if current is not None:
@@ -4121,8 +4295,9 @@ def api_fleet_rollout_activity(
 
 @app.post("/api/fleet/rollouts/{rollout_id}/start")
 def api_fleet_rollout_start(rollout_id: str, request: Request) -> dict[str, object]:
-    require_production_writes()
-    _rollout_or_404(rollout_id, _request_principal(request).org_id)
+    principal = _request_principal(request)
+    require_production_writes(org_id=principal.org_id)
+    _rollout_or_404(rollout_id, principal.org_id)
     try:
         return start_rollout(paths(), rollout_id)
     except ValueError as exc:
@@ -4152,8 +4327,8 @@ def api_fleet_rollout_retry(
     retry: FleetRetryRequest,
     request: Request,
 ) -> dict[str, object]:
-    require_production_writes()
     principal = _request_principal(request)
+    require_production_writes(org_id=principal.org_id)
     _rollout_or_404(rollout_id, principal.org_id)
     actor = principal.email or principal.user_id or "netcode-user"
     try:
@@ -4183,7 +4358,7 @@ def _approver_identity(principal, fallback_name: str, requester: str, requester_
     """Resolve who is approving and enforce requester != approver. With auth on,
     the logged-in principal IS the approver; with auth off, a named approver is
     required (advisory but still recorded and still must differ)."""
-    if principal.kind == "user":
+    if principal.kind == "user" or (principal.kind == "system" and principal.email):
         approver = principal.email or principal.user_id or ""
         if principal.user_id and requester_user_id and principal.user_id == requester_user_id:
             raise HTTPException(status_code=403, detail="The requester cannot approve their own change.")
@@ -4325,9 +4500,9 @@ def api_cross_domain_manager_action(
     }
     if action not in allowed:
         raise HTTPException(status_code=400, detail=f"Unsupported manager action {action}")
-    if action in WRITE_ACTIONS:
-        require_production_writes()
     principal = _request_principal(http_request)
+    if action in WRITE_ACTIONS:
+        require_production_writes(org_id=principal.org_id)
     store = PlatformStore(paths())
     try:
         change = store.get_change(change_id)

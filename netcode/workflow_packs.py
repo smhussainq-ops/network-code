@@ -32,7 +32,7 @@ _PACKS: list[dict[str, Any]] = [
         "id": "controlled-routing-acl-update",
         "name": "Controlled Routing / ACL Update",
         "description": "Plan and gate BGP neighbor or ACL changes where blast radius and rollback proof are mandatory.",
-        "change_types": ["bgp_neighbor", "acl_rule"],
+        "change_types": ["bgp_neighbor", "routing_redistribution", "acl_rule"],
         "target_selector": ["site", "device_id", "device_group"],
         "default_gates": ["plan", "validate", "dry_run", "peer_review", "canary", "verify", "rollback"],
         "diagnostics_handoff": True,
@@ -51,7 +51,7 @@ _PACKS: list[dict[str, Any]] = [
 ]
 
 
-def workflow_pack_catalog() -> dict[str, Any]:
+def _catalog_packs() -> list[dict[str, Any]]:
     packs: list[dict[str, Any]] = []
     for pack in _PACKS:
         missing = [change_type for change_type in pack["change_types"] if change_type not in REGISTRY]
@@ -65,10 +65,27 @@ def workflow_pack_catalog() -> dict[str, Any]:
                 "ansible_backend": False,
             }
         )
+    return packs
+
+
+def entitled_change_types(max_packs: int) -> set[str]:
+    allowed: set[str] = set()
+    for pack in _catalog_packs()[: max(0, int(max_packs))]:
+        if pack["status"] == "ready":
+            allowed.update(str(value) for value in pack["change_types"])
+    return allowed
+
+
+def workflow_pack_catalog(max_packs: int | None = None) -> dict[str, Any]:
+    all_packs = _catalog_packs()
+    limit = len(all_packs) if max_packs is None else max(0, int(max_packs))
+    packs = all_packs[:limit]
     return {
         "ok": True,
         "catalog_version": "netcode-native-workflow-packs.v1",
         "packs": packs,
+        "entitled_count": len(packs),
+        "available_count": len(all_packs),
         "safety": {
             "credentials": "runner-local",
             "writes": "gated",

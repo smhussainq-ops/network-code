@@ -50,6 +50,24 @@ def test_fetches_authoritative_public_limits(monkeypatch: pytest.MonkeyPatch) ->
     assert value.production_writes is True
 
 
+def test_cache_and_authority_request_are_scoped_by_organization(monkeypatch: pytest.MonkeyPatch) -> None:
+    seen: list[str] = []
+
+    def authority(request, timeout):
+        headers = {key.lower(): value for key, value in request.header_items()}
+        org_id = headers["x-rezonance-org-id"]
+        seen.append(org_id)
+        payload = _payload()
+        payload["entitlements"]["max_devices"] = 25 if org_id == "org-a" else 10000
+        return _Response(payload)
+
+    monkeypatch.setattr(entitlements.urllib.request, "urlopen", authority)
+    assert entitlements.get_entitlements(org_id="org-a").max_devices == 25
+    assert entitlements.get_entitlements(org_id="org-b").max_devices == 10000
+    assert entitlements.get_entitlements(org_id="org-a").max_devices == 25
+    assert seen == ["org-a", "org-b"]
+
+
 def test_production_writes_fail_closed_for_community(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(entitlements.urllib.request, "urlopen", lambda request, timeout: _Response(_payload(writes=False)))
     with pytest.raises(entitlements.EntitlementError, match="Production writes"):

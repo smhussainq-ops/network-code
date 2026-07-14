@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import threading
 import time
 import urllib.error
@@ -50,7 +51,16 @@ class PlatformEntitlements:
 
 
 _LOCK = threading.Lock()
-_CACHE: tuple[float, PlatformEntitlements] | None = None
+_DEFAULT_ORG_ID = "org_default"
+_ORG_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
+_CACHE: dict[str, tuple[float, PlatformEntitlements]] = {}
+
+
+def canonical_org_id(value: object = None) -> str:
+    candidate = str(value or os.environ.get("NETCODE_DEFAULT_ORG_ID", _DEFAULT_ORG_ID)).strip()
+    if not _ORG_ID_PATTERN.fullmatch(candidate):
+        raise EntitlementError("The organization identifier is invalid.")
+    return candidate
 
 
 def enforcement_enabled() -> bool:
@@ -86,8 +96,8 @@ def _parse(payload: dict[str, Any], *, stale: bool = False) -> PlatformEntitleme
     return result
 
 
-def get_entitlements(*, force: bool = False) -> PlatformEntitlements:
-    global _CACHE
+def get_entitlements(*, org_id: str = _DEFAULT_ORG_ID, force: bool = False) -> PlatformEntitlements:
+    org = canonical_org_id(org_id)
     if not enforcement_enabled():
         return _development_entitlements()
 
@@ -100,13 +110,17 @@ def get_entitlements(*, force: bool = False) -> PlatformEntitlements:
     ttl = max(5, int(os.environ.get("NETCODE_ENTITLEMENT_CACHE_SECONDS", "60") or 60))
     stale_grace = max(ttl, int(os.environ.get("NETCODE_ENTITLEMENT_STALE_SECONDS", "300") or 300))
     with _LOCK:
-        cached = _CACHE
+        cached = _CACHE.get(org)
     if not force and cached and now - cached[0] <= ttl:
         return cached[1]
 
     request = urllib.request.Request(
         url,
-        headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/json",
+            "X-Rezonance-Org-ID": org,
+        },
         method="GET",
     )
     try:
@@ -114,7 +128,7 @@ def get_entitlements(*, force: bool = False) -> PlatformEntitlements:
             payload = json.loads(response.read().decode("utf-8"))
         result = _parse(payload)
         with _LOCK:
-            _CACHE = (now, result)
+            _CACHE[org] = (now, result)
         return result
     except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, OSError, ValueError, json.JSONDecodeError) as exc:
         if cached and now - cached[0] <= stale_grace:
@@ -123,8 +137,8 @@ def get_entitlements(*, force: bool = False) -> PlatformEntitlements:
         raise EntitlementError("The entitlement authority is unavailable; protected operations fail closed.") from exc
 
 
-def require_production_writes() -> PlatformEntitlements:
-    entitlements = get_entitlements()
+def require_production_writes(*, org_id: str = _DEFAULT_ORG_ID) -> PlatformEntitlements:
+    entitlements = get_entitlements(org_id=org_id)
     if not entitlements.production_writes:
         raise EntitlementError(
             f"Production writes are not included in the {entitlements.plan_id} plan. Planning, dry-run, and verification remain available."
@@ -141,8 +155,14 @@ def job_requires_production_writes(action: str) -> bool:
     return False
 
 
-def enforce_capacity(resource: str, *, current: int, additional: int = 1) -> PlatformEntitlements:
-    entitlements = get_entitlements()
+def enforce_capacity(
+    resource: str,
+    *,
+    current: int,
+    additional: int = 1,
+    org_id: str = _DEFAULT_ORG_ID,
+) -> PlatformEntitlements:
+    entitlements = get_entitlements(org_id=org_id)
     limits = {
         "devices": entitlements.max_devices,
         "connectors": entitlements.max_connectors,
@@ -159,6 +179,5 @@ def enforce_capacity(resource: str, *, current: int, additional: int = 1) -> Pla
 
 
 def reset_cache_for_tests() -> None:
-    global _CACHE
     with _LOCK:
-        _CACHE = None
+        _CACHE.clear()
