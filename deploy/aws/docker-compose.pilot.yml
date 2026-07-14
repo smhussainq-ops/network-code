@@ -6,11 +6,11 @@ services:
     ports:
       - "8095:8095"
     env_file:
-      - ./netcode.env.example
+      - ./netcode.env
     volumes:
       - netcode-data:/data
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8095/api/health', timeout=5).read()"]
+      test: ["CMD", "python", "-c", "import os,urllib.request; h=(os.getenv('NETCODE_ALLOWED_HOSTS','localhost').split(',')[0].strip() or 'localhost'); q=urllib.request.Request('http://127.0.0.1:8095/api/ready',headers={'Host':h}); urllib.request.urlopen(q,timeout=5).read()"]
       interval: 30s
       timeout: 10s
       retries: 3

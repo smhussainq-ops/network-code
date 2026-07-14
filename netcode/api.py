@@ -12,11 +12,13 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor, TimeoutError
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from urllib.parse import urlparse
 
 from fastapi import Body, FastAPI, Header, HTTPException, Query, Request, Response, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
+from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from netcode.ai_assistant import assistant_response
 from netcode.ansible_backend import (
@@ -115,6 +117,7 @@ from netcode.runner_hub import (
 from netcode.orchestrator import create_add_vlan_intent, create_desired_state_intent, run_static_pipeline
 from netcode.paths import paths
 from netcode.platform import platform_capabilities
+from netcode.production_readiness import collect_netcode_production_issues, is_production_environment
 from netcode.scale import rollout_plan
 from netcode.shell_desktop import build_desktop_shell_profile
 from netcode.source_of_truth import netbox_sync, netbox_test, provider_catalog, source_of_truth
@@ -454,7 +457,22 @@ class NetBoxRequest(BaseModel):
 TROUBLESHOOT_READ_TIMEOUT_SECONDS = 20
 
 
-app = FastAPI(title="Netcode Platform", version="0.1.0")
+_PRODUCTION_RUNTIME = is_production_environment(os.environ)
+app = FastAPI(
+    title="Netcode Platform",
+    version="0.1.0",
+    docs_url=None if _PRODUCTION_RUNTIME else "/docs",
+    redoc_url=None if _PRODUCTION_RUNTIME else "/redoc",
+    openapi_url=None if _PRODUCTION_RUNTIME else "/openapi.json",
+)
+
+_ALLOWED_HOSTS = [
+    host.strip()
+    for host in os.environ.get("NETCODE_ALLOWED_HOSTS", "").split(",")
+    if host.strip()
+]
+if _ALLOWED_HOSTS:
+    app.add_middleware(TrustedHostMiddleware, allowed_hosts=_ALLOWED_HOSTS)
 
 
 @app.exception_handler(EntitlementError)
@@ -469,7 +487,12 @@ async def _entitlement_error(_request: Request, exc: EntitlementError) -> JSONRe
 
 @app.on_event("startup")
 def _startup() -> None:
-    init_workspace(paths())
+    workspace = paths()
+    workspace.ensure()
+    issues = _netcode_production_readiness_issues()
+    if issues:
+        raise RuntimeError("Netcode production configuration is not ready: " + "; ".join(issues))
+    init_workspace(workspace, include_examples=not is_production_environment(os.environ))
     _bootstrap_admin()
     # Rollout orchestrator threads die with the process: fail any orphaned
     # running rollouts closed (halted + queued jobs cancelled) at boot.
@@ -499,6 +522,14 @@ def _bootstrap_admin() -> None:
         store.create_user(DEFAULT_ORG_ID, email, hash_password(password), role="admin")
 
 
+def _netcode_production_readiness_issues() -> list[str]:
+    store = PlatformStore(paths())
+    return collect_netcode_production_issues(
+        os.environ,
+        persisted_auth_users=store.active_user_count() > 0,
+    )
+
+
 def _enforce_catalog_growth(
     store: PlatformStore,
     org_id: str,
@@ -521,8 +552,10 @@ def _enforce_catalog_growth(
 # UI and all existing tests keep working. Auth ON (NETCODE_AUTH=1): user endpoints
 # require a valid session + role; runner endpoints keep their own token auth.
 
-_PUBLIC_EXACT = {"/", "/app", "/app/", "/api/health", "/api/auth/login", "/api/auth/logout"}
+_PUBLIC_EXACT = {"/", "/app", "/app/", "/api/health", "/api/ready", "/api/auth/login"}
 _ADMIN_PATHS = {"/api/runners/join-token"}
+_VIEWER_MUTATION_PATHS = {"/api/auth/logout"}
+_RESERVED_DOC_PATHS = frozenset({"/docs", "/redoc", "/openapi.json"})
 
 
 def _is_rez_bridge_request(path: str, authorization: str | None) -> bool:
@@ -746,8 +779,19 @@ def _intent_from_rca_proposal(request: RcaRemediationProposalRequest) -> dict[st
 @app.middleware("http")
 async def _rbac(request: Request, call_next):
     path = request.url.path
+    normalized_path = path.rstrip("/") or "/"
+    if _PRODUCTION_RUNTIME and (
+        normalized_path in _RESERVED_DOC_PATHS
+        or normalized_path.startswith(("/docs/", "/redoc/"))
+    ):
+        return JSONResponse({"detail": "Not found."}, status_code=404)
+    authorization = request.headers.get("authorization")
+    cookie_token = (request.cookies.get("netcode_session") or "").strip()
+    using_cookie_auth = not authorization and bool(cookie_token)
+    if not authorization and cookie_token:
+        authorization = f"Bearer {cookie_token}"
     if auth_enabled():
-        request.state.principal = resolve_principal(PlatformStore(paths()), request.headers.get("authorization"))
+        request.state.principal = resolve_principal(PlatformStore(paths()), authorization)
     else:
         request.state.principal = SYSTEM_PRINCIPAL
     principal = request.state.principal
@@ -758,15 +802,44 @@ async def _rbac(request: Request, call_next):
         path in _PUBLIC_EXACT
         or path.startswith("/static")
         or path.startswith("/api/runner/")
-        or _is_rez_bridge_request(path, request.headers.get("authorization"))
+        or _is_rez_bridge_request(path, authorization)
     )
     if auth_enabled() and not bypass:
         if not principal.authenticated:
             return JSONResponse({"detail": "Authentication required."}, status_code=401)
-        required = "admin" if path in _ADMIN_PATHS else ("operator" if request.method in ("POST", "PUT", "PATCH", "DELETE") else "viewer")
+        if using_cookie_auth and request.method in ("POST", "PUT", "PATCH", "DELETE"):
+            origin = (request.headers.get("origin") or request.headers.get("referer") or "").strip()
+            origin_host = (urlparse(origin).hostname or "").strip().lower()
+            request_host = (request.url.hostname or "").strip().lower()
+            if _PRODUCTION_RUNTIME and origin_host != request_host:
+                return JSONResponse({"detail": "Request origin is not allowed."}, status_code=403)
+        required = (
+            "admin"
+            if path in _ADMIN_PATHS
+            else "viewer"
+            if path in _VIEWER_MUTATION_PATHS
+            else "operator"
+            if request.method in ("POST", "PUT", "PATCH", "DELETE")
+            else "viewer"
+        )
         if not principal.has_role(required):
             return JSONResponse({"detail": f"This action requires the '{required}' role."}, status_code=403)
     return await call_next(request)
+
+
+@app.middleware("http")
+async def _security_headers(request: Request, call_next):
+    response = await call_next(request)
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+    response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
+    response.headers["Content-Security-Policy"] = (
+        "default-src 'self'; script-src 'self'; style-src 'self'; "
+        "img-src 'self' data:; connect-src 'self' ws: wss:; "
+        "object-src 'none'; frame-ancestors 'none'; base-uri 'none'"
+    )
+    return response
 
 
 @app.get("/")
@@ -819,6 +892,16 @@ def health() -> dict[str, object]:
         "execution": {"mode": execution_mode(), "pool": runner_pool()},
         "entitlements": entitlement_status,
     }
+
+
+@app.get("/api/ready")
+def ready() -> JSONResponse:
+    """Load-balancer readiness probe with no configuration or secret disclosure."""
+    issues = _netcode_production_readiness_issues()
+    return JSONResponse(
+        status_code=200 if not issues else 503,
+        content={"status": "ready" if not issues else "not_ready"},
+    )
 
 
 @app.post("/api/init")
@@ -1961,22 +2044,40 @@ def _require_runner(store: PlatformStore, authorization: str | None):
 
 
 @app.post("/api/auth/login")
-def api_login(request: LoginRequest) -> dict[str, object]:
+def api_login(request: LoginRequest) -> JSONResponse:
     store = PlatformStore(paths())
     org_id = request.org_id or DEFAULT_ORG_ID
     user = store.get_user_by_email(org_id, request.email)
     if not user or not verify_password(request.password, str(user["password_hash"])):
         raise HTTPException(status_code=401, detail="Invalid email or password.")
     token = mint_session(store, str(user["id"]), org_id)
-    return {"ok": True, "token": token, "user": {"email": user["email"], "role": user["role"], "org_id": org_id}}
+    response = JSONResponse(
+        {
+            "ok": True,
+            "token": token,
+            "user": {"email": user["email"], "role": user["role"], "org_id": org_id},
+        }
+    )
+    response.set_cookie(
+        "netcode_session",
+        token,
+        max_age=12 * 60 * 60,
+        httponly=True,
+        secure=_PRODUCTION_RUNTIME,
+        samesite="lax",
+        path="/",
+    )
+    return response
 
 
 @app.post("/api/auth/logout")
-def api_logout(authorization: str | None = Header(default=None)) -> dict[str, object]:
-    token = (authorization or "").removeprefix("Bearer ").strip()
+def api_logout(request: Request, authorization: str | None = Header(default=None)) -> JSONResponse:
+    token = (authorization or "").removeprefix("Bearer ").strip() or (request.cookies.get("netcode_session") or "").strip()
     if token:
         PlatformStore(paths()).revoke_session(token_hash(token))
-    return {"ok": True}
+    response = JSONResponse({"ok": True})
+    response.delete_cookie("netcode_session", path="/", httponly=True, secure=_PRODUCTION_RUNTIME, samesite="lax")
+    return response
 
 
 @app.get("/api/auth/me")

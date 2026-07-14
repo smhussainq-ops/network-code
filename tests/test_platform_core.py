@@ -3635,6 +3635,12 @@ def test_auth_rbac_and_tenant_isolation(tmp_path: Path, monkeypatch):
     view_tok = login("view@a.co", "view-pw").json()["token"]
     H = lambda t: {"Authorization": f"Bearer {t}"}
 
+    # Browser sessions are HttpOnly cookies; the standalone UI no longer stores
+    # long-lived bearer tokens in localStorage. Header-token clients still work.
+    cookie_login = login("admin@a.co", "s3cret-pw")
+    assert "HttpOnly" in cookie_login.headers["set-cookie"]
+    assert client.get("/api/auth/me").json()["role"] == "admin"
+
     assert client.get("/api/auth/me", headers=H(admin_tok)).json()["role"] == "admin"
 
     # Viewer may read but not perform write actions.

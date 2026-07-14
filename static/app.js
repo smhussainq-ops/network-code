@@ -72,7 +72,7 @@ function apiError(data, fallback) {
   return typeof data.detail === "string" ? data.detail : formatJson(data.detail);
 }
 
-let authToken = localStorage.getItem("netcode_token") || "";
+let authToken = "";
 
 function authHeaders(extra = {}) {
   return authToken ? { ...extra, Authorization: `Bearer ${authToken}` } : extra;
@@ -145,8 +145,7 @@ async function handleLogin(event) {
     });
     const data = await res.json();
     if (!res.ok || !data.token) throw new Error(data.detail || "Invalid email or password.");
-    authToken = data.token;
-    localStorage.setItem("netcode_token", authToken);
+    authToken = "";
     $("login-overlay").hidden = true;
     await boot();
   } catch (error) {

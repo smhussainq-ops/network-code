@@ -138,7 +138,12 @@ WORKSPACE_GITIGNORE = """# Netcode change workspace: Git tracks ONLY change arti
 """
 
 
-def init_workspace(paths: WorkspacePaths, force: bool = False) -> list[Path]:
+def init_workspace(
+    paths: WorkspacePaths,
+    force: bool = False,
+    *,
+    include_examples: bool = True,
+) -> list[Path]:
     paths.ensure()
     written: list[Path] = []
 
@@ -202,10 +207,11 @@ def init_workspace(paths: WorkspacePaths, force: bool = False) -> list[Path]:
             "store-1844": ["10.44.30.0/24", "10.44.40.0/24"],
         },
     }
-    inv_path = paths.inventories / "lab.yaml"
-    if force or not inv_path.exists():
-        write_yaml(inv_path, inventory)
-        written.append(inv_path)
+    if include_examples:
+        inv_path = paths.inventories / "lab.yaml"
+        if force or not inv_path.exists():
+            write_yaml(inv_path, inventory)
+            written.append(inv_path)
 
     policies = {
         "vlan": {
@@ -262,6 +268,10 @@ def init_workspace(paths: WorkspacePaths, force: bool = False) -> list[Path]:
             ],
         },
     }
+    if not include_examples:
+        # Keep the generic rendering safety floor, but never project sample
+        # customer subnets into a production workspace.
+        policies["segmentation"]["pci_subnets"] = []
     policy_path = paths.policies / "invariants.yaml"
     if force or not policy_path.exists():
         write_yaml(policy_path, policies)
@@ -281,9 +291,10 @@ def init_workspace(paths: WorkspacePaths, force: bool = False) -> list[Path]:
         "policy": {"pci_reachable": False, "internet_reachable": True},
         "metadata": {"requested_by": "lab-engineer", "learning_mode": True},
     }
-    example_path = paths.intents / "examples" / "add_guest_vlan.yaml"
-    if force or not example_path.exists():
-        write_yaml(example_path, example)
-        written.append(example_path)
+    if include_examples:
+        example_path = paths.intents / "examples" / "add_guest_vlan.yaml"
+        if force or not example_path.exists():
+            write_yaml(example_path, example)
+            written.append(example_path)
 
     return written

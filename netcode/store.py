@@ -1978,6 +1978,17 @@ class PlatformStore:
             row = conn.execute("SELECT 1 FROM users WHERE org_id = ? AND email = ?", (org_id, email.strip().lower())).fetchone()
         return row is not None
 
+    def active_user_count(self, org_id: str | None = None) -> int:
+        with self._connect() as conn:
+            if org_id is None:
+                row = conn.execute("SELECT COUNT(*) AS total FROM users WHERE status = 'active'").fetchone()
+            else:
+                row = conn.execute(
+                    "SELECT COUNT(*) AS total FROM users WHERE org_id = ? AND status = 'active'",
+                    (org_id,),
+                ).fetchone()
+        return int(row["total"]) if row else 0
+
     def create_session(self, token_hash: str, user_id: str, org_id: str, expires_at: str) -> None:
         with self._connect() as conn:
             conn.execute(

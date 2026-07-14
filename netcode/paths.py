@@ -52,6 +52,9 @@ class WorkspacePaths:
 
     @property
     def static(self) -> Path:
+        configured = os.environ.get("NETCODE_STATIC_DIR", "").strip()
+        if configured:
+            return Path(configured).expanduser().resolve()
         return self.root / "static"
 
     def ensure(self) -> None:
