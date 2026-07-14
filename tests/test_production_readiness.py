@@ -247,6 +247,9 @@ def test_production_workspace_does_not_seed_lab_inventory_or_example_intent(tmp_
 def test_production_image_does_not_embed_lab_inventory():
     dockerfile = (Path(__file__).resolve().parents[1] / "Dockerfile").read_text(encoding="utf-8")
 
+    assert dockerfile.startswith("FROM public.ecr.aws/amazonlinux/amazonlinux:2023-minimal\n")
+    assert "FROM python:3.12-slim" not in dockerfile
+    assert "USER 65534:65534" in dockerfile
     assert "COPY inventories" not in dockerfile
 
 
