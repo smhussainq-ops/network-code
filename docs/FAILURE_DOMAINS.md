@@ -1,5 +1,7 @@
 # Netcode Failure-Domain & Resilience
 
+> **Current implementation note (2026-07-14):** This document began as the Phase 0 architecture record. Job leases, safe crash recovery, uncertain-write reconciliation, per-device serialization, connector drain, credential expiry/rotation, and revocation have since shipped. Current evidence is in `docs/R5_CONNECTOR_RELIABILITY_EVIDENCE_2026-07-14.md`; where older Phase 0 wording conflicts, the dated evidence is authoritative.
+
 **"But it's cloud-controlled."**
 
 Every network engineer who lived through a Meraki dashboard outage — or watched a controller push bad config to every site at once — asks this first. It is the right question. The wrong answer is to promise the cloud never goes down. The right answer is architectural: **the cloud is not in the datapath, and it cannot touch your devices.** Netcode is built so that a total control-plane failure degrades to "you can't start new changes for a while" — never to "your running network is at risk."
@@ -27,10 +29,11 @@ This is the Meraki inversion: cloud-controlled becomes the *differentiator*, bec
 |---|---|---|---|---|
 | **Control plane unreachable / down** | Nothing on the device | Devices keep running untouched. In-flight session aborts safely (see below). Git artifacts on disk survive. New changes can't be *started* until it returns. | Author workflow only | Structural (no device reach) |
 | **Runner offline** | A queued change | Job stays `queued`; nothing is claimed; **nothing reaches the device.** | The queued change waits | **PROVEN LIVE** — VLAN 95 never appeared |
-| **Runner crashes mid-apply** | The in-flight config session | SIGTERM drain finishes/aborts the current job before exit; a hard crash leaves the EOS session uncommitted, so running-config is unchanged. | One device, one change | SIGTERM handler in code |
+| **Runner crashes mid-apply** | The in-flight operation | SIGTERM drains normally. An expired write lease is never replayed; it becomes `reconcile_required`, queues read-only state verification, and remains blocked for human review. | One device, one change | Lease and reconciliation failure-injection tests |
 | **Network partition during a config session** | The candidate config | EOS config session is abandoned uncommitted → running-config untouched. On the runner side, `config_session` aborts on any exception. | One device, one change | Abort discipline in `lab.py` |
 | **Compromised / buggy control plane pushes forbidden config** | Device integrity | Runner re-runs fail-closed policy **locally** before touching the device; forbidden config is blocked at the runner even if the cloud check is bypassed. | Blocked at the edge | Local gate in `runner_checks.py` |
 | **Bad or duplicated result submitted** | Workflow integrity | HMAC-SHA256 signature verified control-plane-side; mismatch → result rejected, job left claimable, workflow **not advanced.** | Rejected, no state change | Signature check in `runner_hub.py` |
+| **Duplicate request or connector process** | Duplicate device operation | Idempotency, one active claim per connector identity, and per-device mutation serialization reduce duplicate execution to one durable operation. | One durable job | Concurrency and lease tests |
 | **Credential exposure via the cloud** | Device passwords | Credentials never transit the cloud; job payloads are credential-free; runner resolves creds from its own local inventory. | None (creds never leave premises) | **PROVEN LIVE** — password stripped, change still succeeded |
 
 ---
@@ -141,14 +144,14 @@ A full compromise of the SaaS therefore yields zero device passwords. There is n
 
 ## What we do NOT yet handle (honesty section)
 
-Resilience claims are only credible if we're equally clear about the gaps. As of Phase 0:
+Resilience claims are only credible if we're equally clear about the remaining gaps:
 
 - **HMAC, not asymmetric signing.** Results are signed with a symmetric per-runner secret issued at enrollment. The control plane holds that secret, so it could in principle forge a runner's result. Phase 1 upgrades to runner-held asymmetric keys so the cloud can *verify* but never *forge*. (`runner_hub.py` header note.)
-- **SQLite store, single admin token.** State lives in SQLite (`store.py`) behind one `NETCODE_ADMIN_TOKEN` (open when unset, for local dev). There is no HA control plane, no multi-tenant isolation, and no RBAC yet — Postgres + auth/RBAC are M5. A control-plane host failure means restore-from-disk, not automatic failover.
-- **No runner high-availability / no job leasing timeout.** A single runner per pool is the tested configuration. If a runner claims a job and then dies *ungracefully*, that job's cloud-side record can be left in `running` (the device is still safe — see §3/§4 — but the workflow entry needs manual attention). There is no automatic lease expiry that re-queues a claimed-but-abandoned job yet.
+- **Single control-plane task for the pilot.** Organization scoping and Postgres-backed deployment are implemented, but interactive coordination still requires one control-plane task until shared coordination is proven. This limits control-plane availability, not device safety.
+- **Connector HA needs environment proof.** Leases, duplicate-process protection, per-device serialization, recovery, drain, rotation, and revocation are implemented. A multi-connector customer deployment still requires a public TLS/WSS soak and failure test in that environment.
 - **Apply is verify-gated but not transactional across devices.** Each change targets one device via one config session. There is no multi-device atomic commit; a change spanning several devices is several independent sessions, each individually safe but not jointly all-or-nothing.
-- **Read paths still run control-plane-side.** Verify/readiness/drift/discovery currently execute on the control plane and are local-mode only; they are not yet routed through the runner (`network-as-code-phase0-plan.md`, deferred items). In runner mode, live reads that need device reach are not available until this lands.
-- **Lab adapter is marked not production-ready.** `AristaEOSLabAdapter.metadata.production_ready = False`. The config-session write model is proven on Arista lab hardware; production certification across platforms is future work.
+- **Read depth varies by platform.** Discovery, verification, drift, Rez read tools, Shell, and supported APIs route through the Local Connector. The reviewed status of each platform is published by `/api/platform/capabilities`; contract-tested adapters are not hardware certifications.
+- **Write support remains intentionally narrow.** Arista EOS has the live dry-run/apply/verify/rollback proof. Other direct and manager-mediated writes stay `planned` or `hardware-blocked` until proven on the customer's selected hardware.
 
 None of these gaps put the *running network* at risk — the device-safety properties in §3–§7 hold regardless. They are workflow-integrity and operational-maturity gaps, and each has a named home on the Phase 0 → Phase 1 roadmap.
 

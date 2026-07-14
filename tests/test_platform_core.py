@@ -8,7 +8,7 @@ from pathlib import Path
 from fastapi.testclient import TestClient
 
 from netcode.adapters.registry import AdapterRegistry
-from netcode.adapters.rez import RezAdapterBridge
+from netcode.adapters.rez import READ_TRANSPORTS, RezAdapterBridge
 from netcode import api
 from netcode.bootstrap import init_workspace
 from netcode.discovery import DiscoveryService
@@ -4018,3 +4018,5 @@ def test_platform_capabilities_endpoint(tmp_path: Path, monkeypatch):
     assert response.status_code == 200
     assert data["summary"] == "Safe, reviewable, evidence-backed network changes."
     assert len(data["deliverables"]) == 15
+    assert data["support_matrix"]["schema"] == "rezonance.product-support.v1"
+    assert len(data["support_matrix"]["rows"]) == len(READ_TRANSPORTS)

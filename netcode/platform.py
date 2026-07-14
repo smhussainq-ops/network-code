@@ -5,6 +5,7 @@ from __future__ import annotations
 from netcode.adapters.registry import AdapterRegistry
 from netcode.inventory import Inventory
 from netcode.paths import WorkspacePaths
+from netcode.product_capabilities import product_support_matrix
 from netcode.store import PlatformStore
 from netcode.ui_config import configured_inventory_path, configured_policy_path, configured_template_dir, read_ui_config
 
@@ -16,6 +17,7 @@ def platform_capabilities(paths: WorkspacePaths) -> dict[str, object]:
     template_dir = configured_template_dir(paths)
     inventory = Inventory(inventory_path)
     adapters = AdapterRegistry().summary()
+    support_matrix = product_support_matrix()
     jobs = PlatformStore(paths).list_jobs(limit=1)
     latest_job = jobs[0] if jobs else None
     sot_summary = {
@@ -59,4 +61,5 @@ def platform_capabilities(paths: WorkspacePaths) -> dict[str, object]:
             }
             for item_id, name, meaning, evidence in items
         ],
+        "support_matrix": support_matrix,
     }

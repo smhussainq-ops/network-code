@@ -1,16 +1,18 @@
 # Netcode Security Whitepaper
 
+> **Historical baseline plus current delta:** The body below preserves the Phase 0 trust-boundary design. Connector leases, uncertain-write reconciliation, organization scoping, bounded bearer credentials, rotation, revocation, drain, and queue controls shipped after the original text. Use `docs/R5_CONNECTOR_RELIABILITY_EVIDENCE_2026-07-14.md` and the current code for the launch control inventory; do not rely on the old Phase 0 "not yet" ledger where it conflicts.
+
 ## SaaS Control Plane + On-Prem Runner Architecture
 
-**Document status:** Phase 0 (control-plane/runner split — built and hardware-proven). Version 0.1.0-phase0.
+**Document status:** Phase 0 trust-boundary record with a 2026-07-14 control delta. The dated R5 and R12 evidence documents define current launch behavior.
 **Audience:** Security reviewers, CISOs, and CABs evaluating Netcode for a mid-market network estate.
-**Scope:** This document describes the trust architecture of the Netcode control plane and the on-prem runner. Every claim below is grounded in the shipping code; file and line references are given so a reviewer can verify each assertion directly rather than take it on faith. Where a control is planned but not yet built, it is labeled **Planned** and separated from what runs today.
+**Scope:** This document describes the original trust architecture of the Netcode control plane and the on-prem runner. File and line references in the historical body may have moved; launch claims must be checked against the dated evidence documents and current code.
 
 ---
 
 ## 1. Executive summary
 
-Netcode is a network-as-code platform for CLI-managed devices (Arista EOS today). It splits into two trust domains:
+Netcode is a multi-vendor network-operations platform with an evidence-bound capability matrix. Its currently proven write surface is intentionally narrower than its read surface. It splits into two trust domains:
 
 - A **SaaS control plane** (FastAPI, `netcode/api.py`) that hosts the workflow, the change record, the job queue, and the evidence store. It runs in Netcode's cloud.
 - An **on-prem runner** (`netcode/runner_agent.py`) that the customer runs inside their own network, next to the devices. It holds device credentials, executes changes, and reports signed results.
@@ -21,9 +23,9 @@ The security posture rests on a single structural claim, which the rest of this 
 
 Two independent facts establish this. First, the job payload the control plane builds and queues is deliberately credential-free (`netcode/jobs.py::_runner_payload`); the runner resolves credentials from its own local inventory by device id (`netcode/runner_agent.py::_execute_job`). Second, before touching any device the runner re-runs a fail-closed policy gate locally against the exact config it is about to push (`netcode/runner_checks.py::local_policy_gate`), so a compromised or buggy control plane still cannot cause a forbidden change.
 
-This has been proven on hardware: with `NETCODE_EXECUTION=runner`, the queued job payload carried no password, the control-plane inventory had the device password stripped, and configuration changes still succeeded — because the runner supplied credentials from its own local store. 39 tests pass against this architecture.
+This has been proven on hardware: with `NETCODE_EXECUTION=runner`, the queued job payload carried no password, the control-plane inventory had the device password stripped, and configuration changes still succeeded — because the runner supplied credentials from its own local store. Current regression counts are preserved in the dated evidence documents rather than embedded here.
 
-We are explicit about what is *not* yet done. Result integrity today uses **HMAC-SHA256 with a per-runner shared secret**, not asymmetric signing; admin endpoints are guarded by a **single shared admin token**, not full RBAC; the store is **SQLite**, not Postgres. Section 9 states each Phase 0 reality against its planned successor without overstatement.
+We are explicit about what is *not* yet done. Result integrity today uses **HMAC-SHA256 with a per-runner shared secret**, not asymmetric signing. Local/community state defaults to SQLite, while hosted deployment supports Postgres and still requires public backup/restore proof. Section 10 preserves the original ledger plus the current identity and storage delta.
 
 ---
 
@@ -59,7 +61,7 @@ Job delivery uses **long-polling** rather than a push channel. The runner posts 
 
 ### Exact egress allowlist
 
-The runner communicates with **exactly five endpoints**, all POST, all to the single control-plane base URL configured at enrollment (`--server`). No other outbound destination is contacted by the agent:
+The runner communicates only with the configured control-plane origin. The original Phase 0 calls remain below; current releases add same-origin lease renewal, credential rotation/confirmation, and the authenticated interactive Shell channel. No inbound listener is opened on the runner:
 
 | Method | Path | Purpose | Auth |
 |---|---|---|---|
@@ -95,7 +97,7 @@ The runner writes these to `~/.netcode-runner/identity.json` and **chmods the fi
 
 **Identity scoping.** A runner belongs to exactly one pool. It can only claim jobs queued for its own pool (`poll_for_job` passes `runner.pool` to `claim_next_job`), and job claiming is atomic across concurrent runners (`store.claim_next_job`, conditional UPDATE, lines 432–447). This makes pool-per-tenant isolation a natural Phase 1 primitive.
 
-**Phase 0 identity honesty:** the runner token is a bearer secret, not an asymmetric key or mTLS certificate. There is a `token_hash` column but **no revocation flag or expiry** in the Phase 0 schema — the runner record exists and authenticates until deleted. Per-runner revocation, keypair-based identity, and short-lived auto-renewing mTLS certs are **Planned** (Section 9).
+**Current identity boundary:** the connector token remains a bearer secret rather than an asymmetric key or mTLS certificate. Tokens are hash-stored, time-bounded, rotated through a prepare/confirm protocol with bounded overlap, and can be revoked per connector. Revocation also requests drain and prevents further authentication. Asymmetric runner-held identity remains planned.
 
 ---
 
@@ -244,7 +246,7 @@ We enumerate the adversaries a mid-market reviewer cares about and state the Pha
 - Join tokens are **single-use and atomically consumed** (Section 4) — a stolen used token is inert.
 - Runner tokens and join tokens are **stored only as SHA-256 hashes** — a database read does not yield usable bearer tokens.
 - The identity file is **`0600`** on the runner host.
-- **Limit (Phase 0):** there is no per-runner revocation flag or token expiry in the schema; a stolen *live* runner token authenticates until the runner record is deleted. Revocation and short-lived auto-renewing certs are Planned.
+- **Current limit:** bearer tokens now expire, rotate, and can be revoked, but they are not mTLS certificates and the control plane still participates in the shared-secret lifecycle. Runner-held asymmetric identity remains planned.
 
 ### 9.4 Malicious or buggy runner
 
@@ -264,12 +266,12 @@ Netcode Phase 0 is the control-plane/runner split, built and hardware-proven. Th
 | Control | Phase 0 reality (shipping) | Planned |
 |---|---|---|
 | **Result signing** | HMAC-SHA256, per-runner shared secret generated by and stored on the control plane (`store.py` L143). Protects integrity vs. transport/at-rest/third parties; cloud technically can forge. | Runner-held **asymmetric keys**; cloud never holds the private key. Evidence provably runner-originated even against a compromised control plane. |
-| **Runner identity** | Bearer runner token (hash-stored). No revocation flag, no expiry in schema. | Locally-generated keypair → short-lived **auto-renewing mTLS certs**; **per-runner revocation**. |
+| **Runner identity** | Time-bounded bearer token (hash-stored) with prepare/confirm rotation, bounded previous-token overlap, and per-runner revocation. | Locally-generated keypair → short-lived **auto-renewing mTLS certs**. |
 | **Access control (admin)** | Single shared admin token via `NETCODE_ADMIN_TOKEN` (`api.py::_admin_guard`). **Open when unset** — intended for local dev only. | Full **RBAC**, per-user identity, multi-tenancy. |
 | **Credential custody** | Local `inventory.yaml` on the runner host (inside customer boundary). Never in cloud payload — proven. | **OS keyring / Vault / customer KMS**; startup self-check that refuses to run if misconfigured. |
 | **Transport** | HTTPS to the configured `--server`; agent will speak HTTP if pointed at one (lab default). | **Enforced TLS + certificate pinning** at the agent. |
 | **Job spec provenance** | Payload is credential-free and re-validated locally; not cryptographically signed by the cloud. | **Signed job specs** verified on-runner. |
-| **Store** | **SQLite** with WAL (`store.py`). | **Postgres** (blocking prerequisite before any external pilot). |
+| **Store** | SQLite with WAL for local/community use; Postgres is selected through `DATABASE_URL` for the hosted pilot. | Prove backup/restore and failover behavior in the public AWS environment. |
 | **Supply chain** | Standard-library-only runner (`urllib`), auditable, minimal dependencies. | **SBOM + CVE scanning, SLSA provenance, signed binaries, signed auto-update with rollback**, annual pen-test attestation. |
 
 **On the admin token specifically:** `_admin_guard` (`api.py`, lines 536–542) returns early — i.e. **allows the request** — when `NETCODE_ADMIN_TOKEN` is unset. This is a deliberate local-development affordance and **must not** be left unset in any hosted deployment. It is called out here so no reviewer discovers it later and mistakes a dev convenience for a production posture. Minting join tokens is the one runner-facing operation it guards; in a hosted deployment the token must be set, and it is superseded by RBAC in Phase 1.
