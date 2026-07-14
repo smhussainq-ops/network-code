@@ -109,9 +109,11 @@ from netcode.auth import (
 from netcode.models import load_intent, load_intent_data
 from netcode.runner_hub import (
     authenticate_runner,
+    confirm_runner_token_rotation,
     enroll_runner,
     mint_join_token,
     poll_for_job,
+    prepare_runner_token_rotation,
     runner_summary,
     submit_job_progress,
     submit_job_result,
@@ -2152,8 +2154,12 @@ def _admin_guard(authorization: str | None) -> None:
         raise HTTPException(status_code=401, detail="Admin token required.")
 
 
+def _runner_bearer_token(authorization: str | None) -> str:
+    return (authorization or "").removeprefix("Bearer ").strip()
+
+
 def _require_runner(store: PlatformStore, authorization: str | None):
-    token = (authorization or "").removeprefix("Bearer ").strip()
+    token = _runner_bearer_token(authorization)
     runner = authenticate_runner(store, token)
     if runner is None:
         raise HTTPException(status_code=401, detail="Runner token is invalid or revoked.")
@@ -2265,10 +2271,73 @@ def api_runner_resume(runner_id: str, request: Request) -> dict[str, object]:
     return {"ok": True, "runner": record_to_dict(runner), "message": "Connector resumed."}
 
 
+@app.post("/api/runners/{runner_id}/revoke")
+async def api_runner_revoke(runner_id: str, request: Request) -> dict[str, object]:
+    store, _runner = _admin_runner_for_request(runner_id, request)
+    principal = _request_principal(request)
+    actor = principal.email or principal.user_id or "netcode-admin"
+    try:
+        runner = store.revoke_runner(runner_id, principal.org_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    store.record_runner_security_event(
+        runner.id,
+        runner.org_id,
+        "token_revoked",
+        actor,
+        {"reason": "administrator request"},
+    )
+    channel = _RUNNER_CHANNELS.pop(runner_id, None)
+    _RUNNER_CHANNEL_POOLS.pop(runner_id, None)
+    await _terminate_shells_for_runner(runner_id, "connector_revoked")
+    if channel is not None:
+        try:
+            await channel.close(code=4403)
+        except Exception:  # noqa: BLE001 - the connector may already be disconnected.
+            pass
+    return {
+        "ok": True,
+        "runner": record_to_dict(runner),
+        "message": "Connector credential revoked; re-enrollment is required.",
+    }
+
+
+@app.get("/api/runners/{runner_id}/security-events")
+def api_runner_security_events(runner_id: str, request: Request) -> dict[str, object]:
+    store, _runner = _admin_runner_for_request(runner_id, request)
+    principal = _request_principal(request)
+    events = store.list_runner_security_events(runner_id, principal.org_id)
+    return {"ok": True, "runner_id": runner_id, "events": events, "count": len(events)}
+
+
 @app.post("/api/runner/enroll")
 def api_runner_enroll(request: RunnerEnrollRequest) -> dict[str, object]:
     store = PlatformStore(paths())
     return enroll_runner(store, request.join_token, request.name)
+
+
+@app.post("/api/runner/token/rotate")
+def api_runner_token_rotate(authorization: str | None = Header(default=None)) -> dict[str, object]:
+    store = PlatformStore(paths())
+    token = _runner_bearer_token(authorization)
+    runner = _require_runner(store, authorization)
+    try:
+        return prepare_runner_token_rotation(store, runner, token)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except (PermissionError, ValueError) as exc:
+        raise HTTPException(status_code=401, detail=str(exc)) from exc
+
+
+@app.post("/api/runner/token/confirm")
+def api_runner_token_confirm(authorization: str | None = Header(default=None)) -> dict[str, object]:
+    store = PlatformStore(paths())
+    token = _runner_bearer_token(authorization)
+    runner = _require_runner(store, authorization)
+    try:
+        return confirm_runner_token_rotation(store, runner, token)
+    except (PermissionError, ValueError) as exc:
+        raise HTTPException(status_code=401, detail=str(exc)) from exc
 
 
 @app.post("/api/runner/poll")

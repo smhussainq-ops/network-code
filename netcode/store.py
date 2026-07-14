@@ -326,6 +326,12 @@ class RunnerRecord:
     device_count: int = 0
     drain_requested: bool = False
     draining_at: str | None = None
+    token_expires_at: str | None = None
+    token_rotate_after: str | None = None
+    token_rotated_at: str | None = None
+    previous_token_expires_at: str | None = None
+    pending_token_valid_until: str | None = None
+    revoked_at: str | None = None
 
 
 @dataclass(frozen=True)
@@ -486,6 +492,33 @@ class PlatformStore:
             self._ensure_column(conn, "runners", "device_count", "INTEGER NOT NULL DEFAULT 0")
             self._ensure_column(conn, "runners", "drain_requested", "INTEGER NOT NULL DEFAULT 0")
             self._ensure_column(conn, "runners", "draining_at", "TEXT")
+            self._ensure_column(conn, "runners", "token_expires_at", "TEXT")
+            self._ensure_column(conn, "runners", "token_rotate_after", "TEXT")
+            self._ensure_column(conn, "runners", "token_rotated_at", "TEXT")
+            self._ensure_column(conn, "runners", "previous_token_hash", "TEXT")
+            self._ensure_column(conn, "runners", "previous_token_expires_at", "TEXT")
+            self._ensure_column(conn, "runners", "pending_token_hash", "TEXT")
+            self._ensure_column(conn, "runners", "pending_token_expires_at", "TEXT")
+            self._ensure_column(conn, "runners", "pending_token_rotate_after", "TEXT")
+            self._ensure_column(conn, "runners", "pending_token_valid_until", "TEXT")
+            self._ensure_column(conn, "runners", "revoked_at", "TEXT")
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS runner_security_events (
+                    id TEXT PRIMARY KEY,
+                    runner_id TEXT NOT NULL,
+                    org_id TEXT NOT NULL,
+                    event TEXT NOT NULL,
+                    actor TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    metadata_json TEXT NOT NULL DEFAULT '{}'
+                )
+                """
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_runner_security_events "
+                "ON runner_security_events (org_id, runner_id, created_at DESC)"
+            )
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS device_catalog (
@@ -1185,6 +1218,12 @@ class PlatformStore:
             device_count=int(self._col(row, "device_count") or 0),
             drain_requested=bool(self._col(row, "drain_requested") or False),
             draining_at=self._col(row, "draining_at"),
+            token_expires_at=self._col(row, "token_expires_at"),
+            token_rotate_after=self._col(row, "token_rotate_after"),
+            token_rotated_at=self._col(row, "token_rotated_at"),
+            previous_token_expires_at=self._col(row, "previous_token_expires_at"),
+            pending_token_valid_until=self._col(row, "pending_token_valid_until"),
+            revoked_at=self._col(row, "revoked_at"),
         )
 
     # ── Runner registry & job queue (Phase 0 SaaS split) ──────────────────
@@ -1210,13 +1249,38 @@ class PlatformStore:
                 return None
             return {"pool": row["pool"], "org_id": self._col(row, "org_id") or DEFAULT_ORG_ID}
 
-    def create_runner(self, name: str, pool: str, token_hash: str, hmac_secret: str, org_id: str = DEFAULT_ORG_ID) -> RunnerRecord:
+    def create_runner(
+        self,
+        name: str,
+        pool: str,
+        token_hash: str,
+        hmac_secret: str,
+        org_id: str = DEFAULT_ORG_ID,
+        *,
+        token_expires_at: str | None = None,
+        token_rotate_after: str | None = None,
+    ) -> RunnerRecord:
         runner_id = str(uuid.uuid4())
         now = utc_now()
         with self._connect() as conn:
             conn.execute(
-                "INSERT INTO runners (id, name, pool, token_hash, hmac_secret, status, version, created_at, last_seen, org_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (runner_id, name, pool, token_hash, hmac_secret, "enrolled", "", now, now, org_id),
+                "INSERT INTO runners (id, name, pool, token_hash, hmac_secret, status, version, created_at, "
+                "last_seen, org_id, token_expires_at, token_rotate_after) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    runner_id,
+                    name,
+                    pool,
+                    token_hash,
+                    hmac_secret,
+                    "enrolled",
+                    "",
+                    now,
+                    now,
+                    org_id,
+                    token_expires_at,
+                    token_rotate_after,
+                ),
             )
         return self.get_runner(runner_id)
 
@@ -1228,9 +1292,159 @@ class PlatformStore:
         return self._runner(row)
 
     def runner_by_token_hash(self, token_hash: str) -> RunnerRecord | None:
+        now = utc_now()
         with self._connect() as conn:
-            row = conn.execute("SELECT * FROM runners WHERE token_hash = ?", (token_hash,)).fetchone()
+            row = conn.execute(
+                "SELECT * FROM runners WHERE revoked_at IS NULL AND ("
+                "(token_hash = ? AND (token_expires_at IS NULL OR token_expires_at > ?)) OR "
+                "(previous_token_hash = ? AND previous_token_expires_at > ?) OR "
+                "(pending_token_hash = ? AND pending_token_valid_until > ?))",
+                (token_hash, now, token_hash, now, token_hash, now),
+            ).fetchone()
         return self._runner(row) if row else None
+
+    def prepare_runner_token_rotation(
+        self,
+        runner_id: str,
+        org_id: str,
+        *,
+        presented_token_hash: str,
+        pending_token_hash: str,
+        pending_token_expires_at: str,
+        pending_token_rotate_after: str,
+        pending_token_valid_until: str,
+    ) -> RunnerRecord:
+        """Stage a new credential without invalidating the connector's saved token."""
+        now = utc_now()
+        with self._connect() as conn:
+            if self.engine == "sqlite":
+                conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT * FROM runners WHERE id = ? AND org_id = ?" +
+                (" FOR UPDATE" if self.engine == "postgres" else ""),
+                (runner_id, org_id),
+            ).fetchone()
+            if not row or self._col(row, "revoked_at"):
+                raise ValueError(f"Unknown or revoked runner {runner_id}")
+            if not hmac.compare_digest(str(row["token_hash"]), presented_token_hash):
+                raise PermissionError("Only the current connector token can begin rotation")
+            current_expiry = str(self._col(row, "token_expires_at") or "")
+            if current_expiry and current_expiry <= now:
+                raise PermissionError("Connector token has expired; re-enrollment is required")
+            pending_hash = str(self._col(row, "pending_token_hash") or "")
+            pending_until = str(self._col(row, "pending_token_valid_until") or "")
+            if pending_hash and pending_until > now:
+                raise RuntimeError("A connector token rotation is already pending confirmation")
+            conn.execute(
+                "UPDATE runners SET pending_token_hash = ?, pending_token_expires_at = ?, "
+                "pending_token_rotate_after = ?, pending_token_valid_until = ? WHERE id = ? AND org_id = ?",
+                (
+                    pending_token_hash,
+                    pending_token_expires_at,
+                    pending_token_rotate_after,
+                    pending_token_valid_until,
+                    runner_id,
+                    org_id,
+                ),
+            )
+        return self.get_runner(runner_id)
+
+    def confirm_runner_token_rotation(
+        self,
+        runner_id: str,
+        org_id: str,
+        *,
+        presented_token_hash: str,
+        previous_token_expires_at: str,
+    ) -> tuple[RunnerRecord, bool]:
+        """Promote a locally saved pending token; confirmation is idempotent."""
+        now = utc_now()
+        already_confirmed = False
+        with self._connect() as conn:
+            if self.engine == "sqlite":
+                conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT * FROM runners WHERE id = ? AND org_id = ?" +
+                (" FOR UPDATE" if self.engine == "postgres" else ""),
+                (runner_id, org_id),
+            ).fetchone()
+            if not row or self._col(row, "revoked_at"):
+                raise ValueError(f"Unknown or revoked runner {runner_id}")
+            pending_hash = str(self._col(row, "pending_token_hash") or "")
+            if not pending_hash and hmac.compare_digest(str(row["token_hash"]), presented_token_hash):
+                already_confirmed = True
+            else:
+                pending_until = str(self._col(row, "pending_token_valid_until") or "")
+                if not pending_hash or not hmac.compare_digest(pending_hash, presented_token_hash):
+                    raise PermissionError("The presented connector token is not pending confirmation")
+                if not pending_until or pending_until <= now:
+                    raise PermissionError("The pending connector token has expired")
+                conn.execute(
+                    "UPDATE runners SET previous_token_hash = token_hash, previous_token_expires_at = ?, "
+                    "token_hash = pending_token_hash, token_expires_at = pending_token_expires_at, "
+                    "token_rotate_after = pending_token_rotate_after, token_rotated_at = ?, "
+                    "pending_token_hash = NULL, pending_token_expires_at = NULL, "
+                    "pending_token_rotate_after = NULL, pending_token_valid_until = NULL "
+                    "WHERE id = ? AND org_id = ?",
+                    (previous_token_expires_at, now, runner_id, org_id),
+                )
+        return self.get_runner(runner_id), already_confirmed
+
+    def revoke_runner(self, runner_id: str, org_id: str) -> RunnerRecord:
+        now = utc_now()
+        with self._connect() as conn:
+            cursor = conn.execute(
+                "UPDATE runners SET revoked_at = ?, status = 'revoked', drain_requested = 1, draining_at = ? "
+                "WHERE id = ? AND org_id = ? AND revoked_at IS NULL",
+                (now, now, runner_id, org_id),
+            )
+        if cursor.rowcount != 1:
+            raise ValueError(f"Unknown or already revoked runner {runner_id}")
+        return self.get_runner(runner_id)
+
+    def record_runner_security_event(
+        self,
+        runner_id: str,
+        org_id: str,
+        event: str,
+        actor: str,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT INTO runner_security_events "
+                "(id, runner_id, org_id, event, actor, created_at, metadata_json) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    str(uuid.uuid4()),
+                    runner_id,
+                    org_id,
+                    str(event),
+                    str(actor),
+                    utc_now(),
+                    json.dumps(metadata or {}, sort_keys=True),
+                ),
+            )
+
+    def list_runner_security_events(self, runner_id: str, org_id: str, *, limit: int = 100) -> list[dict[str, Any]]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM runner_security_events WHERE runner_id = ? AND org_id = ? "
+                "ORDER BY created_at DESC LIMIT ?",
+                (runner_id, org_id, max(1, min(int(limit), 500))),
+            ).fetchall()
+        return [
+            {
+                "id": str(row["id"]),
+                "runner_id": str(row["runner_id"]),
+                "org_id": str(row["org_id"]),
+                "event": str(row["event"]),
+                "actor": str(row["actor"]),
+                "created_at": str(row["created_at"]),
+                "metadata": json.loads(row["metadata_json"] or "{}"),
+            }
+            for row in rows
+        ]
 
     def runner_hmac_secret(self, runner_id: str) -> str:
         with self._connect() as conn:
@@ -1245,13 +1459,13 @@ class PlatformStore:
             if version is None:
                 conn.execute(
                     "UPDATE runners SET status = CASE WHEN drain_requested = 1 THEN 'draining' ELSE ? END, "
-                    "last_seen = ? WHERE id = ?",
+                    "last_seen = ? WHERE id = ? AND revoked_at IS NULL",
                     (status, utc_now(), runner_id),
                 )
             else:
                 conn.execute(
                     "UPDATE runners SET status = CASE WHEN drain_requested = 1 THEN 'draining' ELSE ? END, "
-                    "version = ?, last_seen = ? WHERE id = ?",
+                    "version = ?, last_seen = ? WHERE id = ? AND revoked_at IS NULL",
                     (status, version, utc_now(), runner_id),
                 )
 
@@ -1265,7 +1479,7 @@ class PlatformStore:
                 "UPDATE runners SET status = CASE WHEN drain_requested = 1 THEN 'draining' ELSE ? END, "
                 "version = ?, last_seen = ?, draining_at = CASE "
                 "WHEN drain_requested = 1 OR ? = 'draining' THEN COALESCE(draining_at, ?) ELSE NULL END "
-                "WHERE id = ?",
+                "WHERE id = ? AND revoked_at IS NULL",
                 (normalized, version, now, normalized, now, runner_id),
             )
         return self.get_runner(runner_id)
@@ -1275,7 +1489,7 @@ class PlatformStore:
         with self._connect() as conn:
             cursor = conn.execute(
                 "UPDATE runners SET drain_requested = ?, status = ?, draining_at = ?, last_seen = last_seen "
-                "WHERE id = ? AND org_id = ?",
+                "WHERE id = ? AND org_id = ? AND revoked_at IS NULL",
                 (
                     int(requested),
                     "draining" if requested else "enrolled",
@@ -1548,12 +1762,16 @@ class PlatformStore:
                     )
             if replace:
                 conn.execute(
-                    "UPDATE runners SET inventory_revision = ?, device_count = ?, last_seen = ?, status = 'online' WHERE id = ?",
+                    "UPDATE runners SET inventory_revision = ?, device_count = ?, last_seen = ?, "
+                    "status = CASE WHEN drain_requested = 1 THEN 'draining' ELSE 'online' END "
+                    "WHERE id = ? AND revoked_at IS NULL",
                     (revision, len(normalized), now, runner.id),
                 )
             else:
                 conn.execute(
-                    "UPDATE runners SET last_seen = ?, status = 'online' WHERE id = ?",
+                    "UPDATE runners SET last_seen = ?, "
+                    "status = CASE WHEN drain_requested = 1 THEN 'draining' ELSE 'online' END "
+                    "WHERE id = ? AND revoked_at IS NULL",
                     (now, runner.id),
                 )
             count_row = conn.execute(

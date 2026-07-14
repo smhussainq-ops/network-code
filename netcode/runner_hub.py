@@ -14,10 +14,12 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import os
 import re
 import secrets
 import time
 import uuid
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from netcode.entitlements import EntitlementError, enforce_capacity
@@ -37,6 +39,39 @@ from netcode.workflow import state_after_lab_action
 
 def _hash(token: str) -> str:
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def _bounded_env_seconds(name: str, default: int, minimum: int, maximum: int) -> int:
+    try:
+        configured = int(os.environ.get(name, str(default)) or str(default))
+    except ValueError:
+        configured = default
+    return max(minimum, min(configured, maximum))
+
+
+def runner_token_ttl_seconds() -> int:
+    return _bounded_env_seconds("NETCODE_RUNNER_TOKEN_TTL_SECONDS", 90 * 24 * 3600, 300, 365 * 24 * 3600)
+
+
+def runner_token_pending_seconds() -> int:
+    return _bounded_env_seconds("NETCODE_RUNNER_TOKEN_PENDING_SECONDS", 15 * 60, 60, 3600)
+
+
+def runner_token_grace_seconds() -> int:
+    return _bounded_env_seconds("NETCODE_RUNNER_TOKEN_GRACE_SECONDS", 5 * 60, 30, 3600)
+
+
+def _runner_token_window() -> dict[str, str]:
+    issued = datetime.now(timezone.utc)
+    ttl = runner_token_ttl_seconds()
+    pending_seconds = min(runner_token_pending_seconds(), max(60, ttl // 4))
+    return {
+        "token_expires_at": (issued + timedelta(seconds=ttl)).isoformat(),
+        "token_rotate_after": (issued + timedelta(seconds=max(60, int(ttl * 0.8)))).isoformat(),
+        "pending_token_valid_until": (
+            issued + timedelta(seconds=pending_seconds)
+        ).isoformat(),
+    }
 
 
 def canonical_json(value: dict[str, Any]) -> str:
@@ -76,14 +111,32 @@ def enroll_runner(store: PlatformStore, join_token: str, name: str) -> dict[str,
         return {"ok": False, "message": str(exc), "error": "connector_limit_reached"}
     runner_token = f"nrt_{secrets.token_urlsafe(32)}"
     hmac_secret = secrets.token_urlsafe(32)
+    window = _runner_token_window()
     # The runner's tenant is decided exactly once, here, from the join token's org.
-    runner = store.create_runner(name=name, pool=pool, token_hash=_hash(runner_token), hmac_secret=hmac_secret, org_id=org_id)
+    runner = store.create_runner(
+        name=name,
+        pool=pool,
+        token_hash=_hash(runner_token),
+        hmac_secret=hmac_secret,
+        org_id=org_id,
+        token_expires_at=window["token_expires_at"],
+        token_rotate_after=window["token_rotate_after"],
+    )
+    store.record_runner_security_event(
+        runner.id,
+        runner.org_id,
+        "token_enrolled",
+        runner.id,
+        {"token_expires_at": window["token_expires_at"]},
+    )
     return {
         "ok": True,
         "runner_id": runner.id,
         "runner_token": runner_token,
         "hmac_secret": hmac_secret,
         "pool": pool,
+        "token_expires_at": window["token_expires_at"],
+        "token_rotate_after": window["token_rotate_after"],
         "message": f"Runner '{name}' enrolled into pool '{pool}'.",
     }
 
@@ -93,6 +146,74 @@ def authenticate_runner(store: PlatformStore, bearer_token: str) -> RunnerRecord
     if not token:
         return None
     return store.runner_by_token_hash(_hash(token))
+
+
+def prepare_runner_token_rotation(
+    store: PlatformStore,
+    runner: RunnerRecord,
+    current_token: str,
+) -> dict[str, Any]:
+    pending_token = f"nrt_{secrets.token_urlsafe(32)}"
+    window = _runner_token_window()
+    store.prepare_runner_token_rotation(
+        runner.id,
+        runner.org_id,
+        presented_token_hash=_hash(current_token),
+        pending_token_hash=_hash(pending_token),
+        pending_token_expires_at=window["token_expires_at"],
+        pending_token_rotate_after=window["token_rotate_after"],
+        pending_token_valid_until=window["pending_token_valid_until"],
+    )
+    store.record_runner_security_event(
+        runner.id,
+        runner.org_id,
+        "token_rotation_prepared",
+        runner.id,
+        {"pending_token_valid_until": window["pending_token_valid_until"]},
+    )
+    return {
+        "ok": True,
+        "runner_id": runner.id,
+        "runner_token": pending_token,
+        "token_expires_at": window["token_expires_at"],
+        "token_rotate_after": window["token_rotate_after"],
+        "pending_token_valid_until": window["pending_token_valid_until"],
+        "confirmation_required": True,
+    }
+
+
+def confirm_runner_token_rotation(
+    store: PlatformStore,
+    runner: RunnerRecord,
+    presented_token: str,
+) -> dict[str, Any]:
+    previous_expires = (
+        datetime.now(timezone.utc) + timedelta(seconds=runner_token_grace_seconds())
+    ).isoformat()
+    confirmed, already_confirmed = store.confirm_runner_token_rotation(
+        runner.id,
+        runner.org_id,
+        presented_token_hash=_hash(presented_token),
+        previous_token_expires_at=previous_expires,
+    )
+    if not already_confirmed:
+        store.record_runner_security_event(
+            runner.id,
+            runner.org_id,
+            "token_rotation_confirmed",
+            runner.id,
+            {
+                "token_expires_at": confirmed.token_expires_at,
+                "previous_token_expires_at": previous_expires,
+            },
+        )
+    return {
+        "ok": True,
+        "runner_id": confirmed.id,
+        "token_expires_at": confirmed.token_expires_at,
+        "token_rotate_after": confirmed.token_rotate_after,
+        "already_confirmed": already_confirmed,
+    }
 
 
 def poll_for_job(store: PlatformStore, runner: RunnerRecord, wait_seconds: float = 20.0) -> JobRecord | None:

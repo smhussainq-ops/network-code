@@ -45,7 +45,7 @@ INVENTORY_FILE = IDENTITY_DIR / ("inventory.dpapi" if _WINDOWS_DPAPI else "inven
 POLICY_FILE = IDENTITY_DIR / "policy.yaml"
 MANAGER_LEDGER_FILE = IDENTITY_DIR / "manager-operations.json"
 OPERATION_LEDGER_FILE = IDENTITY_DIR / "device-operations.db"
-VERSION = "0.6.0-idempotent-operations"
+VERSION = "0.7.0-token-lifecycle"
 
 _stop = False
 _SHELL_ADAPTERS: dict[str, dict[str, Any]] = {}
@@ -155,19 +155,33 @@ def enroll(args: argparse.Namespace) -> int:
         "hmac_secret": resp["hmac_secret"],
         "pool": resp["pool"],
         "name": args.name,
+        "token_expires_at": resp.get("token_expires_at"),
+        "token_rotate_after": resp.get("token_rotate_after"),
+        "token_pending": False,
     }
-    serialized = json.dumps(identity, indent=2).encode("utf-8")
-    if IDENTITY_FILE.suffix.lower() == ".dpapi":
-        from netcode.windows_security import protect_machine
-
-        IDENTITY_FILE.write_bytes(protect_machine(serialized))
-    else:
-        IDENTITY_FILE.write_bytes(serialized)
-        IDENTITY_FILE.chmod(0o600)
+    _write_identity(identity)
     print(f"[runner] Enrolled '{args.name}' into pool '{resp['pool']}'. Identity saved to {IDENTITY_FILE}")
     if not INVENTORY_FILE.exists():
         print(f"[runner] NOTE: put your device inventory (with credentials) at {INVENTORY_FILE}")
     return 0
+
+
+def _write_identity(identity: dict[str, Any]) -> None:
+    """Atomically replace the machine identity; a failed write leaves the old token usable."""
+    IDENTITY_DIR.mkdir(parents=True, exist_ok=True)
+    serialized = json.dumps(identity, indent=2).encode("utf-8")
+    if IDENTITY_FILE.suffix.lower() == ".dpapi":
+        from netcode.windows_security import protect_machine
+
+        serialized = protect_machine(serialized)
+    temporary = IDENTITY_FILE.with_name(f".{IDENTITY_FILE.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        temporary.write_bytes(serialized)
+        if IDENTITY_FILE.suffix.lower() != ".dpapi":
+            temporary.chmod(0o600)
+        os.replace(temporary, IDENTITY_FILE)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def _load_identity() -> dict[str, Any]:
@@ -179,6 +193,79 @@ def _load_identity() -> dict[str, Any]:
 
         serialized = unprotect_machine(serialized)
     return json.loads(serialized.decode("utf-8"))
+
+
+def _identity_time(value: Any) -> datetime | None:
+    try:
+        parsed = datetime.fromisoformat(str(value or ""))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+def _token_rotation_due(identity: dict[str, Any], *, now: datetime | None = None) -> bool:
+    if bool(identity.get("token_pending")):
+        return True
+    rotate_after = _identity_time(identity.get("token_rotate_after"))
+    return rotate_after is None or rotate_after <= (now or datetime.now(timezone.utc))
+
+
+def _pending_token_rejected(exc: Exception) -> bool:
+    message = str(exc)
+    return "HTTP 401" in message or "HTTP 403" in message
+
+
+def _confirm_pending_identity(identity: dict[str, Any]) -> dict[str, Any]:
+    token = str(identity.get("runner_token") or "")
+    try:
+        response = _post(identity["server"], "/api/runner/token/confirm", {}, token=token)
+    except Exception as exc:
+        fallback = str(identity.get("rotation_fallback_token") or "")
+        if not fallback or not _pending_token_rejected(exc):
+            raise
+        restored = dict(identity)
+        restored["runner_token"] = fallback
+        restored["token_pending"] = False
+        restored.pop("rotation_fallback_token", None)
+        restored.pop("pending_token_valid_until", None)
+        _write_identity(restored)
+        return restored
+    confirmed = dict(identity)
+    confirmed["token_pending"] = False
+    confirmed["token_expires_at"] = response.get("token_expires_at")
+    confirmed["token_rotate_after"] = response.get("token_rotate_after")
+    confirmed.pop("rotation_fallback_token", None)
+    confirmed.pop("pending_token_valid_until", None)
+    try:
+        _write_identity(confirmed)
+    except Exception:  # noqa: BLE001 - current server token remains the pending local token.
+        # The pending token has already become current server-side. Keep using it;
+        # idempotent confirmation will repair the local marker on the next pass.
+        return identity
+    return confirmed
+
+
+def _maintain_runner_token(identity: dict[str, Any]) -> dict[str, Any]:
+    if bool(identity.get("token_pending")):
+        return _confirm_pending_identity(identity)
+    if not _token_rotation_due(identity):
+        return identity
+    old_token = str(identity.get("runner_token") or "")
+    response = _post(identity["server"], "/api/runner/token/rotate", {}, token=old_token)
+    pending = dict(identity)
+    pending["runner_token"] = response["runner_token"]
+    pending["rotation_fallback_token"] = old_token
+    pending["token_expires_at"] = response.get("token_expires_at")
+    pending["token_rotate_after"] = response.get("token_rotate_after")
+    pending["pending_token_valid_until"] = response.get("pending_token_valid_until")
+    pending["token_pending"] = True
+    _write_identity(pending)
+    try:
+        return _confirm_pending_identity(pending)
+    except Exception:  # noqa: BLE001 - pending token remains valid and confirmation is retried.
+        return pending
 
 
 def import_inventory(args: argparse.Namespace) -> int:
@@ -216,6 +303,30 @@ def doctor(args: argparse.Namespace) -> int:
         try:
             identity = _load_identity()
             checks.append({"id": "identity", "status": "pass", "message": "Connector is enrolled."})
+            expiry = _identity_time(identity.get("token_expires_at"))
+            now = datetime.now(timezone.utc)
+            if bool(identity.get("token_pending")):
+                checks.append({
+                    "id": "connector_token",
+                    "status": "warn",
+                    "message": "Connector credential rotation is awaiting server confirmation.",
+                })
+            elif expiry is not None and expiry <= now:
+                checks.append({
+                    "id": "connector_token",
+                    "status": "fail",
+                    "message": "Connector credential expired; re-enrollment is required.",
+                })
+            else:
+                checks.append({
+                    "id": "connector_token",
+                    "status": "pass",
+                    "message": (
+                        f"Connector credential is active through {expiry.isoformat()}."
+                        if expiry is not None
+                        else "Legacy connector credential is active and will rotate on service start."
+                    ),
+                })
         except Exception as exc:  # noqa: BLE001
             checks.append({"id": "identity", "status": "fail", "message": f"Identity cannot be read: {exc}"})
     else:
@@ -2408,23 +2519,38 @@ class _RunnerPaths:
 
 def run(args: argparse.Namespace) -> int:
     identity = _load_identity()
-    server, token, secret, pool = identity["server"], identity["runner_token"], identity["hmac_secret"], identity["pool"]
+    try:
+        identity = _maintain_runner_token(identity)
+    except Exception as exc:  # noqa: BLE001 - existing token remains available for retry.
+        print(f"[runner] Token maintenance deferred: {exc}", file=sys.stderr)
+    server = identity["server"]
+    token = identity["runner_token"]
+    secret = identity["hmac_secret"]
+    pool = identity["pool"]
     signal.signal(signal.SIGTERM, _handle_sigterm)
     signal.signal(signal.SIGINT, _handle_sigterm)
     print(f"[runner] Polling {server} for pool '{pool}' as {identity['name']} (v{VERSION}). Ctrl-C to stop.")
-    _start_interactive_channel(server, token)  # persistent outbound WS for the interactive shell
+    _start_interactive_channel(server, lambda: token)  # token provider covers rotation on reconnect
     try:
         _post(server, "/api/runner/heartbeat", {"version": VERSION, "state": "online"}, token=token)
     except Exception as exc:  # noqa: BLE001
         print(f"[runner] Heartbeat failed (continuing): {exc}", file=sys.stderr)
     inventory_revision = ""
     inventory_sync_at = 0.0
+    token_maintenance_at = time.monotonic() + 60.0
     try:
         inventory_revision = _sync_inventory_catalog(server, token)
         inventory_sync_at = time.monotonic()
     except Exception as exc:  # noqa: BLE001
         print(f"[runner] Inventory catalog sync failed (continuing): {exc}", file=sys.stderr)
     while not _stop:
+        if time.monotonic() >= token_maintenance_at:
+            try:
+                identity = _maintain_runner_token(identity)
+                token = identity["runner_token"]
+            except Exception as exc:  # noqa: BLE001 - retain current identity and retry later.
+                print(f"[runner] Token maintenance deferred: {exc}", file=sys.stderr)
+            token_maintenance_at = time.monotonic() + 60.0
         if time.monotonic() - inventory_sync_at >= 30.0:
             try:
                 inventory_revision = _sync_inventory_catalog(server, token, inventory_revision)
@@ -2477,7 +2603,7 @@ def run(args: argparse.Namespace) -> int:
     return 0
 
 
-def _start_interactive_channel(server: str, token: str) -> None:
+def _start_interactive_channel(server: str, token_provider: Callable[[], str]) -> None:
     """Persistent OUTBOUND WebSocket to the control plane for interactive PTY
     sessions. Runs in a daemon thread alongside the job-poll loop. On an 'open'
     frame it launches a guarded InteractivePtySession to the device and streams
@@ -2561,7 +2687,7 @@ def _start_interactive_channel(server: str, token: str) -> None:
         while not _stop:
             try:
                 ws = ws_client.create_connection(ws_url, timeout=12)
-                ws.send(json.dumps({"token": token}))
+                ws.send(json.dumps({"token": token_provider()}))
                 ws.settimeout(None)  # connect had a timeout; recv() must block on an idle channel
                 holder["ws"] = ws
                 print("[runner] Interactive channel connected.", flush=True)
