@@ -62,6 +62,27 @@ def test_eos_dry_run_records_native_session_kind():
     assert result.evidence["dry_run_capability"]["dry_run_kind"] == "native_session"
 
 
+def test_eos_session_name_is_stable_for_one_operation_key():
+    first = _adapter({})
+    second = _adapter({})
+    first.operation_id = "nop_stable_operation"
+    second.operation_id = "nop_stable_operation"
+    commands: list[str] = []
+
+    def fake_send_checked(command: str) -> str:
+        commands.append(command)
+        return "ok"
+
+    first._send_checked = fake_send_checked  # type: ignore[method-assign]
+    second._send_checked = fake_send_checked  # type: ignore[method-assign]
+    first_result = first.config_session("vlan 90", "dry-run")
+    second_result = second.config_session("vlan 90", "dry-run")
+
+    assert first_result.session_name == second_result.session_name
+    assert first_result.session_name.startswith("netcode_")
+    assert len(first_result.session_name) == len("netcode_") + 12
+
+
 def test_eos_dry_run_progress_is_driven_by_accepted_commands():
     events = []
     adapter = _adapter({}, progress=events.append)

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import re
 import shutil
 import subprocess
@@ -159,12 +160,14 @@ class AristaEOSLabAdapter(ExecutionAdapter):
         *,
         progress: ProgressCallback | None = None,
         operation: str = "execution",
+        operation_id: str = "",
     ):
         self.device = device
         self.timeout = timeout
         self._conn = None
         self.progress = progress
         self.operation = operation
+        self.operation_id = str(operation_id or "").strip()
         self._verify_current = 0
         self._verify_total = 0
         self._verify_phase = "verify"
@@ -343,7 +346,11 @@ class AristaEOSLabAdapter(ExecutionAdapter):
             self.disconnect()
 
     def config_session(self, config: str, action: Literal["dry-run", "apply", "rollback"]) -> LabResult:
-        session_name = f"netcode_{int(time.time())}"
+        session_name = (
+            f"netcode_{hashlib.sha256(self.operation_id.encode('utf-8')).hexdigest()[:12]}"
+            if self.operation_id
+            else f"netcode_{int(time.time())}"
+        )
         transcript: list[dict[str, str]] = []
         commands = [line for line in config.splitlines() if line.strip()]
         try:
@@ -905,11 +912,17 @@ def run_lab_action_for_device(
     action: Literal["dry-run", "apply", "rollback"],
     *,
     progress: ProgressCallback | None = None,
+    operation_id: str = "",
 ) -> LabResult:
     platform = normalize_platform(device.platform)
     if action == "dry-run":
         if platform == "arista_eos":
-            return AristaEOSLabAdapter(device, progress=progress, operation=action).dry_run(intent, render)
+            return AristaEOSLabAdapter(
+                device,
+                progress=progress,
+                operation=action,
+                operation_id=operation_id,
+            ).dry_run(intent, render)
         capability = dry_run_capability(platform)
         if capability["dry_run_kind"] == "offline_validation":
             return offline_dry_run(device, intent, render, progress=progress)
@@ -929,7 +942,12 @@ def run_lab_action_for_device(
             message=f"{action} is not implemented for {platform} in this runner yet.",
             evidence={"platform": platform, "write_supported": False},
         )
-    adapter = AristaEOSLabAdapter(device, progress=progress, operation=action)
+    adapter = AristaEOSLabAdapter(
+        device,
+        progress=progress,
+        operation=action,
+        operation_id=operation_id,
+    )
     if action == "apply":
         return adapter.apply(intent, render)
     if action == "rollback":

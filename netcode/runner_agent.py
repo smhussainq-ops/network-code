@@ -44,7 +44,8 @@ IDENTITY_FILE = IDENTITY_DIR / ("identity.dpapi" if _WINDOWS_DPAPI else "identit
 INVENTORY_FILE = IDENTITY_DIR / ("inventory.dpapi" if _WINDOWS_DPAPI else "inventory.yaml")
 POLICY_FILE = IDENTITY_DIR / "policy.yaml"
 MANAGER_LEDGER_FILE = IDENTITY_DIR / "manager-operations.json"
-VERSION = "0.5.0-job-leases"
+OPERATION_LEDGER_FILE = IDENTITY_DIR / "device-operations.db"
+VERSION = "0.6.0-idempotent-operations"
 
 _stop = False
 _SHELL_ADAPTERS: dict[str, dict[str, Any]] = {}
@@ -423,7 +424,7 @@ class _JobLeaseRenewer:
                 print(f"[runner] Job lease renewal failed for {self.job_id}: {exc}", file=sys.stderr, flush=True)
 
 
-def _execute_job(
+def _execute_job_inner(
     job: dict[str, Any],
     progress: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
@@ -499,11 +500,102 @@ def _execute_job(
 
     if action not in {"dry-run", "apply", "rollback"}:
         return {"status": "fail", "action": action, "device_id": device_id, "message": f"Unknown action {action}."}
-    lab = run_lab_action_for_device(device, intent, render, action, progress=progress)
+    lab = run_lab_action_for_device(
+        device,
+        intent,
+        render,
+        action,
+        progress=progress,
+        operation_id=str(job.get("idempotency_key") or ""),
+    )
     result = lab.__dict__ if hasattr(lab, "__dict__") else dict(lab)
     result.setdefault("action", action)
     result.setdefault("device_id", device_id)
     result["runner_version"] = VERSION
+    return result
+
+
+def _execute_job(
+    job: dict[str, Any],
+    progress: Callable[[dict[str, Any]], None] | None = None,
+) -> dict[str, Any]:
+    """Execute a claimed job with runner-local replay protection."""
+    job_action = str(job.get("action") or "").strip().lower()
+    if job_action.startswith("read_") or job_action.startswith("manager_"):
+        return _execute_job_inner(job, progress=progress)
+    if not (job_action.startswith("lab_") or job_action.startswith("ansible_")):
+        return _execute_job_inner(job, progress=progress)
+
+    operation_key = str(job.get("idempotency_key") or "").strip()
+    payload = job.get("payload") if isinstance(job.get("payload"), dict) else {}
+    device = payload.get("device") if isinstance(payload.get("device"), dict) else {}
+    device_id = str(job.get("device_id") or payload.get("device_id") or device.get("id") or "").strip().lower()
+    change_id = str(job.get("change_id") or payload.get("change_id") or "").strip()
+    if not operation_key:
+        return {
+            "status": "fail",
+            "action": str(payload.get("action") or job_action),
+            "device_id": device_id,
+            "message": "Runner refused a device operation without a durable idempotency key.",
+            "error": "missing_operation_key",
+        }
+
+    request = {
+        "job_action": job_action,
+        "change_id": change_id,
+        "device_id": device_id,
+        "payload": payload,
+    }
+    from netcode.operation_ledger import RunnerOperationLedger
+
+    ledger = RunnerOperationLedger(OPERATION_LEDGER_FILE)
+    try:
+        decision = ledger.begin(
+            operation_key,
+            request,
+            action=job_action,
+            change_id=change_id,
+            device_id=device_id,
+        )
+    except ValueError as exc:
+        return {
+            "status": "fail",
+            "action": str(payload.get("action") or job_action),
+            "device_id": device_id,
+            "message": str(exc),
+            "error": "operation_key_conflict",
+        }
+    if decision.mode == "replay":
+        return dict(decision.result or {})
+    if decision.mode == "reconcile_required":
+        return {
+            "status": "reconcile_required",
+            "action": str(payload.get("action") or job_action),
+            "device_id": device_id,
+            "message": "A prior attempt did not record a terminal result; inspect live state before any retry.",
+            "operation_key": operation_key,
+        }
+
+    try:
+        result = _execute_job_inner(job, progress=progress)
+    except Exception as exc:  # noqa: BLE001 - an interrupted write has an uncertain outcome.
+        result = {
+            "status": "reconcile_required",
+            "action": str(payload.get("action") or job_action),
+            "device_id": device_id,
+            "message": f"Device operation ended without a proven outcome: {type(exc).__name__}: {exc}",
+            "operation_key": operation_key,
+        }
+    try:
+        ledger.complete(operation_key, result)
+    except Exception as exc:  # noqa: BLE001 - successful device work without a ledger commit is uncertain.
+        return {
+            "status": "reconcile_required",
+            "action": str(payload.get("action") or job_action),
+            "device_id": device_id,
+            "message": f"Device outcome exists but its local terminal record could not be persisted: {type(exc).__name__}: {exc}",
+            "operation_key": operation_key,
+        }
     return result
 
 

@@ -264,12 +264,14 @@ def submit_job_result(
 
     phase = execution_phase_for_job(job.action)
     if job.change_id != "__read__" and phase:
-        passed = result.get("ok", result.get("status") == "pass") is True
+        result_status = str(result.get("status") or "").strip().lower()
+        passed = result.get("ok", result_status == "pass") is True
         payload = job.payload or {}
         device = payload.get("device") if isinstance(payload.get("device"), dict) else {}
-        terminal = "passed" if passed else "failed"
+        terminal = "reconcile_required" if result_status == "reconcile_required" else "passed" if passed else "failed"
+        terminal_status = "failed" if terminal == "reconcile_required" else terminal
         last_event = store.last_execution_event(job.id)
-        if last_event is None or last_event.stage != terminal or last_event.status != terminal:
+        if last_event is None or last_event.stage != terminal or last_event.status != terminal_status:
             store.record_execution_event(
                 event_id=str(uuid.uuid4()),
                 job_id=job.id,
@@ -278,7 +280,7 @@ def submit_job_result(
                 device_id=str(payload.get("device_id") or device.get("id") or ""),
                 phase=phase,
                 stage=terminal,
-                status=terminal,
+                status=terminal_status,
                 message=_safe_progress_message(
                     result.get("message") or ("Execution passed." if passed else "Execution failed.")
                 ),
@@ -291,11 +293,76 @@ def submit_job_result(
         read_ok = result.get("ok", result.get("status") == "pass")
         final_job = store.update_job(job.id, "completed" if read_ok else "failed", str(result.get("message", "read complete")), result)
         store.record_job_signature(job.id, signature)
+        reconciliation_for = str((job.payload or {}).get("reconciliation_for_job_id") or "").strip()
+        if reconciliation_for and job.change_id != "__read__":
+            change = store.get_change(job.change_id)
+            combined_result = dict(change.result or {})
+            reconciliation = dict(combined_result.get("connector_reconciliation") or {})
+            reconciliation.update({
+                "verification_job_id": job.id,
+                "verification_status": "completed" if read_ok else "failed",
+                "verification_result": result,
+                "reconciliation_for_job_id": reconciliation_for,
+                "operator_review_required": True,
+            })
+            combined_result["connector_reconciliation"] = reconciliation
+            store.update_change(change.id, "blocked", combined_result, workflow_state="blocked")
+            store.record_workflow_event(
+                change.id,
+                "connector_reconciliation_completed",
+                change.workflow_state,
+                "blocked",
+                "Read-only live-state reconciliation completed; operator review is still required.",
+                reconciliation,
+            )
         # The runner has used any discovery credentials in the payload; purge them
         # from the DB now so they never sit at rest in the control plane.
         store.scrub_job_payload_secrets(job.id)
         store.touch_runner(runner.id, status="online")
         return {"ok": True, "job": record_to_dict(final_job), "message": "Read result accepted."}
+
+    if str(result.get("status") or "").strip().lower() == "reconcile_required":
+        change = store.get_change(job.change_id)
+        reconciliation_job = store.queue_reconciliation_read(job)
+        evidence = {
+            "job_id": job.id,
+            "runner_id": runner.id,
+            "action": job.action,
+            "attempt_count": job.attempt_count,
+            "reason": "runner_operation_outcome_uncertain",
+            "result": result,
+        }
+        if reconciliation_job is not None:
+            evidence["verification_job_id"] = reconciliation_job.id
+            evidence["verification_status"] = reconciliation_job.status
+        else:
+            evidence["verification_status"] = "not_available_for_action"
+        combined_result = dict(change.result or {})
+        combined_result["connector_reconciliation"] = evidence
+        store.update_change(change.id, "blocked", combined_result, workflow_state="blocked")
+        store.record_workflow_event(
+            change.id,
+            "connector_reconciliation_required",
+            change.workflow_state,
+            "blocked",
+            str(result.get("message") or "Live device state must be reconciled before retry."),
+            evidence,
+        )
+        final_job = store.update_job(
+            job.id,
+            "reconcile_required",
+            str(result.get("message") or "Live device state must be reconciled before retry."),
+            result,
+        )
+        store.record_job_signature(job.id, signature)
+        store.touch_runner(runner.id, status="online")
+        return {
+            "ok": True,
+            "job": record_to_dict(final_job),
+            "change": record_to_dict(store.get_change(change.id)),
+            "workflow_state": "blocked",
+            "message": "Uncertain operation recorded; change blocked pending read-only reconciliation.",
+        }
 
     if job.action.startswith("manager_"):
         action = job.action.removeprefix("manager_")

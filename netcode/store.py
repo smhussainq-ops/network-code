@@ -2074,17 +2074,19 @@ class PlatformStore:
         *,
         target_runner_id: str | None = None,
         change_id: str = "__read__",
+        idempotency_key: str | None = None,
     ) -> JobRecord:
         """Queue a device-READ job for a runner. Not tied to a change (uses the '__read__'
         sentinel), so submitting its result never advances a change workflow."""
         job_id = str(uuid.uuid4())
         now = utc_now()
         canonical_device = job_device_id(payload)
+        operation_key = str(idempotency_key or "").strip() or None
         with self._connect() as conn:
             conn.execute(
                 "INSERT INTO jobs (id, change_id, action, status, message, created_at, updated_at, result_json, "
-                "org_id, pool, payload_json, target_runner_id, device_id)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "org_id, pool, payload_json, target_runner_id, device_id, idempotency_key)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING",
                 (
                     job_id,
                     change_id,
@@ -2099,9 +2101,44 @@ class PlatformStore:
                     json.dumps(payload),
                     target_runner_id,
                     canonical_device,
+                    operation_key,
                 ),
             )
+            if operation_key:
+                row = conn.execute(
+                    "SELECT id FROM jobs WHERE org_id = ? AND idempotency_key = ?",
+                    (org_id, operation_key),
+                ).fetchone()
+                if not row:
+                    raise RuntimeError("Failed to queue or resolve the idempotent read operation")
+                job_id = str(row["id"])
         return self.get_job(job_id)
+
+    def queue_reconciliation_read(self, job: JobRecord) -> JobRecord | None:
+        """Queue one read-only live-state check for an uncertain direct device write."""
+        if job.action not in {"lab_apply", "lab_rollback"}:
+            return None
+        payload = job.payload or {}
+        intent_yaml = str(payload.get("intent_yaml") or "")
+        device_id = str(job.device_id or job_device_id(payload)).strip().lower()
+        if not intent_yaml or not device_id or not job.pool:
+            return None
+        verification_payload = {
+            "device_id": device_id,
+            "intent_yaml": intent_yaml,
+            "present": job.action == "lab_apply",
+            "reconciliation_for_job_id": job.id,
+            "uncertain_action": job.action,
+        }
+        return self.create_read_job(
+            job.org_id,
+            str(job.pool),
+            "verify",
+            verification_payload,
+            target_runner_id=job.target_runner_id or job.claimed_by,
+            change_id=job.change_id,
+            idempotency_key=f"reconcile_{job.id}",
+        )
 
     def recover_expired_jobs(self, *, org_id: str | None = None, pool: str | None = None) -> dict[str, int]:
         """Recover orphaned connector work without ever replaying an uncertain write."""
@@ -2166,6 +2203,12 @@ class PlatformStore:
                         "attempt_count": job.attempt_count,
                         "reason": "connector_lease_expired",
                     }
+                    reconciliation_job = self.queue_reconciliation_read(job)
+                    if reconciliation_job is not None:
+                        evidence["verification_job_id"] = reconciliation_job.id
+                        evidence["verification_status"] = reconciliation_job.status
+                    else:
+                        evidence["verification_status"] = "not_available_for_action"
                     phase = execution_phase_for_job(job.action)
                     if phase:
                         self.record_execution_event(

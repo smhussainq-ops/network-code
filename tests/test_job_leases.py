@@ -102,6 +102,79 @@ def test_expired_write_never_requeues_and_blocks_change_for_reconciliation(tmp_p
     assert store.get_change(change.id).workflow_state == "blocked"
 
 
+def test_expired_apply_queues_one_read_only_reconciliation_and_keeps_human_gate(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    runner = _runner(store)
+    change = _change(store, tmp_path)
+    job = store.queue_job(
+        change.id,
+        "lab_apply",
+        runner.pool,
+        {
+            "action": "apply",
+            "device": {"id": "edge-1"},
+            "intent_yaml": "change_type: custom_config\ntargets:\n  device_ids: [edge-1]\ncustom:\n  config: test\n",
+        },
+        target_runner_id=runner.id,
+    )
+    claimed = store.claim_next_job(DEFAULT_ORG_ID, runner.pool, runner.id)
+    assert claimed is not None and claimed.lease_token
+    _expire(store, job.id)
+
+    assert store.recover_expired_jobs()["reconcile_required"] == 1
+    blocked = store.get_change(change.id)
+    reconciliation_job_id = blocked.result["connector_reconciliation"]["verification_job_id"]
+    reconciliation = store.get_job(reconciliation_job_id)
+    assert reconciliation.action == "read_verify"
+    assert reconciliation.payload["present"] is True
+    assert reconciliation.payload["reconciliation_for_job_id"] == job.id
+    assert store.queue_reconciliation_read(store.get_job(job.id)).id == reconciliation.id
+
+    read_claim = store.claim_next_job(DEFAULT_ORG_ID, runner.pool, runner.id)
+    assert read_claim is not None and read_claim.id == reconciliation.id and read_claim.lease_token
+    result = {"ok": True, "status": "pass", "message": "desired state is present"}
+    accepted = submit_job_result(
+        store,
+        runner,
+        reconciliation.id,
+        result,
+        sign_result(f"{runner.name}-hmac", result),
+        read_claim.lease_token,
+    )
+
+    assert accepted["ok"] is True
+    reviewed = store.get_change(change.id)
+    assert reviewed.workflow_state == "blocked"
+    proof = reviewed.result["connector_reconciliation"]
+    assert proof["verification_result"]["status"] == "pass"
+    assert proof["operator_review_required"] is True
+    assert store.list_workflow_events(change.id)[-1].action == "connector_reconciliation_completed"
+
+
+def test_uncertain_rollback_reconciliation_checks_previous_state(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    runner = _runner(store)
+    change = _change(store, tmp_path)
+    job = store.queue_job(
+        change.id,
+        "lab_rollback",
+        runner.pool,
+        {
+            "action": "rollback",
+            "device": {"id": "edge-1"},
+            "intent_yaml": "change_type: custom_config\ntargets:\n  device_ids: [edge-1]\ncustom:\n  config: test\n",
+        },
+    )
+    assert store.claim_next_job(DEFAULT_ORG_ID, runner.pool, runner.id) is not None
+    _expire(store, job.id)
+    store.recover_expired_jobs()
+
+    reconciliation = store.get_job(
+        store.get_change(change.id).result["connector_reconciliation"]["verification_job_id"]
+    )
+    assert reconciliation.payload["present"] is False
+
+
 def test_expired_ansible_check_fails_closed_because_check_mode_can_be_overridden(tmp_path: Path) -> None:
     store = _store(tmp_path)
     runner = _runner(store)
@@ -361,6 +434,42 @@ def test_crash_during_result_completion_reconciles_a_write(tmp_path: Path) -> No
     assert store.recover_expired_jobs()["reconcile_required"] == 1
     assert store.get_job(job.id).status == "reconcile_required"
     assert store.get_change(change.id).workflow_state == "blocked"
+
+
+def test_runner_reported_uncertain_outcome_blocks_without_retry(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    runner = _runner(store)
+    change = _change(store, tmp_path)
+    job = store.queue_job(
+        change.id,
+        "lab_apply",
+        runner.pool,
+        {"action": "apply", "device": {"id": "edge-1"}},
+    )
+    claimed = store.claim_next_job(DEFAULT_ORG_ID, runner.pool, runner.id)
+    assert claimed is not None and claimed.lease_token
+    result = {
+        "status": "reconcile_required",
+        "action": "apply",
+        "device_id": "edge-1",
+        "message": "connection ended after commit started",
+        "operation_key": job.idempotency_key,
+    }
+
+    accepted = submit_job_result(
+        store,
+        runner,
+        job.id,
+        result,
+        sign_result(f"{runner.name}-hmac", result),
+        claimed.lease_token,
+    )
+
+    assert accepted["ok"] is True and accepted["workflow_state"] == "blocked"
+    assert store.get_job(job.id).status == "reconcile_required"
+    assert store.get_change(change.id).workflow_state == "blocked"
+    assert store.list_execution_events(change.id)[-1].stage == "reconcile_required"
+    assert store.list_workflow_events(change.id)[-1].action == "connector_reconciliation_required"
 
 
 @pytest.mark.parametrize(
