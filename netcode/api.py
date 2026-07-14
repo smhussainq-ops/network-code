@@ -18,7 +18,6 @@ from fastapi import Body, FastAPI, Header, HTTPException, Query, Request, Respon
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
-from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from netcode.ai_assistant import assistant_response
 from netcode.ansible_backend import (
@@ -153,6 +152,7 @@ from netcode.store import (
     record_to_dict,
     utc_now,
 )
+from netcode.trusted_hosts import PrivateReadinessTrustedHostMiddleware
 from netcode.troubleshooting import troubleshoot_state
 from netcode.ui_config import (
     configured_inventory_path,
@@ -472,7 +472,7 @@ _ALLOWED_HOSTS = [
     if host.strip()
 ]
 if _ALLOWED_HOSTS:
-    app.add_middleware(TrustedHostMiddleware, allowed_hosts=_ALLOWED_HOSTS)
+    app.add_middleware(PrivateReadinessTrustedHostMiddleware, allowed_hosts=_ALLOWED_HOSTS)
 
 
 @app.exception_handler(EntitlementError)

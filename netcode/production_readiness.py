@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 
 _PRODUCTION_ENVS = {"prod", "production", "staging"}
@@ -44,6 +44,33 @@ def _strong_service_secret(value: str) -> bool:
     )
 
 
+def _database_url_issues(database_url: str) -> list[str]:
+    """Validate a production PostgreSQL URL without returning secret material."""
+    try:
+        parsed = urlparse(database_url)
+        port = parsed.port
+    except ValueError:
+        return ["DATABASE_URL must be a valid PostgreSQL URL"]
+
+    if parsed.scheme not in {"postgres", "postgresql"} or not parsed.hostname:
+        return ["DATABASE_URL must use PostgreSQL"]
+    if not parsed.username or not parsed.password or not parsed.path.strip("/"):
+        return ["DATABASE_URL must include database credentials and name"]
+    if port is not None and not 1 <= port <= 65535:
+        return ["DATABASE_URL must use a valid database port"]
+
+    password = unquote(parsed.password)
+    if any(marker in password.lower() for marker in ("replace", "changeme", "change-me")):
+        return ["DATABASE_URL must not contain placeholder credentials"]
+    if len(password) < 16:
+        return ["DATABASE_URL must contain a strong database secret"]
+
+    sslmode = parse_qs(parsed.query).get("sslmode", [""])[-1].lower()
+    if sslmode not in {"require", "verify-ca", "verify-full"}:
+        return ["DATABASE_URL must require TLS"]
+    return []
+
+
 def is_production_environment(env: Mapping[str, str]) -> bool:
     return _value(env, "NETCODE_ENV").lower() in _PRODUCTION_ENVS
 
@@ -70,10 +97,32 @@ def collect_netcode_production_issues(
         issues.append("NETCODE_LICENSE_ENFORCEMENT must be enabled")
 
     database_url = _value(env, "DATABASE_URL")
-    if not database_url.startswith(("postgres://", "postgresql://")):
-        issues.append("DATABASE_URL must use PostgreSQL")
-    elif any(marker in database_url.lower() for marker in ("replace", "changeme", "change-me")):
-        issues.append("DATABASE_URL must not contain placeholder credentials")
+    database_fields = {
+        "host": _value(env, "NETCODE_DATABASE_HOST"),
+        "name": _value(env, "NETCODE_DATABASE_NAME"),
+        "user": _value(env, "NETCODE_DATABASE_USER"),
+        "password": str(env.get("NETCODE_DATABASE_PASSWORD", "") or ""),
+    }
+    if database_url:
+        issues.extend(_database_url_issues(database_url))
+    elif not all(database_fields.values()):
+        issues.append("DATABASE_URL or complete NETCODE_DATABASE_* fields are required")
+    else:
+        password = database_fields["password"]
+        if len(password) < 16 or any(
+            marker in password.lower() for marker in ("replace", "changeme", "change-me")
+        ):
+            issues.append("NETCODE_DATABASE_PASSWORD must be a strong secret")
+        port = _value(env, "NETCODE_DATABASE_PORT") or "5432"
+        try:
+            valid_port = 1 <= int(port) <= 65535
+        except ValueError:
+            valid_port = False
+        if not valid_port:
+            issues.append("NETCODE_DATABASE_PORT must be between 1 and 65535")
+        sslmode = (_value(env, "NETCODE_DATABASE_SSLMODE") or "").lower()
+        if sslmode not in {"require", "verify-ca", "verify-full"}:
+            issues.append("NETCODE_DATABASE_SSLMODE must require TLS")
     if not _value(env, "NETCODE_WORKSPACE"):
         issues.append("NETCODE_WORKSPACE must reference durable workspace storage")
 

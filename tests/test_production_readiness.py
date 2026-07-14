@@ -2,12 +2,14 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
 from fastapi.testclient import TestClient
 
 from netcode import api
 from netcode.bootstrap import init_workspace
 from netcode.paths import WorkspacePaths
 from netcode.production_readiness import collect_netcode_production_issues
+from netcode.store import database_url
 from netcode.yamlio import read_yaml
 
 
@@ -19,7 +21,10 @@ def _valid_env() -> dict[str, str]:
         "NETCODE_AUTH": "1",
         "NETCODE_REQUIRE_APPROVAL": "true",
         "NETCODE_LICENSE_ENFORCEMENT": "true",
-        "DATABASE_URL": "postgresql://netcode:secret@postgres.internal:5432/netcode",
+        "DATABASE_URL": (
+            "postgresql://netcode:a-long-random-database-secret@"
+            "postgres.internal:5432/netcode?sslmode=require"
+        ),
         "NETCODE_WORKSPACE": "/data",
         "NETCODE_ALLOWED_HOSTS": "netcode.rezonance.example",
         "NETCODE_REZ_BRIDGE_TOKEN": "bridge-token-with-at-least-32-characters",
@@ -48,6 +53,100 @@ def test_persisted_admin_allows_bootstrap_secret_to_be_removed():
     env.pop("NETCODE_BOOTSTRAP_ADMIN_PASSWORD")
 
     assert collect_netcode_production_issues(env, persisted_auth_users=True) == []
+
+
+def test_complete_rds_secret_fields_replace_composed_database_url():
+    env = _valid_env()
+    env.pop("DATABASE_URL")
+    env.update(
+        {
+            "NETCODE_DATABASE_HOST": "netcode.cluster.example",
+            "NETCODE_DATABASE_PORT": "5432",
+            "NETCODE_DATABASE_NAME": "netcode",
+            "NETCODE_DATABASE_USER": "netcode_admin",
+            "NETCODE_DATABASE_PASSWORD": "a-random-rds-secret-with-32-characters",
+            "NETCODE_DATABASE_SSLMODE": "verify-full",
+        }
+    )
+
+    assert collect_netcode_production_issues(env, persisted_auth_users=False) == []
+
+
+def test_rds_secret_fields_require_tls_and_complete_values():
+    env = _valid_env()
+    env.pop("DATABASE_URL")
+    env.update(
+        {
+            "NETCODE_DATABASE_HOST": "netcode.cluster.example",
+            "NETCODE_DATABASE_NAME": "netcode",
+            "NETCODE_DATABASE_USER": "netcode_admin",
+            "NETCODE_DATABASE_PASSWORD": "short",
+            "NETCODE_DATABASE_SSLMODE": "disable",
+        }
+    )
+
+    issues = collect_netcode_production_issues(env, persisted_auth_users=False)
+
+    assert "NETCODE_DATABASE_PASSWORD must be a strong secret" in issues
+    assert "NETCODE_DATABASE_SSLMODE must require TLS" in issues
+
+
+def test_composed_database_url_requires_tls_and_strong_credentials():
+    env = _valid_env()
+    env["DATABASE_URL"] = "postgresql://netcode:short@postgres.internal:5432/netcode?sslmode=disable"
+
+    issues = collect_netcode_production_issues(env, persisted_auth_users=False)
+
+    assert "DATABASE_URL must contain a strong database secret" in issues
+
+    env["DATABASE_URL"] = (
+        "postgresql://netcode:a-long-random-database-secret@"
+        "postgres.internal:5432/netcode?sslmode=disable"
+    )
+    issues = collect_netcode_production_issues(env, persisted_auth_users=False)
+    assert "DATABASE_URL must require TLS" in issues
+
+
+def test_database_url_builds_from_secret_fields_and_url_encodes_password(tmp_path, monkeypatch):
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    monkeypatch.setenv("NETCODE_DATABASE_HOST", "netcode.cluster.example")
+    monkeypatch.setenv("NETCODE_DATABASE_PORT", "5432")
+    monkeypatch.setenv("NETCODE_DATABASE_NAME", "netcode")
+    monkeypatch.setenv("NETCODE_DATABASE_USER", "netcode_admin")
+    monkeypatch.setenv("NETCODE_DATABASE_PASSWORD", "p@ss:/word with spaces")
+    monkeypatch.setenv("NETCODE_DATABASE_SSLMODE", "verify-full")
+
+    resolved = database_url(WorkspacePaths(tmp_path))
+
+    assert resolved.startswith("postgresql://netcode_admin:p%40ss%3A%2Fword%20with%20spaces@")
+    assert resolved.endswith("/netcode?sslmode=verify-full")
+
+
+def test_database_url_rejects_partial_secret_fields(tmp_path, monkeypatch):
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    monkeypatch.setenv("NETCODE_DATABASE_HOST", "netcode.cluster.example")
+    monkeypatch.delenv("NETCODE_DATABASE_NAME", raising=False)
+    monkeypatch.delenv("NETCODE_DATABASE_USER", raising=False)
+    monkeypatch.delenv("NETCODE_DATABASE_PASSWORD", raising=False)
+
+    try:
+        database_url(WorkspacePaths(tmp_path))
+    except RuntimeError as exc:
+        assert "Incomplete NETCODE_DATABASE_* configuration" in str(exc)
+    else:
+        raise AssertionError("partial RDS secret fields must fail closed")
+
+
+def test_database_url_rejects_disabled_tls_for_secret_fields(tmp_path, monkeypatch):
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    monkeypatch.setenv("NETCODE_DATABASE_HOST", "netcode.cluster.example")
+    monkeypatch.setenv("NETCODE_DATABASE_NAME", "netcode")
+    monkeypatch.setenv("NETCODE_DATABASE_USER", "netcode_admin")
+    monkeypatch.setenv("NETCODE_DATABASE_PASSWORD", "a-long-random-database-secret")
+    monkeypatch.setenv("NETCODE_DATABASE_SSLMODE", "disable")
+
+    with pytest.raises(RuntimeError, match="must require TLS"):
+        database_url(WorkspacePaths(tmp_path))
 
 
 def test_production_rejects_direct_execution_and_approval_bypasses():

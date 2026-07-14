@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote, urlencode
 
 from netcode.paths import WorkspacePaths
 from netcode.yamlio import read_yaml
@@ -35,8 +36,40 @@ def execution_phase_for_job(action: str) -> str:
 
 
 def database_url(paths: WorkspacePaths) -> str:
-    """SQLite by default (paths.database stays the source of truth); Postgres via DATABASE_URL."""
-    return os.environ.get("DATABASE_URL", "").strip() or f"sqlite:///{paths.database}"
+    """Resolve SQLite, a complete DATABASE_URL, or ECS-injected RDS fields."""
+    configured_url = os.environ.get("DATABASE_URL", "").strip()
+    if configured_url:
+        return configured_url
+
+    components = {
+        "host": os.environ.get("NETCODE_DATABASE_HOST", "").strip(),
+        "port": os.environ.get("NETCODE_DATABASE_PORT", "").strip() or "5432",
+        "name": os.environ.get("NETCODE_DATABASE_NAME", "").strip(),
+        "user": os.environ.get("NETCODE_DATABASE_USER", "").strip(),
+        "password": os.environ.get("NETCODE_DATABASE_PASSWORD", ""),
+    }
+    if any(value for key, value in components.items() if key != "port"):
+        missing = [key for key in ("host", "name", "user", "password") if not components[key]]
+        if missing:
+            raise RuntimeError(
+                "Incomplete NETCODE_DATABASE_* configuration: " + ", ".join(sorted(missing))
+            )
+        try:
+            port = int(components["port"])
+        except ValueError as exc:
+            raise RuntimeError("NETCODE_DATABASE_PORT must be an integer") from exc
+        if not 1 <= port <= 65535:
+            raise RuntimeError("NETCODE_DATABASE_PORT must be between 1 and 65535")
+        sslmode = os.environ.get("NETCODE_DATABASE_SSLMODE", "require").strip().lower() or "require"
+        if sslmode not in {"require", "verify-ca", "verify-full"}:
+            raise RuntimeError("NETCODE_DATABASE_SSLMODE must require TLS")
+        query = urlencode({"sslmode": sslmode})
+        return (
+            f"postgresql://{quote(components['user'], safe='')}:{quote(components['password'], safe='')}"
+            f"@{components['host']}:{port}/{quote(components['name'], safe='')}?{query}"
+        )
+
+    return f"sqlite:///{paths.database}"
 
 
 def _engine_for(url: str) -> str:
