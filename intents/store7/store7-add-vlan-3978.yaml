@@ -1,0 +1,21 @@
+change_type: add_vlan
+site: store7
+targets:
+  device_ids:
+  - v2-store7
+  device_group: access-switches
+policy:
+  pci_reachable: false
+  internet_reachable: true
+metadata:
+  requested_by: marcus
+  ticket_id: null
+  learning_mode: true
+vlan:
+  id: 3978
+  name: MARCUS_DRYRUN
+  subnet: 10.97.78.0/24
+  purpose: progress-proof
+  svi:
+    enabled: false
+    gateway_ip: null

@@ -2069,6 +2069,7 @@ def api_runner_heartbeat(request: RunnerHeartbeatRequest, authorization: str | N
 
 _RUNNER_INVENTORY_FIELDS = {
     "id", "hostname", "host", "port", "platform", "site", "role", "groups", "aliases", "management", "serial",
+    "building", "floor", "closet", "location",
 }
 _RUNNER_INVENTORY_SECRET_MARKERS = {
     "username", "password", "passwd", "pwd", "secret", "token", "credential",
@@ -2098,7 +2099,10 @@ def _sanitize_runner_inventory(devices: list[dict[str, object]]) -> list[dict[st
             )
         device_id = str(raw.get("id") or "").strip()
         host = str(raw.get("host") or "").strip()
-        scalar_fields = ("id", "hostname", "host", "port", "platform", "site", "role", "serial")
+        scalar_fields = (
+            "id", "hostname", "host", "port", "platform", "site", "role", "serial",
+            "building", "floor", "closet",
+        )
         invalid_scalar = next(
             (field for field in scalar_fields if isinstance(raw.get(field), (dict, list, tuple, set))),
             None,
@@ -2119,10 +2123,29 @@ def _sanitize_runner_inventory(devices: list[dict[str, object]]) -> list[dict[st
         groups = raw.get("groups") or []
         aliases = raw.get("aliases") or []
         management = raw.get("management") or {}
+        location = raw.get("location") or {}
         if not isinstance(groups, list) or not isinstance(aliases, list):
             raise HTTPException(status_code=400, detail=f"Runner inventory item {index} groups and aliases must be lists.")
         if not isinstance(management, dict):
             raise HTTPException(status_code=400, detail=f"Runner inventory item {index} management must be a mapping.")
+        if not isinstance(location, dict):
+            raise HTTPException(status_code=400, detail=f"Runner inventory item {index} location must be a mapping.")
+        allowed_location_fields = {"campus", "building", "floor", "closet", "room", "rack", "zone"}
+        unknown_location = sorted(str(key).strip().lower() for key in location if str(key).strip().lower() not in allowed_location_fields)
+        if unknown_location:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Runner inventory item {index} location contains unsupported fields: {', '.join(unknown_location)}.",
+            )
+        invalid_location = next(
+            (key for key, value in location.items() if not isinstance(value, (str, int, float))),
+            None,
+        )
+        if invalid_location:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Runner inventory item {index} location field {invalid_location} must be a scalar value.",
+            )
         if any(not isinstance(item, str) for item in [*groups, *aliases]):
             raise HTTPException(
                 status_code=400,
@@ -2139,6 +2162,14 @@ def _sanitize_runner_inventory(devices: list[dict[str, object]]) -> list[dict[st
             "groups": [str(item).strip() for item in groups if str(item).strip()],
             "aliases": [str(item).strip() for item in aliases if str(item).strip()],
             "serial": str(raw.get("serial") or "").strip(),
+            "building": str(raw.get("building") or "").strip()[:256],
+            "floor": str(raw.get("floor") or "").strip()[:256],
+            "closet": str(raw.get("closet") or "").strip()[:256],
+            "location": {
+                key: str(location[key]).strip()[:256]
+                for key in ("campus", "building", "floor", "closet", "room", "rack", "zone")
+                if isinstance(location.get(key), (str, int, float)) and str(location[key]).strip()
+            },
             "management": management,
         })
     return public

@@ -193,7 +193,16 @@ def to_rez_network_design(revision: Mapping[str, Any]) -> dict[str, Any]:
         site_devices = _dict(site.get("devices"))
         public_device = {
             key: copy.deepcopy(device[key])
-            for key in ("role", "platform", "transport")
+            for key in (
+                "role",
+                "platform",
+                "transport",
+                "building",
+                "floor",
+                "closet",
+                "location",
+                "groups",
+            )
             if device.get(key) not in (None, "")
         }
         site_devices[device_id] = _deep_merge(public_device, _dict(site_devices.get(device_id)))

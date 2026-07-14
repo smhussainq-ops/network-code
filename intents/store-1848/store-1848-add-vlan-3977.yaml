@@ -1,0 +1,21 @@
+change_type: add_vlan
+site: store-1848
+targets:
+  device_ids:
+  - v2-store7
+  device_group: access-switches
+policy:
+  pci_reachable: false
+  internet_reachable: true
+metadata:
+  requested_by: netcode-user
+  ticket_id: null
+  learning_mode: true
+vlan:
+  id: 3977
+  name: MARCUS_FLEET_PROGRESS
+  subnet: 10.97.77.0/24
+  purpose: fleet-progress-e2e
+  svi:
+    enabled: false
+    gateway_ip: null

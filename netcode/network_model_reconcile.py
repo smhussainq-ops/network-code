@@ -23,6 +23,19 @@ DEPENDENCY_DOMAINS = {
     "nat": "security_policy",
     "vpn": "vpn",
     "ha": "ha",
+    "vlan": "switching",
+    "trunk": "switching",
+    "stp": "switching",
+    "lacp": "switching",
+    "multi_chassis": "switching",
+    "fhrp": "routing",
+    "vrf": "routing",
+    "dhcp_relay": "services",
+    "wireless_controller": "wireless",
+    "wireless_ap": "wireless",
+    "nac": "security_policy",
+    "multicast": "routing",
+    "evpn_vxlan": "fabric",
 }
 
 

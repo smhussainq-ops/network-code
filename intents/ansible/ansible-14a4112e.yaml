@@ -1,0 +1,9 @@
+kind: ansible_pack
+playbook_path: .netcode/generated-playbooks/check-routing-health.yml
+rollback_playbook_path: ''
+targets:
+- v2-store1
+mode: check
+metadata:
+  requested_by: rez-ui
+  source: netcode_ansible

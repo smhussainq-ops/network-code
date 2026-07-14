@@ -52,6 +52,8 @@ READ_TRANSPORTS: dict[str, tuple[str, ...]] = {
     "aruba_aoscx": ("api",),
     "cisco_sdwan": ("api",),
     "meraki": ("api",),
+    "fortimanager": ("api",),
+    "panorama": ("api",),
 }
 
 
@@ -110,7 +112,7 @@ class RezAdapterBridge:
     def _clear_stale_driver_modules(self) -> None:
         """Avoid reusing a previously imported Rez drivers package from another root."""
         root = self.root.resolve()
-        for module_name in ("drivers.collector", "drivers"):
+        for module_name in ("drivers.configured_state", "drivers.collector", "drivers"):
             module = sys.modules.get(module_name)
             module_file = getattr(module, "__file__", None) if module else None
             if not module_file:
@@ -271,7 +273,14 @@ class RezAdapterBridge:
             kwargs["host"] = kwargs.pop("hostname")
         if not accepts_any:
             kwargs = {key: value for key, value in kwargs.items() if key in parameters}
-        return platform, driver_cls(**kwargs)
+        driver = driver_cls(**kwargs)
+        # Privileged EXEC is required by several CLI platforms to read the
+        # running configuration. The secret remains in runner-local inventory;
+        # it is attached only to the in-process driver and is never serialized.
+        if platform in {"arista_eos", "cisco_ios", "cisco_nxos", "cisco_asa"}:
+            options = dict(device.connection_options or {})
+            setattr(driver, "enable_secret", str(options.get("secret") or device.password or ""))
+        return platform, driver
 
     async def collect_device_state_async(self, device: Device) -> dict[str, object]:
         started = time.perf_counter()
@@ -315,11 +324,30 @@ class RezAdapterBridge:
                 state_payload = state.dict()
             else:
                 state_payload = state
+            configuration_warning = ""
+            if isinstance(state_payload, dict):
+                # Configuration facts are normalized while the runner-local
+                # read session is still open. Raw configuration and secrets do
+                # not cross the connector boundary.
+                try:
+                    configured_module = importlib.import_module("drivers.configured_state")
+                    configured_state = await configured_module.collect_configured_state(
+                        platform,
+                        driver,
+                        state_payload,
+                    )
+                except Exception as exc:
+                    configuration_warning = f"configured_state: {type(exc).__name__}: {exc}"
+                    configured_state = None
+                if configured_state is not None:
+                    state_payload["configured_state"] = configured_state
             warnings = []
             errors = []
             if isinstance(state_payload, dict):
                 warnings = list(state_payload.get("collection_warnings") or [])
                 errors = list(state_payload.get("collection_errors") or [])
+            if configuration_warning:
+                warnings.append(configuration_warning)
             return {
                 "ok": True,
                 "device_id": device.id,

@@ -40,7 +40,15 @@ def _revision(status: str = "approved") -> dict:
                     "archetype": "dual-edge",
                     "intent": {"routing": {"ospf": {"area": "0.0.0.12"}}},
                     "devices": {
-                        "border-a": {"role": "edge", "groups": ["pci"], "overrides": {"ntp": {"prefer": 1}}}
+                        "border-a": {
+                            "role": "edge",
+                            "groups": ["pci"],
+                            "building": "Building A",
+                            "floor": "4",
+                            "closet": "MDF-A",
+                            "location": {"campus": "North", "building": "Building A", "floor": "4", "closet": "MDF-A"},
+                            "overrides": {"ntp": {"prefer": 1}},
+                        }
                     },
                     "operational_dependencies": [
                         {
@@ -123,4 +131,6 @@ def test_rez_export_preserves_exact_customer_design_without_lab_defaults():
     assert design["source"]["type"] == "rezonance_model"
     assert design["sites"]["region-blue"]["operational_dependencies"][0]["id"] == "wan-peer-a"
     assert design["sites"]["region-blue"]["devices"]["border-a"]["role"] == "edge"
+    assert design["sites"]["region-blue"]["devices"]["border-a"]["building"] == "Building A"
+    assert design["sites"]["region-blue"]["devices"]["border-a"]["location"]["closet"] == "MDF-A"
     assert "v2-" not in str(design)

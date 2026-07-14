@@ -24,6 +24,10 @@ class Device:
     role: str | None = None
     aliases: tuple[str, ...] = ()
     serial: str = ""
+    building: str | None = None
+    floor: str | None = None
+    closet: str | None = None
+    location: dict[str, str] = field(default_factory=dict, compare=False)
     # Public, non-secret ownership metadata for devices controlled by a native
     # manager such as FortiManager or Panorama.
     management: dict[str, Any] = field(default_factory=dict, repr=False, compare=False)
@@ -58,9 +62,31 @@ class Inventory:
             role=str(raw.get("role") or "").strip() or None,
             aliases=tuple(str(item).strip() for item in (raw.get("aliases") or []) if str(item).strip()),
             serial=str(raw.get("serial") or raw.get("serial_number") or raw.get("chassis_id") or "").strip(),
+            building=str(raw.get("building") or "").strip() or None,
+            floor=str(raw.get("floor") or "").strip() or None,
+            closet=str(raw.get("closet") or "").strip() or None,
+            location=self._location(raw),
             management=management,
             connection_options=self._connection_options(defaults, raw),
         )
+
+    @staticmethod
+    def _location(raw: dict[str, Any]) -> dict[str, str]:
+        """Keep only bounded, non-secret physical placement metadata."""
+        result: dict[str, str] = {}
+        value = raw.get("location")
+        if isinstance(value, dict):
+            for key in ("campus", "building", "floor", "closet", "room", "rack", "zone"):
+                if isinstance(value.get(key), (str, int, float)):
+                    normalized = str(value[key]).strip()[:256]
+                    if normalized:
+                        result[key] = normalized
+        for key in ("building", "floor", "closet"):
+            if isinstance(raw.get(key), (str, int, float)):
+                normalized = str(raw[key]).strip()[:256]
+                if normalized:
+                    result[key] = normalized
+        return result
 
     @staticmethod
     def _management(device_id: str, raw: dict[str, Any]) -> dict[str, Any]:

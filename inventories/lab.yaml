@@ -64,6 +64,15 @@ devices:
   - stores
   - access-switches
   site: store-1849
+- id: v2-hq-core
+  hostname: v2-hq-core
+  host: 172.100.1.11
+  platform: arista_eos
+  site: discovered
+  role: ''
+  groups:
+  - discovered
+  port: 22
 known_subnets:
   store-1842:
   - 10.42.30.0/24

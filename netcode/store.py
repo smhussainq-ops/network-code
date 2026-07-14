@@ -332,6 +332,7 @@ class PlatformStore:
                     site TEXT,
                     role TEXT,
                     groups_json TEXT NOT NULL DEFAULT '[]',
+                    location_json TEXT NOT NULL DEFAULT '{}',
                     management_json TEXT NOT NULL DEFAULT '{}',
                     runner_id TEXT NOT NULL,
                     runner_pool TEXT NOT NULL,
@@ -343,6 +344,7 @@ class PlatformStore:
                 """
             )
             self._ensure_column(conn, "device_catalog", "management_json", "TEXT NOT NULL DEFAULT '{}'")
+            self._ensure_column(conn, "device_catalog", "location_json", "TEXT NOT NULL DEFAULT '{}'")
             self._ensure_column(conn, "device_catalog", "serial", "TEXT NOT NULL DEFAULT ''")
             conn.execute(
                 """
@@ -1092,6 +1094,16 @@ class PlatformStore:
             platform = str(raw.get("platform") or "unknown").strip().lower()
             serial = str(raw.get("serial") or "").strip()
             groups = sorted({str(item).strip() for item in (raw.get("groups") or []) if str(item).strip()})
+            raw_location = raw.get("location") if isinstance(raw.get("location"), dict) else {}
+            location = {
+                key: str(raw_location[key]).strip()[:256]
+                for key in ("campus", "building", "floor", "closet", "room", "rack", "zone")
+                if isinstance(raw_location.get(key), (str, int, float)) and str(raw_location[key]).strip()
+            }
+            for key in ("building", "floor", "closet"):
+                value = raw.get(key)
+                if isinstance(value, (str, int, float)) and str(value).strip():
+                    location[key] = str(value).strip()[:256]
             management: dict[str, Any] = {}
             if raw.get("management"):
                 from netcode.firewall_managers import ManagerOwnership, assert_no_secrets
@@ -1120,6 +1132,7 @@ class PlatformStore:
                 "site": str(raw.get("site") or "").strip() or None,
                 "role": str(raw.get("role") or "").strip() or None,
                 "groups": groups,
+                "location": location,
                 "aliases": sorted(alias for alias in aliases if alias),
                 "management": management,
             }
@@ -1209,8 +1222,8 @@ class PlatformStore:
                     """
                     INSERT INTO device_catalog
                     (org_id, canonical_id, display_id, hostname, host, port, platform, serial, site, role,
-                     groups_json, management_json, runner_id, runner_pool, source, last_seen, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'runner_inventory', ?, ?)
+                     groups_json, location_json, management_json, runner_id, runner_pool, source, last_seen, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'runner_inventory', ?, ?)
                     ON CONFLICT (org_id, canonical_id) DO UPDATE SET
                       display_id = excluded.display_id,
                       hostname = excluded.hostname,
@@ -1221,6 +1234,7 @@ class PlatformStore:
                       site = excluded.site,
                       role = excluded.role,
                       groups_json = excluded.groups_json,
+                      location_json = excluded.location_json,
                       management_json = excluded.management_json,
                       runner_id = excluded.runner_id,
                       runner_pool = excluded.runner_pool,
@@ -1240,6 +1254,7 @@ class PlatformStore:
                         device["site"],
                         device["role"],
                         json.dumps(device["groups"]),
+                        json.dumps(device["location"]),
                         json.dumps(device["management"]),
                         runner.id,
                         runner.pool,
@@ -1282,7 +1297,9 @@ class PlatformStore:
     @staticmethod
     def _catalog_row(row: Any) -> dict[str, Any]:
         raw_groups = row["groups_json"] or "[]"
+        raw_location = row["location_json"] or "{}"
         raw_management = row["management_json"] or "{}"
+        location = json.loads(raw_location)
         return {
             "canonical_id": row["canonical_id"],
             "id": row["display_id"],
@@ -1294,6 +1311,10 @@ class PlatformStore:
             "site": row["site"],
             "role": row["role"],
             "groups": json.loads(raw_groups),
+            "building": location.get("building"),
+            "floor": location.get("floor"),
+            "closet": location.get("closet"),
+            "location": location,
             "management": json.loads(raw_management),
             "runner_id": row["runner_id"],
             "runner_pool": row["runner_pool"],

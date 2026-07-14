@@ -28,6 +28,10 @@ _PUBLIC_DEVICE_FIELDS = {
     "runner_pool",
     "source",
     "updated_at",
+    "building",
+    "floor",
+    "closet",
+    "location",
 }
 
 
@@ -73,6 +77,11 @@ def _sites_from_devices(devices: Mapping[str, Mapping[str, Any]]) -> dict[str, d
         sites[site]["devices"][device_id] = {
             "role": str(device.get("role") or "").strip(),
             "platform": str(device.get("platform") or "").strip(),
+            **{
+                key: copy.deepcopy(device[key])
+                for key in ("building", "floor", "closet", "location", "groups")
+                if device.get(key) not in (None, "", [], {})
+            },
         }
     return sites
 

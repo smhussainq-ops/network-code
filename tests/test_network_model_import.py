@@ -41,6 +41,15 @@ def _device(index: int) -> dict:
         "site": f"site-{index // 10:03d}",
         "role": "edge",
         "groups": ["production"],
+        "building": f"building-{index // 40 + 1}",
+        "floor": str(index // 20 + 1),
+        "closet": f"closet-{index // 10 + 1}",
+        "location": {
+            "campus": "north-campus",
+            "building": f"building-{index // 40 + 1}",
+            "floor": str(index // 20 + 1),
+            "closet": f"closet-{index // 10 + 1}",
+        },
     }
 
 
@@ -69,6 +78,12 @@ def test_catalog_import_pages_without_connecting_and_is_idempotent(tmp_path: Pat
     assert len(first["revision"]["model"]["devices"]) == 120
     assert first["revision"]["status"] == "proposed"
     assert first["revision"]["authority_bindings"]["identity"]["mode"] == "propose"
+    imported = first["revision"]["model"]["devices"]["edge-000"]
+    site_device = first["revision"]["model"]["sites"]["site-000"]["devices"]["edge-000"]
+    assert imported["building"] == "building-1"
+    assert imported["location"]["closet"] == "closet-1"
+    assert site_device["floor"] == "1"
+    assert site_device["closet"] == "closet-1"
 
 
 def test_public_device_import_rejects_ambiguous_management_identity():

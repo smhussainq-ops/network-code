@@ -10,7 +10,7 @@ from fastapi.testclient import TestClient
 from netcode import api
 from netcode.bootstrap import init_workspace
 from netcode.network_model import NETWORK_MODEL_SCHEMA, NETWORK_OBSERVATION_SCHEMA, NetworkModelError
-from netcode.network_model_reconcile import reconcile_revision
+from netcode.network_model_reconcile import DEPENDENCY_DOMAINS, reconcile_revision
 from netcode.network_model_store import NetworkModelRepository
 from netcode.paths import WorkspacePaths
 from netcode.runner_hub import enroll_runner, mint_join_token
@@ -18,6 +18,35 @@ from netcode.store import PlatformStore
 
 
 NOW = datetime(2026, 7, 12, 12, 0, tzinfo=timezone.utc)
+
+
+def test_campus_dependency_families_map_to_reviewable_model_domains():
+    assert DEPENDENCY_DOMAINS == {
+        "interface": "topology",
+        "lldp": "topology",
+        "ospf": "routing",
+        "bgp": "routing",
+        "default_route": "routing",
+        "sdwan": "sdwan",
+        "qos": "qos",
+        "firewall_policy": "security_policy",
+        "nat": "security_policy",
+        "vpn": "vpn",
+        "ha": "ha",
+        "vlan": "switching",
+        "trunk": "switching",
+        "stp": "switching",
+        "lacp": "switching",
+        "multi_chassis": "switching",
+        "fhrp": "routing",
+        "vrf": "routing",
+        "dhcp_relay": "services",
+        "wireless_controller": "wireless",
+        "wireless_ap": "wireless",
+        "nac": "security_policy",
+        "multicast": "routing",
+        "evpn_vxlan": "fabric",
+    }
 
 
 def _repository(tmp_path: Path) -> NetworkModelRepository:

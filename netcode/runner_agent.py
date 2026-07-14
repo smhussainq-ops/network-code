@@ -297,6 +297,10 @@ def _public_inventory_snapshot() -> dict[str, Any]:
                 "groups": list(device.groups),
                 "aliases": list(device.aliases),
                 "serial": device.serial,
+                "building": device.building or "",
+                "floor": device.floor or "",
+                "closet": device.closet or "",
+                "location": dict(device.location),
                 "management": dict(device.management),
             }
             for device in Inventory(INVENTORY_FILE).devices

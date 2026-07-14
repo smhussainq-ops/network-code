@@ -33,6 +33,10 @@ def _device(device_id: str, host: str, *, site: str = "Site-101", role: str = "e
         "role": role,
         "groups": ["production"],
         "aliases": [f"alias-{device_id}"],
+        "building": "Building A",
+        "floor": "3",
+        "closet": "IDF-3A",
+        "location": {"campus": "North", "building": "Building A", "floor": "3", "closet": "IDF-3A"},
     }
 
 
@@ -56,6 +60,8 @@ def test_catalog_resolves_canonical_id_hostname_ip_fqdn_and_alias(tmp_path: Path
     saved = store.devices_by_identifiers(DEFAULT_ORG_ID, ["alias-v2-hq-core", "v2-hq-core"])
     assert [item["canonical_id"] for item in saved] == ["v2-hq-core"]
     assert "password" not in json.dumps(store.query_devices(DEFAULT_ORG_ID)).lower()
+    assert resolved["building"] == "Building A"
+    assert resolved["location"]["closet"] == "IDF-3A"
 
     store.sync_runner_devices(
         runner,
@@ -93,6 +99,17 @@ def test_runner_inventory_sync_rejects_credentials(tmp_path: Path, monkeypatch):
     )
     assert disguised.status_code == 400
     assert "strings only" in disguised.json()["detail"]
+
+    unsupported_location = client.post(
+        "/api/runner/inventory-sync",
+        headers={"Authorization": f"Bearer {token}"},
+        json={
+            "revision": "bad-3",
+            "devices": [{**_device("edge-1", "192.0.2.1"), "location": {"password": "hidden"}}],
+        },
+    )
+    assert unsupported_location.status_code == 400
+    assert "location contains unsupported fields" in unsupported_location.json()["detail"]
 
 
 def test_duplicate_canonical_id_cannot_be_stolen_by_another_connector(tmp_path: Path):

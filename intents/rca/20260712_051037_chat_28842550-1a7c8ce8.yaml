@@ -1,0 +1,50 @@
+change_type: routing_redistribution
+site: hq
+targets:
+  device_ids:
+  - v2-hq-edge-1
+  - v2-hq-edge-2
+policy: {}
+metadata:
+  requested_by: rez-rca
+  ticket_id: 20260712_051037_chat_28842550
+  learning_mode: true
+  source: rez_rca
+  draft_only: true
+  human_approval_required: true
+  rationale: Restore the exact intended redistribution dependency confirmed by Rez.
+  evidence_refs:
+  - 'root atom: CP_REDISTRIBUTION_GAP'
+  - 'dependency: design:hq:redistribution:hq-ospf-to-bgp'
+  confidence: 1.0
+  proposal_schema: netcode.remediation.v1
+  proposal_source: site_operational_context
+  confirmed_root_atom_id: CP_REDISTRIBUTION_GAP
+redistribution:
+  from_protocol: ospf
+  to_protocol: bgp
+  target_process: '65000'
+  route_map: HQ-OSPF-TO-BGP
+  prefix_list: HQ-SITE-LOOPBACKS
+  prefixes:
+  - 1.1.1.0/24
+  route_tag: 65001
+reverse_redistribution:
+  from_protocol: bgp
+  to_protocol: ospf
+  target_process: '1'
+  route_map: HQ-BGP-TO-OSPF
+  prefix_list: HQ-REMOTE-LOOPBACKS
+  prefixes:
+  - 2.2.2.0/24
+  - 3.3.3.0/24
+  - 4.4.4.0/24
+  - 5.5.5.0/24
+  route_tag: 65000
+reachability_checks:
+- source_device: v2-store8
+  source_ip: 4.4.4.8
+  destination: 1.1.1.1
+- source_device: v2-hq-core
+  source_ip: 1.1.1.1
+  destination: 4.4.4.8
