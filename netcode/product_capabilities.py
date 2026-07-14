@@ -143,6 +143,11 @@ def _reviewed_capabilities(platform: str) -> dict[str, dict[str, str]]:
         capabilities["write"] = _status("planned", "Direct FortiGate writes are not a launch capability; use a reviewed manager path when certified.")
     elif platform == "cisco_ios":
         capabilities["dry_run"] = _status("contract-tested", "Offline validation and generated diff; no native candidate commit claim.")
+        for feature in ("write", "verify", "rollback"):
+            capabilities[feature] = _status(
+                "contract-tested",
+                "Community Golden Baseline NTP workflow only; live Cisco GNS3 proof is still required.",
+            )
     elif platform in {"fortimanager", "panorama"}:
         capabilities["manager_execution"] = _status(
             "hardware-blocked",
@@ -159,12 +164,14 @@ def product_support_matrix(registry: AdapterRegistry | None = None) -> dict[str,
     rows = []
     for platform in sorted(READ_TRANSPORTS):
         capabilities = _reviewed_capabilities(platform)
+        execution = AdapterRegistry.EXECUTION_ADAPTERS.get(platform, {})
         rows.append({
             "platform": platform,
             "label": _PLATFORM_LABELS[platform],
             "runtime_adapter_available": platform in runtime_platforms,
             "read_transports": list(READ_TRANSPORTS[platform]),
             "capabilities": capabilities,
+            "supported_change_types": list(execution.get("supported_change_types", [])),
             "evidence": list(_EVIDENCE.get(platform, [])),
         })
     return {
@@ -189,5 +196,6 @@ def unsupported_platform_row(platform: str) -> dict[str, Any]:
         "runtime_adapter_available": False,
         "read_transports": [],
         "capabilities": {feature: _status("unsupported") for feature in FEATURES},
+        "supported_change_types": [],
         "evidence": [],
     }

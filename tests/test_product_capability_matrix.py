@@ -55,3 +55,13 @@ def test_manager_paths_remain_hardware_blocked() -> None:
 
     assert rows["fortimanager"]["capabilities"]["manager_execution"]["status"] == "hardware-blocked"
     assert rows["panorama"]["capabilities"]["manager_execution"]["status"] == "hardware-blocked"
+
+
+def test_cisco_community_write_scope_is_explicit_and_not_overclaimed() -> None:
+    rows = {row["platform"]: row for row in product_support_matrix()["rows"]}
+    cisco = rows["cisco_ios"]
+
+    assert cisco["supported_change_types"] == ["ntp_standardize"]
+    assert cisco["capabilities"]["dry_run"]["status"] == "contract-tested"
+    assert cisco["capabilities"]["write"]["status"] == "contract-tested"
+    assert cisco["capabilities"]["write"]["status"] != "pilot-certified"

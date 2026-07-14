@@ -133,6 +133,60 @@ def test_progress_rejects_bad_signature_and_wrong_phase(tmp_path: Path, monkeypa
     assert [item.stage for item in store.list_execution_events(change.id)] == ["claimed"]
 
 
+def test_discovery_read_job_accepts_signed_discovery_progress(tmp_path: Path, monkeypatch) -> None:
+    _paths, store, _client = _workspace(tmp_path, monkeypatch)
+    runner = store.create_runner("runner-1", "store-lab", "token-hash", "runner-hmac")
+    job = store.create_read_job(
+        DEFAULT_ORG_ID,
+        runner.pool,
+        "rez_discover_network",
+        {"seed_node": "192.0.2.10", "depth": 0},
+    )
+    claimed = store.claim_next_job(DEFAULT_ORG_ID, runner.pool, runner.id)
+    assert claimed is not None
+    event = {
+        "event_id": str(uuid.uuid4()),
+        "sequence": 2,
+        "phase": "discovery",
+        "stage": "scope_validated",
+        "status": "running",
+        "message": "Discovery scope validated.",
+        "device_id": "",
+    }
+
+    accepted = submit_job_progress(
+        store,
+        runner,
+        job.id,
+        event,
+        sign_result("runner-hmac", event),
+        claimed.lease_token,
+    )
+
+    assert accepted["ok"] is True
+    assert store.list_execution_events("__read__")[-1].stage == "scope_validated"
+
+    skipped = {
+        **event,
+        "event_id": str(uuid.uuid4()),
+        "sequence": 3,
+        "stage": "device_skipped",
+        "status": "skipped",
+        "message": "No reachable endpoint was found at this sweep address.",
+    }
+    skipped_result = submit_job_progress(
+        store,
+        runner,
+        job.id,
+        skipped,
+        sign_result("runner-hmac", skipped),
+        claimed.lease_token,
+    )
+
+    assert skipped_result["ok"] is True
+    assert store.list_execution_events("__read__")[-1].status == "skipped"
+
+
 def test_change_activity_and_paginated_fleet_search(tmp_path: Path, monkeypatch) -> None:
     paths, store, client = _workspace(tmp_path, monkeypatch)
     rollout = store.create_rollout(

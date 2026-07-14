@@ -62,6 +62,7 @@ class WorkspacePaths:
             self.intents,
             self.intents / "examples",
             self.templates / "arista",
+            self.templates / "cisco_ios",
             self.policies,
             self.inventories,
             self.rendered,

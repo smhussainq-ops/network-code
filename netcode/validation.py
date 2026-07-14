@@ -441,7 +441,8 @@ class StaticValidator:
         )
 
     def _deterministic_render(self, intent: Intent, render: RenderResult) -> CheckResult:
-        second = render_intent(intent, self.paths)
+        template_platform = Path(render.template_path).parent.name
+        second = render_intent(intent, self.paths, platform=template_platform)
         if second.config != render.config:
             return self._fail(
                 "deterministic_render",

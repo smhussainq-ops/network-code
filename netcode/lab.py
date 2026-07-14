@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import re
 import shutil
 import subprocess
@@ -109,24 +110,101 @@ DRY_RUN_CAPABILITIES: dict[str, dict[str, str]] = {
 
 
 def normalize_platform(platform: str) -> str:
-    normalized = str(platform or "").strip().lower().replace("-", "_").replace(" ", "_")
+    normalized = AdapterRegistry.normalize_execution_platform(platform)
     aliases = {
-        "arista": "arista_eos",
-        "eos": "arista_eos",
-        "arista_eos": "arista_eos",
-        "ios": "cisco_ios",
-        "cisco_ios": "cisco_ios",
-        "iosxe": "cisco_xe",
-        "cisco_iosxe": "cisco_xe",
-        "cisco_xe": "cisco_xe",
         "nxos": "cisco_nxos",
-        "cisco_nxos": "cisco_nxos",
         "iosxr": "cisco_xr",
-        "cisco_xr": "cisco_xr",
         "junos": "juniper_junos",
-        "juniper_junos": "juniper_junos",
     }
-    return aliases.get(normalized, normalized or "arista_eos")
+    return aliases.get(normalized, normalized)
+
+
+_NTP_STATE_SCHEMA = "netcode.ntp-pre-change.v1"
+
+
+def _ntp_line_map(output: str, managed_servers: list[str]) -> dict[str, str]:
+    managed = {str(server).strip() for server in managed_servers if str(server).strip()}
+    result: dict[str, str] = {}
+    for raw_line in str(output or "").splitlines():
+        line = raw_line.strip()
+        match = re.match(r"^ntp\s+server\s+(\S+)(?:\s+.*)?$", line, flags=re.IGNORECASE)
+        if match and match.group(1) in managed:
+            result[match.group(1)] = line
+    return result
+
+
+def _capture_ntp_state(device: Device, intent: NtpStandardizeIntent, output: str) -> dict[str, object]:
+    managed_servers = sorted({str(server).strip() for server in intent.ntp.servers if str(server).strip()})
+    prior_lines = _ntp_line_map(output, managed_servers)
+    identity = "\n".join(f"{server}={prior_lines.get(server, '')}" for server in managed_servers)
+    return {
+        "schema": _NTP_STATE_SCHEMA,
+        "device_id": device.id,
+        "platform": normalize_platform(device.platform),
+        "managed_servers": managed_servers,
+        "prior_lines": prior_lines,
+        "fingerprint": hashlib.sha256(identity.encode("utf-8")).hexdigest(),
+    }
+
+
+def _validated_ntp_state(
+    device: Device,
+    intent: NtpStandardizeIntent,
+    state: object,
+) -> dict[str, object]:
+    if not isinstance(state, dict) or state.get("schema") != _NTP_STATE_SCHEMA:
+        raise ValueError("Exact pre-change NTP state is missing; rollback is blocked.")
+    if str(state.get("device_id") or "").strip().lower() != device.id.strip().lower():
+        raise ValueError("Pre-change NTP state belongs to a different device.")
+    if normalize_platform(str(state.get("platform") or "")) != normalize_platform(device.platform):
+        raise ValueError("Pre-change NTP state belongs to a different platform.")
+    expected_servers = sorted({str(server).strip() for server in intent.ntp.servers if str(server).strip()})
+    managed_servers = sorted(str(server).strip() for server in state.get("managed_servers", []) if str(server).strip())
+    if managed_servers != expected_servers:
+        raise ValueError("Pre-change NTP state does not match the reviewed server scope.")
+    prior_lines = state.get("prior_lines")
+    if not isinstance(prior_lines, dict):
+        raise ValueError("Pre-change NTP state has no restorable line map.")
+    normalized_prior: dict[str, str] = {}
+    for raw_server, raw_line in prior_lines.items():
+        server = str(raw_server).strip()
+        line = str(raw_line).strip()
+        if server not in managed_servers or not line or "\n" in str(raw_line) or "\r" in str(raw_line):
+            raise ValueError("Pre-change NTP state contains an out-of-scope restore command.")
+        match = re.fullmatch(r"ntp\s+server\s+(\S+)(?:\s+.*)?", line, flags=re.IGNORECASE)
+        if not match or match.group(1) != server:
+            raise ValueError("Pre-change NTP state contains an invalid restore command.")
+        normalized_prior[server] = line
+    identity = "\n".join(f"{server}={normalized_prior.get(server, '')}" for server in managed_servers)
+    expected_fingerprint = hashlib.sha256(identity.encode("utf-8")).hexdigest()
+    if not hmac.compare_digest(str(state.get("fingerprint") or ""), expected_fingerprint):
+        raise ValueError("Pre-change NTP state fingerprint is invalid.")
+    return {
+        **state,
+        "managed_servers": managed_servers,
+        "prior_lines": normalized_prior,
+        "fingerprint": expected_fingerprint,
+    }
+
+
+def _ntp_state_matches(output: str, state: dict[str, object]) -> bool:
+    servers = [str(value) for value in state["managed_servers"]]
+    return _ntp_line_map(output, servers) == state["prior_lines"]
+
+
+def _ntp_restore_config(output: str, state: dict[str, object]) -> str:
+    servers = [str(value) for value in state["managed_servers"]]
+    current = _ntp_line_map(output, servers)
+    prior = {str(key): str(value) for key, value in dict(state["prior_lines"]).items()}
+    commands: list[str] = []
+    for server in servers:
+        if current.get(server) == prior.get(server):
+            continue
+        if current.get(server):
+            commands.append(f"no ntp server {server}")
+        if prior.get(server):
+            commands.append(prior[server])
+    return "\n".join(commands) + ("\n" if commands else "")
 
 
 def dry_run_capability(platform: str) -> dict[str, str]:
@@ -161,6 +239,7 @@ class AristaEOSLabAdapter(ExecutionAdapter):
         progress: ProgressCallback | None = None,
         operation: str = "execution",
         operation_id: str = "",
+        operation_context: dict[str, object] | None = None,
     ):
         self.device = device
         self.timeout = timeout
@@ -168,6 +247,7 @@ class AristaEOSLabAdapter(ExecutionAdapter):
         self.progress = progress
         self.operation = operation
         self.operation_id = str(operation_id or "").strip()
+        self.operation_context = dict(operation_context or {})
         self._verify_current = 0
         self._verify_total = 0
         self._verify_phase = "verify"
@@ -255,7 +335,13 @@ class AristaEOSLabAdapter(ExecutionAdapter):
         self.operation = "dry-run"
         self.connect()
         try:
+            rollback_state = None
+            if isinstance(intent, NtpStandardizeIntent):
+                current = self.show("show running-config | include ntp server")
+                rollback_state = _capture_ntp_state(self.device, intent, current)
             result = self.config_session(render.config, "dry-run")
+            if rollback_state is not None:
+                result.evidence["rollback_state"] = rollback_state
             _emit_progress(
                 self.progress,
                 phase="dry-run",
@@ -271,8 +357,35 @@ class AristaEOSLabAdapter(ExecutionAdapter):
         self.operation = "apply"
         self.connect()
         try:
+            rollback_state = None
+            if isinstance(intent, NtpStandardizeIntent):
+                current = self.show("show running-config | include ntp server")
+                try:
+                    rollback_state = _validated_ntp_state(
+                        self.device,
+                        intent,
+                        self.operation_context.get("approved_pre_change_state"),
+                    )
+                except ValueError as exc:
+                    return LabResult(
+                        status="fail",
+                        action="apply",
+                        device_id=self.device.id,
+                        message=str(exc),
+                        evidence={"write_started": False},
+                    )
+                if not _ntp_state_matches(current, rollback_state):
+                    return LabResult(
+                        status="fail",
+                        action="apply",
+                        device_id=self.device.id,
+                        message="Live NTP state changed after the approved dry-run; re-run validation before applying.",
+                        evidence={"write_started": False, "approved_pre_change_state": rollback_state},
+                    )
             session = self.config_session(render.config, "apply")
             if session.status != "pass":
+                if rollback_state is not None:
+                    session.evidence["rollback_state"] = rollback_state
                 return session
             _emit_progress(
                 self.progress,
@@ -292,7 +405,11 @@ class AristaEOSLabAdapter(ExecutionAdapter):
                 device_id=self.device.id,
                 message=verify.message if verify.status == "pass" else "Apply completed but verification failed.",
                 session_name=session.session_name,
-                evidence={"session": session.evidence, "verification": verify.evidence},
+                evidence={
+                    "session": session.evidence,
+                    "verification": verify.evidence,
+                    **({"rollback_state": rollback_state} if rollback_state is not None else {}),
+                },
             )
             _emit_progress(
                 self.progress,
@@ -309,8 +426,36 @@ class AristaEOSLabAdapter(ExecutionAdapter):
         self.operation = "rollback"
         self.connect()
         try:
-            rollback = rollback_config(intent)
+            rollback_state = None
+            if isinstance(intent, NtpStandardizeIntent):
+                try:
+                    rollback_state = _validated_ntp_state(
+                        self.device,
+                        intent,
+                        self.operation_context.get("rollback_state"),
+                    )
+                except ValueError as exc:
+                    return LabResult(
+                        status="fail",
+                        action="rollback",
+                        device_id=self.device.id,
+                        message=str(exc),
+                        evidence={"write_started": False},
+                    )
+                current = self.show("show running-config | include ntp server")
+                rollback = _ntp_restore_config(current, rollback_state)
+            else:
+                rollback = rollback_config(intent)
             if not rollback.strip():
+                if rollback_state is not None:
+                    verify = self._verify_ntp_state(rollback_state)
+                    return LabResult(
+                        status=verify.status,
+                        action="rollback",
+                        device_id=self.device.id,
+                        message="NTP state already matches the exact pre-change state.",
+                        evidence={"no_op": True, "verification": verify.evidence, "rollback_state": rollback_state},
+                    )
                 return LabResult(
                     status="fail",
                     action="rollback",
@@ -320,11 +465,15 @@ class AristaEOSLabAdapter(ExecutionAdapter):
             session = self.config_session(rollback, "rollback")
             if session.status != "pass":
                 return session
-            verify = self.verify_intent(
-                intent,
-                present=False,
-                progress_phase="rollback",
-                progress_stage="previous_state_check",
+            verify = (
+                self._verify_ntp_state(rollback_state)
+                if rollback_state is not None
+                else self.verify_intent(
+                    intent,
+                    present=False,
+                    progress_phase="rollback",
+                    progress_stage="previous_state_check",
+                )
             )
             result = LabResult(
                 status="pass" if verify.status == "pass" else "fail",
@@ -332,7 +481,11 @@ class AristaEOSLabAdapter(ExecutionAdapter):
                 device_id=self.device.id,
                 message=verify.message if verify.status == "pass" else "Rollback committed but verification failed.",
                 session_name=session.session_name,
-                evidence={"session": session.evidence, "verification": verify.evidence},
+                evidence={
+                    "session": session.evidence,
+                    "verification": verify.evidence,
+                    **({"rollback_state": rollback_state} if rollback_state is not None else {}),
+                },
             )
             _emit_progress(
                 self.progress,
@@ -713,6 +866,26 @@ class AristaEOSLabAdapter(ExecutionAdapter):
             evidence={"commands": {command: output}, "servers": intent.ntp.servers},
         )
 
+    def _verify_ntp_state(self, state: dict[str, object]) -> LabResult:
+        command = "show running-config | include ntp server"
+        output = self.show(command)
+        matched = _ntp_state_matches(output, state)
+        return LabResult(
+            status="pass" if matched else "fail",
+            action="verify_rollback",
+            device_id=self.device.id,
+            message=(
+                "Exact pre-change NTP state was restored."
+                if matched
+                else "NTP rollback did not restore the exact reviewed pre-change state."
+            ),
+            evidence={
+                "commands": {command: output},
+                "expected_lines": state["prior_lines"],
+                "managed_servers": state["managed_servers"],
+            },
+        )
+
     def _verify_os_upgrade(self, intent: OsUpgradeIntent, present: bool) -> LabResult:
         command = "show running-config | include ^boot system"
         output = self.show(command)
@@ -734,12 +907,390 @@ class AristaEOSLabAdapter(ExecutionAdapter):
         )
 
 
+class CiscoIOSNtpAdapter(AristaEOSLabAdapter):
+    """Governed IOS/IOS-XE execution for the Community Golden Baseline pack.
+
+    IOS has no candidate commit contract comparable to EOS config sessions, so
+    the reviewed dry-run is offline and the first target is the proof device.
+    Running config is saved only after the live NTP verification succeeds.
+    """
+
+    metadata = ExecutionAdapterMetadata(
+        name="netcode.cisco_ios_ntp",
+        platform="cisco_ios",
+        capabilities=["dry_run", "diff", "apply", "rollback", "verify"],
+        safe_write_model="offline validation, first-device proof, verify-before-save, exact pre-change rollback",
+        production_ready=False,
+    )
+
+    def connect(self) -> None:
+        try:
+            from netmiko import ConnectHandler
+        except Exception as exc:
+            raise RuntimeError(f"netmiko is required for Cisco IOS operations: {exc}") from exc
+
+        self._conn = ConnectHandler(
+            device_type="cisco_ios",
+            host=self.device.host,
+            username=self.device.username,
+            password=self.device.password,
+            port=self.device.port,
+            fast_cli=False,
+            conn_timeout=self.timeout,
+            auth_timeout=self.timeout,
+            banner_timeout=self.timeout,
+        )
+        try:
+            self._conn.enable()
+        except Exception as exc:
+            raise RuntimeError(f"Could not enter Cisco IOS privileged mode: {exc}") from exc
+        self._send("terminal length 0")
+        _emit_progress(
+            self.progress,
+            phase=self.operation,
+            stage="connected",
+            message=f"Connected to {self.device.id} through the Local Connector.",
+        )
+
+    def _cli_error(self, output: str) -> bool:
+        markers = (
+            "% Invalid input",
+            "% Incomplete command",
+            "% Ambiguous command",
+            "% Authorization failed",
+            "% Configuration failed",
+            "% Permission denied",
+        )
+        return any(marker.lower() in str(output or "").lower() for marker in markers)
+
+    def _configure(
+        self,
+        config: str,
+        phase: str,
+        *,
+        reverse: bool = False,
+    ) -> tuple[str, list[dict[str, str]]]:
+        if not self._conn:
+            raise RuntimeError("Not connected")
+        commands = [line.strip() for line in config.splitlines() if line.strip()]
+        if not commands:
+            return "", []
+        output = self._conn.send_config_set(
+            config_commands=commands,
+            read_timeout=self.timeout,
+            error_pattern=r"%\s*(?:Invalid input|Incomplete command|Ambiguous command|Authorization failed|Configuration failed)",
+        )
+        if self._cli_error(output):
+            raise RuntimeError(f"Cisco IOS rejected the reviewed configuration batch: {output}")
+        transcript: list[dict[str, str]] = []
+        for index, command in enumerate(commands, start=1):
+            transcript.append({
+                "command": command,
+                "output": output if index == len(commands) else "Accepted in reviewed configuration batch.",
+            })
+            _emit_progress(
+                self.progress,
+                phase=phase,
+                stage="reverse_commands_applied" if reverse or phase == "rollback" else "commands_applied",
+                message=f"Device accepted command {index} of {len(commands)}.",
+                current_step=index,
+                total_steps=len(commands),
+                command=command,
+            )
+        return output, transcript
+
+    def _save_verified_config(self, phase: str) -> str:
+        if not self._conn or not hasattr(self._conn, "save_config"):
+            raise RuntimeError("Cisco IOS connector cannot save the verified running configuration.")
+        output = str(self._conn.save_config())
+        if self._cli_error(output):
+            raise RuntimeError(f"Cisco IOS rejected the save operation: {output}")
+        _emit_progress(
+            self.progress,
+            phase=phase,
+            stage="startup_config_saved",
+            message="Verified running configuration was saved to startup configuration.",
+        )
+        return output
+
+    def _restore_running_ntp_state(
+        self,
+        state: dict[str, object],
+        *,
+        persist: bool = False,
+    ) -> dict[str, object]:
+        """Best-effort compensation for a failed IOS transaction.
+
+        IOS changes running-config immediately. A failed command, verification,
+        or save therefore must restore the exact reviewed pre-change state
+        before the job returns. If compensation cannot be proven, the result
+        remains failed and explicitly requires reconciliation.
+        """
+        evidence: dict[str, object] = {
+            "attempted": True,
+            "status": "failed",
+            "startup_config_saved": False,
+        }
+        _emit_progress(
+            self.progress,
+            phase=self.operation,
+            stage="automatic_rollback_started",
+            message="Apply did not complete safely; restoring the reviewed pre-change NTP state.",
+        )
+        try:
+            current = self.show("show running-config | include ntp server")
+            rollback = _ntp_restore_config(current, state)
+            transcript: list[dict[str, str]] = []
+            if rollback:
+                _, transcript = self._configure(
+                    rollback,
+                    self.operation,
+                    reverse=True,
+                )
+            verify = self._verify_ntp_state(state)
+            evidence.update({
+                "status": verify.status,
+                "commands": transcript,
+                "verification": verify.evidence,
+                "no_op": not bool(rollback),
+            })
+            if verify.status != "pass":
+                evidence["error"] = verify.message
+                return evidence
+            if persist:
+                evidence["save_output"] = self._save_verified_config(self.operation)
+                evidence["startup_config_saved"] = True
+            _emit_progress(
+                self.progress,
+                phase=self.operation,
+                stage="automatic_rollback_verified",
+                status="passed",
+                message="Exact pre-change NTP state was restored and verified.",
+            )
+            return evidence
+        except Exception as exc:
+            evidence["error"] = f"{type(exc).__name__}: {exc}"
+            _emit_progress(
+                self.progress,
+                phase=self.operation,
+                stage="automatic_rollback_failed",
+                status="failed",
+                message="Automatic restoration could not be proven; manual reconciliation is required.",
+            )
+            return evidence
+
+    def apply(self, intent: Intent, render) -> LabResult:
+        self.operation = "apply"
+        if not isinstance(intent, NtpStandardizeIntent):
+            return LabResult(
+                status="fail",
+                action="apply",
+                device_id=self.device.id,
+                message=f"Cisco IOS Community execution supports ntp_standardize, not {intent.change_type}.",
+                evidence={"write_started": False},
+            )
+        self.connect()
+        rollback_state: dict[str, object] | None = None
+        transcript: list[dict[str, str]] = []
+        try:
+            current = self.show("show running-config | include ntp server")
+            try:
+                rollback_state = _validated_ntp_state(
+                    self.device,
+                    intent,
+                    self.operation_context.get("approved_pre_change_state"),
+                )
+            except ValueError as exc:
+                return LabResult(
+                    status="fail",
+                    action="apply",
+                    device_id=self.device.id,
+                    message=str(exc),
+                    evidence={"write_started": False},
+                )
+            if not _ntp_state_matches(current, rollback_state):
+                return LabResult(
+                    status="fail",
+                    action="apply",
+                    device_id=self.device.id,
+                    message="Live NTP state changed after the approved dry-run; re-run validation before applying.",
+                    evidence={"write_started": False, "approved_pre_change_state": rollback_state},
+                )
+            try:
+                _, transcript = self._configure(render.config, "apply")
+            except Exception as exc:
+                compensation = self._restore_running_ntp_state(rollback_state)
+                return LabResult(
+                    status="fail",
+                    action="apply",
+                    device_id=self.device.id,
+                    message=(
+                        f"Cisco IOS apply failed before verification: {exc}. "
+                        + (
+                            "The exact pre-change state was restored."
+                            if compensation.get("status") == "pass"
+                            else "Automatic restoration was not proven; manual reconciliation is required."
+                        )
+                    ),
+                    evidence={
+                        "transcript": transcript,
+                        "rollback_state": rollback_state,
+                        "startup_config_saved": False,
+                        "automatic_rollback": compensation,
+                        "running_config_may_be_modified": compensation.get("status") != "pass",
+                    },
+                )
+            verify = self.verify_intent(
+                intent,
+                present=True,
+                progress_phase="apply",
+                progress_stage="safety_check",
+            )
+            if verify.status != "pass":
+                compensation = self._restore_running_ntp_state(rollback_state)
+                return LabResult(
+                    status="fail",
+                    action="apply",
+                    device_id=self.device.id,
+                    message=(
+                        "Cisco IOS live verification failed; startup config was not saved. "
+                        + (
+                            "The exact pre-change running state was restored."
+                            if compensation.get("status") == "pass"
+                            else "Automatic restoration was not proven; manual reconciliation is required."
+                        )
+                    ),
+                    evidence={
+                        "transcript": transcript,
+                        "verification": verify.evidence,
+                        "rollback_state": rollback_state,
+                        "startup_config_saved": False,
+                        "automatic_rollback": compensation,
+                        "running_config_may_be_modified": compensation.get("status") != "pass",
+                    },
+                )
+            try:
+                save_output = self._save_verified_config("apply")
+            except Exception as exc:
+                compensation = self._restore_running_ntp_state(rollback_state, persist=True)
+                return LabResult(
+                    status="fail",
+                    action="apply",
+                    device_id=self.device.id,
+                    message=(
+                        f"Live verification passed, but startup-config save failed: {exc}. "
+                        + (
+                            "The exact pre-change state was restored and saved."
+                            if compensation.get("status") == "pass" and compensation.get("startup_config_saved")
+                            else "Automatic restoration was not proven durable; manual reconciliation is required."
+                        )
+                    ),
+                    evidence={
+                        "transcript": transcript,
+                        "verification": verify.evidence,
+                        "rollback_state": rollback_state,
+                        "startup_config_saved": False,
+                        "automatic_rollback": compensation,
+                        "running_config_may_be_modified": compensation.get("status") != "pass",
+                    },
+                )
+            return LabResult(
+                status="pass",
+                action="apply",
+                device_id=self.device.id,
+                message="Cisco IOS NTP standardization applied, verified live, and saved.",
+                evidence={
+                    "transcript": transcript,
+                    "verification": verify.evidence,
+                    "rollback_state": rollback_state,
+                    "startup_config_saved": True,
+                    "save_output": save_output,
+                },
+            )
+        finally:
+            self.disconnect()
+
+    def rollback(self, intent: Intent, render) -> LabResult:
+        self.operation = "rollback"
+        if not isinstance(intent, NtpStandardizeIntent):
+            return LabResult(
+                status="fail",
+                action="rollback",
+                device_id=self.device.id,
+                message=f"Cisco IOS Community rollback supports ntp_standardize, not {intent.change_type}.",
+                evidence={"write_started": False},
+            )
+        try:
+            rollback_state = _validated_ntp_state(
+                self.device,
+                intent,
+                self.operation_context.get("rollback_state"),
+            )
+        except ValueError as exc:
+            return LabResult(
+                status="fail",
+                action="rollback",
+                device_id=self.device.id,
+                message=str(exc),
+                evidence={"write_started": False},
+            )
+        self.connect()
+        transcript: list[dict[str, str]] = []
+        try:
+            current = self.show("show running-config | include ntp server")
+            rollback = _ntp_restore_config(current, rollback_state)
+            if rollback:
+                try:
+                    _, transcript = self._configure(rollback, "rollback")
+                except Exception as exc:
+                    return LabResult(
+                        status="fail",
+                        action="rollback",
+                        device_id=self.device.id,
+                        message=f"Cisco IOS rollback command failed: {exc}",
+                        evidence={"transcript": transcript, "rollback_state": rollback_state},
+                    )
+            verify = self._verify_ntp_state(rollback_state)
+            if verify.status != "pass":
+                return LabResult(
+                    status="fail",
+                    action="rollback",
+                    device_id=self.device.id,
+                    message=verify.message,
+                    evidence={"transcript": transcript, "verification": verify.evidence, "rollback_state": rollback_state},
+                )
+            try:
+                save_output = self._save_verified_config("rollback")
+            except Exception as exc:
+                return LabResult(
+                    status="fail",
+                    action="rollback",
+                    device_id=self.device.id,
+                    message=f"NTP state was restored in running config, but startup-config save failed: {exc}",
+                    evidence={"transcript": transcript, "verification": verify.evidence, "rollback_state": rollback_state},
+                )
+            return LabResult(
+                status="pass",
+                action="rollback",
+                device_id=self.device.id,
+                message="Cisco IOS exact pre-change NTP state restored, verified, and saved.",
+                evidence={
+                    "transcript": transcript,
+                    "verification": verify.evidence,
+                    "rollback_state": rollback_state,
+                    "startup_config_saved": True,
+                    "save_output": save_output,
+                },
+            )
+        finally:
+            self.disconnect()
+
+
 def _netmiko_device_type(platform: str) -> str:
     normalized = normalize_platform(platform)
     mapping = {
         "arista_eos": "arista_eos",
         "cisco_ios": "cisco_ios",
-        "cisco_xe": "cisco_xe",
         "cisco_nxos": "cisco_nxos",
         "juniper_junos": "juniper_junos",
     }
@@ -892,6 +1443,11 @@ def offline_dry_run(
             "diff": diff,
             "rendered_config_lines": len([line for line in render.config.splitlines() if line.strip()]),
             "current_config_collected": bool(current_config.strip()),
+            **(
+                {"rollback_state": _capture_ntp_state(device, intent, current_config)}
+                if isinstance(intent, NtpStandardizeIntent)
+                else {}
+            ),
         },
         dry_run_kind="offline_validation",
     )
@@ -913,8 +1469,19 @@ def run_lab_action_for_device(
     *,
     progress: ProgressCallback | None = None,
     operation_id: str = "",
+    operation_context: dict[str, object] | None = None,
 ) -> LabResult:
     platform = normalize_platform(device.platform)
+    try:
+        AdapterRegistry.require_execution_support(platform, intent.change_type)
+    except ValueError as exc:
+        return LabResult(
+            status="fail",
+            action=action,
+            device_id=device.id,
+            message=str(exc),
+            evidence={"platform": platform, "write_started": False},
+        )
     if action == "dry-run":
         if platform == "arista_eos":
             return AristaEOSLabAdapter(
@@ -922,6 +1489,7 @@ def run_lab_action_for_device(
                 progress=progress,
                 operation=action,
                 operation_id=operation_id,
+                operation_context=operation_context,
             ).dry_run(intent, render)
         capability = dry_run_capability(platform)
         if capability["dry_run_kind"] == "offline_validation":
@@ -934,19 +1502,13 @@ def run_lab_action_for_device(
             evidence={"dry_run_capability": capability},
             dry_run_kind="canary_only",
         )
-    if platform != "arista_eos":
-        return LabResult(
-            status="fail",
-            action=action,
-            device_id=device.id,
-            message=f"{action} is not implemented for {platform} in this runner yet.",
-            evidence={"platform": platform, "write_supported": False},
-        )
-    adapter = AristaEOSLabAdapter(
+    adapter_class = AristaEOSLabAdapter if platform == "arista_eos" else CiscoIOSNtpAdapter
+    adapter = adapter_class(
         device,
         progress=progress,
         operation=action,
         operation_id=operation_id,
+        operation_context=operation_context,
     )
     if action == "apply":
         return adapter.apply(intent, render)
@@ -981,9 +1543,17 @@ def _device_for_intent(paths: WorkspacePaths, intent: Intent, device_id: str | N
     return inventory.resolve_targets(intent.targets, site=intent.site)[0]
 
 
-def run_lab_action(paths: WorkspacePaths, intent_path: Path, action: Literal["dry-run", "apply", "rollback"], device_id: str | None = None) -> dict[str, object]:
+def run_lab_action(
+    paths: WorkspacePaths,
+    intent_path: Path,
+    action: Literal["dry-run", "apply", "rollback"],
+    device_id: str | None = None,
+    *,
+    operation_context: dict[str, object] | None = None,
+) -> dict[str, object]:
     intent = load_intent(intent_path)
-    render = render_intent(intent, paths)
+    device = _device_for_intent(paths, intent, device_id)
+    render = render_intent(intent, paths, platform=device.platform)
     validation = StaticValidator(paths).validate(intent, render)
     if not validation.passed:
         return LabResult(
@@ -1002,8 +1572,13 @@ def run_lab_action(paths: WorkspacePaths, intent_path: Path, action: Literal["dr
             evidence={"apply_locked": True, "change_type": intent.change_type},
         ).__dict__
 
-    device = _device_for_intent(paths, intent, device_id)
-    result = run_lab_action_for_device(device, intent, render, action)
+    result = run_lab_action_for_device(
+        device,
+        intent,
+        render,
+        action,
+        operation_context=operation_context,
+    )
 
     payload = result.__dict__.copy()
     if result.status == "pass" and action in {"apply", "rollback"}:

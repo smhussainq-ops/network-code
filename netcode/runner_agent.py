@@ -26,6 +26,7 @@ import platform
 import re
 import shutil
 import signal
+import socket
 import subprocess
 import site
 import sys
@@ -535,6 +536,13 @@ class _JobLeaseRenewer:
                 print(f"[runner] Job lease renewal failed for {self.job_id}: {exc}", file=sys.stderr, flush=True)
 
 
+def _runner_workspace_root() -> Path:
+    configured = str(os.environ.get("NETCODE_RUNNER_WORKSPACE", "")).strip()
+    if configured:
+        return Path(configured).expanduser().resolve()
+    return Path(__file__).resolve().parent.parent
+
+
 def _execute_job_inner(
     job: dict[str, Any],
     progress: Callable[[dict[str, Any]], None] | None = None,
@@ -569,14 +577,26 @@ def _execute_job_inner(
     device_id = device_spec.get("id")
 
     # Render workspace: the runner uses ITS OWN templates (never the control
-    # plane's rendered output) so it fully controls what gets pushed. Defaults to
-    # the runner's working directory, which ships the templates/ tree.
-    ws_root = Path(os.environ.get("NETCODE_RUNNER_WORKSPACE", "") or Path.cwd()).resolve()
+    # plane's rendered output) so it fully controls what gets pushed. Resolve
+    # relative to the installed runner, not the shell's launch directory.
+    ws_root = _runner_workspace_root()
     workdir = Path(tempfile.mkdtemp(prefix="netcode-runner-"))
     intent_path = workdir / "intent.yaml"
     intent_path.write_text(payload.get("intent_yaml", ""), encoding="utf-8")
     intent = load_intent(intent_path)
-    render = render_intent(intent, _RunnerPaths(ws_root))
+
+    # Credentials and the authoritative platform come only from the connector's
+    # inventory. Resolve them before rendering so a cloud payload cannot select
+    # a different vendor template.
+    if not INVENTORY_FILE.exists():
+        return {"status": "fail", "action": action, "device_id": device_id,
+                "message": f"No local inventory at {INVENTORY_FILE}; cannot resolve credentials."}
+    inventory = Inventory(INVENTORY_FILE)
+    device = inventory.find_device(device_id)
+    if device is None:
+        return {"status": "fail", "action": action, "device_id": device_id,
+                "message": f"Device {device_id} not in local runner inventory."}
+    render = render_intent(intent, _RunnerPaths(ws_root), platform=device.platform)
 
     # Second safety gate: local fail-closed policy re-check. A compromised control
     # plane cannot make the runner push forbidden config — the runner's OWN
@@ -599,16 +619,6 @@ def _execute_job_inner(
             "message": "Runner-local policy and credential safety checks passed.",
         })
 
-    # Credentials come ONLY from the runner's local inventory, never from the cloud payload.
-    if not INVENTORY_FILE.exists():
-        return {"status": "fail", "action": action, "device_id": device_id,
-                "message": f"No local inventory at {INVENTORY_FILE}; cannot resolve credentials."}
-    inventory = Inventory(INVENTORY_FILE)
-    device = inventory.find_device(device_id)
-    if device is None:
-        return {"status": "fail", "action": action, "device_id": device_id,
-                "message": f"Device {device_id} not in local runner inventory."}
-
     if action not in {"dry-run", "apply", "rollback"}:
         return {"status": "fail", "action": action, "device_id": device_id, "message": f"Unknown action {action}."}
     lab = run_lab_action_for_device(
@@ -618,6 +628,10 @@ def _execute_job_inner(
         action,
         progress=progress,
         operation_id=str(job.get("idempotency_key") or ""),
+        operation_context={
+            "approved_pre_change_state": payload.get("approved_pre_change_state"),
+            "rollback_state": payload.get("rollback_state"),
+        },
     )
     result = lab.__dict__ if hasattr(lab, "__dict__") else dict(lab)
     result.setdefault("action", action)
@@ -1675,6 +1689,32 @@ def _execute_rez_scan_device(
     password = existing.password if existing else str(defaults.get("password") or "")
     port = requested_port or (existing.port if existing else int(defaults.get("port") or 22))
 
+    # Auto-detection can fan out across several vendor drivers, so reject a
+    # closed endpoint first. When the caller selected a platform, let that
+    # adapter own transport validation; API-backed drivers are not required to
+    # expose a generic SSH socket and can return a more precise failure.
+    if existing is None and not requested_platform:
+        try:
+            with socket.create_connection((host, port), timeout=1.0):
+                pass
+        except OSError as exc:
+            return {
+                "ok": False,
+                "status": "fail",
+                "found": False,
+                "host": host,
+                "port": port,
+                "provider": "rez-runner",
+                "requested_platform": requested_platform or "auto",
+                "tried_platforms": [],
+                "error": f"endpoint_unreachable:{type(exc).__name__}",
+                "safety": {
+                    "device_writes": "none",
+                    "source_of_truth_written": False,
+                    "message": "The endpoint did not accept a bounded connection, so vendor drivers were not tried.",
+                },
+            }
+
     rez = AdapterRegistry().rez
     driver_map = rez.driver_map()
     if not driver_map:
@@ -1727,6 +1767,10 @@ def _execute_rez_scan_device(
         state = result.get("state")
         if not isinstance(state, dict):
             return {"ok": False, "status": "fail", "host": host, "platform": platform, "error": "Rez driver returned non-object state."}
+        state = dict(state)
+        collected_at = datetime.now(timezone.utc).isoformat()
+        state["_collected_at"] = str(state.get("_collected_at") or collected_at)
+        state["collected_at"] = str(state.get("collected_at") or state["_collected_at"])
         state_summary = _extract_state_summary(state, device_id or host, platform)
         hostname = str(state_summary.get("hostname") or device_id or _safe_device_id(host))
         candidate = {
@@ -1870,6 +1914,7 @@ def _execute_rez_discover_network(
     candidates: list[dict[str, Any]] = []
     results: list[dict[str, Any]] = []
     failures: list[dict[str, Any]] = []
+    skipped: list[dict[str, Any]] = []
 
     while frontier and len(scanned) < profile.max_devices:
         current_depth = min(depth for _, depth in frontier)
@@ -1917,12 +1962,33 @@ def _execute_rez_discover_network(
             public_result["depth"] = current_depth
             results.append(public_result)
             if not result.get("ok") or not isinstance(result.get("state"), dict):
+                error = str(result.get("error") or result.get("message") or "collection_failed")
+                if (
+                    target.optional_probe
+                    and not target.device_id
+                    and error.startswith("endpoint_unreachable:")
+                ):
+                    skipped_target = {
+                        "host": target.host,
+                        "port": target.port,
+                        "depth": current_depth,
+                        "reason": "no_reachable_endpoint",
+                    }
+                    skipped.append(skipped_target)
+                    emit({
+                        "stage": "device_skipped",
+                        "status": "skipped",
+                        "host": target.host,
+                        "depth": current_depth,
+                        "message": "No reachable endpoint was found at this sweep address.",
+                    })
+                    continue
                 failure = {
                     "device_id": target.device_id,
                     "host": target.host,
                     "port": target.port,
                     "depth": current_depth,
-                    "error": str(result.get("error") or result.get("message") or "collection_failed"),
+                    "error": error,
                     "tried_platforms": result.get("tried_platforms") or [],
                 }
                 failures.append(failure)
@@ -1975,7 +2041,10 @@ def _execute_rez_discover_network(
         "stage": "discovery_completed" if ok else "discovery_failed",
         "status": "passed" if ok and not partial else ("partial" if partial else "failed"),
         "message": (
-            f"Discovery collected {len(states)} device(s); {len(failures)} failed."
+            (
+                f"Discovery collected {len(states)} device(s); "
+                f"{len(skipped)} unused sweep address(es) skipped; {len(failures)} failed."
+            )
             if ok
             else "Discovery did not collect any device state."
         ),
@@ -1990,10 +2059,12 @@ def _execute_rez_discover_network(
         "source_of_truth_candidates": candidates,
         "device_results": results,
         "failures": failures,
+        "skipped_targets": skipped,
         "progress_events": event_log,
         "requested": len(scanned),
         "collected": len(states),
         "failed": len(failures),
+        "skipped": len(skipped),
         "elapsed_seconds": round(time.monotonic() - started, 3),
         "safety": {
             "device_writes": "none",

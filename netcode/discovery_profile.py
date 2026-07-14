@@ -28,6 +28,7 @@ class DiscoveryTarget:
     port: int = 22
     site: str = ""
     groups: tuple[str, ...] = ()
+    optional_probe: bool = False
 
     def scan_payload(self) -> dict[str, Any]:
         return {
@@ -170,6 +171,7 @@ class DiscoveryProfile:
             *,
             requested_port: int | None = None,
             known_device: Device | None = None,
+            optional_probe: bool = False,
         ) -> None:
             known = known_device or inventory.find_device(host)
             if known:
@@ -181,7 +183,11 @@ class DiscoveryProfile:
                     raise DiscoveryProfileError(
                         f"Unknown hostname '{host}'. Add it to the Local Connector inventory or use an IP address."
                     ) from exc
-                target = DiscoveryTarget(host=host, port=requested_port or 22)
+                target = DiscoveryTarget(
+                    host=host,
+                    port=requested_port or 22,
+                    optional_probe=optional_probe,
+                )
             if requested_port and requested_port != target.port:
                 target = DiscoveryTarget(
                     host=target.host,
@@ -190,6 +196,7 @@ class DiscoveryProfile:
                     port=requested_port,
                     site=target.site,
                     groups=target.groups,
+                    optional_probe=target.optional_probe,
                 )
             target_key = (target.host, target.port)
             if target_key in seen_targets:
@@ -207,10 +214,12 @@ class DiscoveryProfile:
             if known:
                 add_host(known.host, requested_port=requested_port, known_device=known)
                 continue
-            try:
-                network = ipaddress.ip_network(host_token, strict=False)
-            except ValueError:
-                network = None
+            network = None
+            if "/" in host_token:
+                try:
+                    network = ipaddress.ip_network(host_token, strict=False)
+                except ValueError:
+                    network = None
             if network is not None:
                 host_count = int(network.num_addresses)
                 if network.version == 4 and network.prefixlen < 31:
@@ -222,12 +231,20 @@ class DiscoveryProfile:
                 if not explicit_allowed:
                     allowed.append(network)
                 for address in network.hosts():
-                    add_host(str(address), requested_port=requested_port)
+                    add_host(
+                        str(address),
+                        requested_port=requested_port,
+                        optional_probe=True,
+                    )
                 continue
             expanded = _expand_ip_range(host_token, remaining=max_devices - len(targets))
             if expanded is not None:
                 for host in expanded:
-                    add_host(host, requested_port=requested_port)
+                    add_host(
+                        host,
+                        requested_port=requested_port,
+                        optional_probe=True,
+                    )
                 continue
             add_host(host_token, requested_port=requested_port)
 

@@ -107,6 +107,7 @@ from netcode.auth import (
     verify_password,
 )
 from netcode.models import load_intent, load_intent_data
+from netcode.change_types import spec_for
 from netcode.runner_hub import (
     authenticate_runner,
     confirm_runner_token_rotation,
@@ -1261,6 +1262,19 @@ def desired_state_plan(request: DesiredStatePlanRequest, http_request: Request) 
         principal = _request_principal(http_request)
         _require_entitled_change_type(principal.org_id, request.change_type)
         store = PlatformStore(p)
+        configured_inventory = Inventory(configured_inventory_path(p))
+        inventory_device = configured_inventory.find_device(request.device_id)
+        catalog_device = store.resolve_device(principal.org_id, request.device_id)
+        target_platform = (
+            inventory_device.platform
+            if inventory_device is not None
+            else str(catalog_device.get("platform") or "unknown")
+            if catalog_device is not None
+            else str(configured_inventory.defaults.get("platform") or "unknown")
+        )
+        change_spec = spec_for(request.change_type)
+        if change_spec.lab_write:
+            AdapterRegistry.require_execution_support(target_platform, request.change_type)
         model_context: dict[str, object] | None = None
         if request.environment_id.strip():
             active_model = NetworkModelRepository(store).active_revision(
@@ -1273,7 +1287,6 @@ def desired_state_plan(request: DesiredStatePlanRequest, http_request: Request) 
                     f"Network Model revision changed from {request.model_revision_id} "
                     f"to {active_model['revision_id']}; refresh the plan."
                 )
-            catalog_device = store.resolve_device(principal.org_id, request.device_id)
             canonical_device_id = str(catalog_device.get("canonical_id")) if catalog_device else request.device_id
             domain_by_change = {
                 "add_vlan": "topology",
@@ -1303,7 +1316,12 @@ def desired_state_plan(request: DesiredStatePlanRequest, http_request: Request) 
             values=request.values,
         )
         intent = load_intent(intent_path)
-        result = run_static_pipeline(p, intent_path, org_id=principal.org_id)
+        result = run_static_pipeline(
+            p,
+            intent_path,
+            org_id=principal.org_id,
+            platform=target_platform if change_spec.lab_write else "arista_eos",
+        )
         change = store.get_or_create_change(intent_path, request.device_id, requested_by=request.requested_by, org_id=principal.org_id, created_by_user_id=principal.user_id)
         candidate = None
         if model_context is not None and result.status == "pass":

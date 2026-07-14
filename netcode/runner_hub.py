@@ -233,7 +233,7 @@ def poll_for_job(store: PlatformStore, runner: RunnerRecord, wait_seconds: float
         time.sleep(0.5)
 
 
-_PROGRESS_STATUSES = {"queued", "running", "passed", "failed"}
+_PROGRESS_STATUSES = {"queued", "running", "passed", "failed", "skipped"}
 _SENSITIVE_COMMAND = re.compile(
     r"\b(?:password|passwd|secret|community|token|api[-_ ]?key|private[-_ ]?key|"
     r"pre-shared-key|key-string)\b",
@@ -320,9 +320,12 @@ def submit_job_progress(
         return {"ok": False, "message": "Progress total_steps is outside the accepted range."}
     if current_step is not None and total_steps is not None and current_step > total_steps:
         return {"ok": False, "message": "Progress current_step cannot exceed total_steps."}
-    change = store.get_change(job.change_id)
-    if change.org_id != runner.org_id:
+    if job.org_id != runner.org_id:
         return {"ok": False, "message": "Progress tenant does not match the job."}
+    if job.change_id != "__read__":
+        change = store.get_change(job.change_id)
+        if change.org_id != runner.org_id:
+            return {"ok": False, "message": "Progress tenant does not match the change."}
     saved = store.record_execution_event(
         event_id=event_id,
         job_id=job.id,

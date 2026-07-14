@@ -274,6 +274,113 @@ def test_duplicate_operation_requests_create_one_durable_job(tmp_path: Path) -> 
     assert count == 1
 
 
+def test_safe_action_can_retry_after_terminal_failure_without_losing_audit(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    runner = _runner(store)
+    change = _change(store, tmp_path)
+    payload = {
+        "action": "dry-run",
+        "device": {"id": "edge-1", "host": "192.0.2.10", "platform": "arista_eos"},
+    }
+
+    first = store.queue_job(
+        change.id,
+        "lab_dry-run",
+        runner.pool,
+        payload,
+        target_runner_id=runner.id,
+        retry_terminal=True,
+    )
+    duplicate = store.queue_job(
+        change.id,
+        "lab_dry-run",
+        runner.pool,
+        payload,
+        target_runner_id=runner.id,
+        retry_terminal=True,
+    )
+    assert duplicate.id == first.id
+
+    store.update_job(first.id, "reconcile_required", "outcome uncertain", {"status": "reconcile_required"})
+    retry = store.queue_job(
+        change.id,
+        "lab_dry-run",
+        runner.pool,
+        payload,
+        target_runner_id=runner.id,
+        retry_terminal=True,
+    )
+
+    assert retry.id != first.id
+    assert retry.idempotency_key == f"{first.idempotency_key}:retry:1"
+    assert store.get_job(first.id).status == "reconcile_required"
+
+
+def test_write_action_does_not_retry_after_terminal_uncertainty(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    runner = _runner(store)
+    change = _change(store, tmp_path)
+    payload = {
+        "action": "apply",
+        "device": {"id": "edge-1", "host": "192.0.2.10", "platform": "arista_eos"},
+    }
+
+    first = store.queue_job(
+        change.id,
+        "lab_apply",
+        runner.pool,
+        payload,
+        target_runner_id=runner.id,
+    )
+    store.update_job(first.id, "reconcile_required", "outcome uncertain", {"status": "reconcile_required"})
+    replay = store.queue_job(
+        change.id,
+        "lab_apply",
+        runner.pool,
+        payload,
+        target_runner_id=runner.id,
+    )
+
+    assert replay.id == first.id
+
+
+def test_concurrent_safe_retries_create_one_new_attempt(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    runner = _runner(store)
+    change = _change(store, tmp_path)
+    payload = {
+        "action": "verify",
+        "device": {"id": "edge-1", "host": "192.0.2.10", "platform": "arista_eos"},
+    }
+    first = store.queue_job(
+        change.id,
+        "lab_verify",
+        runner.pool,
+        payload,
+        target_runner_id=runner.id,
+        retry_terminal=True,
+    )
+    store.update_job(first.id, "failed", "read failed", {"status": "fail"})
+    barrier = threading.Barrier(2)
+
+    def retry():
+        barrier.wait()
+        return store.queue_job(
+            change.id,
+            "lab_verify",
+            runner.pool,
+            payload,
+            target_runner_id=runner.id,
+            retry_terminal=True,
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        retries = [future.result() for future in (executor.submit(retry), executor.submit(retry))]
+
+    assert retries[0].id == retries[1].id
+    assert retries[0].id != first.id
+
+
 def test_idempotency_key_cannot_be_rebound_to_another_operation(tmp_path: Path) -> None:
     store = _store(tmp_path)
     runner = _runner(store)

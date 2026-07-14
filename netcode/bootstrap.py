@@ -157,6 +157,7 @@ def init_workspace(
         (paths.templates / "arista" / "custom_config.j2", CUSTOM_CONFIG_TEMPLATE),
         (paths.templates / "arista" / "ntp_standardize.j2", NTP_STANDARDIZE_TEMPLATE),
         (paths.templates / "arista" / "os_upgrade.j2", OS_UPGRADE_TEMPLATE),
+        (paths.templates / "cisco_ios" / "ntp_standardize.j2", NTP_STANDARDIZE_TEMPLATE),
     ]
     for path, content in files:
         if force or not path.exists():

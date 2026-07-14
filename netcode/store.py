@@ -156,6 +156,8 @@ def execution_phase_for_job(action: str) -> str:
         return normalized.removeprefix("lab_")
     if normalized == "read_verify":
         return "verify"
+    if normalized == "read_rez_discover_network":
+        return "discovery"
     if normalized.startswith("manager_"):
         return normalized.removeprefix("manager_")
     return ""
@@ -2106,12 +2108,15 @@ class PlatformStore:
         target_runner_id: str | None = None,
         device_id: str | None = None,
         idempotency_key: str | None = None,
+        retry_terminal: bool = False,
     ) -> JobRecord:
-        """Queue one change operation exactly once.
+        """Queue one change operation with a durable idempotency boundary.
 
         The key is durable and unique within an organization. Concurrent API
         requests for the same reviewed operation therefore receive the same job
-        instead of creating a second device write.
+        instead of creating a second device write. Callers may opt safe,
+        read-only actions into a new audited attempt after the prior attempt is
+        terminal; write actions must retain the default exactly-once behavior.
         """
         now = utc_now()
         job_id = str(uuid.uuid4())
@@ -2123,7 +2128,8 @@ class PlatformStore:
             if not org_row:
                 raise ValueError(f"Unknown change {change_id}")
             org_id = str(org_row["org_id"] or DEFAULT_ORG_ID)
-            operation_key = str(idempotency_key or "").strip() or job_idempotency_key(
+            caller_key = str(idempotency_key or "").strip()
+            base_operation_key = caller_key or job_idempotency_key(
                 org_id=org_id,
                 change_id=change_id,
                 action=action,
@@ -2132,6 +2138,20 @@ class PlatformStore:
             )
             if self.engine == "postgres":
                 conn.execute("SELECT id FROM orgs WHERE id = ? FOR UPDATE", (org_id,)).fetchone()
+            operation_key = base_operation_key
+            if retry_terminal and not caller_key:
+                attempts = conn.execute(
+                    "SELECT id, status, idempotency_key FROM jobs "
+                    "WHERE org_id = ? AND (idempotency_key = ? OR idempotency_key LIKE ?) "
+                    "ORDER BY created_at DESC, id DESC",
+                    (org_id, base_operation_key, f"{base_operation_key}:retry:%"),
+                ).fetchall()
+                if attempts:
+                    latest = attempts[0]
+                    if str(latest["status"]) in TERMINAL_JOB_STATUSES:
+                        operation_key = f"{base_operation_key}:retry:{len(attempts)}"
+                    else:
+                        operation_key = str(latest["idempotency_key"])
             existing = conn.execute(
                 "SELECT id FROM jobs WHERE org_id = ? AND idempotency_key = ?",
                 (org_id, operation_key),

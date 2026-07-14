@@ -13,6 +13,17 @@ from netcode.inventory import Device
 class AdapterRegistry:
     """Registry for execution and state adapters."""
 
+    PLATFORM_ALIASES = {
+        "arista": "arista_eos",
+        "eos": "arista_eos",
+        "ios": "cisco_ios",
+        "iosxe": "cisco_ios",
+        "ios_xe": "cisco_ios",
+        "cisco_xe": "cisco_ios",
+        "cisco_iosxe": "cisco_ios",
+        "cisco_ios_xe": "cisco_ios",
+    }
+
     EXECUTION_ADAPTERS = {
         "arista_eos": {
             "name": "netcode.arista_config_session",
@@ -21,14 +32,25 @@ class AdapterRegistry:
             "write_supported": True,
             "safe_write_model": "EOS config session with abortable dry-run and explicit commit",
             "production_ready": False,
+            "supported_change_types": [
+                "add_vlan",
+                "interface_config",
+                "bgp_neighbor",
+                "routing_redistribution",
+                "acl_rule",
+                "custom_config",
+                "ntp_standardize",
+                "os_upgrade",
+            ],
         },
         "cisco_ios": {
-            "name": "netcode.cisco_ios_execution_stub",
-            "capabilities": [],
-            "status": "planned_stub",
-            "write_supported": False,
-            "safe_write_model": "requires adapter SDK implementation",
+            "name": "netcode.cisco_ios_ntp",
+            "capabilities": ["dry_run", "diff", "apply", "rollback", "verify"],
+            "status": "contract_tested",
+            "write_supported": True,
+            "safe_write_model": "offline validation, first-device proof, verify-before-save, exact pre-change rollback",
             "production_ready": False,
+            "supported_change_types": ["ntp_standardize"],
         },
         "cisco_nxos": {
             "name": "netcode.cisco_nxos_execution_stub",
@@ -66,6 +88,36 @@ class AdapterRegistry:
 
     def __init__(self, rez: RezAdapterBridge | None = None):
         self.rez = rez or RezAdapterBridge()
+
+    @classmethod
+    def normalize_execution_platform(cls, platform: str) -> str:
+        normalized = str(platform or "").strip().lower().replace("-", "_").replace(" ", "_")
+        return cls.PLATFORM_ALIASES.get(normalized, normalized or "unknown")
+
+    @classmethod
+    def execution_support(cls, platform: str, change_type: str) -> dict[str, object]:
+        normalized = cls.normalize_execution_platform(platform)
+        adapter = cls.EXECUTION_ADAPTERS.get(normalized)
+        supported = set(adapter.get("supported_change_types", [])) if adapter else set()
+        return {
+            "platform": normalized,
+            "change_type": str(change_type or "").strip(),
+            "adapter": adapter,
+            "supported": bool(adapter and adapter.get("write_supported") and change_type in supported),
+            "supported_change_types": sorted(supported),
+        }
+
+    @classmethod
+    def require_execution_support(cls, platform: str, change_type: str) -> dict[str, object]:
+        support = cls.execution_support(platform, change_type)
+        if support["supported"]:
+            return support
+        supported = support["supported_change_types"]
+        detail = ", ".join(supported) if supported else "none"
+        raise ValueError(
+            f"{support['platform']} does not support governed '{change_type}' execution. "
+            f"Supported change types: {detail}."
+        )
 
     def summary(self) -> dict[str, object]:
         rez_summary = self.rez.summary()

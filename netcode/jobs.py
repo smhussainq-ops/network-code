@@ -13,6 +13,7 @@ import uuid
 from pathlib import Path
 
 from netcode.inventory import Inventory
+from netcode.adapters.registry import AdapterRegistry
 from netcode.firewall_managers import ManagerJobRequest, WRITE_ACTIONS
 from netcode.entitlements import require_production_writes
 from netcode.lab import run_arista_end_to_end, run_lab_action
@@ -178,6 +179,7 @@ class JobRunner:
                 pool,
                 payload,
                 target_runner_id=target_runner_id,
+                retry_terminal=action in {"dry-run", "verify"},
             )
             self.store.record_execution_event(
                 event_id=str(uuid.uuid4()),
@@ -213,7 +215,28 @@ class JobRunner:
         job = self.store.create_job(change.id, f"lab_{action}")
         self.store.update_job(job.id, "running", f"Running lab {action}")
         try:
-            result = run_lab_action(self.paths, intent_path, action, device_id)  # type: ignore[arg-type]
+            intent = load_intent(intent_path)
+            operation_context = self._operation_context(
+                change_id=change.id,
+                org_id=change.org_id,
+                action=action,
+                change_type=intent.change_type,
+            )
+            if operation_context:
+                result = run_lab_action(
+                    self.paths,
+                    intent_path,
+                    action,  # type: ignore[arg-type]
+                    device_id,
+                    operation_context=operation_context,
+                )
+            else:
+                result = run_lab_action(
+                    self.paths,
+                    intent_path,
+                    action,  # type: ignore[arg-type]
+                    device_id,
+                )
             status = "completed" if result.get("status") == "pass" else "failed"
             workflow = state_after_lab_action(action, result.get("status") == "pass")
             self.store.update_change(change.id, status, result, workflow_state=workflow.state)
@@ -359,6 +382,44 @@ class JobRunner:
             },
         }
 
+    def _ntp_state_from_job(self, change_id: str, action: str, org_id: str) -> dict[str, object] | None:
+        expected_action = f"lab_{action}"
+        for job in self.store.list_jobs(limit=500, org_id=org_id):
+            if job.change_id != change_id or job.action != expected_action:
+                continue
+            # Only the newest attempt can authorize the next write. A newer
+            # failed or incomplete attempt must not fall back to stale proof.
+            if job.status != "completed":
+                return None
+            result = job.result if isinstance(job.result, dict) else {}
+            evidence = result.get("evidence") if isinstance(result.get("evidence"), dict) else {}
+            state = evidence.get("rollback_state")
+            if isinstance(state, dict):
+                return dict(state)
+            return None
+        return None
+
+    def _operation_context(
+        self,
+        *,
+        change_id: str,
+        org_id: str,
+        action: str,
+        change_type: str,
+    ) -> dict[str, object]:
+        if change_type != "ntp_standardize":
+            return {}
+        source_action = "dry-run" if action == "apply" else "apply" if action == "rollback" else ""
+        if not source_action:
+            return {}
+        state = self._ntp_state_from_job(change_id, source_action, org_id)
+        if state is None:
+            raise ValueError(
+                "Exact pre-change NTP evidence is unavailable; run dry-run again before apply or rollback."
+            )
+        key = "approved_pre_change_state" if action == "apply" else "rollback_state"
+        return {key: state}
+
     def _runner_job_spec(
         self,
         intent_path: Path,
@@ -375,7 +436,6 @@ class JobRunner:
         to any connector that happens to share its pool.
         """
         intent = load_intent(intent_path)
-        render = render_intent(intent, self.paths)
         inventory = Inventory(configured_inventory_path(self.paths))
         requested_id = str(device_id or "").strip()
         if not requested_id and intent.targets.device_ids:
@@ -415,6 +475,14 @@ class JobRunner:
                 }
                 pool = str(catalog_device["runner_pool"])
                 target_runner_id = str(catalog_device["runner_id"])
+        AdapterRegistry.require_execution_support(str(public_device["platform"]), intent.change_type)
+        render = render_intent(intent, self.paths, platform=str(public_device["platform"]))
+        operation_context = self._operation_context(
+            change_id=change_id,
+            org_id=org_id,
+            action=action,
+            change_type=intent.change_type,
+        )
         policy_path = configured_policy_path(self.paths)
         payload = {
             "action": action,
@@ -423,6 +491,7 @@ class JobRunner:
             "intent_yaml": intent_path.read_text(encoding="utf-8"),
             "rendered_config": render.config,
             "policy_yaml": policy_path.read_text(encoding="utf-8") if policy_path.exists() else "",
+            **operation_context,
         }
         return payload, pool, target_runner_id
 

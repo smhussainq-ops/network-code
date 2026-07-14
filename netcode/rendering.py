@@ -9,6 +9,7 @@ from typing import Any
 from jinja2 import Environment, FileSystemLoader, StrictUndefined
 
 from netcode.intent_utils import config_filename, template_for_intent
+from netcode.adapters.registry import AdapterRegistry
 from netcode.models import Intent, RenderResult
 from netcode.paths import WorkspacePaths
 from netcode.ui_config import configured_template_dir
@@ -27,9 +28,21 @@ def _variables(intent: Intent) -> dict[str, Any]:
     return data
 
 
-def render_intent(intent: Intent, paths: WorkspacePaths) -> RenderResult:
+def render_intent(
+    intent: Intent,
+    paths: WorkspacePaths,
+    *,
+    platform: str = "arista_eos",
+) -> RenderResult:
     template_name = template_for_intent(intent)
-    template_path = configured_template_dir(paths) / "arista" / template_name
+    normalized_platform = AdapterRegistry.normalize_execution_platform(platform)
+    template_family = "arista" if normalized_platform == "arista_eos" else normalized_platform
+    template_path = configured_template_dir(paths) / template_family / template_name
+    if not template_path.exists():
+        raise ValueError(
+            f"No {normalized_platform} template is available for governed "
+            f"'{intent.change_type}' execution."
+        )
     env = Environment(
         loader=FileSystemLoader(str(template_path.parent)),
         undefined=StrictUndefined,

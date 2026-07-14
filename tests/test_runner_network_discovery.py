@@ -86,6 +86,8 @@ def test_recursive_discovery_runs_on_connector_and_preserves_inventory(tmp_path:
     assert result["partial"] is False
     assert result["collected"] == 2
     assert set(result["device_states"]) == {"core-1", "edge-1"}
+    assert all(state.get("_collected_at") for state in result["device_states"].values())
+    assert all(state.get("collected_at") for state in result["device_states"].values())
     assert calls == ["10.20.0.10", "10.20.0.11"]
     assert "203.0.113.9" not in calls
     assert inventory_path.read_text(encoding="utf-8") == original
@@ -158,4 +160,76 @@ def test_unsafe_scope_is_rejected_before_adapter_runs(tmp_path: Path, monkeypatc
 
     assert result["ok"] is False
     assert result["scope_rejected"] is True
+    assert calls == []
+
+
+def test_unknown_unreachable_endpoint_skips_vendor_driver_fanout(tmp_path: Path, monkeypatch):
+    inventory_path = tmp_path / "inventory.yaml"
+    _write_inventory(inventory_path)
+    monkeypatch.setattr(runner_agent, "INVENTORY_FILE", inventory_path)
+    calls: list[str] = []
+    _install_fake_rez(monkeypatch, calls)
+
+    def unreachable(*_args, **_kwargs):
+        raise TimeoutError("closed")
+
+    monkeypatch.setattr(runner_agent.socket, "create_connection", unreachable)
+    result = runner_agent._execute_rez_scan_device(
+        {"host": "10.20.0.99", "port": 22},
+        persist_inventory=False,
+    )
+
+    assert result["ok"] is False
+    assert result["error"] == "endpoint_unreachable:TimeoutError"
+    assert result["tried_platforms"] == []
+    assert calls == []
+
+
+def test_range_sweep_skips_unknown_closed_addresses_without_marking_partial(tmp_path: Path, monkeypatch):
+    inventory_path = tmp_path / "inventory.yaml"
+    _write_inventory(inventory_path)
+    monkeypatch.setattr(runner_agent, "INVENTORY_FILE", inventory_path)
+    calls: list[str] = []
+    _install_fake_rez(monkeypatch, calls)
+
+    def unreachable(*_args, **_kwargs):
+        raise TimeoutError("closed")
+
+    monkeypatch.setattr(runner_agent.socket, "create_connection", unreachable)
+    result = runner_agent._execute_rez_discover_network(
+        {"seed_node": "10.20.0.10-12", "depth": 0, "max_devices": 10}
+    )
+
+    assert result["ok"] is True
+    assert result["status"] == "pass"
+    assert result["partial"] is False
+    assert result["collected"] == 2
+    assert result["failed"] == 0
+    assert result["skipped"] == 1
+    assert result["skipped_targets"] == [
+        {"host": "10.20.0.12", "port": 22, "depth": 0, "reason": "no_reachable_endpoint"}
+    ]
+    assert set(calls) == {"10.20.0.10", "10.20.0.11"}
+
+
+def test_explicit_unknown_closed_address_remains_a_failure(tmp_path: Path, monkeypatch):
+    inventory_path = tmp_path / "inventory.yaml"
+    _write_inventory(inventory_path)
+    monkeypatch.setattr(runner_agent, "INVENTORY_FILE", inventory_path)
+    calls: list[str] = []
+    _install_fake_rez(monkeypatch, calls)
+
+    def unreachable(*_args, **_kwargs):
+        raise TimeoutError("closed")
+
+    monkeypatch.setattr(runner_agent.socket, "create_connection", unreachable)
+    result = runner_agent._execute_rez_discover_network(
+        {"seed_node": "10.20.0.99", "depth": 0}
+    )
+
+    assert result["ok"] is False
+    assert result["status"] == "fail"
+    assert result["failed"] == 1
+    assert result["skipped"] == 0
+    assert result["failures"][0]["host"] == "10.20.0.99"
     assert calls == []

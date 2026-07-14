@@ -27,6 +27,7 @@ from netcode.inventory import Inventory
 from netcode.jobs import JobRunner, execution_mode, runner_pool
 from netcode.models import load_intent
 from netcode.orchestrator import create_desired_state_intent, run_static_pipeline
+from netcode.adapters.registry import AdapterRegistry
 from netcode.paths import WorkspacePaths
 from netcode.scale import rollout_plan
 from netcode.store import DEFAULT_ORG_ID, TERMINAL_JOB_STATUSES, PlatformStore, change_audit_id, record_to_dict
@@ -171,6 +172,20 @@ def plan_fleet_rollout(
     else:
         raise ValueError("Pick targets: device_ids or device_group.")
 
+    unsupported: list[str] = []
+    for selected_id in selected:
+        platform = str(selected_metadata[selected_id].get("platform") or "unknown")
+        support = AdapterRegistry.execution_support(platform, change_type)
+        if not support["supported"]:
+            available = ", ".join(support["supported_change_types"]) or "none"
+            unsupported.append(
+                f"{selected_id} ({support['platform']}; supported change types: {available})"
+            )
+    if unsupported:
+        raise ValueError(
+            f"Governed '{change_type}' execution is not available for: " + "; ".join(unsupported)
+        )
+
     waves_plan = rollout_plan(p, selected, canary_size=canary_size, batch_size=batch_size)
     waves: list[list[str]] = [waves_plan["canaries"]] + waves_plan["batches"]
 
@@ -205,7 +220,12 @@ def plan_fleet_rollout(
                 )
                 store.add_rollout_target(rollout_id, device_id, wave_index,
                                          change_id=change.id, intent_path=str(intent_path))
-                result = run_static_pipeline(p, intent_path, org_id=org_id)
+                result = run_static_pipeline(
+                    p,
+                    intent_path,
+                    org_id=org_id,
+                    platform=str(device.get("platform") or "unknown"),
+                )
                 passed = result.status == "pass"
                 workflow = state_after_static_validation(passed)
                 stored_result = result.model_dump()

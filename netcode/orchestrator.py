@@ -99,11 +99,12 @@ def run_static_pipeline(
     intent_path: Path,
     *,
     org_id: str = DEFAULT_ORG_ID,
+    platform: str = "arista_eos",
 ) -> PipelineResult:
     ensure_initialized(paths)
     intent_path = intent_path.resolve()
     intent = load_intent(intent_path)
-    render = render_intent(intent, paths)
+    render = render_intent(intent, paths, platform=platform)
     rendered_path = write_rendered_config(paths, intent, render)
     validation = StaticValidator(paths, org_id=org_id).validate(intent, render)
     intent_data = read_yaml(intent_path)
