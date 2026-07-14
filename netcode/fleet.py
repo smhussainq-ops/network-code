@@ -29,7 +29,7 @@ from netcode.models import load_intent
 from netcode.orchestrator import create_desired_state_intent, run_static_pipeline
 from netcode.paths import WorkspacePaths
 from netcode.scale import rollout_plan
-from netcode.store import DEFAULT_ORG_ID, PlatformStore, change_audit_id, record_to_dict
+from netcode.store import DEFAULT_ORG_ID, TERMINAL_JOB_STATUSES, PlatformStore, change_audit_id, record_to_dict
 from netcode.ui_config import configured_inventory_path
 from netcode.workflow import state_after_static_validation
 
@@ -631,7 +631,7 @@ def _lab_action_and_wait(
     deadline = time.monotonic() + JOB_WAIT_SECONDS
     while time.monotonic() < deadline:
         current = store.get_job(job_id)
-        if current.status in ("completed", "failed"):
+        if current.status in TERMINAL_JOB_STATUSES:
             result = current.result or {}
             return current.status == "completed", str(result.get("message") or current.message or "")
         time.sleep(JOB_POLL_SECONDS)
@@ -739,7 +739,7 @@ def _read_and_wait(
     deadline = time.monotonic() + READ_WAIT_SECONDS
     while time.monotonic() < deadline:
         current = store.get_job(job.id)
-        if current.status in ("completed", "failed"):
+        if current.status in TERMINAL_JOB_STATUSES:
             return current.result or {"ok": current.status == "completed", "message": current.message}
         time.sleep(0.5)
     store.cancel_job_if_queued(job.id, f"read deadline: {action} exceeded {READ_WAIT_SECONDS}s")

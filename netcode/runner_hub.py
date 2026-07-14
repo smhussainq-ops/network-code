@@ -28,6 +28,7 @@ from netcode.store import (
     JobRecord,
     PlatformStore,
     RunnerRecord,
+    TERMINAL_JOB_STATUSES,
     execution_phase_for_job,
     record_to_dict,
 )
@@ -139,6 +140,7 @@ def submit_job_progress(
     job_id: str,
     event: dict[str, Any],
     signature: str,
+    lease_token: str,
 ) -> dict[str, Any]:
     """Accept signed display-only progress from the runner.
 
@@ -149,8 +151,9 @@ def submit_job_progress(
         job = store.get_job(job_id)
     except Exception:
         return {"ok": False, "message": f"Unknown job {job_id}."}
-    if job.claimed_by != runner.id or job.status != "running":
-        return {"ok": False, "message": "Progress is accepted only from the runner currently executing this job."}
+    lease_expires_at = store.renew_job_lease(job.id, runner.id, lease_token)
+    if not lease_expires_at:
+        return {"ok": False, "message": "Progress rejected because the connector job lease is missing, stale, or expired."}
     expected = sign_result(store.runner_hmac_secret(runner.id), event)
     if not hmac.compare_digest(expected, signature or ""):
         return {"ok": False, "message": "Progress signature verification failed."}
@@ -212,7 +215,7 @@ def submit_job_progress(
         command=_safe_progress_command(event.get("command")),
     )
     store.touch_runner(runner.id, status="online")
-    return {"ok": True, "event": record_to_dict(saved)}
+    return {"ok": True, "event": record_to_dict(saved), "lease_expires_at": lease_expires_at}
 
 
 def submit_job_result(
@@ -221,24 +224,43 @@ def submit_job_result(
     job_id: str,
     result: dict[str, Any],
     signature: str,
+    lease_token: str,
 ) -> dict[str, Any]:
     """Verify signature and ownership, then complete the job and advance the change workflow."""
     try:
         job = store.get_job(job_id)
     except Exception:
         return {"ok": False, "message": f"Unknown job {job_id}."}
-    if job.claimed_by != runner.id:
-        return {"ok": False, "message": "This job is not claimed by this runner."}
-    if job.status not in ("running",):
-        return {"ok": False, "message": f"Job is {job.status}; results are only accepted for running jobs."}
 
     secret = store.runner_hmac_secret(runner.id)
     expected = sign_result(secret, result)
+    if (
+        job.status in TERMINAL_JOB_STATUSES
+        and job.claimed_by == runner.id
+        and job.signature
+        and hmac.compare_digest(job.signature, signature or "")
+        and canonical_json(job.result or {}) == canonical_json(result)
+    ):
+        response: dict[str, Any] = {
+            "ok": True,
+            "job": record_to_dict(job),
+            "replayed": True,
+            "message": "Previously accepted result acknowledged without replaying workflow state.",
+        }
+        if job.change_id != "__read__":
+            change = store.get_change(job.change_id)
+            response["change"] = record_to_dict(change)
+            response["workflow_state"] = change.workflow_state
+        return response
+    if not store.job_lease_matches(job.id, runner.id, lease_token):
+        return {"ok": False, "message": "Result rejected because the connector job lease is missing, stale, or expired."}
     if not hmac.compare_digest(expected, signature or ""):
         # Reject without changing job state: the runner holds both token and secret,
         # so a mismatch means corruption/bug — leave the job claimable for a retry
         # rather than bricking it.
         return {"ok": False, "message": "Result signature verification failed; result rejected."}
+    if not store.begin_job_completion(job.id, runner.id, lease_token):
+        return {"ok": False, "message": "Result rejected because another request already owns job completion."}
 
     phase = execution_phase_for_job(job.action)
     if job.change_id != "__read__" and phase:

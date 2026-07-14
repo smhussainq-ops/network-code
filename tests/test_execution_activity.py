@@ -54,8 +54,12 @@ def test_signed_progress_is_idempotent_append_only_and_redacted(tmp_path: Path, 
         "total_steps": 2,
         "command": "snmp-server community hunter2 ro",
     }
-    accepted = submit_job_progress(store, runner, job.id, event, sign_result("runner-hmac", event))
-    replay = submit_job_progress(store, runner, job.id, event, sign_result("runner-hmac", event))
+    accepted = submit_job_progress(
+        store, runner, job.id, event, sign_result("runner-hmac", event), claimed.lease_token
+    )
+    replay = submit_job_progress(
+        store, runner, job.id, event, sign_result("runner-hmac", event), claimed.lease_token
+    )
 
     assert accepted["ok"] is True
     assert replay["ok"] is True
@@ -75,9 +79,13 @@ def test_signed_progress_is_idempotent_append_only_and_redacted(tmp_path: Path, 
         current_step=None,
         total_steps=None,
     )
-    assert submit_job_progress(store, runner, job.id, terminal, sign_result("runner-hmac", terminal))["ok"]
+    assert submit_job_progress(
+        store, runner, job.id, terminal, sign_result("runner-hmac", terminal), claimed.lease_token
+    )["ok"]
     result = {"status": "pass", "message": "Apply passed."}
-    assert submit_job_result(store, runner, job.id, result, sign_result("runner-hmac", result))["ok"]
+    assert submit_job_result(
+        store, runner, job.id, result, sign_result("runner-hmac", result), claimed.lease_token
+    )["ok"]
     assert [item.stage for item in store.list_execution_events(change.id)].count("passed") == 1
 
 
@@ -95,7 +103,8 @@ def test_progress_rejects_bad_signature_and_wrong_phase(tmp_path: Path, monkeypa
         {"action": "dry-run", "device": {"id": "edge-1"}},
         target_runner_id=runner.id,
     )
-    store.claim_next_job(DEFAULT_ORG_ID, "store-lab", runner.id)
+    claimed = store.claim_next_job(DEFAULT_ORG_ID, "store-lab", runner.id)
+    assert claimed is not None
     event = {
         "event_id": str(uuid.uuid4()),
         "sequence": 2,
@@ -106,8 +115,10 @@ def test_progress_rejects_bad_signature_and_wrong_phase(tmp_path: Path, monkeypa
         "device_id": "edge-1",
     }
 
-    assert submit_job_progress(store, runner, job.id, event, "bad")["ok"] is False
-    assert submit_job_progress(store, runner, job.id, event, sign_result("runner-hmac", event))["ok"] is False
+    assert submit_job_progress(store, runner, job.id, event, "bad", claimed.lease_token)["ok"] is False
+    assert submit_job_progress(
+        store, runner, job.id, event, sign_result("runner-hmac", event), claimed.lease_token
+    )["ok"] is False
     malformed_id = dict(event, event_id="not-a-uuid", phase="dry-run")
     malformed_result = submit_job_progress(
         store,
@@ -115,6 +126,7 @@ def test_progress_rejects_bad_signature_and_wrong_phase(tmp_path: Path, monkeypa
         job.id,
         malformed_id,
         sign_result("runner-hmac", malformed_id),
+        claimed.lease_token,
     )
     assert malformed_result["ok"] is False
     assert "UUID" in malformed_result["message"]

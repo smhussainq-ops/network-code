@@ -44,7 +44,7 @@ IDENTITY_FILE = IDENTITY_DIR / ("identity.dpapi" if _WINDOWS_DPAPI else "identit
 INVENTORY_FILE = IDENTITY_DIR / ("inventory.dpapi" if _WINDOWS_DPAPI else "inventory.yaml")
 POLICY_FILE = IDENTITY_DIR / "policy.yaml"
 MANAGER_LEDGER_FILE = IDENTITY_DIR / "manager-operations.json"
-VERSION = "0.4.0-execution-events"
+VERSION = "0.5.0-job-leases"
 
 _stop = False
 _SHELL_ADAPTERS: dict[str, dict[str, Any]] = {}
@@ -334,6 +334,7 @@ def _progress_reporter(
     job: dict[str, Any],
 ) -> Callable[[dict[str, Any]], None] | None:
     job_id = str(job.get("id") or "")
+    lease_token = str(job.get("lease_token") or "")
     job_action = str(job.get("action") or "").strip().lower()
     if job_action.startswith("lab_"):
         phase = job_action.removeprefix("lab_")
@@ -367,7 +368,7 @@ def _progress_reporter(
             _post(
                 server,
                 f"/api/runner/jobs/{job_id}/progress",
-                {"event": event, "signature": signature},
+                {"event": event, "signature": signature, "lease_token": lease_token},
                 token=token,
                 timeout=8,
             )
@@ -375,6 +376,51 @@ def _progress_reporter(
             print(f"[runner] Progress frame {job_id}:{sequence} was not delivered: {exc}", file=sys.stderr)
 
     return report
+
+
+class _JobLeaseRenewer:
+    """Keep one claimed job owned while a blocking device operation runs."""
+
+    def __init__(self, server: str, runner_token: str, job: dict[str, Any]):
+        self.server = server
+        self.runner_token = runner_token
+        self.job_id = str(job.get("id") or "")
+        self.lease_token = str(job.get("lease_token") or "")
+        try:
+            lease_seconds = int(job.get("lease_seconds") or 90)
+        except (TypeError, ValueError):
+            lease_seconds = 90
+        self.interval = max(5.0, min(30.0, lease_seconds / 3.0))
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    @property
+    def valid(self) -> bool:
+        return bool(self.job_id and self.lease_token)
+
+    def start(self) -> None:
+        if not self.valid:
+            return
+        self._thread = threading.Thread(target=self._run, name=f"job-lease-{self.job_id[:8]}", daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=2.0)
+
+    def _run(self) -> None:
+        while not self._stop.wait(self.interval):
+            try:
+                _post(
+                    self.server,
+                    f"/api/runner/jobs/{self.job_id}/lease",
+                    {"lease_token": self.lease_token},
+                    token=self.runner_token,
+                    timeout=8,
+                )
+            except Exception as exc:  # noqa: BLE001
+                print(f"[runner] Job lease renewal failed for {self.job_id}: {exc}", file=sys.stderr, flush=True)
 
 
 def _execute_job(
@@ -2304,18 +2350,32 @@ def run(args: argparse.Namespace) -> int:
         job = resp.get("job") or {}
         job_id = job.get("id")
         action = (job.get("payload") or {}).get("action")
+        lease_token = str(job.get("lease_token") or "")
+        if not job_id or not lease_token:
+            print("[runner] Refusing an unleased job claim from the control plane.", file=sys.stderr, flush=True)
+            time.sleep(1)
+            continue
         print(f"[runner] Claimed job {job_id} ({action}).")
         progress = _progress_reporter(server, token, secret, job)
+        lease = _JobLeaseRenewer(server, token, job)
+        lease.start()
         try:
             result = _execute_job(job, progress=progress)
         except Exception as exc:  # noqa: BLE001
             result = {"status": "fail", "message": f"Runner execution error: {type(exc).__name__}: {exc}"}
         signature = hmac.new(secret.encode("utf-8"), _canonical(result).encode("utf-8"), hashlib.sha256).hexdigest()
         try:
-            ack = _post(server, f"/api/runner/jobs/{job_id}/result", {"result": result, "signature": signature}, token=token)
+            ack = _post(
+                server,
+                f"/api/runner/jobs/{job_id}/result",
+                {"result": result, "signature": signature, "lease_token": lease_token},
+                token=token,
+            )
             print(f"[runner] Reported job {job_id}: {result.get('status')} — {(ack or {}).get('message', '')}")
         except Exception as exc:  # noqa: BLE001
             print(f"[runner] Failed to report job {job_id}: {exc}", file=sys.stderr)
+        finally:
+            lease.stop()
     print("[runner] Stopped.")
     return 0
 

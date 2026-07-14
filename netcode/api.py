@@ -149,9 +149,11 @@ from netcode.network_model_lifecycle import (
 )
 from netcode.store import (
     DEFAULT_ORG_ID,
+    TERMINAL_JOB_STATUSES,
     PlatformStore,
     change_audit_id,
     change_summary_to_dict,
+    job_lease_seconds,
     record_to_dict,
     utc_now,
 )
@@ -404,11 +406,17 @@ class RunnerPollRequest(BaseModel):
 class RunnerResultRequest(BaseModel):
     result: dict[str, object]
     signature: str = ""
+    lease_token: str
 
 
 class RunnerProgressRequest(BaseModel):
     event: dict[str, object]
     signature: str = ""
+    lease_token: str
+
+
+class RunnerLeaseRequest(BaseModel):
+    lease_token: str
 
 
 class RunnerHeartbeatRequest(BaseModel):
@@ -497,6 +505,7 @@ def _startup() -> None:
         raise RuntimeError("Netcode production configuration is not ready: " + "; ".join(issues))
     init_workspace(workspace, include_examples=not is_production_environment(os.environ))
     _bootstrap_admin()
+    PlatformStore(workspace).recover_expired_jobs()
     # Rollout orchestrator threads die with the process: fail any orphaned
     # running rollouts closed (halted + queued jobs cancelled) at boot.
     try:
@@ -2228,14 +2237,42 @@ def api_runner_poll(request: RunnerPollRequest, authorization: str | None = Head
                 {"error": "production_write_not_entitled", "message": str(exc)},
             )
             return Response(status_code=204)
-    return {"ok": True, "job": record_to_dict(job)}
+    serialized = record_to_dict(job)
+    serialized["lease_token"] = job.lease_token
+    serialized["lease_seconds"] = job_lease_seconds()
+    return {"ok": True, "job": serialized}
+
+
+@app.post("/api/runner/jobs/{job_id}/lease")
+def api_runner_job_lease(
+    job_id: str,
+    request: RunnerLeaseRequest,
+    authorization: str | None = Header(default=None),
+) -> dict[str, object]:
+    store = PlatformStore(paths())
+    runner = _require_runner(store, authorization)
+    expires_at = store.renew_job_lease(job_id, runner.id, request.lease_token)
+    if not expires_at:
+        raise HTTPException(status_code=409, detail="Connector job lease is missing, stale, or expired.")
+    store.touch_runner(runner.id, status="online")
+    return {"ok": True, "job_id": job_id, "lease_expires_at": expires_at}
 
 
 @app.post("/api/runner/jobs/{job_id}/result")
 def api_runner_job_result(job_id: str, request: RunnerResultRequest, authorization: str | None = Header(default=None)) -> dict[str, object]:
     store = PlatformStore(paths())
     runner = _require_runner(store, authorization)
-    return submit_job_result(store, runner, job_id, dict(request.result), request.signature)
+    result = submit_job_result(
+        store,
+        runner,
+        job_id,
+        dict(request.result),
+        request.signature,
+        request.lease_token,
+    )
+    if not result.get("ok") and "lease" in str(result.get("message") or "").lower():
+        raise HTTPException(status_code=409, detail=str(result.get("message") or "Result rejected."))
+    return result
 
 
 @app.post("/api/runner/jobs/{job_id}/progress")
@@ -2246,7 +2283,14 @@ def api_runner_job_progress(
 ) -> dict[str, object]:
     store = PlatformStore(paths())
     runner = _require_runner(store, authorization)
-    result = submit_job_progress(store, runner, job_id, dict(request.event), request.signature)
+    result = submit_job_progress(
+        store,
+        runner,
+        job_id,
+        dict(request.event),
+        request.signature,
+        request.lease_token,
+    )
     if not result.get("ok"):
         raise HTTPException(status_code=400, detail=str(result.get("message") or "Progress rejected."))
     return result
@@ -2478,7 +2522,7 @@ def _runner_read(
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         current = store.get_job(job.id)
-        if current.status in ("completed", "failed"):
+        if current.status in TERMINAL_JOB_STATUSES:
             result = dict(current.result or {"ok": current.status == "completed", "message": current.message})
             result["_job_id"] = current.id
             result["_runner_id"] = current.claimed_by
@@ -4627,13 +4671,13 @@ def api_cross_domain_verify(
         manager_job = store.get_job(request.manager_job_id)
         if manager_job.change_id != change.id or manager_job.action != "manager_deploy":
             raise ValueError("manager_job_id is not the deploy job for this cross-domain change")
-        if manager_job.status not in {"completed", "failed"} or not manager_job.signature:
+        if manager_job.status not in TERMINAL_JOB_STATUSES or not manager_job.signature:
             raise ValueError("manager deploy evidence must be a completed, signed runner result")
         manager_push_status = "success" if manager_job.status == "completed" else "failed"
         evidence: list[CheckEvidence] = []
         for job_id in list(dict.fromkeys(request.evidence_job_ids)):
             job = store.get_job(job_id)
-            if job.action != "read_cross_domain_verify" or job.status not in {"completed", "failed"} or not job.signature:
+            if job.action != "read_cross_domain_verify" or job.status not in TERMINAL_JOB_STATUSES or not job.signature:
                 raise ValueError(f"evidence job {job_id} is not a completed, signed cross-domain runner result")
             job_change_id = str((job.result or {}).get("change_id") or "")
             if job_change_id != change.id:
@@ -5079,6 +5123,7 @@ def api_change_from_rca(request: RcaRemediationProposalRequest, http_request: Re
 def api_jobs(request: Request) -> dict[str, object]:
     store = PlatformStore(paths())
     org = _request_principal(request).org_id
+    store.recover_expired_jobs(org_id=org)
     return {"jobs": [record_to_dict(record) for record in store.list_jobs(org_id=org)]}
 
 
@@ -5087,6 +5132,7 @@ def api_job(job_id: str, request: Request) -> dict[str, object]:
     """Single job status for UI polling of runner-executed (queued) lab actions."""
     store = PlatformStore(paths())
     org = _request_principal(request).org_id
+    store.recover_expired_jobs(org_id=org)
     try:
         job = store.get_job(job_id)
     except Exception as exc:

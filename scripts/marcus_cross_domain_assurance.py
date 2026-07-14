@@ -107,7 +107,14 @@ def manager_capabilities() -> dict[str, Any]:
 def sign_and_submit(store: PlatformStore, runner, job_id: str, result: dict[str, Any]) -> dict[str, Any]:
     claimed = store.claim_next_job(runner.org_id, runner.pool, runner.id)
     require(claimed is not None and claimed.id == job_id, f"runner did not claim expected job {job_id}")
-    accepted = submit_job_result(store, runner, job_id, result, sign_result("runner-hmac", result))
+    accepted = submit_job_result(
+        store,
+        runner,
+        job_id,
+        result,
+        sign_result("runner-hmac", result),
+        claimed.lease_token,
+    )
     require(accepted.get("ok") is True, f"signed runner result rejected: {accepted}")
     return accepted
 

@@ -489,6 +489,23 @@ def test_runner_enroll_queue_claim_signed_result_roundtrip(tmp_path: Path, monke
     assert claim["ok"] and claim["job"]["id"] == dry["job"]["id"]
     assert claim["job"]["status"] == "running"
     assert claim["job"]["claimed_by"]
+    assert claim["job"]["lease_token"].startswith("jlt_")
+    assert claim["job"]["lease_seconds"] >= 30
+    listed_claim = next(
+        item for item in client.get("/api/jobs").json()["jobs"] if item["id"] == dry["job"]["id"]
+    )
+    assert "lease_token" not in listed_claim
+    assert client.post(
+        f"/api/runner/jobs/{dry['job']['id']}/lease",
+        json={"lease_token": "jlt_stale"},
+        headers=auth,
+    ).status_code == 409
+    renewed = client.post(
+        f"/api/runner/jobs/{dry['job']['id']}/lease",
+        json={"lease_token": claim["job"]["lease_token"]},
+        headers=auth,
+    )
+    assert renewed.status_code == 200 and renewed.json()["lease_expires_at"]
 
     # A second poll returns 204 (no more work).
     assert client.post("/api/runner/poll", json={"wait_seconds": 0}, headers=auth).status_code == 204
@@ -496,12 +513,20 @@ def test_runner_enroll_queue_claim_signed_result_roundtrip(tmp_path: Path, monke
     # Bad signature is rejected (control plane does not trust an unsigned result).
     good_result = {"status": "pass", "action": "dry-run", "device_id": "v2-store1", "message": "diff captured, session aborted",
                    "evidence": {"transcript": [{"command": "show session-config diffs", "output": "+vlan 90"}]}}
-    bad = client.post(f"/api/runner/jobs/{dry['job']['id']}/result", json={"result": good_result, "signature": "deadbeef"}, headers=auth).json()
+    bad = client.post(
+        f"/api/runner/jobs/{dry['job']['id']}/result",
+        json={"result": good_result, "signature": "deadbeef", "lease_token": claim["job"]["lease_token"]},
+        headers=auth,
+    ).json()
     assert bad["ok"] is False and "signature" in bad["message"].lower()
 
     # Correctly-signed result advances the change to dry_run_passed.
     sig = hmac_mod.new(secret.encode(), canonical_json(good_result).encode(), hashlib.sha256).hexdigest()
-    submit = client.post(f"/api/runner/jobs/{dry['job']['id']}/result", json={"result": good_result, "signature": sig}, headers=auth).json()
+    submit = client.post(
+        f"/api/runner/jobs/{dry['job']['id']}/result",
+        json={"result": good_result, "signature": sig, "lease_token": claim["job"]["lease_token"]},
+        headers=auth,
+    ).json()
     assert submit["ok"] is True
     assert submit["workflow_state"] == "dry_run_passed"
     assert submit["job"]["status"] == "completed"
@@ -551,7 +576,11 @@ def test_runner_read_job_routing_roundtrip(tmp_path: Path, monkeypatch):
             if claim.status_code == 200:
                 job = claim.json()["job"]
                 sig = hmac_mod.new(secret.encode(), canonical_json(canned).encode(), hashlib.sha256).hexdigest()
-                client.post(f"/api/runner/jobs/{job['id']}/result", json={"result": canned, "signature": sig}, headers=auth)
+                client.post(
+                    f"/api/runner/jobs/{job['id']}/result",
+                    json={"result": canned, "signature": sig, "lease_token": job["lease_token"]},
+                    headers=auth,
+                )
                 return
             time.sleep(0.1)
 
@@ -1075,7 +1104,11 @@ def test_rez_runner_read_endpoint_roundtrip_returns_runner_stdout(tmp_path: Path
                 assert job["action"] == "read_rez_ssh_command"
                 assert job["payload"] == {"device": "edge-1", "command": "show version", "_runner_timeout_seconds": 60.0}
                 sig = hmac_mod.new(secret.encode(), canonical_json(canned).encode(), hashlib.sha256).hexdigest()
-                client.post(f"/api/runner/jobs/{job['id']}/result", json={"result": canned, "signature": sig}, headers=auth)
+                client.post(
+                    f"/api/runner/jobs/{job['id']}/result",
+                    json={"result": canned, "signature": sig, "lease_token": job["lease_token"]},
+                    headers=auth,
+                )
                 return
             time.sleep(0.1)
 
@@ -2433,7 +2466,7 @@ def test_ansible_runner_check_result_advances_to_dry_run_passed(tmp_path: Path, 
 
     accepted = client.post(
         f"/api/runner/jobs/{claimed['id']}/result",
-        json={"result": result, "signature": signature},
+        json={"result": result, "signature": signature, "lease_token": claimed["lease_token"]},
         headers=auth,
     ).json()
 

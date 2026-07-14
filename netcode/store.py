@@ -7,12 +7,15 @@ Postgres engine so call sites stay engine-agnostic.
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
 import os
+import secrets
 import sqlite3
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote, urlencode
@@ -22,6 +25,59 @@ from netcode.yamlio import read_yaml
 
 
 DEFAULT_ORG_ID = "org_default"
+TERMINAL_JOB_STATUSES = frozenset({"completed", "failed", "cancelled", "reconcile_required"})
+
+
+_RETRY_SAFE_JOB_ACTIONS = frozenset(
+    {
+        "lab_verify",
+        "manager_probe",
+        "manager_snapshot",
+        "manager_preview",
+        "manager_validate",
+        "manager_poll",
+        "manager_verify",
+    }
+)
+
+
+def job_is_retry_safe(action: str) -> bool:
+    """Return whether an expired claim may be executed again without a write.
+
+    Read jobs are created only through ``create_read_job`` and receive the
+    ``read_`` prefix there. Every other action must be explicitly listed; an
+    unknown action therefore fails closed into reconciliation.
+    """
+    normalized = str(action or "").strip().lower()
+    return normalized.startswith("read_") or normalized in _RETRY_SAFE_JOB_ACTIONS
+
+
+def job_lease_seconds() -> int:
+    try:
+        configured = int(os.environ.get("NETCODE_JOB_LEASE_SECONDS", "90") or "90")
+    except ValueError:
+        configured = 90
+    return max(30, min(configured, 900))
+
+
+def job_max_attempts() -> int:
+    try:
+        configured = int(os.environ.get("NETCODE_JOB_MAX_ATTEMPTS", "3") or "3")
+    except ValueError:
+        configured = 3
+    return max(1, min(configured, 10))
+
+
+def _token_hash(token: str) -> str:
+    return hashlib.sha256(str(token or "").encode("utf-8")).hexdigest()
+
+
+def _contains_redacted_secret(value: Any) -> bool:
+    if isinstance(value, dict):
+        return any(_contains_redacted_secret(item) for item in value.values())
+    if isinstance(value, list):
+        return any(_contains_redacted_secret(item) for item in value)
+    return value == "***redacted***"
 
 
 def execution_phase_for_job(action: str) -> str:
@@ -178,6 +234,10 @@ class JobRecord:
     signature: str | None = None
     org_id: str = DEFAULT_ORG_ID
     target_runner_id: str | None = None
+    lease_expires_at: str | None = None
+    lease_heartbeat_at: str | None = None
+    attempt_count: int = 0
+    lease_token: str | None = None
 
 
 @dataclass(frozen=True)
@@ -441,6 +501,10 @@ class PlatformStore:
             self._ensure_column(conn, "jobs", "claimed_by", "TEXT")
             self._ensure_column(conn, "jobs", "signature", "TEXT")
             self._ensure_column(conn, "jobs", "target_runner_id", "TEXT")
+            self._ensure_column(conn, "jobs", "lease_token_hash", "TEXT")
+            self._ensure_column(conn, "jobs", "lease_expires_at", "TEXT")
+            self._ensure_column(conn, "jobs", "lease_heartbeat_at", "TEXT")
+            self._ensure_column(conn, "jobs", "attempt_count", "INTEGER NOT NULL DEFAULT 0")
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_jobs_runner_target "
                 "ON jobs (pool, status, target_runner_id, created_at)"
@@ -644,12 +708,17 @@ class PlatformStore:
         now = utc_now()
         result_json = json.dumps(result) if result is not None else None
         with self._connect() as conn:
-            conn.execute(
-                """
-                UPDATE jobs SET status = ?, message = ?, updated_at = ?, result_json = ? WHERE id = ?
-                """,
-                (status, message, now, result_json, job_id),
-            )
+            if status in {"queued", "running", "completing"}:
+                conn.execute(
+                    "UPDATE jobs SET status = ?, message = ?, updated_at = ?, result_json = ? WHERE id = ?",
+                    (status, message, now, result_json, job_id),
+                )
+            else:
+                conn.execute(
+                    "UPDATE jobs SET status = ?, message = ?, updated_at = ?, result_json = ?, "
+                    "lease_token_hash = NULL, lease_expires_at = NULL, lease_heartbeat_at = NULL WHERE id = ?",
+                    (status, message, now, result_json, job_id),
+                )
         return self.get_job(job_id)
 
     def update_change(self, change_id: str, status: str, result: dict[str, Any] | None = None, workflow_state: str | None = None) -> ChangeRecord:
@@ -1002,6 +1071,9 @@ class PlatformStore:
             signature=self._col(row, "signature"),
             org_id=self._col(row, "org_id") or DEFAULT_ORG_ID,
             target_runner_id=self._col(row, "target_runner_id"),
+            lease_expires_at=self._col(row, "lease_expires_at"),
+            lease_heartbeat_at=self._col(row, "lease_heartbeat_at"),
+            attempt_count=int(self._col(row, "attempt_count") or 0),
         )
 
     def _runner(self, row: sqlite3.Row) -> RunnerRecord:
@@ -1906,11 +1978,117 @@ class PlatformStore:
             )
         return self.get_job(job_id)
 
+    def recover_expired_jobs(self, *, org_id: str | None = None, pool: str | None = None) -> dict[str, int]:
+        """Recover orphaned connector work without ever replaying an uncertain write."""
+        now = utc_now()
+        clauses = ["status IN ('running', 'completing')", "(lease_expires_at IS NULL OR lease_expires_at <= ?)"]
+        params: list[Any] = [now]
+        if org_id:
+            clauses.append("org_id = ?")
+            params.append(org_id)
+        if pool:
+            clauses.append("pool = ?")
+            params.append(pool)
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM jobs WHERE " + " AND ".join(clauses) + " ORDER BY created_at ASC",
+                tuple(params),
+            ).fetchall()
+
+        recovered = {"requeued": 0, "failed": 0, "reconcile_required": 0}
+        for row in rows:
+            job = self._job(row)
+            retry_safe = job_is_retry_safe(job.action)
+            payload_has_scrubbed_secret = _contains_redacted_secret(job.payload or {})
+            if retry_safe and job.attempt_count < job_max_attempts() and not payload_has_scrubbed_secret:
+                status = "queued"
+                message = "Connector lease expired; safe read-only work requeued."
+                bucket = "requeued"
+            elif retry_safe:
+                status = "failed"
+                message = (
+                    "Connector lease expired after its retry limit."
+                    if not payload_has_scrubbed_secret
+                    else "Connector lease expired after one-time discovery credentials were scrubbed; start a new scan."
+                )
+                bucket = "failed"
+            else:
+                status = "reconcile_required"
+                message = (
+                    "Connector lease expired after a potentially mutating action. "
+                    "Reconcile live device state before any retry."
+                )
+                bucket = "reconcile_required"
+            with self._connect() as conn:
+                cursor = conn.execute(
+                    "UPDATE jobs SET status = ?, message = ?, updated_at = ?, claimed_by = NULL, "
+                    "lease_token_hash = NULL, lease_expires_at = NULL, lease_heartbeat_at = NULL "
+                    "WHERE id = ? AND status IN ('running', 'completing') "
+                    "AND (lease_expires_at IS NULL OR lease_expires_at <= ?)",
+                    (status, message, now, job.id, now),
+                )
+            if cursor.rowcount == 1:
+                recovered[bucket] += 1
+                if bucket == "reconcile_required" and job.change_id != "__read__":
+                    try:
+                        change = self.get_change(job.change_id)
+                    except ValueError:
+                        continue
+                    evidence = {
+                        "job_id": job.id,
+                        "runner_id": job.claimed_by,
+                        "action": job.action,
+                        "attempt_count": job.attempt_count,
+                        "reason": "connector_lease_expired",
+                    }
+                    phase = execution_phase_for_job(job.action)
+                    if phase:
+                        self.record_execution_event(
+                            event_id=str(uuid.uuid4()),
+                            job_id=job.id,
+                            change_id=job.change_id,
+                            org_id=job.org_id,
+                            device_id=change.device_id or "",
+                            phase=phase,
+                            stage="reconcile_required",
+                            status="failed",
+                            message=message,
+                            sequence=self.next_execution_sequence(job.id),
+                        )
+                    combined_result = dict(change.result or {})
+                    combined_result["connector_reconciliation"] = evidence
+                    self.update_change(change.id, "blocked", combined_result, workflow_state="blocked")
+                    self.record_workflow_event(
+                        change.id,
+                        "connector_lease_expired",
+                        change.workflow_state,
+                        "blocked",
+                        message,
+                        evidence,
+                    )
+        return recovered
+
     def claim_next_job(self, org_id: str, pool: str, runner_id: str) -> JobRecord | None:
         """Atomically claim the oldest queued job for a (org, pool). Concurrent- and tenant-safe:
         a runner may only claim jobs in its OWN org, and catalog-targeted jobs may
         only be claimed by the runner that advertised the target device."""
+        self.recover_expired_jobs(org_id=org_id, pool=pool)
+        lease_token = f"jlt_{secrets.token_urlsafe(32)}"
+        now = datetime.now(timezone.utc)
+        now_text = now.isoformat()
+        lease_expires_at = (now + timedelta(seconds=job_lease_seconds())).isoformat()
         with self._connect() as conn:
+            if self.engine == "postgres":
+                conn.execute("SELECT id FROM runners WHERE id = ? FOR UPDATE", (runner_id,)).fetchone()
+            else:
+                conn.execute("BEGIN IMMEDIATE")
+            active = conn.execute(
+                "SELECT id FROM jobs WHERE claimed_by = ? AND status IN ('running', 'completing') "
+                "AND lease_expires_at > ? LIMIT 1",
+                (runner_id, now_text),
+            ).fetchone()
+            if active:
+                return None
             row = conn.execute(
                 "SELECT id FROM jobs WHERE status = 'queued' AND org_id = ? AND pool = ? "
                 "AND (target_runner_id IS NULL OR target_runner_id = ?) "
@@ -1920,10 +2098,25 @@ class PlatformStore:
             if not row:
                 return None
             cursor = conn.execute(
-                "UPDATE jobs SET status = 'running', claimed_by = ?, message = ?, updated_at = ? "
+                "UPDATE jobs SET status = 'running', claimed_by = ?, message = ?, updated_at = ?, "
+                "lease_token_hash = ?, lease_expires_at = ?, lease_heartbeat_at = ?, "
+                "attempt_count = attempt_count + 1 "
                 "WHERE id = ? AND status = 'queued' "
-                "AND (target_runner_id IS NULL OR target_runner_id = ?)",
-                (runner_id, f"Claimed by runner {runner_id}", utc_now(), row["id"], runner_id),
+                "AND (target_runner_id IS NULL OR target_runner_id = ?) "
+                "AND NOT EXISTS (SELECT 1 FROM jobs active WHERE active.claimed_by = ? "
+                "AND active.status IN ('running', 'completing') AND active.lease_expires_at > ?)",
+                (
+                    runner_id,
+                    f"Claimed by runner {runner_id}",
+                    now_text,
+                    _token_hash(lease_token),
+                    lease_expires_at,
+                    now_text,
+                    row["id"],
+                    runner_id,
+                    runner_id,
+                    now_text,
+                ),
             )
             if cursor.rowcount != 1:
                 return None  # another runner won the race
@@ -1933,6 +2126,7 @@ class PlatformStore:
         # therefore never leaves the credential at rest in the control plane —
         # the previous scrub-on-successful-result missed exactly that case.
         claimed = self.get_job(row["id"])
+        claimed = JobRecord(**{**claimed.__dict__, "lease_token": lease_token})
         phase = execution_phase_for_job(claimed.action)
         if claimed.change_id != "__read__" and phase:
             payload = claimed.payload or {}
@@ -1952,6 +2146,53 @@ class PlatformStore:
             )
         self.scrub_job_payload_secrets(claimed.id)
         return claimed
+
+    def renew_job_lease(self, job_id: str, runner_id: str, lease_token: str) -> str | None:
+        """Renew only the current claim; stale connector processes are rejected."""
+        token = str(lease_token or "").strip()
+        if not token:
+            return None
+        now = datetime.now(timezone.utc)
+        now_text = now.isoformat()
+        expires = (now + timedelta(seconds=job_lease_seconds())).isoformat()
+        with self._connect() as conn:
+            cursor = conn.execute(
+                "UPDATE jobs SET lease_expires_at = ?, lease_heartbeat_at = ?, updated_at = ? "
+                "WHERE id = ? AND status = 'running' AND claimed_by = ? "
+                "AND lease_token_hash = ? AND lease_expires_at > ?",
+                (expires, now_text, now_text, job_id, runner_id, _token_hash(token), now_text),
+            )
+        return expires if cursor.rowcount == 1 else None
+
+    def job_lease_matches(self, job_id: str, runner_id: str, lease_token: str) -> bool:
+        token = str(lease_token or "").strip()
+        if not token:
+            return False
+        now = utc_now()
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT lease_token_hash FROM jobs WHERE id = ? AND status = 'running' "
+                "AND claimed_by = ? AND lease_expires_at > ?",
+                (job_id, runner_id, now),
+            ).fetchone()
+        return bool(row and hmac.compare_digest(str(row["lease_token_hash"] or ""), _token_hash(token)))
+
+    def begin_job_completion(self, job_id: str, runner_id: str, lease_token: str) -> bool:
+        """Atomically reserve result processing so one job advances workflow once."""
+        token = str(lease_token or "").strip()
+        if not token:
+            return False
+        now = datetime.now(timezone.utc)
+        now_text = now.isoformat()
+        expires = (now + timedelta(seconds=job_lease_seconds())).isoformat()
+        with self._connect() as conn:
+            cursor = conn.execute(
+                "UPDATE jobs SET status = 'completing', lease_expires_at = ?, "
+                "lease_heartbeat_at = ?, updated_at = ? WHERE id = ? AND status = 'running' "
+                "AND claimed_by = ? AND lease_token_hash = ? AND lease_expires_at > ?",
+                (expires, now_text, now_text, job_id, runner_id, _token_hash(token), now_text),
+            )
+        return cursor.rowcount == 1
 
     def record_job_signature(self, job_id: str, signature: str) -> None:
         with self._connect() as conn:
@@ -2101,6 +2342,7 @@ def record_to_dict(
     record: ChangeRecord | JobRecord | WorkflowEventRecord | ExecutionEventRecord,
 ) -> dict[str, Any]:
     data = record.__dict__.copy()
+    data.pop("lease_token", None)
     if isinstance(record, ChangeRecord):
         data["rez_change_id"] = change_audit_id(record.id, record.created_at)
     if "payload" in data and data["payload"]:

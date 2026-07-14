@@ -715,7 +715,9 @@ def _submit_signed_jobs(store, runner, change_id, checks, *, manager_ok=True):
         "status": "pass" if manager_ok else "fail",
         "message": "manager deploy finished",
     }
-    submit_job_result(store, runner, manager_job.id, manager_result, sign_result("runner-hmac", manager_result))
+    submit_job_result(
+        store, runner, manager_job.id, manager_result, sign_result("runner-hmac", manager_result), claimed.lease_token
+    )
 
     read_job = store.create_read_job(
         runner.org_id,
@@ -733,7 +735,9 @@ def _submit_signed_jobs(store, runner, change_id, checks, *, manager_ok=True):
         "service_checks": checks,
         "message": "exact-flow evidence collected",
     }
-    submit_job_result(store, runner, read_job.id, read_result, sign_result("runner-hmac", read_result))
+    submit_job_result(
+        store, runner, read_job.id, read_result, sign_result("runner-hmac", read_result), claimed.lease_token
+    )
     return manager_job.id, read_job.id
 
 
@@ -781,7 +785,9 @@ def test_preview_signed_result_then_second_engineer_approval_unlocks_manager_sta
     claimed = store.claim_next_job(runner.org_id, runner.pool, runner.id)
     assert claimed.id == queued["job"]["id"]
     preview_result = {"status": "pass", "message": "Manager preview and isolation checks passed."}
-    accepted = submit_job_result(store, runner, claimed.id, preview_result, sign_result("runner-hmac", preview_result))
+    accepted = submit_job_result(
+        store, runner, claimed.id, preview_result, sign_result("runner-hmac", preview_result), claimed.lease_token
+    )
     assert accepted["workflow_state"] == "dry_run_passed"
     assert store.get_change(change_id).result["plan"]["plan_id"].startswith("XDOM-")
 
