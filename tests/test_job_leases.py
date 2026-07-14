@@ -165,6 +165,147 @@ def test_duplicate_connector_processes_share_one_active_claim(tmp_path: Path) ->
     assert store.claim_next_job(DEFAULT_ORG_ID, runner.pool, runner.id) is None
 
 
+def test_duplicate_operation_requests_create_one_durable_job(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    runner = _runner(store)
+    change = _change(store, tmp_path)
+    payload = {
+        "action": "apply",
+        "device": {"id": "EDGE-1", "host": "192.0.2.10", "platform": "arista_eos"},
+        "intent_yaml": "change_type: custom_config\n",
+        "rendered_config": "interface Ethernet1\n description pilot\n",
+    }
+    barrier = threading.Barrier(2)
+
+    def queue():
+        barrier.wait()
+        return store.queue_job(
+            change.id,
+            "lab_apply",
+            runner.pool,
+            payload,
+            target_runner_id=runner.id,
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        jobs = [future.result() for future in (executor.submit(queue), executor.submit(queue))]
+
+    assert jobs[0].id == jobs[1].id
+    assert jobs[0].device_id == "edge-1"
+    assert jobs[0].idempotency_key and jobs[0].idempotency_key.startswith("nop_")
+    with store._connect() as conn:  # noqa: SLF001 - assert the durable uniqueness boundary.
+        count = conn.execute(
+            "SELECT COUNT(*) AS count FROM jobs WHERE change_id = ? AND action = 'lab_apply'",
+            (change.id,),
+        ).fetchone()["count"]
+    assert count == 1
+
+
+def test_idempotency_key_cannot_be_rebound_to_another_operation(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    runner = _runner(store)
+    first_change = _change(store, tmp_path)
+    second_intent = tmp_path / "intents" / "lease-test-2.yaml"
+    second_intent.write_text("change_type: custom_config\n", encoding="utf-8")
+    second_change = store.create_change(second_intent, "edge-2")
+    shared_key = "caller-supplied-operation-key"
+    store.queue_job(
+        first_change.id,
+        "lab_apply",
+        runner.pool,
+        {"action": "apply", "device": {"id": "edge-1"}},
+        idempotency_key=shared_key,
+    )
+
+    with pytest.raises(ValueError, match="different device operation"):
+        store.queue_job(
+            second_change.id,
+            "lab_apply",
+            runner.pool,
+            {"action": "apply", "device": {"id": "edge-2"}},
+            idempotency_key=shared_key,
+        )
+    assert second_change.last_job_id is None
+
+
+def test_same_device_is_serialized_across_distinct_connectors(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    first_runner = _runner(store, "connector-a")
+    second_runner = _runner(store, "connector-b")
+    first_change = _change(store, tmp_path)
+    second_intent = tmp_path / "intents" / "lease-test-2.yaml"
+    second_intent.write_text("change_type: custom_config\n", encoding="utf-8")
+    second_change = store.create_change(second_intent, "edge-1")
+    payload = {"action": "apply", "device": {"id": "EDGE-1"}}
+    first_job = store.queue_job(
+        first_change.id,
+        "lab_apply",
+        first_runner.pool,
+        payload,
+        target_runner_id=first_runner.id,
+    )
+    second_job = store.queue_job(
+        second_change.id,
+        "lab_apply",
+        second_runner.pool,
+        payload,
+        target_runner_id=second_runner.id,
+    )
+
+    first_claim = store.claim_next_job(DEFAULT_ORG_ID, first_runner.pool, first_runner.id)
+    assert first_claim is not None and first_claim.id == first_job.id
+    assert store.claim_next_job(DEFAULT_ORG_ID, second_runner.pool, second_runner.id) is None
+
+    store.update_job(first_job.id, "completed", "first operation completed", {"status": "pass"})
+    second_claim = store.claim_next_job(DEFAULT_ORG_ID, second_runner.pool, second_runner.id)
+    assert second_claim is not None and second_claim.id == second_job.id
+
+
+def test_distinct_devices_can_run_on_distinct_connectors(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    first_runner = _runner(store, "connector-a")
+    second_runner = _runner(store, "connector-b")
+    first_change = _change(store, tmp_path)
+    second_intent = tmp_path / "intents" / "lease-test-2.yaml"
+    second_intent.write_text("change_type: custom_config\n", encoding="utf-8")
+    second_change = store.create_change(second_intent, "edge-2")
+    store.queue_job(
+        first_change.id,
+        "lab_apply",
+        first_runner.pool,
+        {"action": "apply", "device": {"id": "edge-1"}},
+        target_runner_id=first_runner.id,
+    )
+    store.queue_job(
+        second_change.id,
+        "lab_apply",
+        second_runner.pool,
+        {"action": "apply", "device": {"id": "edge-2"}},
+        target_runner_id=second_runner.id,
+    )
+
+    assert store.claim_next_job(DEFAULT_ORG_ID, first_runner.pool, first_runner.id) is not None
+    assert store.claim_next_job(DEFAULT_ORG_ID, second_runner.pool, second_runner.id) is not None
+
+
+def test_read_jobs_do_not_require_a_fake_change_foreign_key(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    runner = _runner(store)
+    job = store.create_read_job(
+        DEFAULT_ORG_ID,
+        runner.pool,
+        "verify",
+        {"device_id": "edge-1"},
+    )
+    assert job.change_id == "__read__"
+    with store._connect() as conn:  # noqa: SLF001 - schema contract for Postgres parity.
+        foreign_keys = conn.execute("PRAGMA foreign_key_list(jobs)").fetchall()
+        indexes = {row["name"] for row in conn.execute("PRAGMA index_list(jobs)").fetchall()}
+    assert not foreign_keys
+    assert "idx_jobs_one_active_device" in indexes
+    assert "idx_jobs_org_idempotency" in indexes
+
+
 def test_duplicate_signed_result_is_acknowledged_without_second_transition(tmp_path: Path) -> None:
     store = _store(tmp_path)
     runner = _runner(store)

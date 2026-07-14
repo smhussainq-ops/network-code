@@ -72,6 +72,56 @@ def _token_hash(token: str) -> str:
     return hashlib.sha256(str(token or "").encode("utf-8")).hexdigest()
 
 
+def job_device_id(payload: dict[str, Any] | None) -> str:
+    """Extract the canonical execution target used for device serialization."""
+    value = payload or {}
+    device = value.get("device") if isinstance(value.get("device"), dict) else {}
+    ownership = value.get("ownership") if isinstance(value.get("ownership"), dict) else {}
+    candidate = (
+        value.get("manager_id")
+        or value.get("device_id")
+        or device.get("id")
+        or ownership.get("device_id")
+        or ""
+    )
+    return str(candidate).strip().lower()
+
+
+def job_idempotency_key(
+    *,
+    org_id: str,
+    change_id: str,
+    action: str,
+    device_id: str,
+    payload: dict[str, Any],
+) -> str:
+    """Create a stable opaque key for one reviewed device operation."""
+    canonical = json.dumps(
+        {
+            "org_id": str(org_id),
+            "change_id": str(change_id),
+            "action": str(action).strip().lower(),
+            "device_id": str(device_id).strip().lower(),
+            "payload": payload,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+    return f"nop_{hashlib.sha256(canonical.encode('utf-8')).hexdigest()}"
+
+
+def _is_active_device_conflict(exc: Exception) -> bool:
+    diagnostic = getattr(exc, "diag", None)
+    if str(getattr(diagnostic, "constraint_name", "")) == "idx_jobs_one_active_device":
+        return True
+    message = str(exc).lower()
+    return (
+        "idx_jobs_one_active_device" in message
+        or "unique constraint failed: jobs.org_id, jobs.device_id" in message
+    )
+
+
 def _contains_redacted_secret(value: Any) -> bool:
     if isinstance(value, dict):
         return any(_contains_redacted_secret(item) for item in value.values())
@@ -237,6 +287,8 @@ class JobRecord:
     lease_expires_at: str | None = None
     lease_heartbeat_at: str | None = None
     attempt_count: int = 0
+    device_id: str = ""
+    idempotency_key: str | None = None
     lease_token: str | None = None
 
 
@@ -345,8 +397,7 @@ class PlatformStore:
                     message TEXT NOT NULL,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
-                    result_json TEXT,
-                    FOREIGN KEY(change_id) REFERENCES changes(id)
+                    result_json TEXT
                 )
                 """
             )
@@ -505,6 +556,8 @@ class PlatformStore:
             self._ensure_column(conn, "jobs", "lease_expires_at", "TEXT")
             self._ensure_column(conn, "jobs", "lease_heartbeat_at", "TEXT")
             self._ensure_column(conn, "jobs", "attempt_count", "INTEGER NOT NULL DEFAULT 0")
+            self._ensure_column(conn, "jobs", "device_id", "TEXT NOT NULL DEFAULT ''")
+            self._ensure_column(conn, "jobs", "idempotency_key", "TEXT")
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_jobs_runner_target "
                 "ON jobs (pool, status, target_runner_id, created_at)"
@@ -602,6 +655,20 @@ class PlatformStore:
             self._ensure_column(conn, "rollouts", "retry_scope", "TEXT")
             for table in ("changes", "jobs", "runners", "join_tokens"):
                 self._ensure_column(conn, table, "org_id", f"TEXT DEFAULT '{DEFAULT_ORG_ID}'")
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_jobs_device_claim "
+                "ON jobs (org_id, device_id, status, lease_expires_at)"
+            )
+            conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_org_idempotency "
+                "ON jobs (org_id, idempotency_key) "
+                "WHERE idempotency_key IS NOT NULL AND idempotency_key <> ''"
+            )
+            conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_one_active_device "
+                "ON jobs (org_id, device_id) "
+                "WHERE device_id <> '' AND status IN ('running', 'completing')"
+            )
             self._ensure_column(conn, "changes", "created_by_user_id", "TEXT")
             self._ensure_column(conn, "changes", "title", "TEXT NOT NULL DEFAULT ''")
             self._ensure_column(conn, "changes", "source", "TEXT NOT NULL DEFAULT ''")
@@ -1074,6 +1141,8 @@ class PlatformStore:
             lease_expires_at=self._col(row, "lease_expires_at"),
             lease_heartbeat_at=self._col(row, "lease_heartbeat_at"),
             attempt_count=int(self._col(row, "attempt_count") or 0),
+            device_id=str(self._col(row, "device_id") or ""),
+            idempotency_key=self._col(row, "idempotency_key"),
         )
 
     def _runner(self, row: sqlite3.Row) -> RunnerRecord:
@@ -1686,20 +1755,74 @@ class PlatformStore:
         payload: dict[str, Any],
         *,
         target_runner_id: str | None = None,
+        device_id: str | None = None,
+        idempotency_key: str | None = None,
     ) -> JobRecord:
-        job = self.create_job(change_id, action)  # inherits org_id from the parent change
+        """Queue one change operation exactly once.
+
+        The key is durable and unique within an organization. Concurrent API
+        requests for the same reviewed operation therefore receive the same job
+        instead of creating a second device write.
+        """
+        now = utc_now()
+        job_id = str(uuid.uuid4())
+        canonical_device = str(device_id or job_device_id(payload)).strip().lower()
         with self._connect() as conn:
+            if self.engine == "sqlite":
+                conn.execute("BEGIN IMMEDIATE")
+            org_row = conn.execute("SELECT org_id FROM changes WHERE id = ?", (change_id,)).fetchone()
+            if not org_row:
+                raise ValueError(f"Unknown change {change_id}")
+            org_id = str(org_row["org_id"] or DEFAULT_ORG_ID)
+            operation_key = str(idempotency_key or "").strip() or job_idempotency_key(
+                org_id=org_id,
+                change_id=change_id,
+                action=action,
+                device_id=canonical_device,
+                payload=payload,
+            )
             conn.execute(
-                "UPDATE jobs SET pool = ?, payload_json = ?, target_runner_id = ?, message = ? WHERE id = ?",
+                "INSERT INTO jobs (id, change_id, action, status, message, created_at, updated_at, "
+                "result_json, org_id, pool, payload_json, target_runner_id, device_id, idempotency_key) "
+                "VALUES (?, ?, ?, 'queued', ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT DO NOTHING",
                 (
+                    job_id,
+                    change_id,
+                    action,
+                    f"Queued for runner pool {pool}",
+                    now,
+                    now,
+                    org_id,
                     pool,
                     json.dumps(payload),
                     target_runner_id,
-                    f"Queued for runner pool {pool}",
-                    job.id,
+                    canonical_device,
+                    operation_key,
                 ),
             )
-        return self.get_job(job.id)
+            row = conn.execute(
+                "SELECT id, change_id, action, device_id, payload_json FROM jobs "
+                "WHERE org_id = ? AND idempotency_key = ?",
+                (org_id, operation_key),
+            ).fetchone()
+            if not row:
+                raise RuntimeError("Failed to queue or resolve the idempotent operation")
+            existing_payload = json.loads(row["payload_json"] or "{}")
+            if (
+                str(row["change_id"]) != change_id
+                or str(row["action"]) != action
+                or str(row["device_id"] or "") != canonical_device
+                or json.dumps(existing_payload, sort_keys=True, separators=(",", ":"), default=str)
+                != json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
+            ):
+                raise ValueError("Idempotency key is already bound to a different device operation")
+            actual_job_id = str(row["id"])
+            conn.execute(
+                "UPDATE changes SET last_job_id = ?, updated_at = ? WHERE id = ?",
+                (actual_job_id, now, change_id),
+            )
+        return self.get_job(actual_job_id)
 
     # ── Fleet rollouts ────────────────────────────────────────────────────
 
@@ -1956,11 +2079,12 @@ class PlatformStore:
         sentinel), so submitting its result never advances a change workflow."""
         job_id = str(uuid.uuid4())
         now = utc_now()
+        canonical_device = job_device_id(payload)
         with self._connect() as conn:
             conn.execute(
                 "INSERT INTO jobs (id, change_id, action, status, message, created_at, updated_at, result_json, "
-                "org_id, pool, payload_json, target_runner_id)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "org_id, pool, payload_json, target_runner_id, device_id)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     job_id,
                     change_id,
@@ -1974,6 +2098,7 @@ class PlatformStore:
                     pool,
                     json.dumps(payload),
                     target_runner_id,
+                    canonical_device,
                 ),
             )
         return self.get_job(job_id)
@@ -2092,32 +2217,54 @@ class PlatformStore:
             row = conn.execute(
                 "SELECT id FROM jobs WHERE status = 'queued' AND org_id = ? AND pool = ? "
                 "AND (target_runner_id IS NULL OR target_runner_id = ?) "
+                "AND (COALESCE(device_id, '') = '' OR NOT EXISTS ("
+                "SELECT 1 FROM jobs device_active WHERE device_active.org_id = jobs.org_id "
+                "AND LOWER(device_active.device_id) = LOWER(jobs.device_id) "
+                "AND device_active.status IN ('running', 'completing') "
+                "AND device_active.lease_expires_at > ?)) "
                 "ORDER BY created_at ASC LIMIT 1",
-                (org_id, pool, runner_id),
+                (org_id, pool, runner_id, now_text),
             ).fetchone()
             if not row:
                 return None
-            cursor = conn.execute(
-                "UPDATE jobs SET status = 'running', claimed_by = ?, message = ?, updated_at = ?, "
-                "lease_token_hash = ?, lease_expires_at = ?, lease_heartbeat_at = ?, "
-                "attempt_count = attempt_count + 1 "
-                "WHERE id = ? AND status = 'queued' "
-                "AND (target_runner_id IS NULL OR target_runner_id = ?) "
-                "AND NOT EXISTS (SELECT 1 FROM jobs active WHERE active.claimed_by = ? "
-                "AND active.status IN ('running', 'completing') AND active.lease_expires_at > ?)",
-                (
-                    runner_id,
-                    f"Claimed by runner {runner_id}",
-                    now_text,
-                    _token_hash(lease_token),
-                    lease_expires_at,
-                    now_text,
-                    row["id"],
-                    runner_id,
-                    runner_id,
-                    now_text,
-                ),
-            )
+            conn.execute("SAVEPOINT device_claim")
+            try:
+                cursor = conn.execute(
+                    "UPDATE jobs SET status = 'running', claimed_by = ?, message = ?, updated_at = ?, "
+                    "lease_token_hash = ?, lease_expires_at = ?, lease_heartbeat_at = ?, "
+                    "attempt_count = attempt_count + 1 "
+                    "WHERE id = ? AND status = 'queued' "
+                    "AND (target_runner_id IS NULL OR target_runner_id = ?) "
+                    "AND NOT EXISTS (SELECT 1 FROM jobs active WHERE active.claimed_by = ? "
+                    "AND active.status IN ('running', 'completing') AND active.lease_expires_at > ?) "
+                    "AND (COALESCE(device_id, '') = '' OR NOT EXISTS ("
+                    "SELECT 1 FROM jobs device_active WHERE device_active.org_id = jobs.org_id "
+                    "AND LOWER(device_active.device_id) = LOWER(jobs.device_id) "
+                    "AND device_active.id <> jobs.id "
+                    "AND device_active.status IN ('running', 'completing') "
+                    "AND device_active.lease_expires_at > ?))",
+                    (
+                        runner_id,
+                        f"Claimed by runner {runner_id}",
+                        now_text,
+                        _token_hash(lease_token),
+                        lease_expires_at,
+                        now_text,
+                        row["id"],
+                        runner_id,
+                        runner_id,
+                        now_text,
+                        now_text,
+                    ),
+                )
+            except Exception as exc:
+                conn.execute("ROLLBACK TO SAVEPOINT device_claim")
+                conn.execute("RELEASE SAVEPOINT device_claim")
+                if _is_active_device_conflict(exc):
+                    return None
+                raise
+            else:
+                conn.execute("RELEASE SAVEPOINT device_claim")
             if cursor.rowcount != 1:
                 return None  # another runner won the race
         # Fetch the job WITH its real payload to hand back to the runner (it
