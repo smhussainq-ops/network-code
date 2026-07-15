@@ -170,6 +170,17 @@ def test_site_context_interface_remediation_stays_typed_and_human_gated(tmp_path
     assert body["change"]["workflow_state"] == "validated"
     assert body["change"]["result"]["plan"]["commands"] == "interface Ethernet2\n   no shutdown\n"
     assert body["change"]["result"]["plan"]["rollback"] == "interface Ethernet2\n   shutdown\n"
+    interface_policy = next(
+        check
+        for check in body["change"]["result"]["pipeline"]["validation"]["checks"]
+        if check["id"] == "interface_policy"
+    )
+    assert interface_policy["message"] == "The change is limited to the interface administrative state."
+    assert interface_policy["evidence"] == {
+        "interface": "Ethernet2",
+        "apply_scope": "admin_state",
+        "expected_enabled": True,
+    }
 
 
 def test_site_context_redistribution_remediation_is_typed_validated_and_human_gated(

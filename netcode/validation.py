@@ -213,6 +213,15 @@ class StaticValidator:
         name = intent.interface.name.lower()
         if name.startswith("management"):
             return self._fail("interface_policy", "Interface Policy", "Management interfaces are blocked from this UI workflow.", interface=intent.interface.name)
+        if intent.interface.apply_scope == "admin_state":
+            return self._pass(
+                "interface_policy",
+                "Interface Policy",
+                "The change is limited to the interface administrative state.",
+                interface=intent.interface.name,
+                apply_scope="admin_state",
+                expected_enabled=intent.interface.enabled,
+            )
         if intent.interface.mode == "access" and intent.interface.access_vlan is not None:
             vlan_policy = self.policy.get("vlan", {})
             allowed_min, allowed_max = vlan_policy.get("allowed_range", [2, 4094])
@@ -229,6 +238,7 @@ class StaticValidator:
             "Interface intent stays within editable access/trunk/routed interface scope.",
             interface=intent.interface.name,
             mode=intent.interface.mode,
+            apply_scope=intent.interface.apply_scope,
         )
 
     def _bgp_policy(self, intent: BgpNeighborIntent, render: RenderResult) -> CheckResult:
