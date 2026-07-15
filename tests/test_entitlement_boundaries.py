@@ -268,6 +268,28 @@ def test_community_second_connector_fails_after_join_token_claim(tmp_path: Path,
     assert len(store.list_runners(org_id="org_default")) == 1
 
 
+def test_revoked_community_connector_can_be_replaced(tmp_path: Path, monkeypatch) -> None:
+    workspace = WorkspacePaths(tmp_path)
+    init_workspace(workspace)
+    monkeypatch.setattr(entitlement_module, "get_entitlements", _community_entitlements)
+    store = PlatformStore(workspace)
+    previous = store.create_runner(
+        name="connector-a",
+        pool="default",
+        token_hash="first-token-hash",
+        hmac_secret="first-secret",
+        org_id="org_default",
+    )
+    store.revoke_runner(previous.id, "org_default")
+
+    join = runner_hub.mint_join_token(store, "default", org_id="org_default")
+    result = runner_hub.enroll_runner(store, join["join_token"], "connector-b")
+
+    assert result["ok"] is True
+    assert store.active_runner_count("org_default") == 1
+    assert len(store.list_runners(org_id="org_default")) == 2
+
+
 def test_trusted_rez_proxy_binds_request_to_forwarded_organization(tmp_path: Path, monkeypatch) -> None:
     init_workspace(WorkspacePaths(tmp_path))
     monkeypatch.chdir(tmp_path)

@@ -2245,7 +2245,7 @@ def api_mint_join_token(request: JoinTokenRequest, http_request: Request, author
     store = PlatformStore(paths())
     enforce_capacity(
         "connectors",
-        current=len(store.list_runners(org_id=principal.org_id)),
+        current=store.active_runner_count(principal.org_id),
         additional=1,
         org_id=principal.org_id,
     )

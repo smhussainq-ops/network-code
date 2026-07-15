@@ -103,7 +103,7 @@ def enroll_runner(store: PlatformStore, join_token: str, name: str) -> dict[str,
     try:
         enforce_capacity(
             "connectors",
-            current=len(store.list_runners(org_id=org_id)),
+            current=store.active_runner_count(org_id),
             additional=1,
             org_id=org_id,
         )

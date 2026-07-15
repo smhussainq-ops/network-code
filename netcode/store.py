@@ -1548,6 +1548,15 @@ class PlatformStore:
                 rows = conn.execute("SELECT * FROM runners WHERE org_id = ? ORDER BY created_at DESC", (org_id,)).fetchall()
         return [self._runner(row) for row in rows]
 
+    def active_runner_count(self, org_id: str) -> int:
+        """Count connector identities that can still authenticate and claim work."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) AS total FROM runners WHERE org_id = ? AND revoked_at IS NULL",
+                (org_id,),
+            ).fetchone()
+        return int(row["total"] if row else 0)
+
     def queue_metrics(self, org_id: str) -> dict[str, Any]:
         with self._connect() as conn:
             row = conn.execute(
