@@ -7,6 +7,46 @@ from netcode.store import PlatformStore
 from netcode.yamlio import read_yaml, write_yaml
 
 
+def test_first_discovery_import_creates_secret_free_source_of_truth(tmp_path):
+    paths = WorkspacePaths(tmp_path)
+    paths.ensure()
+    inventory_path = paths.inventories / "lab.yaml"
+
+    result = DiscoveryService(paths).import_candidate(
+        {
+            "id": "first-edge",
+            "hostname": "FIRST-EDGE",
+            "host": "192.0.2.10",
+            "platform": "arista_eos",
+            "site": "site-101",
+            "password": "must-not-persist",
+        }
+    )
+
+    assert result["ok"] is True
+    assert result["action"] == "added"
+    assert inventory_path.exists()
+    inventory = read_yaml(inventory_path)
+    assert inventory == {
+        "devices": [
+            {
+                "id": "first-edge",
+                "hostname": "FIRST-EDGE",
+                "host": "192.0.2.10",
+                "platform": "arista_eos",
+                "site": "site-101",
+                "role": "",
+                "groups": ["discovered"],
+                "port": 22,
+                "serial": "",
+                "aliases": [],
+            }
+        ]
+    }
+    assert "password" not in inventory
+    assert "defaults" not in inventory
+
+
 def test_discovery_import_rejects_serial_change_on_existing_device(tmp_path):
     paths = WorkspacePaths(tmp_path)
     init_workspace(paths)

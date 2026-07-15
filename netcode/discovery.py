@@ -241,7 +241,10 @@ class DiscoveryService:
             return {"ok": False, "error": f"Missing required source-of-truth fields: {', '.join(missing)}"}
 
         inventory_path = configured_inventory_path(self.paths)
-        inventory = read_yaml(inventory_path)
+        # A new SaaS workspace has no inventory file until its first approved
+        # discovery result. Start from an empty, secret-free document rather
+        # than requiring sample inventory bootstrap data in production.
+        inventory = read_yaml(inventory_path) if inventory_path.exists() else {}
         devices = list(inventory.get("devices") or [])
         sanitized = {
             "id": _safe_device_id(str(candidate.get("id"))),
