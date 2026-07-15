@@ -2046,7 +2046,8 @@ class PlatformStore:
         end_reason: str | None = None,
     ) -> dict[str, Any] | None:
         now = utc_now()
-        touched_value = None if device_touched is None else int(device_touched)
+        touched_present = int(device_touched is not None)
+        touched_value = int(bool(device_touched))
         with self._connect() as conn:
             conn.execute(
                 """
@@ -2055,7 +2056,7 @@ class PlatformStore:
                     change_id = COALESCE(?, change_id),
                     command_count = command_count + ?,
                     output_bytes = output_bytes + ?,
-                    device_touched = CASE WHEN ? IS NULL THEN device_touched ELSE ? END,
+                    device_touched = CASE WHEN ? = 1 THEN ? ELSE device_touched END,
                     last_activity = ?,
                     ended_at = CASE WHEN ? = 1 THEN ? ELSE ended_at END,
                     end_reason = COALESCE(?, end_reason)
@@ -2063,7 +2064,7 @@ class PlatformStore:
                 """,
                 (
                     status, change_id, max(0, int(command_delta)),
-                    max(0, int(output_bytes_delta)), touched_value, touched_value,
+                    max(0, int(output_bytes_delta)), touched_present, touched_value,
                     now, int(ended), now, end_reason, session_id,
                 ),
             )

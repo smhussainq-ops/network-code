@@ -17,9 +17,17 @@ class _RecordingConnection:
     def __init__(self, rows: list[dict[str, str]]) -> None:
         self.rows = rows
         self.statements: list[str] = []
+        self.parameters: list[Any] = []
 
-    def execute(self, sql: str, _params: Any = None) -> _Rows:
+    def __enter__(self) -> "_RecordingConnection":
+        return self
+
+    def __exit__(self, *_args: Any) -> None:
+        return None
+
+    def execute(self, sql: str, params: Any = None) -> _Rows:
         self.statements.append(sql)
+        self.parameters.append(params)
         if "information_schema.table_constraints" in sql:
             return _Rows(self.rows)
         return _Rows([])
@@ -54,3 +62,17 @@ def test_sqlite_skips_postgres_constraint_migration() -> None:
     _store("sqlite")._drop_legacy_jobs_change_foreign_keys(conn)
 
     assert conn.statements == []
+
+
+def test_shell_counter_update_never_sends_untyped_null_for_touch_flag() -> None:
+    conn = _RecordingConnection([])
+    store = _store("postgres")
+    store._connect = lambda: conn  # type: ignore[method-assign]
+    store.get_shell_session = lambda session_id: {"id": session_id}  # type: ignore[method-assign]
+
+    updated = store.update_shell_session("shell-1", output_bytes_delta=12)
+
+    assert updated == {"id": "shell-1"}
+    params = conn.parameters[-1]
+    assert params[4:6] == (0, 0)
+    assert "CASE WHEN ? = 1 THEN ? ELSE device_touched END" in conn.statements[-1]

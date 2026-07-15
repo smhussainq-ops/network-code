@@ -12,6 +12,52 @@ from netcode.paths import WorkspacePaths
 from netcode.store import DEFAULT_ORG_ID, PlatformStore
 
 
+def test_shell_session_updates_counters_without_erasing_touch_state(tmp_path: Path):
+    workspace = WorkspacePaths(tmp_path)
+    init_workspace(workspace)
+    store = PlatformStore(workspace)
+    store.create_shell_session(
+        session_id="session-counter-test",
+        org_id=DEFAULT_ORG_ID,
+        device_id="v2-store1",
+        display_id="v2-store1",
+        platform="arista_eos",
+        transcript_path=str(workspace.reports / "shell-session-counter-test.jsonl"),
+        device_touched=True,
+    )
+
+    updated = store.update_shell_session(
+        "session-counter-test",
+        command_delta=2,
+        output_bytes_delta=128,
+    )
+
+    assert updated is not None
+    assert updated["command_count"] == 2
+    assert updated["output_bytes"] == 128
+    assert updated["device_touched"] is True
+
+
+def test_shell_session_can_explicitly_clear_touch_state(tmp_path: Path):
+    workspace = WorkspacePaths(tmp_path)
+    init_workspace(workspace)
+    store = PlatformStore(workspace)
+    store.create_shell_session(
+        session_id="session-touch-test",
+        org_id=DEFAULT_ORG_ID,
+        device_id="v2-store1",
+        display_id="v2-store1",
+        platform="arista_eos",
+        transcript_path=str(workspace.reports / "shell-session-touch-test.jsonl"),
+        device_touched=True,
+    )
+
+    updated = store.update_shell_session("session-touch-test", device_touched=False)
+
+    assert updated is not None
+    assert updated["device_touched"] is False
+
+
 def test_shell_transcript_survives_process_memory_loss(tmp_path: Path, monkeypatch):
     workspace = WorkspacePaths(tmp_path)
     init_workspace(workspace)
