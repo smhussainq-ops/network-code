@@ -431,6 +431,7 @@ class PlatformStore:
                 )
                 """
             )
+            self._drop_legacy_jobs_change_foreign_keys(conn)
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS workflow_events (
@@ -748,6 +749,41 @@ class PlatformStore:
                 "WHERE NOT EXISTS (SELECT 1 FROM orgs WHERE id = ?)",
                 (DEFAULT_ORG_ID, "Default", "default", utc_now(), DEFAULT_ORG_ID),
             )
+
+    def _drop_legacy_jobs_change_foreign_keys(self, conn: _EngineConn) -> None:
+        """Remove obsolete Postgres constraints that reject change-less read jobs.
+
+        Runner reads intentionally use the ``__read__`` sentinel and must never
+        advance a change workflow. Early Postgres schemas linked every job to a
+        change even though the current schema and SQLite implementation do not.
+        """
+        if self.engine != "postgres":
+            return
+        constraints = conn.execute(
+            """
+            SELECT constraint_name
+            FROM information_schema.table_constraints
+            WHERE table_schema = current_schema()
+              AND table_name = 'jobs'
+              AND constraint_type = 'FOREIGN KEY'
+              AND constraint_name IN (
+                  SELECT tc.constraint_name
+                  FROM information_schema.table_constraints AS tc
+                  JOIN information_schema.constraint_column_usage AS ccu
+                    ON ccu.constraint_schema = tc.constraint_schema
+                   AND ccu.constraint_name = tc.constraint_name
+                  WHERE tc.table_schema = current_schema()
+                    AND tc.table_name = 'jobs'
+                    AND tc.constraint_type = 'FOREIGN KEY'
+                    AND ccu.table_schema = current_schema()
+                    AND ccu.table_name = 'changes'
+              )
+            """
+        ).fetchall()
+        for row in constraints:
+            name = str(row["constraint_name"])
+            quoted_name = name.replace('"', '""')
+            conn.execute(f'ALTER TABLE jobs DROP CONSTRAINT "{quoted_name}"')
 
     def _ensure_column(self, conn: _EngineConn, table: str, column: str, definition: str) -> None:
         if self.engine == "postgres":
