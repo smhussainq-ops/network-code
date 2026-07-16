@@ -18,7 +18,7 @@ from zipfile import ZIP_DEFLATED, ZipFile
 from netcode.shell_desktop import build_desktop_shell_profile
 
 
-PACKAGE_VERSION = "0.3.0-community-preview"
+PACKAGE_VERSION = "0.3.1-community-preview"
 
 
 def _rez_runtime_files() -> dict[str, bytes]:
@@ -91,7 +91,7 @@ def _install_runner_ps1(control_plane_url: str) -> str:
     return dedent(
         fr"""
         param(
-          [Parameter(Mandatory=$true)][string]$JoinToken,
+          [string]$JoinToken = "",
           [string]$RunnerName = $env:COMPUTERNAME,
           [string]$ControlPlaneUrl = "{control_plane_url}",
           [string]$PackageSpec = "",
@@ -117,6 +117,20 @@ def _install_runner_ps1(control_plane_url: str) -> str:
         $BundledExeRoot = Join-Path $PSScriptRoot "bin\RezonanceLocalConnector"
         $InstalledExeRoot = Join-Path $Root "bin\RezonanceLocalConnector"
         New-Item -ItemType Directory -Force -Path $Root,$DataRoot,$ScriptsRoot | Out-Null
+
+        $TaskName = "RezonanceLocalConnector"
+        $ExistingTask = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+        if ($ExistingTask) {{ Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue }}
+        Get-Process -Name "RezonanceLocalConnector" -ErrorAction SilentlyContinue | ForEach-Object {{
+          try {{
+            if ($_.Path -and $_.Path.StartsWith($Root, [StringComparison]::OrdinalIgnoreCase)) {{
+              Stop-Process -Id $_.Id -Force
+              $_.WaitForExit(15000)
+            }}
+          }} catch {{
+            throw "Unable to stop the installed Local Connector process: $($_.Exception.Message)"
+          }}
+        }}
 
         foreach ($Script in @("start-runner.ps1", "open-connector.ps1", "diagnose-runner.ps1", "uninstall-runner.ps1")) {{
           Copy-Item -Force (Join-Path $PSScriptRoot $Script) (Join-Path $ScriptsRoot $Script)
@@ -156,18 +170,27 @@ def _install_runner_ps1(control_plane_url: str) -> str:
         $env:NETCODE_REZ_ROOT = $RezRoot
         if ($ProxyUrl) {{ $env:HTTPS_PROXY = $ProxyUrl; $env:HTTP_PROXY = $ProxyUrl; $env:WSS_PROXY = $ProxyUrl }}
         if ($CaBundle) {{ $env:SSL_CERT_FILE = $CaBundle; $env:REQUESTS_CA_BUNDLE = $CaBundle }}
-        if (Test-Path $Executable) {{
-          & $Executable enroll --server $ControlPlaneUrl --join-token $JoinToken --name $RunnerName
+        $IdentityPath = Join-Path $DataRoot "identity.dpapi"
+        $IdentityExists = Test-Path $IdentityPath
+        if ($IdentityExists) {{
+          Write-Host "Preserved existing protected connector identity."
+        }} elseif ($JoinToken) {{
+          if (Test-Path $Executable) {{
+            & $Executable enroll --server $ControlPlaneUrl --join-token $JoinToken --name $RunnerName
+          }} else {{
+            & $Python -m netcode.runner_agent enroll --server $ControlPlaneUrl --join-token $JoinToken --name $RunnerName
+          }}
+          if ($LASTEXITCODE -ne 0) {{ throw "Connector enrollment failed." }}
         }} else {{
-          & $Python -m netcode.runner_agent enroll --server $ControlPlaneUrl --join-token $JoinToken --name $RunnerName
+          Write-Host "Enrollment is required. The Local Connector window will request the one-time join token."
         }}
-        if ($LASTEXITCODE -ne 0) {{ throw "Connector enrollment failed." }}
 
         # SYSTEM runs the startup task and DPAPI uses machine scope. Restrict the
-        # ProgramData tree so other local users cannot read connector data.
-        & icacls.exe $Root /inheritance:r /grant:r "SYSTEM:(OI)(CI)F" "BUILTIN\Administrators:(OI)(CI)F" | Out-Null
+        # ProgramData tree to SYSTEM, administrators, and the installing user.
+        $CurrentUser = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+        & icacls.exe $Root /inheritance:r /grant:r "SYSTEM:(OI)(CI)F" "BUILTIN\Administrators:(OI)(CI)F" "${{CurrentUser}}:(OI)(CI)M" | Out-Null
+        if ($LASTEXITCODE -ne 0) {{ throw "Unable to protect Local Connector data permissions." }}
 
-        $TaskName = "RezonanceLocalConnector"
         $InstalledStart = Join-Path $ScriptsRoot "start-runner.ps1"
         if ($RegisterStartupTask) {{
           $Action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$InstalledStart`""
@@ -193,7 +216,7 @@ def _install_runner_ps1(control_plane_url: str) -> str:
         if (Test-Path $Executable) {{ $Shortcut.IconLocation = "$Executable,0" }}
         $Shortcut.Save()
 
-        Write-Host "Rezonance Local Connector installed and enrolled."
+        Write-Host $(if ($IdentityExists -or $JoinToken) {{ "Rezonance Local Connector installed and enrolled." }} else {{ "Rezonance Local Connector installed. Complete enrollment in the control window." }})
         Write-Host "Next: discover local inventory in the Rezonance Local Connector window."
         if (-not $NoOpenControl) {{
           & (Join-Path $ScriptsRoot "open-connector.ps1")

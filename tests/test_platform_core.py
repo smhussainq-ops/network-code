@@ -3064,6 +3064,11 @@ def test_windows_runner_package_contains_install_scripts_and_no_secrets():
     assert "machine-scoped DPAPI" in combined
     assert "AllowInsecureHttpForLab" in combined
     assert "ControlPlaneUrl" in combined
+    assert '[string]$JoinToken = ""' in combined
+    assert "Preserved existing protected connector identity." in combined
+    assert "Enrollment is required. The Local Connector window will request" in combined
+    assert 'Get-Process -Name "RezonanceLocalConnector"' in combined
+    assert '[Security.Principal.WindowsIdentity]::GetCurrent().Name' in combined
 
     with zipfile.ZipFile(BytesIO(package), "r") as archive:
         checksums = archive.read("SHA256SUMS.txt").decode("utf-8").splitlines()
