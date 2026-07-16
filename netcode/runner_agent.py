@@ -47,6 +47,7 @@ POLICY_FILE = IDENTITY_DIR / "policy.yaml"
 MANAGER_LEDGER_FILE = IDENTITY_DIR / "manager-operations.json"
 OPERATION_LEDGER_FILE = IDENTITY_DIR / "device-operations.db"
 VERSION = "0.7.0-token-lifecycle"
+COMMUNITY_MAX_DEVICES = 25
 
 _stop = False
 _SHELL_ADAPTERS: dict[str, dict[str, Any]] = {}
@@ -163,7 +164,7 @@ def enroll(args: argparse.Namespace) -> int:
     _write_identity(identity)
     print(f"[runner] Enrolled '{args.name}' into pool '{resp['pool']}'. Identity saved to {IDENTITY_FILE}")
     if not INVENTORY_FILE.exists():
-        print(f"[runner] NOTE: put your device inventory (with credentials) at {INVENTORY_FILE}")
+        print("[runner] Next: open the Local Connector control application and run bounded discovery.")
     return 0
 
 
@@ -294,6 +295,222 @@ def import_inventory(args: argparse.Namespace) -> int:
     print(f"[runner] Imported {len(devices)} device(s) into {INVENTORY_FILE}")
     print("[runner] Credentials stay on this runner. They are not sent to the control plane.")
     return 0
+
+
+def _atomic_write_inventory(path: Path, data: dict[str, Any]) -> None:
+    """Replace an inventory without ever writing a plaintext DPAPI temporary."""
+    from netcode.yamlio import write_yaml
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.stem}.{uuid.uuid4().hex}.tmp{path.suffix}")
+    try:
+        write_yaml(temporary, data)
+        if temporary.suffix.lower() != ".dpapi":
+            temporary.chmod(0o600)
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def bootstrap_discovered_inventory(
+    payload: dict[str, Any],
+    progress: Callable[[dict[str, Any]], None] | None = None,
+) -> dict[str, Any]:
+    """Build protected local inventory exclusively from successful discovery.
+
+    The credential context is written to an encrypted temporary inventory so a
+    failed or partial collector cannot damage the active inventory. Device facts
+    come from Rez collection results; credentials remain runner-local.
+    """
+    from netcode.yamlio import read_yaml, write_yaml
+
+    seed = str(payload.get("seed_node") or payload.get("seeds") or payload.get("host") or "").strip()
+    username = str(payload.get("username") or "").strip()
+    password = str(payload.get("password") or "")
+    site_name = str(payload.get("site") or "unassigned").strip() or "unassigned"
+    try:
+        max_devices = int(payload.get("max_devices") or COMMUNITY_MAX_DEVICES)
+        port = int(payload.get("port") or 22)
+    except (TypeError, ValueError):
+        return {"ok": False, "status": "fail", "error": "Discovery limits and port must be integers."}
+    if not seed:
+        return {"ok": False, "status": "fail", "error": "At least one discovery seed is required."}
+    if not username or not password:
+        return {"ok": False, "status": "fail", "error": "A local device username and password are required."}
+    if not 1 <= max_devices <= COMMUNITY_MAX_DEVICES:
+        return {
+            "ok": False,
+            "status": "fail",
+            "error": f"Community discovery is limited to {COMMUNITY_MAX_DEVICES} devices.",
+            "limit": COMMUNITY_MAX_DEVICES,
+        }
+    if not 1 <= port <= 65535:
+        return {"ok": False, "status": "fail", "error": "Discovery port must be between 1 and 65535."}
+
+    merge = bool(payload.get("merge", True))
+    existing_data: dict[str, Any] = {"defaults": {}, "devices": []}
+    if INVENTORY_FILE.exists():
+        try:
+            existing_data = read_yaml(INVENTORY_FILE)
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "status": "fail", "error": f"Existing inventory cannot be read: {exc}"}
+
+    temporary = INVENTORY_FILE.with_name(
+        f".discovery-{uuid.uuid4().hex}{INVENTORY_FILE.suffix}"
+    )
+    bootstrap_defaults: dict[str, Any] = {
+        "username": username,
+        "password": password,
+        "port": port,
+    }
+    requested_platform = str(payload.get("platform") or "").strip()
+    if requested_platform:
+        bootstrap_defaults["platform"] = requested_platform
+    try:
+        write_yaml(temporary, {"defaults": bootstrap_defaults, "devices": []})
+        if temporary.suffix.lower() != ".dpapi":
+            temporary.chmod(0o600)
+        discovery_payload = {
+            key: value
+            for key, value in payload.items()
+            if key not in {"username", "password", "merge"}
+        }
+        discovery_payload["seed_node"] = seed
+        discovery_payload["site"] = site_name
+        discovery_payload["port"] = port
+        discovery_payload["max_devices"] = max_devices
+        result = _execute_rez_discover_network(
+            discovery_payload,
+            progress,
+            inventory_path=temporary,
+        )
+        if not result.get("ok"):
+            return {
+                **result,
+                "inventory": {
+                    "written": False,
+                    "preserved": INVENTORY_FILE.exists(),
+                },
+            }
+
+        raw_candidates = result.get("source_of_truth_candidates") or []
+        candidates: list[dict[str, Any]] = []
+        public_fields = {
+            "id", "hostname", "host", "platform", "site", "groups", "port",
+            "serial", "aliases", "role", "building", "floor", "closet", "location",
+            "management", "connection",
+        }
+        for value in raw_candidates:
+            if not isinstance(value, dict):
+                continue
+            candidate = {key: value[key] for key in public_fields if key in value}
+            if not all(str(candidate.get(key) or "").strip() for key in ("id", "host", "platform")):
+                continue
+            candidate["site"] = str(candidate.get("site") or site_name)
+            groups = candidate.get("groups") or ["discovered"]
+            candidate["groups"] = [str(group) for group in groups]
+            candidate["username"] = username
+            candidate["password"] = password
+            candidate["port"] = int(candidate.get("port") or port)
+            candidates.append(candidate)
+        if not candidates:
+            return {
+                "ok": False,
+                "status": "fail",
+                "error": "Discovery returned no valid device records.",
+                "inventory": {"written": False, "preserved": INVENTORY_FILE.exists()},
+            }
+
+        devices = list(existing_data.get("devices") or []) if merge else []
+        added = 0
+        updated = 0
+        for candidate in candidates:
+            for index, current in enumerate(devices):
+                if not isinstance(current, dict):
+                    continue
+                same_id = str(current.get("id") or "").strip().lower() == str(candidate["id"]).strip().lower()
+                same_host = str(current.get("host") or "").strip() == str(candidate["host"]).strip()
+                if same_id or same_host:
+                    devices[index] = {**current, **candidate}
+                    updated += 1
+                    break
+            else:
+                devices.append(candidate)
+                added += 1
+        if len(devices) > COMMUNITY_MAX_DEVICES:
+            return {
+                "ok": False,
+                "status": "fail",
+                "error": (
+                    f"The merged inventory would contain {len(devices)} devices; "
+                    f"Community is limited to {COMMUNITY_MAX_DEVICES}."
+                ),
+                "limit": COMMUNITY_MAX_DEVICES,
+                "inventory": {"written": False, "preserved": INVENTORY_FILE.exists()},
+            }
+
+        defaults = dict(existing_data.get("defaults") or {}) if merge else {}
+        defaults.pop("username", None)
+        defaults.pop("password", None)
+        defaults["port"] = port
+        inventory_data = {**(existing_data if merge else {}), "defaults": defaults, "devices": devices}
+        _atomic_write_inventory(INVENTORY_FILE, inventory_data)
+        public_candidates = [
+            {key: value for key, value in candidate.items() if key not in {"username", "password"}}
+            for candidate in candidates
+        ]
+        return {
+            **result,
+            "source_of_truth_candidates": public_candidates,
+            "inventory": {
+                "written": True,
+                "path": str(INVENTORY_FILE),
+                "device_count": len(devices),
+                "discovered": len(candidates),
+                "added": added,
+                "updated": updated,
+                "mode": "merge" if merge else "replace",
+                "protected": INVENTORY_FILE.suffix.lower() == ".dpapi",
+            },
+            "safety": {
+                **dict(result.get("safety") or {}),
+                "inventory_source": "successful_local_discovery",
+                "inventory_written": True,
+                "credentials_returned": False,
+            },
+        }
+    except Exception as exc:  # noqa: BLE001
+        return {
+            "ok": False,
+            "status": "fail",
+            "error": f"Discovery bootstrap failed: {type(exc).__name__}: {exc}",
+            "inventory": {"written": False, "preserved": INVENTORY_FILE.exists()},
+        }
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def discover_inventory(args: argparse.Namespace) -> int:
+    """Interactive recovery command for the same discovery flow used by the UI."""
+    import getpass
+
+    password = getpass.getpass("Device password (stored locally with DPAPI): ")
+    result = bootstrap_discovered_inventory({
+        "seed_node": args.seeds,
+        "allowed_cidrs": args.allowed_cidrs,
+        "excluded_cidrs": args.excluded_cidrs,
+        "site": args.site,
+        "platform": args.platform,
+        "port": args.port,
+        "username": args.username,
+        "password": password,
+        "depth": args.depth,
+        "max_devices": args.max_devices,
+        "concurrency": args.concurrency,
+        "merge": not args.replace,
+    })
+    print(json.dumps(result, indent=2))
+    return 0 if result.get("ok") else 1
 
 
 def doctor(args: argparse.Namespace) -> int:
@@ -1661,6 +1878,7 @@ def _execute_rez_scan_device(
     payload: dict[str, Any],
     *,
     persist_inventory: bool = True,
+    inventory_path: Path | None = None,
 ) -> dict[str, Any]:
     from netcode.adapters.registry import AdapterRegistry
     from netcode.discovery import SSH_AUTODETECT_ORDER, _extract_state_summary, _safe_device_id
@@ -1681,7 +1899,8 @@ def _execute_rez_scan_device(
     except Exception:
         requested_port = 0
 
-    inventory = Inventory(INVENTORY_FILE)
+    inventory_path = inventory_path or INVENTORY_FILE
+    inventory = Inventory(inventory_path)
     existing = inventory.find_device(device_id) if device_id else inventory.find_device(host)
 
     defaults = inventory.defaults
@@ -1806,7 +2025,7 @@ def _execute_rez_scan_device(
             else:
                 devices.append(persisted)
             inventory_data["devices"] = devices
-            write_yaml(INVENTORY_FILE, inventory_data)
+            _atomic_write_inventory(inventory_path, inventory_data)
         return {
             "ok": True,
             "status": "pass",
@@ -1823,7 +2042,7 @@ def _execute_rez_scan_device(
             "runner_inventory": {
                 "action": action_taken,
                 "device": candidate,
-                "inventory": str(INVENTORY_FILE),
+                "inventory": str(inventory_path),
                 "written": persist_inventory,
             },
             "tried_platforms": attempts,
@@ -1858,6 +2077,8 @@ def _execute_rez_scan_device(
 def _execute_rez_discover_network(
     payload: dict[str, Any],
     progress: Callable[[dict[str, Any]], None] | None = None,
+    *,
+    inventory_path: Path | None = None,
 ) -> dict[str, Any]:
     """Run bounded, recursive discovery entirely on the Local Connector."""
     from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -1870,13 +2091,14 @@ def _execute_rez_discover_network(
     )
     from netcode.inventory import Inventory
 
-    if not INVENTORY_FILE.exists():
+    inventory_path = inventory_path or INVENTORY_FILE
+    if not inventory_path.exists():
         return {
             "ok": False,
             "status": "fail",
-            "error": f"No Local Connector inventory at {INVENTORY_FILE}.",
+            "error": f"No Local Connector inventory at {inventory_path}.",
         }
-    inventory = Inventory(INVENTORY_FILE)
+    inventory = Inventory(inventory_path)
     try:
         profile = DiscoveryProfile.from_payload(payload, inventory)
     except DiscoveryProfileError as exc:
@@ -1940,7 +2162,11 @@ def _execute_rez_discover_network(
                 "depth": current_depth,
                 "message": f"Collecting read-only state from {target.device_id or target.host}.",
             })
-            return target, _execute_rez_scan_device(target.scan_payload(), persist_inventory=False)
+            return target, _execute_rez_scan_device(
+                target.scan_payload(),
+                persist_inventory=False,
+                inventory_path=inventory_path,
+            )
 
         completed: list[tuple[DiscoveryTarget, dict[str, Any]]] = []
         with ThreadPoolExecutor(max_workers=min(profile.concurrency, max(1, len(wave)))) as executor:
@@ -2792,14 +3018,33 @@ def main(argv: list[str] | None = None) -> int:
     p_enroll.add_argument("--join-token", required=True)
     p_enroll.add_argument("--name", default="runner")
     p_enroll.set_defaults(func=enroll)
-    p_import = sub.add_parser("inventory-import", help="Install credentialed device inventory on this runner.")
-    p_import.add_argument("file", help="Path to inventory YAML with local device credentials.")
-    p_import.set_defaults(func=import_inventory)
+    if os.getenv("NETCODE_ALLOW_MANUAL_INVENTORY_IMPORT", "").strip() == "1":
+        p_import = sub.add_parser("inventory-import", help="Import inventory for an approved migration.")
+        p_import.add_argument("file", help="Path to an approved migration inventory YAML.")
+        p_import.set_defaults(func=import_inventory)
+    p_discover = sub.add_parser(
+        "discover-inventory",
+        help="Build local inventory from bounded, read-only network discovery.",
+    )
+    p_discover.add_argument("--seeds", required=True, help="Comma-separated IPs, ranges, or CIDRs.")
+    p_discover.add_argument("--username", required=True, help="Runner-local device username.")
+    p_discover.add_argument("--site", default="unassigned")
+    p_discover.add_argument("--platform", default="", help="Optional Rez platform; empty enables detection.")
+    p_discover.add_argument("--port", type=int, default=22)
+    p_discover.add_argument("--allowed-cidrs", action="append", default=[])
+    p_discover.add_argument("--excluded-cidrs", action="append", default=[])
+    p_discover.add_argument("--depth", type=int, default=1)
+    p_discover.add_argument("--max-devices", type=int, default=COMMUNITY_MAX_DEVICES)
+    p_discover.add_argument("--concurrency", type=int, default=4)
+    p_discover.add_argument("--replace", action="store_true", help="Replace rather than merge discovered inventory.")
+    p_discover.set_defaults(func=discover_inventory)
     p_doctor = sub.add_parser("doctor", help="Check enrollment, inventory, and outbound control-plane reachability.")
     p_doctor.add_argument("--timeout", type=float, default=10.0)
     p_doctor.set_defaults(func=doctor)
     p_run = sub.add_parser("run", help="Poll for and execute jobs.")
     p_run.set_defaults(func=run)
+    p_control = sub.add_parser("control", help="Open the Windows Local Connector control application.")
+    p_control.set_defaults(func=lambda _args: __import__("netcode.windows_connector_control", fromlist=["main"]).main())
     args = parser.parse_args(argv)
     return args.func(args)
 

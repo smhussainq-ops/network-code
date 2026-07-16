@@ -1,5 +1,6 @@
 import hashlib
 import json
+import os
 import subprocess
 import zipfile
 from io import BytesIO
@@ -1769,7 +1770,8 @@ devices:
     assert rc == 0
     assert destination.exists()
     assert "local-only" in destination.read_text(encoding="utf-8")
-    assert oct(destination.stat().st_mode & 0o777) == "0o600"
+    if os.name != "nt":
+        assert oct(destination.stat().st_mode & 0o777) == "0o600"
 
 
 def test_runner_inventory_import_rejects_invalid_file(tmp_path: Path, monkeypatch):
@@ -2068,7 +2070,7 @@ def test_template_artifact_endpoint_returns_jinja_body(tmp_path: Path, monkeypat
     data = response.json()
 
     assert response.status_code == 200
-    assert data["path"].endswith("templates/arista/add_vlan.j2")
+    assert Path(data["path"]).parts[-3:] == ("templates", "arista", "add_vlan.j2")
     assert "vlan {{ vlan.id }}" in data["body"]
 
 
@@ -2585,7 +2587,9 @@ def test_runner_ansible_pack_reaudits_locally_and_uses_generated_inventory(tmp_p
             "mode": "check",
             "playbook_name": "ntp.yml",
             "playbook_content": playbook.read_text(encoding="utf-8"),
-            "playbook_sha256": hashlib.sha256(playbook.read_bytes()).hexdigest(),
+            "playbook_sha256": hashlib.sha256(
+                playbook.read_text(encoding="utf-8").encode("utf-8")
+            ).hexdigest(),
             "targets": ["Access-SW-01"],
         }
     )
@@ -2596,9 +2600,7 @@ def test_runner_ansible_pack_reaudits_locally_and_uses_generated_inventory(tmp_p
     assert isinstance(command, list)
     assert "--check" in command
     assert "--diff" in command
-    assert str(captured["kwargs"]["cwd"]).startswith("/private/") or str(
-        captured["kwargs"]["cwd"]
-    ).startswith("/tmp/")
+    assert Path(captured["kwargs"]["cwd"]).name.startswith("netcode-ansible-")
     assert captured["kwargs"].get("shell") is not True
     assert captured["kwargs"]["env"]["ANSIBLE_HOST_KEY_CHECKING"] == "True"
     assert captured["kwargs"]["env"]["ANSIBLE_PARAMIKO_HOST_KEY_CHECKING"] == "True"
@@ -3029,29 +3031,32 @@ def test_windows_runner_package_contains_install_scripts_and_no_secrets():
         "preflight.ps1",
         "install-runner.ps1",
         "start-runner.ps1",
-        "import-inventory.ps1",
+        "open-connector.ps1",
         "diagnose-runner.ps1",
         "uninstall-runner.ps1",
         "build-windows-executable.ps1",
         "windows-entrypoint.py",
         "package-info.json",
         "SHA256SUMS.txt",
-        "sample-inventory.yaml",
         "netcode-shell-profile.json",
         "rez-runtime/drivers/collector.py",
         "rez-runtime/device_state_model.py",
         "runner-source/pyproject.toml",
         "runner-source/netcode/runner_agent.py",
+        "runner-source/netcode/windows_connector_control.py",
     }.issubset(names)
     assert "https://netcode.example.com" in combined
     assert "wss://netcode.example.com" in combined
     assert "runner_token" not in combined
     assert "hmac_secret" not in combined
     assert "<single-use-token>" in combined
-    assert "replace-me" in combined
+    assert "replace-me" not in combined
     assert "NETCODE_REZ_ROOT" in combined
-    assert "inventory-import $InventoryPath" in combined
-    assert "import-inventory --file" not in combined
+    assert "discover local inventory" in combined
+    assert "open-connector.ps1" in combined
+    assert "inventory-import $InventoryPath" not in combined
+    assert "Nuitka Commercial" in combined
+    assert "PyInstaller" not in combined
     assert 'Join-Path $PSScriptRoot "runner-source"' in combined
     assert 'Join-Path $env:ProgramData "Rezonance\\LocalConnector"' in combined
     assert 'New-ScheduledTaskPrincipal -UserId "SYSTEM"' in combined
@@ -3145,7 +3150,7 @@ def test_ui_configured_source_of_truth_path_is_used(tmp_path: Path, monkeypatch)
 
     assert saved.status_code == 200
     assert source.status_code == 200
-    assert source.json()["files"]["inventory"].endswith("inventories/custom.yaml")
+    assert Path(source.json()["files"]["inventory"]).parts[-2:] == ("inventories", "custom.yaml")
     assert source.json()["devices"][0]["id"] == "custom-leaf1"
 
 

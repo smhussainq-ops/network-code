@@ -5,6 +5,7 @@ from pathlib import Path
 import types
 
 from netcode import runner_agent
+from netcode.yamlio import read_yaml, write_yaml
 
 
 def _write_inventory(path: Path) -> str:
@@ -233,3 +234,91 @@ def test_explicit_unknown_closed_address_remains_a_failure(tmp_path: Path, monke
     assert result["skipped"] == 0
     assert result["failures"][0]["host"] == "10.20.0.99"
     assert calls == []
+
+
+def test_community_bootstrap_persists_only_discovered_devices(tmp_path: Path, monkeypatch):
+    inventory_path = tmp_path / "inventory.yaml"
+    monkeypatch.setattr(runner_agent, "INVENTORY_FILE", inventory_path)
+    calls: list[str] = []
+    _install_fake_rez(monkeypatch, calls)
+
+    result = runner_agent.bootstrap_discovered_inventory({
+        "seed_node": "10.20.0.10",
+        "allowed_cidrs": ["10.20.0.0/24"],
+        "site": "community-hq",
+        "platform": "arista_eos",
+        "username": "local-user",
+        "password": "local-secret",
+        "depth": 1,
+        "max_devices": 25,
+        "concurrency": 2,
+    })
+
+    assert result["ok"] is True
+    assert result["inventory"] == {
+        "written": True,
+        "path": str(inventory_path),
+        "device_count": 2,
+        "discovered": 2,
+        "added": 2,
+        "updated": 0,
+        "mode": "merge",
+        "protected": False,
+    }
+    saved = read_yaml(inventory_path)
+    assert {device["host"] for device in saved["devices"]} == {"10.20.0.10", "10.20.0.11"}
+    assert {device["site"] for device in saved["devices"]} == {"community-hq"}
+    assert {device["username"] for device in saved["devices"]} == {"local-user"}
+    assert {device["password"] for device in saved["devices"]} == {"local-secret"}
+    assert "local-secret" not in json.dumps(result)
+    assert not list(tmp_path.glob(".discovery-*"))
+
+
+def test_community_bootstrap_failure_preserves_active_inventory(tmp_path: Path, monkeypatch):
+    inventory_path = tmp_path / "inventory.yaml"
+    write_yaml(inventory_path, {
+        "defaults": {},
+        "devices": [{
+            "id": "existing-1",
+            "host": "192.0.2.10",
+            "platform": "arista_eos",
+            "username": "old-user",
+            "password": "old-secret",
+        }],
+    })
+    original = inventory_path.read_bytes()
+    monkeypatch.setattr(runner_agent, "INVENTORY_FILE", inventory_path)
+    monkeypatch.setattr(
+        runner_agent,
+        "_execute_rez_discover_network",
+        lambda *args, **kwargs: {"ok": False, "status": "fail", "error": "authentication failed"},
+    )
+
+    result = runner_agent.bootstrap_discovered_inventory({
+        "seed_node": "192.0.2.20",
+        "username": "new-user",
+        "password": "new-secret",
+        "max_devices": 25,
+    })
+
+    assert result["ok"] is False
+    assert result["inventory"] == {"written": False, "preserved": True}
+    assert inventory_path.read_bytes() == original
+    assert "new-secret" not in json.dumps(result)
+    assert not list(tmp_path.glob(".discovery-*"))
+
+
+def test_community_bootstrap_rejects_device_count_above_entitlement(tmp_path: Path, monkeypatch):
+    inventory_path = tmp_path / "inventory.yaml"
+    monkeypatch.setattr(runner_agent, "INVENTORY_FILE", inventory_path)
+
+    result = runner_agent.bootstrap_discovered_inventory({
+        "seed_node": "10.20.0.0/27",
+        "username": "local-user",
+        "password": "local-secret",
+        "max_devices": 26,
+    })
+
+    assert result["ok"] is False
+    assert result["limit"] == 25
+    assert not inventory_path.exists()

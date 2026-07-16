@@ -3,6 +3,8 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
+import subprocess
+import sys
 
 from netcode import runner_agent
 from netcode.yamlio import read_yaml, write_yaml
@@ -57,3 +59,53 @@ def test_connector_doctor_reports_public_readiness_only(tmp_path: Path, monkeypa
     assert "private-runner-token" not in output
     assert "private-signing-secret" not in output
     assert "device-secret" not in output
+
+
+def test_control_snapshot_never_returns_local_secrets(tmp_path: Path, monkeypatch):
+    from netcode.windows_connector_control import connector_snapshot
+
+    identity = tmp_path / "identity.json"
+    inventory = tmp_path / "inventory.yaml"
+    identity.write_text(json.dumps({
+        "server": "https://control.example.test",
+        "runner_id": "runner-1",
+        "runner_token": "private-runner-token",
+        "hmac_secret": "private-signing-secret",
+        "pool": "community",
+        "name": "windows-connector",
+    }), encoding="utf-8")
+    write_yaml(inventory, {
+        "devices": [{
+            "id": "core-1",
+            "hostname": "core-1",
+            "host": "192.0.2.10",
+            "platform": "arista_eos",
+            "username": "device-user",
+            "password": "device-secret",
+        }],
+    })
+    monkeypatch.setattr(runner_agent, "IDENTITY_FILE", identity)
+    monkeypatch.setattr(runner_agent, "INVENTORY_FILE", inventory)
+
+    snapshot = connector_snapshot()
+    serialized = json.dumps(snapshot)
+
+    assert snapshot["enrolled"] is True
+    assert snapshot["inventory"]["device_count"] == 1
+    assert "private-runner-token" not in serialized
+    assert "private-signing-secret" not in serialized
+    assert "device-user" not in serialized
+    assert "device-secret" not in serialized
+
+
+def test_community_cli_hides_manual_inventory_import():
+    completed = subprocess.run(
+        [sys.executable, "-m", "netcode.runner_agent", "--help"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0
+    assert "discover-inventory" in completed.stdout
+    assert "inventory-import" not in completed.stdout

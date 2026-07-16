@@ -130,6 +130,10 @@ class DiscoveryProfile:
     max_devices: int
     concurrency: int
     scope_source: str
+    default_platform: str = ""
+    default_site: str = ""
+    default_groups: tuple[str, ...] = ()
+    default_port: int = 22
 
     @classmethod
     def from_payload(cls, payload: dict[str, Any], inventory: Inventory) -> "DiscoveryProfile":
@@ -150,6 +154,18 @@ class DiscoveryProfile:
         excluded = _parse_networks(payload.get("excluded_cidrs") or [], field="excluded")
         allowed: list[ipaddress._BaseNetwork] = list(explicit_allowed)  # type: ignore[name-defined]
         scope_source = "explicit_profile" if explicit_allowed else "connector_inventory_and_explicit_seeds"
+        requested_platform = str(payload.get("platform") or "").strip()
+        requested_site = str(payload.get("site") or "").strip()
+        raw_groups = payload.get("groups") or []
+        if isinstance(raw_groups, str):
+            raw_groups = [item.strip() for item in raw_groups.split(",") if item.strip()]
+        requested_groups = tuple(str(item).strip() for item in raw_groups if str(item).strip())
+        try:
+            default_port = int(payload.get("port") or 22)
+        except (TypeError, ValueError) as exc:
+            raise DiscoveryProfileError("Discovery port must be an integer.") from exc
+        if not 1 <= default_port <= 65535:
+            raise DiscoveryProfileError("Discovery port must be between 1 and 65535.")
 
         if not explicit_allowed:
             for device in inventory.devices:
@@ -185,7 +201,10 @@ class DiscoveryProfile:
                     ) from exc
                 target = DiscoveryTarget(
                     host=host,
-                    port=requested_port or 22,
+                    platform=requested_platform,
+                    port=requested_port or default_port,
+                    site=requested_site,
+                    groups=requested_groups,
                     optional_probe=optional_probe,
                 )
             if requested_port and requested_port != target.port:
@@ -257,6 +276,10 @@ class DiscoveryProfile:
             max_devices=max_devices,
             concurrency=concurrency,
             scope_source=scope_source,
+            default_platform=requested_platform,
+            default_site=requested_site,
+            default_groups=requested_groups,
+            default_port=default_port,
         )
         for target in profile.seeds:
             if not profile.is_allowed(target.host):
@@ -282,6 +305,8 @@ class DiscoveryProfile:
             "max_devices": self.max_devices,
             "concurrency": self.concurrency,
             "scope_source": self.scope_source,
+            "platform": self.default_platform or "auto",
+            "site": self.default_site,
         }
 
     def resolve_reference(self, value: Any, inventory: Inventory) -> DiscoveryTarget | None:
@@ -301,7 +326,13 @@ class DiscoveryProfile:
         known = inventory.find_device(host)
         if known:
             return _target_for_device(known)
-        return DiscoveryTarget(host=host, port=port or 22)
+        return DiscoveryTarget(
+            host=host,
+            platform=self.default_platform,
+            port=port or self.default_port,
+            site=self.default_site,
+            groups=self.default_groups,
+        )
 
 
 _NEIGHBOR_KEYS = (

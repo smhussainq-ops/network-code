@@ -64,8 +64,10 @@ class RezAdapterBridge:
         self._error: str | None = None
 
     def _default_root(self) -> Path:
+        checkout_root = Path(__file__).resolve().parents[3]
         candidates = [
             os.environ.get("NETCODE_REZ_ROOT"),
+            checkout_root / "resonance-core",
             "/Users/syedhussain/Dev/Claude/resonance-core",
             "/home/syedhussain/resonance-core",
             "/Users/syedhussain/Dev/Prod/resonance-core",
