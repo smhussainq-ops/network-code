@@ -365,7 +365,7 @@ def _build_executable_ps1() -> str:
             --enable-plugin=anti-bloat `
             --enable-plugin=tk-inter `
             --assume-yes-for-downloads `
-            --windows-console-mode=attach `
+            --windows-console-mode=hide `
             --include-package=netcode `
             --include-package=netmiko `
             --include-package=paramiko `

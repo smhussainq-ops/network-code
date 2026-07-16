@@ -3069,6 +3069,7 @@ def test_windows_runner_package_contains_install_scripts_and_no_secrets():
     assert "Enrollment is required. The Local Connector window will request" in combined
     assert 'Get-Process -Name "RezonanceLocalConnector"' in combined
     assert '[Security.Principal.WindowsIdentity]::GetCurrent().Name' in combined
+    assert "--windows-console-mode=hide" in combined
 
     with zipfile.ZipFile(BytesIO(package), "r") as archive:
         checksums = archive.read("SHA256SUMS.txt").decode("utf-8").splitlines()
