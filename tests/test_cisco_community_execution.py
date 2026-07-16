@@ -56,7 +56,10 @@ def test_cisco_ntp_pipeline_uses_cisco_template(tmp_path: Path) -> None:
     result = run_static_pipeline(paths, intent_path, platform="cisco_ios")
 
     assert result.status == "pass"
-    assert "/cisco_ios/ntp_standardize.j2" in result.render.template_path
+    assert Path(result.render.template_path).parts[-2:] == (
+        "cisco_ios",
+        "ntp_standardize.j2",
+    )
     assert result.render.config == "ntp server 10.0.0.10 prefer\nntp server 10.0.0.11\n"
 
 

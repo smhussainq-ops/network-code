@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+
 import pytest
 from pydantic import ValidationError
 
@@ -623,7 +625,8 @@ def test_manager_operation_is_idempotent_and_conflicting_reuse_is_rejected(tmp_p
 def test_runner_local_ledger_permissions_are_private(tmp_path):
     path = tmp_path / "ledger.json"
     OperationLedger(path).store("op-1", "key-1", {"ok": True})
-    assert oct(path.stat().st_mode & 0o777) == "0o600"
+    if os.name != "nt":
+        assert oct(path.stat().st_mode & 0o777) == "0o600"
 
 
 def test_runner_dispatches_manager_jobs_before_generic_cli_render(monkeypatch, tmp_path):
