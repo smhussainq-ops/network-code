@@ -65,6 +65,7 @@ class IntentMetadata(BaseModel):
     requested_by: str = "netcode-user"
     ticket_id: str | None = None
     learning_mode: bool = True
+    change_instance_id: str | None = None
 
 
 class AddVlanIntent(BaseModel):

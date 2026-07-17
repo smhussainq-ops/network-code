@@ -513,6 +513,56 @@ def discover_inventory(args: argparse.Namespace) -> int:
     return 0 if result.get("ok") else 1
 
 
+def _rez_runtime_check() -> dict[str, str]:
+    """Load the bundled Rez driver registry without opening a device session."""
+    try:
+        from netcode.adapters.rez import RezAdapterBridge
+
+        health = RezAdapterBridge().health()
+    except Exception as exc:  # noqa: BLE001
+        return {
+            "id": "rez_runtime",
+            "status": "fail",
+            "message": f"Rez driver runtime could not load: {type(exc).__name__}: {exc}",
+        }
+
+    if health.get("ok"):
+        platform_count = int(health.get("platform_count") or 0)
+        return {
+            "id": "rez_runtime",
+            "status": "pass",
+            "message": f"Rez driver runtime loaded {platform_count} platform adapter(s).",
+        }
+
+    error = str(health.get("error") or "driver registry is unavailable")
+    return {
+        "id": "rez_runtime",
+        "status": "fail",
+        "message": f"Rez driver runtime could not load: {error[:500]}",
+    }
+
+
+def _governed_template_check() -> dict[str, str]:
+    """Confirm the standalone runtime can render its supported governed jobs."""
+    template_root = _runner_workspace_root() / "templates"
+    required = (
+        template_root / "arista" / "ntp_standardize.j2",
+        template_root / "cisco_ios" / "ntp_standardize.j2",
+    )
+    missing = [str(path.relative_to(template_root)) for path in required if not path.is_file()]
+    if missing:
+        return {
+            "id": "governed_templates",
+            "status": "fail",
+            "message": f"Governed execution template(s) are missing: {', '.join(missing)}.",
+        }
+    return {
+        "id": "governed_templates",
+        "status": "pass",
+        "message": "Governed Arista and Cisco NTP templates are available locally.",
+    }
+
+
 def doctor(args: argparse.Namespace) -> int:
     """Report Local Connector readiness without revealing local credentials."""
     checks: list[dict[str, Any]] = []
@@ -572,6 +622,9 @@ def doctor(args: argparse.Namespace) -> int:
             checks.append({"id": "inventory", "status": "fail", "message": f"Inventory cannot be read: {exc}"})
     else:
         checks.append({"id": "inventory", "status": "fail", "message": "No local device inventory is installed."})
+
+    checks.append(_rez_runtime_check())
+    checks.append(_governed_template_check())
 
     server = str(identity.get("server") or "")
     if server:

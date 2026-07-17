@@ -47,6 +47,16 @@ def test_connector_doctor_reports_public_readiness_only(tmp_path: Path, monkeypa
     monkeypatch.setattr(runner_agent, "IDENTITY_FILE", identity)
     monkeypatch.setattr(runner_agent, "INVENTORY_FILE", inventory)
     monkeypatch.setattr(runner_agent, "_get", lambda *args, **kwargs: {"ok": True})
+    monkeypatch.setattr(runner_agent, "_rez_runtime_check", lambda: {
+        "id": "rez_runtime",
+        "status": "pass",
+        "message": "Rez driver runtime loaded 11 platform adapter(s).",
+    })
+    monkeypatch.setattr(runner_agent, "_governed_template_check", lambda: {
+        "id": "governed_templates",
+        "status": "pass",
+        "message": "Governed Arista and Cisco NTP templates are available locally.",
+    })
 
     result = runner_agent.doctor(argparse.Namespace(timeout=1.0))
     output = capsys.readouterr().out
@@ -55,10 +65,46 @@ def test_connector_doctor_reports_public_readiness_only(tmp_path: Path, monkeypa
     assert result == 0
     assert data["ok"] is True
     assert data["inventory"]["device_count"] == 1
+    assert next(check for check in data["checks"] if check["id"] == "rez_runtime")["status"] == "pass"
+    assert next(check for check in data["checks"] if check["id"] == "governed_templates")["status"] == "pass"
     assert data["security"]["credentials_returned"] is False
     assert "private-runner-token" not in output
     assert "private-signing-secret" not in output
     assert "device-secret" not in output
+
+
+def test_rez_runtime_check_reports_driver_import_failure(monkeypatch):
+    from netcode.adapters.rez import RezAdapterBridge
+
+    monkeypatch.setattr(RezAdapterBridge, "health", lambda self: {
+        "ok": False,
+        "platform_count": 0,
+        "error": "ModuleNotFoundError: No module named 'pydantic.deprecated.class_validators'",
+    })
+
+    check = runner_agent._rez_runtime_check()
+
+    assert check["id"] == "rez_runtime"
+    assert check["status"] == "fail"
+    assert "pydantic.deprecated.class_validators" in check["message"]
+
+
+def test_governed_template_check_requires_both_supported_ntp_templates(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr(runner_agent, "_runner_workspace_root", lambda: tmp_path)
+    arista = tmp_path / "templates" / "arista" / "ntp_standardize.j2"
+    arista.parent.mkdir(parents=True)
+    arista.write_text("ntp server {{ server }}\n", encoding="utf-8")
+
+    missing = runner_agent._governed_template_check()
+
+    assert missing["status"] == "fail"
+    assert "cisco_ios" in missing["message"]
+
+    cisco = tmp_path / "templates" / "cisco_ios" / "ntp_standardize.j2"
+    cisco.parent.mkdir(parents=True)
+    cisco.write_text("ntp server {{ server }}\n", encoding="utf-8")
+
+    assert runner_agent._governed_template_check()["status"] == "pass"
 
 
 def test_control_snapshot_never_returns_local_secrets(tmp_path: Path, monkeypatch):

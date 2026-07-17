@@ -15,6 +15,7 @@ from netcode.bootstrap import init_workspace
 from netcode.discovery import DiscoveryService
 from netcode.inventory import Device, Inventory
 from netcode.jobs import JobRunner
+from netcode.models import load_intent
 from netcode.paths import WorkspacePaths
 from netcode.platform import platform_capabilities
 from netcode.source_of_truth import source_of_truth
@@ -2187,6 +2188,42 @@ def test_desired_state_catalog_and_dynamic_plans(tmp_path: Path, monkeypatch):
     assert blocked_os_plan.status_code == 400
 
 
+def test_repeated_desired_state_plans_keep_immutable_change_identity(tmp_path: Path, monkeypatch):
+    init_workspace(WorkspacePaths(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    client = TestClient(api.app)
+
+    def plan_ntp(servers: list[str]):
+        return client.post(
+            "/api/desired-state/plan",
+            json={
+                "change_type": "ntp_standardize",
+                "site": "store-1842",
+                "device_id": "v2-store1",
+                "requested_by": "unit",
+                "values": {"servers": servers},
+            },
+        )
+
+    first = plan_ntp(["10.42.0.10"])
+    second = plan_ntp(["10.42.0.11"])
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    first_body = first.json()
+    second_body = second.json()
+    assert first_body["change"]["id"] != second_body["change"]["id"]
+    assert first_body["intent_path"] != second_body["intent_path"]
+    assert first_body["plan"]["slug"] != second_body["plan"]["slug"]
+
+    first_intent = load_intent(Path(first_body["intent_path"]))
+    second_intent = load_intent(Path(second_body["intent_path"]))
+    assert first_intent.ntp.servers == ["10.42.0.10"]
+    assert second_intent.ntp.servers == ["10.42.0.11"]
+    assert first_intent.metadata.change_instance_id
+    assert second_intent.metadata.change_instance_id
+
+
 def test_workflow_pack_catalog_references_supported_native_change_types():
     from netcode.workflow_packs import workflow_pack_catalog
 
@@ -3070,8 +3107,30 @@ def test_windows_runner_package_contains_install_scripts_and_no_secrets():
     assert 'Get-Process -Name "RezonanceLocalConnector"' in combined
     assert '[Security.Principal.WindowsIdentity]::GetCurrent().Name' in combined
     assert "--windows-console-mode=hide" in combined
+    assert "--include-package=pydantic" in combined
+    assert "--include-package=tenacity" in combined
+    assert "--include-data-dir=" in combined
+    assert "runner-source\\templates')=templates" in combined
+    assert "Compiled Rez runtime and governed-template smoke checks passed." in combined
+    assert 'Where-Object { $_.id -eq "rez_runtime" }' in combined
+    assert 'Where-Object { $_.id -eq "governed_templates" }' in combined
+    assert "New-ScheduledTaskSettingsSet" in combined
+    assert "-ExecutionTimeLimit ([TimeSpan]::Zero)" in combined
+    assert "-RestartCount 3" in combined
+    assert "-MultipleInstances IgnoreNew" in combined
+    assert "-AllowStartIfOnBatteries" in combined
+    assert "-DontStopIfGoingOnBatteries" in combined
+    assert "Local Connector startup task registration failed." in combined
+    assert "Local Connector startup task is not supervising the running process." in combined
+    assert "& $Runtime @RuntimeArguments 1>> $StdoutLog 2>> $StderrLog" in combined
+    assert "$ExitCode = $LASTEXITCODE" in combined
+    assert "$RestartLimit = 3" in combined
+    assert "restart attempt $RestartAttempt of $RestartLimit" in combined
+    assert "Start-Process -FilePath $Runtime" not in combined
 
     with zipfile.ZipFile(BytesIO(package), "r") as archive:
+        assert "runner-source/templates/arista/ntp_standardize.j2" in archive.namelist()
+        assert "runner-source/templates/cisco_ios/ntp_standardize.j2" in archive.namelist()
         checksums = archive.read("SHA256SUMS.txt").decode("utf-8").splitlines()
         for line in checksums:
             expected, name = line.split("  ", 1)

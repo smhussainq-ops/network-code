@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -69,6 +70,7 @@ def create_desired_state_intent(
         "requested_by": requested_by,
         "ticket_id": values.get("ticket_id") or None,
         "learning_mode": bool(values.get("learning_mode", True)),
+        "change_instance_id": uuid.uuid4().hex[:12],
     }
     common: dict[str, Any] = {
         "change_type": change_type,

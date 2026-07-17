@@ -36,11 +36,13 @@ def template_for_intent(intent: Intent) -> str:
 
 
 def config_filename(intent: Intent) -> str:
-    return f"{intent_slug(intent)}.eos"
+    return f"{report_stem(intent)}.eos"
 
 
 def report_stem(intent: Intent) -> str:
-    return intent_slug(intent)
+    base = intent_slug(intent)
+    instance_id = getattr(intent.metadata, "change_instance_id", None)
+    return f"{base}-{safe_name(instance_id)}" if instance_id else base
 
 
 def target_device_id(intent: Intent) -> str | None:
@@ -97,7 +99,7 @@ def plan_metadata(intent: Intent) -> dict[str, Any]:
         "change_type": intent.change_type,
         "label": spec.label,
         "title": spec.title(intent),
-        "slug": spec.slug(intent),
+        "slug": report_stem(intent),
         "risk": spec.risk,
         "target_device_id": target_device_id(intent),
         "lab_write_supported": spec.lab_write,

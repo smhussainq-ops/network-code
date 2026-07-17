@@ -18,7 +18,7 @@ from zipfile import ZIP_DEFLATED, ZipFile
 from netcode.shell_desktop import build_desktop_shell_profile
 
 
-PACKAGE_VERSION = "0.3.1-community-preview"
+PACKAGE_VERSION = "0.3.3-community-preview"
 
 
 def _rez_runtime_files() -> dict[str, bytes]:
@@ -53,6 +53,10 @@ def _runner_source_files() -> dict[str, bytes]:
         return {}
     files = {"runner-source/pyproject.toml": pyproject.read_bytes()}
     for path in sorted(package_dir.rglob("*.py")):
+        relative = path.relative_to(project_root)
+        files[f"runner-source/{relative.as_posix()}"] = path.read_bytes()
+    template_dir = project_root / "templates"
+    for path in sorted(template_dir.rglob("*.j2")):
         relative = path.relative_to(project_root)
         files[f"runner-source/{relative.as_posix()}"] = path.read_bytes()
     return files
@@ -184,6 +188,7 @@ def _install_runner_ps1(control_plane_url: str) -> str:
         }} else {{
           Write-Host "Enrollment is required. The Local Connector window will request the one-time join token."
         }}
+        $IdentityExists = Test-Path $IdentityPath
 
         # SYSTEM runs the startup task and DPAPI uses machine scope. Restrict the
         # ProgramData tree to SYSTEM, administrators, and the installing user.
@@ -196,14 +201,36 @@ def _install_runner_ps1(control_plane_url: str) -> str:
           $Action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$InstalledStart`""
           $Trigger = New-ScheduledTaskTrigger -AtStartup
           $Principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
-          Register-ScheduledTask -TaskName $TaskName -Action $Action -Trigger $Trigger -Principal $Principal -Description "Rezonance outbound-only Local Connector" -Force | Out-Null
+          $TaskSettings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1) -StartWhenAvailable -MultipleInstances IgnoreNew -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
+          Register-ScheduledTask -TaskName $TaskName -Action $Action -Trigger $Trigger -Principal $Principal -Settings $TaskSettings -Description "Rezonance outbound-only Local Connector" -Force | Out-Null
+          if (-not (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue)) {{
+            throw "Local Connector startup task registration failed."
+          }}
           Write-Host "Registered startup task: $TaskName"
         }}
         if ($StartNow) {{
-          if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {{
-            Start-ScheduledTask -TaskName $TaskName
+          if (-not $IdentityExists) {{
+            Write-Host "Runner start deferred until enrollment is complete."
           }} else {{
-            Start-Process powershell.exe -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$InstalledStart`"" -WindowStyle Hidden
+            if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {{
+              Start-ScheduledTask -TaskName $TaskName
+            }} else {{
+              Start-Process powershell.exe -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$InstalledStart`"" -WindowStyle Hidden
+            }}
+            $StartDeadline = (Get-Date).AddSeconds(20)
+            do {{
+              Start-Sleep -Milliseconds 500
+              $InstalledProcess = Get-Process -Name "RezonanceLocalConnector" -ErrorAction SilentlyContinue |
+                Where-Object {{ $_.Path -and [string]::Equals($_.Path, $Executable, [StringComparison]::OrdinalIgnoreCase) }} |
+                Select-Object -First 1
+            }} until ($InstalledProcess -or (Get-Date) -ge $StartDeadline)
+            if (-not $InstalledProcess) {{ throw "Installed Local Connector did not remain running after startup." }}
+            if ($RegisterStartupTask) {{
+              $RunningTask = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+              if (-not $RunningTask -or $RunningTask.State -ne "Running") {{
+                throw "Local Connector startup task is not supervising the running process."
+              }}
+            }}
           }}
         }}
 
@@ -243,13 +270,30 @@ def _start_runner_ps1() -> str:
         }
         $LogDir = Join-Path $Root "logs"
         New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
-        $LogFile = Join-Path $LogDir ("connector-" + (Get-Date -Format "yyyyMMdd") + ".log")
+        $LogStem = Join-Path $LogDir ("connector-" + (Get-Date -Format "yyyyMMdd-HHmmss-fff"))
+        $StdoutLog = $LogStem + ".out.log"
+        $StderrLog = $LogStem + ".err.log"
         if (Test-Path $Executable) {
-          & $Executable run *>> $LogFile
+          $Runtime = $Executable
+          $RuntimeArguments = @("run")
         } elseif (Test-Path $Python) {
-          & $Python -m netcode.runner_agent run *>> $LogFile
+          $Runtime = $Python
+          $RuntimeArguments = @("-m", "netcode.runner_agent", "run")
         } else {
           throw "Local Connector runtime not found. Run install-runner.ps1 first."
+        }
+        $RestartAttempt = 0
+        $RestartLimit = 3
+        $RestartDelaySeconds = 60
+        while ($true) {
+          & $Runtime @RuntimeArguments 1>> $StdoutLog 2>> $StderrLog
+          $ExitCode = $LASTEXITCODE
+          if ($RestartAttempt -ge $RestartLimit) {
+            throw "Local Connector exited with code $ExitCode after $RestartLimit restart attempts. See $StderrLog."
+          }
+          $RestartAttempt += 1
+          Add-Content -Encoding UTF8 -LiteralPath $StderrLog -Value "Local Connector exited with code $ExitCode; restart attempt $RestartAttempt of $RestartLimit in $RestartDelaySeconds seconds."
+          Start-Sleep -Seconds $RestartDelaySeconds
         }
         """
     ).strip() + "\n"
@@ -367,6 +411,8 @@ def _build_executable_ps1() -> str:
             --assume-yes-for-downloads `
             --windows-console-mode=hide `
             --include-package=netcode `
+            --include-package=pydantic `
+            --include-package=tenacity `
             --include-package=netmiko `
             --include-package=paramiko `
             --include-package=ntc_templates `
@@ -376,6 +422,7 @@ def _build_executable_ps1() -> str:
             --include-package-data=certifi `
             --include-package-data=ntc_templates `
             --include-package-data=tzdata `
+            --include-data-dir="$(Join-Path $PSScriptRoot 'runner-source\templates')=templates" `
             --report=$Report `
             (Join-Path $PSScriptRoot "windows-entrypoint.py")
           if ($LASTEXITCODE -ne 0) { throw "Nuitka Commercial build failed." }
@@ -387,6 +434,42 @@ def _build_executable_ps1() -> str:
           New-Item -ItemType Directory -Force -Path (Split-Path $Destination) | Out-Null
           Copy-Item -Recurse -Force $BuiltExe.Directory.FullName $Destination
           $Exe = Join-Path $Destination "RezonanceLocalConnector.exe"
+          $SmokeRoot = Join-Path $BuildRoot "doctor-home"
+          $DoctorOut = Join-Path $BuildRoot "compiled-doctor.json"
+          $DoctorErr = Join-Path $BuildRoot "compiled-doctor.err.txt"
+          Remove-Item -Recurse -Force $SmokeRoot -ErrorAction SilentlyContinue
+          Remove-Item -Force $DoctorOut,$DoctorErr -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force -Path $SmokeRoot | Out-Null
+          $PreviousRunnerHome = [Environment]::GetEnvironmentVariable("NETCODE_RUNNER_HOME", "Process")
+          $PreviousRezRoot = [Environment]::GetEnvironmentVariable("NETCODE_REZ_ROOT", "Process")
+          try {
+            $env:NETCODE_RUNNER_HOME = $SmokeRoot
+            $env:NETCODE_REZ_ROOT = Join-Path $PSScriptRoot "rez-runtime"
+            $DoctorProcess = Start-Process -FilePath $Exe -ArgumentList @("doctor", "--timeout", "1") -RedirectStandardOutput $DoctorOut -RedirectStandardError $DoctorErr -PassThru -Wait
+            $DoctorText = Get-Content -Raw $DoctorOut -ErrorAction SilentlyContinue
+            if ([string]::IsNullOrWhiteSpace($DoctorText)) {
+              $DoctorErrorText = Get-Content -Raw $DoctorErr -ErrorAction SilentlyContinue
+              throw "Compiled doctor produced no JSON. stderr: $DoctorErrorText"
+            }
+            try { $Doctor = $DoctorText | ConvertFrom-Json } catch { throw "Compiled doctor returned invalid JSON: $($_.Exception.Message)" }
+            $RezCheck = $Doctor.checks | Where-Object { $_.id -eq "rez_runtime" } | Select-Object -First 1
+            if (-not $RezCheck -or $RezCheck.status -ne "pass") {
+              $Detail = if ($RezCheck) { $RezCheck.message } else { "rez_runtime check is missing" }
+              throw "Compiled Rez runtime smoke check failed: $Detail"
+            }
+            $TemplateCheck = $Doctor.checks | Where-Object { $_.id -eq "governed_templates" } | Select-Object -First 1
+            if (-not $TemplateCheck -or $TemplateCheck.status -ne "pass") {
+              $Detail = if ($TemplateCheck) { $TemplateCheck.message } else { "governed_templates check is missing" }
+              throw "Compiled governed-template smoke check failed: $Detail"
+            }
+            if ($Doctor.security.credentials_returned -ne $false -or $Doctor.security.inbound_listener -ne $false) {
+              throw "Compiled doctor violated the connector security contract."
+            }
+            Write-Host "Compiled Rez runtime and governed-template smoke checks passed."
+          } finally {
+            if ($null -eq $PreviousRunnerHome) { Remove-Item Env:\NETCODE_RUNNER_HOME -ErrorAction SilentlyContinue } else { $env:NETCODE_RUNNER_HOME = $PreviousRunnerHome }
+            if ($null -eq $PreviousRezRoot) { Remove-Item Env:\NETCODE_REZ_ROOT -ErrorAction SilentlyContinue } else { $env:NETCODE_REZ_ROOT = $PreviousRezRoot }
+          }
           $Hash = (Get-FileHash -Algorithm SHA256 $Exe).Hash.ToLowerInvariant()
           Set-Content -Encoding ASCII (Join-Path $PSScriptRoot "WINDOWS-EXE-SHA256.txt") "$Hash  RezonanceLocalConnector.exe"
           Write-Host "Built $Exe"
