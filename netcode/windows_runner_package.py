@@ -125,15 +125,30 @@ def _install_runner_ps1(control_plane_url: str) -> str:
         $TaskName = "RezonanceLocalConnector"
         $ExistingTask = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
         if ($ExistingTask) {{ Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue }}
-        Get-Process -Name "RezonanceLocalConnector" -ErrorAction SilentlyContinue | ForEach-Object {{
+        $ConnectorProcesses = @(Get-Process -Name "RezonanceLocalConnector" -ErrorAction SilentlyContinue)
+        $SupervisorIds = @()
+        foreach ($ConnectorProcess in $ConnectorProcesses) {{
           try {{
-            if ($_.Path -and $_.Path.StartsWith($Root, [StringComparison]::OrdinalIgnoreCase)) {{
-              Stop-Process -Id $_.Id -Force
-              $_.WaitForExit(15000)
+            if ($ConnectorProcess.SessionId -eq 0) {{
+              $CimProcess = Get-CimInstance Win32_Process -Filter "ProcessId=$($ConnectorProcess.Id)" -ErrorAction SilentlyContinue
+              $ParentProcess = if ($CimProcess) {{ Get-Process -Id $CimProcess.ParentProcessId -ErrorAction SilentlyContinue }} else {{ $null }}
+              if ($ParentProcess -and $ParentProcess.SessionId -eq 0 -and $ParentProcess.ProcessName -in @("powershell", "pwsh")) {{
+                $SupervisorIds += $ParentProcess.Id
+              }}
             }}
-          }} catch {{
-            throw "Unable to stop the installed Local Connector process: $($_.Exception.Message)"
+          }} catch {{}}
+        }}
+        $SupervisorIds | Select-Object -Unique | ForEach-Object {{
+          Stop-Process -Id $_ -Force -ErrorAction SilentlyContinue
+        }}
+        foreach ($ConnectorProcess in $ConnectorProcesses) {{
+          if (Get-Process -Id $ConnectorProcess.Id -ErrorAction SilentlyContinue) {{
+            Stop-Process -Id $ConnectorProcess.Id -Force -ErrorAction Stop
+            Wait-Process -Id $ConnectorProcess.Id -Timeout 15 -ErrorAction SilentlyContinue
           }}
+        }}
+        if (Get-Process -Name "RezonanceLocalConnector" -ErrorAction SilentlyContinue) {{
+          throw "Unable to stop the installed Local Connector process."
         }}
 
         foreach ($Script in @("start-runner.ps1", "open-connector.ps1", "diagnose-runner.ps1", "uninstall-runner.ps1")) {{
@@ -358,6 +373,10 @@ def _uninstall_runner_ps1() -> str:
         r"""
         param([switch]$PurgeLocalData)
         $ErrorActionPreference = "Stop"
+        $Principal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
+        if (-not $Principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+          throw "Run uninstall-runner.ps1 from PowerShell opened as Administrator."
+        }
         $Root = Join-Path $env:ProgramData "Rezonance\LocalConnector"
         $TaskName = "RezonanceLocalConnector"
         $ShortcutPath = Join-Path $env:ProgramData "Microsoft\Windows\Start Menu\Programs\Rezonance Local Connector.lnk"
@@ -365,13 +384,44 @@ def _uninstall_runner_ps1() -> str:
           Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
           Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false
         }
+        $ConnectorProcesses = @(Get-Process -Name "RezonanceLocalConnector" -ErrorAction SilentlyContinue)
+        $SupervisorIds = @()
+        foreach ($ConnectorProcess in $ConnectorProcesses) {
+          try {
+            if ($ConnectorProcess.SessionId -eq 0) {
+              $CimProcess = Get-CimInstance Win32_Process -Filter "ProcessId=$($ConnectorProcess.Id)" -ErrorAction SilentlyContinue
+              $ParentProcess = if ($CimProcess) { Get-Process -Id $CimProcess.ParentProcessId -ErrorAction SilentlyContinue } else { $null }
+              if ($ParentProcess -and $ParentProcess.SessionId -eq 0 -and $ParentProcess.ProcessName -in @("powershell", "pwsh")) {
+                $SupervisorIds += $ParentProcess.Id
+              }
+            }
+          } catch {}
+        }
+        $SupervisorIds | Select-Object -Unique | ForEach-Object {
+          Stop-Process -Id $_ -Force -ErrorAction SilentlyContinue
+        }
+        foreach ($ConnectorProcess in $ConnectorProcesses) {
+          if (Get-Process -Id $ConnectorProcess.Id -ErrorAction SilentlyContinue) {
+            Stop-Process -Id $ConnectorProcess.Id -Force -ErrorAction Stop
+            Wait-Process -Id $ConnectorProcess.Id -Timeout 15 -ErrorAction SilentlyContinue
+          }
+        }
+        if (Get-Process -Name "RezonanceLocalConnector" -ErrorAction SilentlyContinue) {
+          throw "Unable to stop the installed Local Connector process."
+        }
         if ($PurgeLocalData) {
-          Remove-Item -Recurse -Force $Root -ErrorAction SilentlyContinue
+          if (Test-Path $Root) { Remove-Item -Recurse -Force $Root -ErrorAction Stop }
+          if (Test-Path $Root) { throw "Local Connector data purge did not complete." }
           Write-Host "Local Connector and all local identity, inventory, and logs were removed."
         } else {
+          $RuntimeTargets = @()
           foreach ($Name in @(".venv", "bin", "rez-runtime", "scripts", "connector-settings.json")) {
-            Remove-Item -Recurse -Force (Join-Path $Root $Name) -ErrorAction SilentlyContinue
+            $Target = Join-Path $Root $Name
+            $RuntimeTargets += $Target
+            if (Test-Path $Target) { Remove-Item -Recurse -Force $Target -ErrorAction Stop }
           }
+          $RemainingRuntime = @($RuntimeTargets | Where-Object { Test-Path $_ })
+          if ($RemainingRuntime) { throw "Runtime removal did not complete: $($RemainingRuntime -join ', ')" }
           Write-Host "Runtime removed. Protected data and logs remain at $Root. Use -PurgeLocalData to remove them."
         }
         Remove-Item -Force $ShortcutPath -ErrorAction SilentlyContinue

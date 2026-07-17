@@ -3105,6 +3105,14 @@ def test_windows_runner_package_contains_install_scripts_and_no_secrets():
     assert "Preserved existing protected connector identity." in combined
     assert "Enrollment is required. The Local Connector window will request" in combined
     assert 'Get-Process -Name "RezonanceLocalConnector"' in combined
+    assert "Get-CimInstance Win32_Process" in combined
+    assert '$ConnectorProcess.SessionId -eq 0' in combined
+    assert '$ParentProcess.SessionId -eq 0' in combined
+    assert 'Wait-Process -Id $ConnectorProcess.Id -Timeout 15' in combined
+    assert "Unable to stop the installed Local Connector process." in combined
+    assert "Run uninstall-runner.ps1 from PowerShell opened as Administrator." in combined
+    assert 'throw "Runtime removal did not complete:' in combined
+    assert '$RuntimeTargets | Where-Object { Test-Path $_ }' in combined
     assert '[Security.Principal.WindowsIdentity]::GetCurrent().Name' in combined
     assert "--windows-console-mode=hide" in combined
     assert "--include-package=pydantic" in combined
