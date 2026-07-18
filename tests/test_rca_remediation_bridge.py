@@ -183,6 +183,82 @@ def test_site_context_interface_remediation_stays_typed_and_human_gated(tmp_path
     }
 
 
+def test_human_reviewed_interface_fault_creates_only_a_validated_draft(tmp_path: Path, monkeypatch):
+    init_workspace(WorkspacePaths(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("NETCODE_ADMIN_TOKEN", "rez-service-token")
+    client = TestClient(api.app)
+    headers = {
+        "Authorization": "Bearer rez-service-token",
+        "X-Rezonance-Org-ID": "org_default",
+        "X-Rezonance-User": "marcus",
+        "X-Rezonance-Role": "operator",
+    }
+    payload = {
+        "proposal_schema": "netcode.remediation.v1",
+        "proposal_source": "human_reviewed_rca",
+        "root_confirmed": True,
+        "root_atom_id": "L1_INTERFACE_ADMIN_DOWN",
+        "source": "rez",
+        "incident_id": "INC-HQ-ET2",
+        "target_device": "v2-store1",
+        "suggested_pack": "interface_config",
+        "rationale": "marcus confirmed Ethernet2 is expected up.",
+        "requested_by": "marcus",
+        "intent_reviewed": True,
+        "reviewed_by": "marcus",
+        "review_candidate_id": "REZ-INTENT-123456789ABC",
+        "proposed_intent": {
+            "change_type": "interface_config",
+            "site": "hq",
+            "values": {"interface": "Ethernet2", "enabled": True, "apply_scope": "admin_state"},
+        },
+    }
+
+    response = client.post("/api/changes/from-rca", headers=headers, json=payload)
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["draft_only"] is True
+    assert body["human_approval_required"] is True
+    assert body["change"]["workflow_state"] == "validated"
+    assert body["intent"]["interface"] == {
+        "name": "Ethernet2",
+        "enabled": True,
+        "apply_scope": "admin_state",
+    }
+    assert PlatformStore(WorkspacePaths(tmp_path.resolve())).list_jobs() == []
+
+
+def test_human_reviewed_interface_fault_rejects_missing_review_identity(tmp_path: Path, monkeypatch):
+    init_workspace(WorkspacePaths(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    client = TestClient(api.app)
+
+    response = client.post(
+        "/api/changes/from-rca",
+        json={
+            "proposal_schema": "netcode.remediation.v1",
+            "proposal_source": "human_reviewed_rca",
+            "root_confirmed": True,
+            "root_atom_id": "L1_INTERFACE_ADMIN_DOWN",
+            "source": "rez",
+            "incident_id": "INC-HQ-ET2",
+            "target_device": "v2-hq-core",
+            "suggested_pack": "interface_config",
+            "intent_reviewed": False,
+            "proposed_intent": {
+                "change_type": "interface_config",
+                "site": "hq",
+                "values": {"interface": "Ethernet2", "enabled": True},
+            },
+        },
+    )
+
+    assert response.status_code == 400
+    assert "review" in response.json()["detail"].lower()
+
+
 def test_site_context_redistribution_remediation_is_typed_validated_and_human_gated(
     tmp_path: Path, monkeypatch
 ):
