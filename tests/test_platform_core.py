@@ -3168,6 +3168,69 @@ def test_windows_runner_download_endpoint_returns_zip(tmp_path: Path, monkeypatc
         assert "install-runner.ps1" in archive.namelist()
 
 
+def test_windows_runner_download_requires_admin_when_auth_enabled(tmp_path: Path, monkeypatch):
+    init_workspace(WorkspacePaths(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("NETCODE_BOOTSTRAP_ADMIN_EMAIL", "admin@example.com")
+    monkeypatch.setenv("NETCODE_BOOTSTRAP_ADMIN_PASSWORD", "admin-password")
+    api._bootstrap_admin()
+    monkeypatch.setenv("NETCODE_AUTH", "1")
+
+    client = TestClient(api.app)
+    assert client.get("/api/runner/download/windows/manifest").status_code == 401
+    assert client.get("/api/runner/download/windows").status_code == 401
+
+    login = client.post(
+        "/api/auth/login",
+        json={"email": "admin@example.com", "password": "admin-password"},
+    )
+    assert login.status_code == 200
+    headers = {"Authorization": f"Bearer {login.json()['token']}"}
+    assert client.get("/api/runner/download/windows/manifest", headers=headers).status_code == 200
+    assert client.get("/api/runner/download/windows", headers=headers).status_code == 200
+
+
+def test_runner_data_plane_keeps_runner_token_auth_when_user_auth_enabled(tmp_path: Path, monkeypatch):
+    init_workspace(WorkspacePaths(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("NETCODE_BOOTSTRAP_ADMIN_EMAIL", "admin@example.com")
+    monkeypatch.setenv("NETCODE_BOOTSTRAP_ADMIN_PASSWORD", "admin-password")
+    api._bootstrap_admin()
+    monkeypatch.setenv("NETCODE_AUTH", "1")
+
+    client = TestClient(api.app)
+    login = client.post(
+        "/api/auth/login",
+        json={"email": "admin@example.com", "password": "admin-password"},
+    )
+    admin = {"Authorization": f"Bearer {login.json()['token']}"}
+    join = client.post("/api/runners/join-token", headers=admin, json={"pool": "pilot"}).json()
+
+    enrolled = client.post(
+        "/api/runner/enroll",
+        json={"join_token": join["join_token"], "name": "connector-test"},
+    )
+    assert enrolled.status_code == 200
+    runner = {"Authorization": f"Bearer {enrolled.json()['runner_token']}"}
+    assert client.post("/api/runner/poll", headers=runner, json={"wait_seconds": 0}).status_code == 204
+    assert client.post("/api/runner/poll", json={"wait_seconds": 0}).status_code == 401
+
+
+def test_production_refuses_unsigned_windows_runner_download(tmp_path: Path, monkeypatch):
+    init_workspace(WorkspacePaths(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(api, "_PRODUCTION_RUNTIME", True)
+
+    client = TestClient(api.app)
+    manifest = client.get("/api/runner/download/windows/manifest")
+    package = client.get("/api/runner/download/windows")
+
+    assert manifest.status_code == 503
+    assert package.status_code == 503
+    assert "signed Windows Local Connector" in manifest.json()["detail"]
+    assert "signed Windows Local Connector" in package.json()["detail"]
+
+
 def test_ui_config_persists_editable_options_and_catalog(tmp_path: Path, monkeypatch):
     init_workspace(WorkspacePaths(tmp_path))
     monkeypatch.chdir(tmp_path)

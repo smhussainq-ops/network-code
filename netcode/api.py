@@ -590,7 +590,13 @@ def _enforce_catalog_growth(
 # require a valid session + role; runner endpoints keep their own token auth.
 
 _PUBLIC_EXACT = {"/", "/app", "/app/", "/api/health", "/api/ready", "/api/auth/login"}
-_ADMIN_PATHS = {"/api/runners/join-token"}
+_RUNNER_PACKAGE_PATHS = frozenset(
+    {
+        "/api/runner/download/windows",
+        "/api/runner/download/windows/manifest",
+    }
+)
+_ADMIN_PATHS = {"/api/runners/join-token", *_RUNNER_PACKAGE_PATHS}
 _VIEWER_MUTATION_PATHS = {"/api/auth/logout"}
 _RESERVED_DOC_PATHS = frozenset({"/docs", "/redoc", "/openapi.json"})
 
@@ -874,10 +880,11 @@ async def _rbac(request: Request, call_next):
 
     # Public UI shell, health, login, static assets, and the runner data plane
     # (which authenticates with its own runner token) bypass user RBAC.
+    runner_data_plane = path.startswith("/api/runner/") and path not in _RUNNER_PACKAGE_PATHS
     bypass = (
         path in _PUBLIC_EXACT
         or path.startswith("/static")
-        or path.startswith("/api/runner/")
+        or runner_data_plane
         or _is_rez_bridge_request(path, authorization)
     )
     if auth_enabled() and not bypass:
@@ -3446,11 +3453,23 @@ def api_shell_desktop_profile(request: Request) -> dict[str, object]:
 
 @app.get("/api/runner/download/windows/manifest")
 def api_windows_runner_manifest(request: Request) -> dict[str, object]:
-    return package_manifest(str(request.base_url).rstrip("/"), runner_pool=runner_pool())
+    manifest = package_manifest(str(request.base_url).rstrip("/"), runner_pool=runner_pool())
+    if _PRODUCTION_RUNTIME and not manifest.get("production_code_signing_complete"):
+        raise HTTPException(
+            status_code=503,
+            detail="The signed Windows Local Connector is not available for production download.",
+        )
+    return manifest
 
 
 @app.get("/api/runner/download/windows")
 def api_windows_runner_download(request: Request) -> Response:
+    manifest = package_manifest(str(request.base_url).rstrip("/"), runner_pool=runner_pool())
+    if _PRODUCTION_RUNTIME and not manifest.get("production_code_signing_complete"):
+        raise HTTPException(
+            status_code=503,
+            detail="The signed Windows Local Connector is not available for production download.",
+        )
     package = build_windows_runner_package(str(request.base_url).rstrip("/"), runner_pool=runner_pool())
     return Response(
         content=package,
