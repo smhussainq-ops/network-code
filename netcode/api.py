@@ -461,6 +461,9 @@ class RcaRemediationProposalRequest(BaseModel):
     title: str = ""
     environment_id: str = ""
     model_revision_id: str = ""
+    intent_reviewed: bool = False
+    reviewed_by: str = ""
+    review_candidate_id: str = ""
 
 
 class LoginRequest(BaseModel):
@@ -666,7 +669,11 @@ _RCA_ALLOWED_CHANGE_TYPES = {
 }
 
 _RCA_PROPOSAL_SCHEMA = "netcode.remediation.v1"
-_RCA_PROPOSAL_SOURCES = {"rez_structured_rca", "site_operational_context"}
+_RCA_PROPOSAL_SOURCES = {
+    "rez_structured_rca",
+    "site_operational_context",
+    "human_reviewed_rca",
+}
 _RCA_NON_ACTIONABLE_ROOTS = {"AGENT_VALIDATED_FINDING"}
 _RCA_NON_ACTIONABLE_PREFIXES = ("CI_", "DATA_GAP", "XL_")
 
@@ -710,6 +717,23 @@ def _require_confirmed_rca_provenance(request: RcaRemediationProposalRequest) ->
         raise HTTPException(status_code=400, detail="A confirmed primary root cause is required before creating a draft.")
     if atom_id in _RCA_NON_ACTIONABLE_ROOTS or atom_id.startswith(_RCA_NON_ACTIONABLE_PREFIXES):
         raise HTTPException(status_code=400, detail="The confirmed root is not an actionable device condition.")
+    if request.proposal_source.strip() == "human_reviewed_rca":
+        if (
+            not request.intent_reviewed
+            or not request.reviewed_by.strip()
+            or not request.review_candidate_id.strip()
+            or atom_id.upper() != "L1_INTERFACE_ADMIN_DOWN"
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail="Human-reviewed RCA drafts require an exact interface intent review and reviewer identity.",
+            )
+        proposed_type = str(request.proposed_intent.get("change_type") or "").strip()
+        if proposed_type != "interface_config":
+            raise HTTPException(
+                status_code=400,
+                detail="Human-reviewed RCA drafts are limited to typed interface administrative-state changes.",
+            )
 
 
 def _proposal_targets(request: RcaRemediationProposalRequest) -> dict[str, object]:
@@ -822,6 +846,9 @@ def _intent_from_rca_proposal(request: RcaRemediationProposalRequest) -> dict[st
         "proposal_schema": request.proposal_schema.strip(),
         "proposal_source": request.proposal_source.strip(),
         "confirmed_root_atom_id": request.root_atom_id.strip(),
+        "intent_reviewed": request.intent_reviewed,
+        "reviewed_by": request.reviewed_by.strip(),
+        "review_candidate_id": request.review_candidate_id.strip(),
     }
 
     if change_type == "custom_config":
@@ -5139,10 +5166,16 @@ def api_change_from_rca(request: RcaRemediationProposalRequest, http_request: Re
         raise HTTPException(status_code=400, detail="Only Rez RCA proposals are accepted.")
     if not request.incident_id.strip():
         raise HTTPException(status_code=400, detail="incident_id is required.")
-    _require_confirmed_rca_provenance(request)
-
     p = paths()
     principal = _request_principal(http_request)
+    _require_confirmed_rca_provenance(request)
+    if request.proposal_source.strip() == "human_reviewed_rca":
+        actor = str(principal.email or principal.user_id or "").strip()
+        if not principal.has_role("operator") or not actor or actor != request.reviewed_by.strip():
+            raise HTTPException(
+                status_code=403,
+                detail="The authenticated operator must match the expected-state reviewer.",
+            )
     store = PlatformStore(p)
     intent = _intent_from_rca_proposal(request)
     try:

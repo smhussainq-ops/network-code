@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import re
 from typing import Any, Mapping, Sequence
 
 from netcode.gitflow import commit_change_artifacts, materialize_model_revision, setup_git_workspace
@@ -132,6 +133,74 @@ def model_patch_from_intent(
     }, [domain]
 
 
+def _interface_operational_dependency(
+    intent: Mapping[str, Any],
+    *,
+    device_id: str,
+) -> tuple[str, dict[str, Any]] | None:
+    """Translate a verified admin-state repair into future RCA intent."""
+    if str(intent.get("change_type") or "").strip() != "interface_config":
+        return None
+    interface = _dict(intent.get("interface"))
+    if interface.get("enabled") is not True or str(interface.get("apply_scope") or "") != "admin_state":
+        return None
+    name = str(interface.get("name") or "").strip()
+    site = str(intent.get("site") or "").strip()
+    if not name or not site or not device_id:
+        return None
+    identity_slug = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
+    dependency = {
+        "id": f"{device_id}:interface:{identity_slug}",
+        "device_id": device_id,
+        "kind": "interface",
+        "domain": "topology",
+        "identity": {"interface": name},
+        "expected": {"admin_state": "up", "oper_state": "up"},
+        "atom_ids": ["L1_INTERFACE_ADMIN_DOWN", "L1_INTERFACE_OPER_DOWN"],
+        "remediation": {
+            "root_atom_id": "L1_INTERFACE_ADMIN_DOWN",
+            "change_type": "interface_config",
+            "values": {
+                "interface": name,
+                "enabled": True,
+                "apply_scope": "admin_state",
+            },
+            "interface": {
+                "name": name,
+                "enabled": True,
+                "apply_scope": "admin_state",
+            },
+        },
+    }
+    return site, dependency
+
+
+def _attach_operational_dependency(
+    patch: Mapping[str, Any],
+    base_model: Mapping[str, Any],
+    intent: Mapping[str, Any],
+    *,
+    device_id: str,
+) -> dict[str, Any]:
+    result = _dict(patch)
+    built = _interface_operational_dependency(intent, device_id=device_id)
+    if built is None:
+        return result
+    site, dependency = built
+    existing_site = _dict(_dict(base_model.get("sites")).get(site))
+    dependencies = [
+        copy.deepcopy(dict(item))
+        for item in existing_site.get("operational_dependencies") or []
+        if isinstance(item, Mapping) and str(item.get("id") or "") != dependency["id"]
+    ]
+    dependencies.append(dependency)
+    dependencies.sort(key=lambda item: str(item.get("id") or ""))
+    sites = result.setdefault("sites", {})
+    site_patch = sites.setdefault(site, {})
+    site_patch["operational_dependencies"] = dependencies
+    return result
+
+
 def create_candidate_for_change_intent(
     repository: NetworkModelRepository,
     platform_store: PlatformStore,
@@ -157,6 +226,12 @@ def create_candidate_for_change_intent(
             f"Network Model revision changed from {parent_revision_id} to {active['revision_id']}"
         )
     patch, domains = model_patch_from_intent(intent, device_id=device_id)
+    patch = _attach_operational_dependency(
+        patch,
+        active["model"],
+        intent,
+        device_id=device_id,
+    )
     if not patch or not domains:
         return None
     revision_id = f"change-{change_id.lower()}"
@@ -210,6 +285,12 @@ def create_candidate_for_change_set(
     domains: set[str] = set()
     for device_id in devices:
         patch, patch_domains = model_patch_from_intent(intent, device_id=device_id)
+        patch = _attach_operational_dependency(
+            patch,
+            _deep_merge(active["model"], combined),
+            intent,
+            device_id=device_id,
+        )
         combined = _deep_merge(combined, patch)
         domains.update(patch_domains)
     if not combined or not domains:

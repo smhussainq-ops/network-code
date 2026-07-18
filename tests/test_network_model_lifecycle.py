@@ -302,6 +302,32 @@ def test_typed_change_lifecycle_uses_human_approval_and_live_verification(tmp_pa
     modeled = candidate["model"]["sites"]["site-101"]["devices"]["edge-1"]["intent"]
     assert modeled["topology"]["interfaces"]["Ethernet1"]["enabled"] is True
     assert "raw_commands" not in str(modeled)
+    dependencies = candidate["model"]["sites"]["site-101"]["operational_dependencies"]
+    assert dependencies == [
+        {
+            "id": "edge-1:interface:ethernet1",
+            "device_id": "edge-1",
+            "kind": "interface",
+            "domain": "topology",
+            "identity": {"interface": "Ethernet1"},
+            "expected": {"admin_state": "up", "oper_state": "up"},
+            "atom_ids": ["L1_INTERFACE_ADMIN_DOWN", "L1_INTERFACE_OPER_DOWN"],
+            "remediation": {
+                "root_atom_id": "L1_INTERFACE_ADMIN_DOWN",
+                "change_type": "interface_config",
+                "values": {
+                    "interface": "Ethernet1",
+                    "enabled": True,
+                    "apply_scope": "admin_state",
+                },
+                "interface": {
+                    "name": "Ethernet1",
+                    "enabled": True,
+                    "apply_scope": "admin_state",
+                },
+            },
+        }
+    ]
 
     client = TestClient(api.app)
     approval = client.post(f"/api/change/{change.id}/approve", json={"approved_by": "reviewer"})
