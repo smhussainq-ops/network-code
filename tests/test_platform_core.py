@@ -21,6 +21,7 @@ from netcode.platform import platform_capabilities
 from netcode.source_of_truth import source_of_truth
 from netcode.store import PlatformStore
 from netcode.verification import verify_vlan_state
+from netcode.windows_runner_package import PACKAGE_VERSION
 from netcode.workflow import state_after_lab_action, state_after_static_validation, workflow_snapshot
 from netcode.yamlio import read_yaml, write_yaml
 
@@ -3177,7 +3178,9 @@ def test_windows_runner_download_requires_admin_when_auth_enabled(tmp_path: Path
     monkeypatch.setenv("NETCODE_AUTH", "1")
 
     client = TestClient(api.app)
-    assert client.get("/api/runner/download/windows/manifest").status_code == 401
+    public_manifest = client.get("/api/runner/download/windows/manifest")
+    assert public_manifest.status_code == 200
+    assert public_manifest.json()["ok"] is True
     assert client.get("/api/runner/download/windows").status_code == 401
 
     login = client.post(
@@ -3220,15 +3223,36 @@ def test_production_refuses_unsigned_windows_runner_download(tmp_path: Path, mon
     init_workspace(WorkspacePaths(tmp_path))
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(api, "_PRODUCTION_RUNTIME", True)
+    monkeypatch.setenv("NETCODE_BOOTSTRAP_ADMIN_EMAIL", "admin@example.com")
+    monkeypatch.setenv("NETCODE_BOOTSTRAP_ADMIN_PASSWORD", "admin-password")
+    api._bootstrap_admin()
+    monkeypatch.setenv("NETCODE_AUTH", "1")
 
     client = TestClient(api.app)
     manifest = client.get("/api/runner/download/windows/manifest")
-    package = client.get("/api/runner/download/windows")
+    unauthenticated_package = client.get("/api/runner/download/windows")
+    login = client.post(
+        "/api/auth/login",
+        json={"email": "admin@example.com", "password": "admin-password"},
+    )
+    headers = {"Authorization": f"Bearer {login.json()['token']}"}
+    authenticated_package = client.get("/api/runner/download/windows", headers=headers)
 
-    assert manifest.status_code == 503
-    assert package.status_code == 503
-    assert "signed Windows Local Connector" in manifest.json()["detail"]
-    assert "signed Windows Local Connector" in package.json()["detail"]
+    assert manifest.status_code == 200
+    assert manifest.json() == {
+        "ok": True,
+        "product": "Rezonance Local Connector",
+        "version": PACKAGE_VERSION,
+        "platform": "windows-x64",
+        "network": "outbound_https_wss_only",
+        "availability": "unavailable",
+        "download_available": False,
+        "production_code_signing_complete": False,
+        "message": "The signed Windows Local Connector is not available for production download.",
+    }
+    assert unauthenticated_package.status_code == 401
+    assert authenticated_package.status_code == 503
+    assert "signed Windows Local Connector" in authenticated_package.json()["detail"]
 
 
 def test_ui_config_persists_editable_options_and_catalog(tmp_path: Path, monkeypatch):

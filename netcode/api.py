@@ -589,14 +589,22 @@ def _enforce_catalog_growth(
 # UI and all existing tests keep working. Auth ON (NETCODE_AUTH=1): user endpoints
 # require a valid session + role; runner endpoints keep their own token auth.
 
-_PUBLIC_EXACT = {"/", "/app", "/app/", "/api/health", "/api/ready", "/api/auth/login"}
+_PUBLIC_EXACT = {
+    "/",
+    "/app",
+    "/app/",
+    "/api/health",
+    "/api/ready",
+    "/api/auth/login",
+    "/api/runner/download/windows/manifest",
+}
 _RUNNER_PACKAGE_PATHS = frozenset(
     {
         "/api/runner/download/windows",
         "/api/runner/download/windows/manifest",
     }
 )
-_ADMIN_PATHS = {"/api/runners/join-token", *_RUNNER_PACKAGE_PATHS}
+_ADMIN_PATHS = {"/api/runners/join-token", "/api/runner/download/windows"}
 _VIEWER_MUTATION_PATHS = {"/api/auth/logout"}
 _RESERVED_DOC_PATHS = frozenset({"/docs", "/redoc", "/openapi.json"})
 
@@ -3455,11 +3463,18 @@ def api_shell_desktop_profile(request: Request) -> dict[str, object]:
 def api_windows_runner_manifest(request: Request) -> dict[str, object]:
     manifest = package_manifest(str(request.base_url).rstrip("/"), runner_pool=runner_pool())
     if _PRODUCTION_RUNTIME and not manifest.get("production_code_signing_complete"):
-        raise HTTPException(
-            status_code=503,
-            detail="The signed Windows Local Connector is not available for production download.",
-        )
-    return manifest
+        return {
+            "ok": True,
+            "product": manifest["product"],
+            "version": manifest["version"],
+            "platform": manifest["platform"],
+            "network": manifest["network"],
+            "availability": "unavailable",
+            "download_available": False,
+            "production_code_signing_complete": False,
+            "message": "The signed Windows Local Connector is not available for production download.",
+        }
+    return {**manifest, "availability": "available", "download_available": True}
 
 
 @app.get("/api/runner/download/windows")
