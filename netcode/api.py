@@ -3446,11 +3446,25 @@ def api_shell_desktop_profile(request: Request) -> dict[str, object]:
 
 @app.get("/api/runner/download/windows/manifest")
 def api_windows_runner_manifest(request: Request) -> dict[str, object]:
-    return package_manifest(str(request.base_url).rstrip("/"), runner_pool=runner_pool())
+    manifest = package_manifest(str(request.base_url).rstrip("/"), runner_pool=runner_pool())
+    enabled = os.environ.get("NETCODE_WINDOWS_DOWNLOAD_ENABLED", "").strip().lower() in {"1", "true", "yes", "on"}
+    manifest["available"] = enabled
+    manifest["download_status"] = "available" if enabled else "blocked_unsigned_preview"
+    return manifest
 
 
 @app.get("/api/runner/download/windows")
 def api_windows_runner_download(request: Request) -> Response:
+    enabled = os.environ.get("NETCODE_WINDOWS_DOWNLOAD_ENABLED", "").strip().lower() in {"1", "true", "yes", "on"}
+    if not enabled:
+        return JSONResponse(
+            status_code=401,
+            content={
+                "ok": False,
+                "error": "windows_download_not_available",
+                "message": "Windows Local Connector downloads are not public until the signed package is released.",
+            },
+        )
     package = build_windows_runner_package(str(request.base_url).rstrip("/"), runner_pool=runner_pool())
     return Response(
         content=package,

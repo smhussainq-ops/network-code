@@ -3145,10 +3145,11 @@ def test_windows_runner_package_contains_install_scripts_and_no_secrets():
             assert hashlib.sha256(archive.read(name)).hexdigest() == expected
 
 
-def test_windows_runner_download_endpoint_returns_zip(tmp_path: Path, monkeypatch):
+def test_windows_runner_download_endpoint_blocks_unsigned_package_by_default(tmp_path: Path, monkeypatch):
     init_workspace(WorkspacePaths(tmp_path))
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("NETCODE_RUNNER_POOL", "pilot")
+    monkeypatch.delenv("NETCODE_WINDOWS_DOWNLOAD_ENABLED", raising=False)
 
     client = TestClient(api.app)
     manifest = client.get("/api/runner/download/windows/manifest").json()
@@ -3160,8 +3161,26 @@ def test_windows_runner_download_endpoint_returns_zip(tmp_path: Path, monkeypatc
     assert manifest["artifact_kind"] == "pilot_zip"
     assert manifest["credentials"] == "windows_dpapi_machine_scope_and_restricted_acl"
     assert manifest["production_code_signing_complete"] is False
+    assert manifest["available"] is False
+    assert manifest["download_status"] == "blocked_unsigned_preview"
     assert manifest["rez_adapter_bundle"]["included"] is True
     assert manifest["runner_source_bundle"]["included"] is True
+    assert response.status_code == 401
+    assert response.json()["error"] == "windows_download_not_available"
+
+
+def test_windows_runner_download_endpoint_returns_zip_when_explicitly_enabled(tmp_path: Path, monkeypatch):
+    init_workspace(WorkspacePaths(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("NETCODE_RUNNER_POOL", "pilot")
+    monkeypatch.setenv("NETCODE_WINDOWS_DOWNLOAD_ENABLED", "true")
+
+    client = TestClient(api.app)
+    manifest = client.get("/api/runner/download/windows/manifest").json()
+    response = client.get("/api/runner/download/windows")
+
+    assert manifest["available"] is True
+    assert manifest["download_status"] == "available"
     assert response.status_code == 200
     assert response.headers["content-type"] == "application/zip"
     with zipfile.ZipFile(BytesIO(response.content), "r") as archive:
