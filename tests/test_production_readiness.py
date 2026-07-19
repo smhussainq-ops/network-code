@@ -259,6 +259,13 @@ def test_production_image_removes_python_build_tree():
     assert "rm -rf /app/build" in dockerfile
 
 
+def test_production_image_stamps_release_identity_for_fresh_scanning():
+    dockerfile = (Path(__file__).resolve().parents[1] / "Dockerfile").read_text(encoding="utf-8")
+
+    assert "ARG RELEASE_ID=development" in dockerfile
+    assert 'LABEL org.opencontainers.image.version="${RELEASE_ID}"' in dockerfile
+
+
 def test_production_api_documentation_is_disabled(monkeypatch):
     monkeypatch.setattr(api, "_PRODUCTION_RUNTIME", True)
     client = TestClient(api.app)

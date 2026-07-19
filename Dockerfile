@@ -1,5 +1,8 @@
 FROM public.ecr.aws/amazonlinux/amazonlinux:2023-minimal
 
+ARG RELEASE_ID=development
+LABEL org.opencontainers.image.version="${RELEASE_ID}"
+
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     NETCODE_WORKSPACE=/data \
