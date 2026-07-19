@@ -3158,18 +3158,30 @@ def test_windows_runner_download_endpoint_blocks_unsigned_package_by_default(tmp
     assert manifest["ok"] is True
     assert manifest["platform"] == "windows-x64"
     assert manifest["runner_pool"] == "pilot"
-    assert manifest["artifact_kind"] == "pilot_zip"
-    assert manifest["credentials"] == "windows_dpapi_machine_scope_and_restricted_acl"
+    assert manifest["artifact_kind"] == "compiled_windows_connector"
+    assert manifest["package_kind"] == "signed_windows_package"
+    assert manifest["control_plane_url"] == "http://testserver"
+    assert manifest["credentials"] == "local_connector_dpapi_machine_scope"
+    assert manifest["python_required"] is False
+    assert manifest["source_bundle_included"] is False
+    assert manifest["build_scripts_included"] is False
+    assert manifest["sample_workflows_included"] is False
+    assert manifest["unsigned_download_public"] is False
     assert manifest["production_code_signing_complete"] is False
     assert manifest["available"] is False
-    assert manifest["download_status"] == "blocked_unsigned_preview"
-    assert manifest["rez_adapter_bundle"]["included"] is True
-    assert manifest["runner_source_bundle"]["included"] is True
+    assert manifest["download_status"] == "blocked_pending_signed_package"
+    body = json.dumps(manifest)
+    assert "pilot_zip" not in body
+    assert "build-windows-executable.ps1" not in body
+    assert "README.md" not in body
+    assert "preflight.ps1" not in body
+    assert "runner_source_bundle" not in body
+    assert "rez_adapter_bundle" not in body
     assert response.status_code == 401
     assert response.json()["error"] == "windows_download_not_available"
 
 
-def test_windows_runner_download_endpoint_returns_zip_when_explicitly_enabled(tmp_path: Path, monkeypatch):
+def test_windows_runner_download_endpoint_stays_blocked_without_signed_artifact(tmp_path: Path, monkeypatch):
     init_workspace(WorkspacePaths(tmp_path))
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("NETCODE_RUNNER_POOL", "pilot")
@@ -3179,12 +3191,34 @@ def test_windows_runner_download_endpoint_returns_zip_when_explicitly_enabled(tm
     manifest = client.get("/api/runner/download/windows/manifest").json()
     response = client.get("/api/runner/download/windows")
 
+    assert manifest["available"] is False
+    assert manifest["download_status"] == "blocked_pending_signed_package"
+    assert response.status_code == 401
+
+
+def test_windows_runner_download_endpoint_returns_only_configured_signed_artifact(tmp_path: Path, monkeypatch):
+    init_workspace(WorkspacePaths(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    signed = tmp_path / "RezonanceLocalConnector-0.3.3-signed.zip"
+    signed.write_bytes(b"signed-package-placeholder")
+    monkeypatch.setenv("NETCODE_RUNNER_POOL", "pilot")
+    monkeypatch.setenv("NETCODE_WINDOWS_DOWNLOAD_ENABLED", "true")
+    monkeypatch.setenv("NETCODE_WINDOWS_SIGNED_ARTIFACT_PATH", str(signed))
+
+    client = TestClient(api.app)
+    manifest = client.get(
+        "/api/runner/download/windows/manifest",
+        headers={"host": "control.rezonancenetworks.com", "x-forwarded-proto": "http"},
+    ).json()
+    response = client.get("/api/runner/download/windows")
+
+    assert manifest["control_plane_url"] == "https://control.rezonancenetworks.com"
     assert manifest["available"] is True
+    assert manifest["production_code_signing_complete"] is True
     assert manifest["download_status"] == "available"
     assert response.status_code == 200
-    assert response.headers["content-type"] == "application/zip"
-    with zipfile.ZipFile(BytesIO(response.content), "r") as archive:
-        assert "install-runner.ps1" in archive.namelist()
+    assert response.headers["content-disposition"] == f'attachment; filename="{signed.name}"'
+    assert response.content == b"signed-package-placeholder"
 
 
 def test_ui_config_persists_editable_options_and_catalog(tmp_path: Path, monkeypatch):

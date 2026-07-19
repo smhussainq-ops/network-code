@@ -3446,31 +3446,70 @@ def api_shell_desktop_profile(request: Request) -> dict[str, object]:
 
 @app.get("/api/runner/download/windows/manifest")
 def api_windows_runner_manifest(request: Request) -> dict[str, object]:
-    manifest = package_manifest(str(request.base_url).rstrip("/"), runner_pool=runner_pool())
-    enabled = os.environ.get("NETCODE_WINDOWS_DOWNLOAD_ENABLED", "").strip().lower() in {"1", "true", "yes", "on"}
-    manifest["available"] = enabled
-    manifest["download_status"] = "available" if enabled else "blocked_unsigned_preview"
-    return manifest
+    base_url = _public_base_url(request)
+    enabled, _artifact_path = _signed_windows_artifact()
+    return {
+        "ok": True,
+        "product": "Rezonance Local Connector",
+        "version": "0.3.3-community-preview",
+        "platform": "windows-x64",
+        "artifact_kind": "compiled_windows_connector",
+        "package_kind": "signed_windows_package",
+        "control_plane_url": base_url,
+        "runner_pool": runner_pool(),
+        "network": "outbound_https_wss_only",
+        "credentials": "local_connector_dpapi_machine_scope",
+        "install_mode": "windows_service_or_system_scheduled_task",
+        "python_required": False,
+        "source_bundle_included": False,
+        "build_scripts_included": False,
+        "sample_workflows_included": False,
+        "unsigned_download_public": False,
+        "production_code_signing_complete": enabled,
+        "available": enabled,
+        "download_status": "available" if enabled else "blocked_pending_signed_package",
+    }
 
 
 @app.get("/api/runner/download/windows")
 def api_windows_runner_download(request: Request) -> Response:
-    enabled = os.environ.get("NETCODE_WINDOWS_DOWNLOAD_ENABLED", "").strip().lower() in {"1", "true", "yes", "on"}
-    if not enabled:
+    enabled, artifact_path = _signed_windows_artifact()
+    if not enabled or artifact_path is None:
         return JSONResponse(
             status_code=401,
             content={
                 "ok": False,
                 "error": "windows_download_not_available",
-                "message": "Windows Local Connector downloads are not public until the signed package is released.",
+                "message": "Windows Local Connector downloads are blocked until a signed package is configured.",
             },
         )
-    package = build_windows_runner_package(str(request.base_url).rstrip("/"), runner_pool=runner_pool())
+    package = artifact_path.read_bytes()
     return Response(
         content=package,
-        media_type="application/zip",
-        headers={"Content-Disposition": 'attachment; filename="rezonance-local-connector-windows-pilot.zip"'},
+        media_type="application/octet-stream",
+        headers={"Content-Disposition": f'attachment; filename="{artifact_path.name}"'},
     )
+
+
+def _public_base_url(request: Request) -> str:
+    forwarded_proto = request.headers.get("x-forwarded-proto")
+    forwarded_host = request.headers.get("x-forwarded-host")
+    proto = (forwarded_proto or request.url.scheme or "https").split(",", 1)[0].strip()
+    host = (forwarded_host or request.headers.get("host") or request.url.netloc).split(",", 1)[0].strip()
+    if proto == "http" and host.endswith(".rezonancenetworks.com"):
+        proto = "https"
+    return f"{proto}://{host}".rstrip("/")
+
+
+def _signed_windows_artifact() -> tuple[bool, Path | None]:
+    enabled = os.environ.get("NETCODE_WINDOWS_DOWNLOAD_ENABLED", "").strip().lower() in {"1", "true", "yes", "on"}
+    artifact = os.environ.get("NETCODE_WINDOWS_SIGNED_ARTIFACT_PATH", "").strip()
+    if not enabled or not artifact:
+        return False, None
+    path = Path(artifact)
+    if not path.is_file():
+        return False, None
+    return True, path
 
 
 def _shell_transcript_path(p, session_id: str) -> Path:
