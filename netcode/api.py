@@ -5181,18 +5181,21 @@ def api_change_from_rca(request: RcaRemediationProposalRequest, http_request: Re
         candidate = None
         if environment_id:
             change_ids = [str(target.get("change_id") or "") for target in target_rows]
-            candidate = create_candidate_for_change_set(
-                NetworkModelRepository(store),
-                store,
-                org_id=principal.org_id,
-                environment_id=environment_id,
-                parent_revision_id=model_revision_id,
-                revision_id=f"rollout-{str(rollout['id']).lower()}",
-                change_ids=change_ids,
-                intent=intent,
-                device_ids=target_ids,
-                created_by=principal.email or principal.user_id or requested_by,
-            )
+            try:
+                candidate = create_candidate_for_change_set(
+                    NetworkModelRepository(store),
+                    store,
+                    org_id=principal.org_id,
+                    environment_id=environment_id,
+                    parent_revision_id=model_revision_id,
+                    revision_id=f"rollout-{str(rollout['id']).lower()}",
+                    change_ids=change_ids,
+                    intent=intent,
+                    device_ids=target_ids,
+                    created_by=principal.email or principal.user_id or requested_by,
+                )
+            except NetworkModelError as exc:
+                raise HTTPException(status_code=409, detail=f"Network Model candidate rejected: {exc}") from exc
             rollout_evidence["network_model"] = {
                 "environment_id": environment_id,
                 "parent_revision_id": model_revision_id,
@@ -5245,17 +5248,20 @@ def api_change_from_rca(request: RcaRemediationProposalRequest, http_request: Re
     )
     candidate = None
     if environment_id and pipeline.status == "pass":
-        candidate = create_candidate_for_change_intent(
-            NetworkModelRepository(store),
-            store,
-            org_id=principal.org_id,
-            environment_id=environment_id,
-            parent_revision_id=model_revision_id,
-            change_id=change.id,
-            intent=intent,
-            device_id=target_ids[0] if target_ids else str(target_device or ""),
-            created_by=principal.email or principal.user_id or requested_by,
-        )
+        try:
+            candidate = create_candidate_for_change_intent(
+                NetworkModelRepository(store),
+                store,
+                org_id=principal.org_id,
+                environment_id=environment_id,
+                parent_revision_id=model_revision_id,
+                change_id=change.id,
+                intent=intent,
+                device_id=target_ids[0] if target_ids else str(target_device or ""),
+                created_by=principal.email or principal.user_id or requested_by,
+            )
+        except NetworkModelError as exc:
+            raise HTTPException(status_code=409, detail=f"Network Model candidate rejected: {exc}") from exc
     evidence = {
         "source": "rez_rca",
         "draft_only": True,

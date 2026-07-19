@@ -129,6 +129,27 @@ def validate_authority_bindings(value: Any, coverage: set[str]) -> dict[str, dic
     return normalized
 
 
+def _validate_unique_site_device_ownership(model: Mapping[str, Any]) -> None:
+    """Require one canonical site owner for every nested device identity."""
+    sites = _dict(model.get("sites"))
+    owners: dict[str, str] = {}
+    for raw_site_id, raw_site in sites.items():
+        site_id = str(raw_site_id or "").strip()
+        site = _dict(raw_site)
+        if not site_id:
+            continue
+        for raw_device_id in _dict(site.get("devices")):
+            device_id = str(raw_device_id or "").strip()
+            if not device_id:
+                continue
+            previous = owners.get(device_id)
+            if previous and previous != site_id:
+                raise NetworkModelError(
+                    f"model device {device_id} is assigned to multiple sites: {previous}, {site_id}"
+                )
+            owners[device_id] = site_id
+
+
 def validate_model_revision(value: Mapping[str, Any]) -> dict[str, Any]:
     """Return a normalized defensive copy of one candidate or approved revision."""
     document = copy.deepcopy(_dict(value))
@@ -167,6 +188,7 @@ def validate_model_revision(value: Mapping[str, Any]) -> dict[str, Any]:
     model = _dict(document.get("model"))
     if not model:
         raise NetworkModelError("model must contain at least one modeled fact")
+    _validate_unique_site_device_ownership(model)
     document["model"] = model
 
     if status in APPROVED_STATUSES:

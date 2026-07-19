@@ -70,6 +70,20 @@ def test_revision_is_immutable_and_persists_materialized_entities(tmp_path: Path
         repository.create_revision(_document(), created_by="another-user")
 
 
+def test_revision_rejects_one_device_assigned_to_multiple_sites(tmp_path: Path):
+    repository = _repository(tmp_path)
+    document = _document()
+    document["model"] = {
+        "sites": {
+            "site-101": {"devices": {"edge-1": {"role": "edge"}}},
+            "site-204": {"devices": {"edge-1": {"role": "edge"}}},
+        }
+    }
+
+    with pytest.raises(ValueError, match="edge-1 is assigned to multiple sites"):
+        repository.create_revision(document, created_by="marcus")
+
+
 def test_revision_cannot_skip_governed_activation_or_reference_unknown_parent(tmp_path: Path):
     repository = _repository(tmp_path)
     active = _document()
