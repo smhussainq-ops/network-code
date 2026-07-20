@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 
+import pytest
 from fastapi.testclient import TestClient
 
 from netcode import api
@@ -336,14 +337,167 @@ def test_forged_rez_organization_header_is_rejected(tmp_path: Path, monkeypatch)
 
 
 def test_trusted_rez_identity_is_the_approval_actor(monkeypatch) -> None:
+    monkeypatch.setenv("NETCODE_AUTH", "1")
     monkeypatch.setenv("NETCODE_ADMIN_TOKEN", "private-rez-service-token")
     principal = api._trusted_rez_service_principal(
         {
             "x-rezonance-org-id": "org-retail-a",
             "x-rezonance-user": "marcus@example.com",
+            "x-rezonance-user-id": "usr_marcus",
             "x-rezonance-role": "operator",
         },
         "Bearer private-rez-service-token",
     )
 
-    assert api._approver_identity(principal, "spoofed-name", "requester@example.com", None) == "marcus@example.com"
+    assert api._approver_identity(principal, "marcus@example.com", "requester@example.com", "usr_requester") == "marcus@example.com"
+
+
+def test_trusted_rez_approval_rejects_spoofed_actor(monkeypatch) -> None:
+    monkeypatch.setenv("NETCODE_AUTH", "1")
+    principal = api.Principal(
+        kind="system",
+        org_id="org-retail-a",
+        role="operator",
+        user_id="usr_marcus",
+        email="marcus@example.com",
+    )
+
+    with pytest.raises(api.HTTPException, match="bound to the authenticated account") as exc_info:
+        api._approver_identity(principal, "spoofed-name", "requester@example.com", "usr_requester")
+
+    assert exc_info.value.status_code == 403
+
+
+def test_trusted_rez_approval_rejects_same_immutable_requester(monkeypatch) -> None:
+    monkeypatch.setenv("NETCODE_AUTH", "1")
+    principal = api.Principal(
+        kind="system",
+        org_id="org-retail-a",
+        role="admin",
+        user_id="usr_marcus",
+        email="marcus@example.com",
+    )
+
+    with pytest.raises(api.HTTPException, match="cannot approve their own change") as exc_info:
+        api._approver_identity(principal, "marcus@example.com", "rez-rca", "usr_marcus")
+
+    assert exc_info.value.status_code == 403
+
+
+def test_approval_requires_stable_authenticated_identity_and_operator_role(monkeypatch) -> None:
+    monkeypatch.setenv("NETCODE_AUTH", "1")
+    missing_identity = api.Principal(
+        kind="system",
+        org_id="org-retail-a",
+        role="admin",
+        email="pilot-admin",
+    )
+    viewer = api.Principal(
+        kind="system",
+        org_id="org-retail-a",
+        role="viewer",
+        user_id="usr_viewer",
+        email="viewer@example.com",
+    )
+
+    with pytest.raises(api.HTTPException) as missing_exc:
+        api._approver_identity(missing_identity, "", "rez-rca", "usr_requester")
+    with pytest.raises(api.HTTPException) as viewer_exc:
+        api._approver_identity(viewer, "viewer@example.com", "rez-rca", "usr_requester")
+
+    assert missing_exc.value.status_code == 401
+    assert viewer_exc.value.status_code == 403
+
+
+def test_trusted_rez_mutation_without_user_id_fails_closed(tmp_path: Path, monkeypatch) -> None:
+    init_workspace(WorkspacePaths(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("NETCODE_AUTH", "1")
+    monkeypatch.setenv("NETCODE_ADMIN_TOKEN", "private-rez-service-token")
+
+    response = TestClient(api.app).post(
+        "/api/git/setup",
+        headers={
+            "Authorization": "Bearer private-rez-service-token",
+            "X-Rezonance-Org-ID": "org-retail-a",
+            "X-Rezonance-User": "marcus@example.com",
+            "X-Rezonance-Role": "operator",
+        },
+        json={},
+    )
+
+    assert response.status_code == 401
+    assert "immutable authenticated user identity" in response.json()["detail"]
+
+
+def test_distinct_authenticated_approver_identity_is_persisted(tmp_path: Path, monkeypatch) -> None:
+    workspace = WorkspacePaths(tmp_path)
+    init_workspace(workspace)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("NETCODE_AUTH", "1")
+    monkeypatch.setenv("NETCODE_ADMIN_TOKEN", "private-rez-service-token")
+    monkeypatch.setattr(api, "approve_change_candidates", lambda *_args, **_kwargs: [])
+    store = PlatformStore(workspace)
+    change = store.create_change(
+        workspace.intents / "examples" / "add_guest_vlan.yaml",
+        "v2-store1",
+        requested_by="rez-rca",
+        org_id="org_default",
+        created_by_user_id="usr_requester",
+    )
+    store.update_change(change.id, "completed", {"status": "pass"}, workflow_state="dry_run_passed")
+    headers = {
+        "Authorization": "Bearer private-rez-service-token",
+        "X-Rezonance-Org-ID": "org_default",
+        "X-Rezonance-User": "pilot-admin",
+        "X-Rezonance-User-ID": "usr_approver",
+        "X-Rezonance-Role": "admin",
+    }
+
+    response = TestClient(api.app).post(
+        f"/api/change/{change.id}/approve",
+        headers=headers,
+        json={"approved_by": "pilot-admin"},
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["approved_by"] == "pilot-admin"
+    assert response.json()["approved_by_user_id"] == "usr_approver"
+    event = next(item for item in store.list_workflow_events(change.id) if item.action == "approve")
+    assert event.evidence["approved_by"] == "pilot-admin"
+    assert event.evidence["approved_by_user_id"] == "usr_approver"
+    assert event.evidence["requested_by"] == "rez-rca"
+    assert event.evidence["requested_by_user_id"] == "usr_requester"
+
+
+def test_approval_cannot_cross_organization_boundary(tmp_path: Path, monkeypatch) -> None:
+    workspace = WorkspacePaths(tmp_path)
+    init_workspace(workspace)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("NETCODE_AUTH", "1")
+    monkeypatch.setenv("NETCODE_ADMIN_TOKEN", "private-rez-service-token")
+    store = PlatformStore(workspace)
+    store.ensure_org("org-a", "A", "a")
+    store.ensure_org("org-b", "B", "b")
+    change = store.create_change(
+        workspace.intents / "examples" / "add_guest_vlan.yaml",
+        "v2-store1",
+        requested_by="rez-rca",
+        org_id="org-a",
+        created_by_user_id="usr_requester",
+    )
+    store.update_change(change.id, "completed", {"status": "pass"}, workflow_state="dry_run_passed")
+
+    response = TestClient(api.app).post(
+        f"/api/change/{change.id}/approve",
+        headers={
+            "Authorization": "Bearer private-rez-service-token",
+            "X-Rezonance-Org-ID": "org-b",
+            "X-Rezonance-User": "other-admin",
+            "X-Rezonance-User-ID": "usr_other_admin",
+            "X-Rezonance-Role": "admin",
+        },
+        json={"approved_by": "other-admin"},
+    )
+
+    assert response.status_code == 404

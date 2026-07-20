@@ -622,7 +622,10 @@ def _trusted_rez_service_principal(headers, authorization: str | None) -> Princi
     if role not in {"viewer", "operator", "admin"}:
         role = "viewer"
     actor = str(headers.get("x-rezonance-user") or "rez-user").strip()[:160] or "rez-user"
-    return Principal(kind="system", org_id=org_id, role=role, email=actor)
+    user_id = str(headers.get("x-rezonance-user-id") or "").strip()[:128]
+    if user_id and not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}", user_id):
+        raise PermissionError("Trusted Rez user identity is invalid.")
+    return Principal(kind="system", org_id=org_id, role=role, user_id=user_id or None, email=actor)
 
 
 def _websocket_principal(ws: WebSocket) -> Principal:
@@ -883,6 +886,11 @@ async def _rbac(request: Request, call_next):
     if auth_enabled() and not bypass:
         if not principal.authenticated:
             return JSONResponse({"detail": "Authentication required."}, status_code=401)
+        if service_scoped and request.method in ("POST", "PUT", "PATCH", "DELETE") and not principal.user_id:
+            return JSONResponse(
+                {"detail": "Trusted Rez write requests require an immutable authenticated user identity."},
+                status_code=401,
+            )
         if using_cookie_auth and request.method in ("POST", "PUT", "PATCH", "DELETE"):
             origin = (request.headers.get("origin") or request.headers.get("referer") or "").strip()
             origin_host = (urlparse(origin).hostname or "").strip().lower()
@@ -4591,17 +4599,28 @@ def api_fleet_rollout_diagnostics_handoff(rollout_id: str, request: Request) -> 
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
-def _approver_identity(principal, fallback_name: str, requester: str, requester_user_id: str | None,
-                       created_by: str | None = None) -> str:
+def _approver_identity(
+    principal: Principal,
+    fallback_name: str,
+    requester: str,
+    requester_user_id: str | None,
+) -> str:
     """Resolve who is approving and enforce requester != approver. With auth on,
     the logged-in principal IS the approver; with auth off, a named approver is
     required (advisory but still recorded and still must differ)."""
-    if principal.kind == "user" or (principal.kind == "system" and principal.email):
+    if auth_enabled():
+        if not principal.authenticated or not principal.user_id:
+            raise HTTPException(status_code=401, detail="Approval requires an authenticated user identity.")
+        if not principal.has_role("operator"):
+            raise HTTPException(status_code=403, detail="Approval requires operator or administrator access.")
         approver = principal.email or principal.user_id or ""
         if principal.user_id and requester_user_id and principal.user_id == requester_user_id:
             raise HTTPException(status_code=403, detail="The requester cannot approve their own change.")
         if approver and approver == requester:
             raise HTTPException(status_code=403, detail="The requester cannot approve their own change.")
+        supplied = (fallback_name or "").strip()
+        if supplied and supplied != approver:
+            raise HTTPException(status_code=403, detail="Approver identity is bound to the authenticated account.")
         return approver
     approver = (fallback_name or "").strip()
     if not approver:
@@ -4627,8 +4646,12 @@ def api_change_approve(change_id: str, request: ApproveRequest, http_request: Re
     if change.workflow_state != "dry_run_passed":
         raise HTTPException(status_code=400,
                             detail=f"Only a dry-run-proven change can be approved (state: {change.workflow_state}).")
-    approver = _approver_identity(principal, request.approved_by, change.requested_by,
-                                  getattr(principal, "user_id", None), change.created_by_user_id)
+    approver = _approver_identity(
+        principal,
+        request.approved_by,
+        change.requested_by,
+        change.created_by_user_id,
+    )
     try:
         model_approvals = approve_change_candidates(
             NetworkModelRepository(store),
@@ -4647,7 +4670,9 @@ def api_change_approve(change_id: str, request: ApproveRequest, http_request: Re
         f"Approved by {approver} (requester: {change.requested_by}).",
         {
             "approved_by": approver,
+            "approved_by_user_id": principal.user_id,
             "requested_by": change.requested_by,
+            "requested_by_user_id": change.created_by_user_id,
             "network_model_revisions": [
                 item["revision"]["revision_id"] for item in model_approvals
             ],
@@ -4655,6 +4680,7 @@ def api_change_approve(change_id: str, request: ApproveRequest, http_request: Re
     )
     return {"ok": True, "change": record_to_dict(store.get_change(change_id)),
             "approved_by": approver,
+            "approved_by_user_id": principal.user_id,
             "network_model": {
                 "approved_revisions": [item["revision"]["revision_id"] for item in model_approvals]
             },
@@ -4827,7 +4853,6 @@ def api_cross_domain_approve_rollback(
         request.approved_by,
         change.requested_by,
         change.created_by_user_id,
-        principal.user_id,
     )
     store.record_workflow_event(
         change.id,
@@ -4835,7 +4860,13 @@ def api_cross_domain_approve_rollback(
         change.workflow_state,
         "approved",
         f"Rollback approved by {approver}.",
-        {"approved_by": approver, "requested_by": change.requested_by, "rollback_only": True},
+        {
+            "approved_by": approver,
+            "approved_by_user_id": principal.user_id,
+            "requested_by": change.requested_by,
+            "requested_by_user_id": change.created_by_user_id,
+            "rollback_only": True,
+        },
     )
     return {
         "ok": True,
@@ -4986,8 +5017,12 @@ def api_cross_domain_verify_start(change_id: str, http_request: Request) -> dict
 def api_fleet_rollout_approve(rollout_id: str, request: ApproveRequest, http_request: Request) -> dict[str, object]:
     principal = _request_principal(http_request)
     rollout = _rollout_or_404(rollout_id, principal.org_id)
-    approver = _approver_identity(principal, request.approved_by, str(rollout.get("requested_by") or ""),
-                                  getattr(principal, "user_id", None), rollout.get("created_by_user_id"))
+    approver = _approver_identity(
+        principal,
+        request.approved_by,
+        str(rollout.get("requested_by") or ""),
+        rollout.get("created_by_user_id"),
+    )
     try:
         store = PlatformStore(paths())
         target_change_ids = {
