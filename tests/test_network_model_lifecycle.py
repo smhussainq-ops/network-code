@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import copy
+from concurrent.futures import ThreadPoolExecutor
+import json
 from pathlib import Path
 import subprocess
+import threading
 
 import pytest
 from fastapi.testclient import TestClient
@@ -52,6 +56,57 @@ def _baseline() -> dict:
             "devices": {"edge-1": {"site": "site-101", "role": "edge"}},
         },
     }
+
+
+def _approved_reviewed_revision(
+    revision_id: str = "reviewed-002",
+    *,
+    source_type: str = "manual_review",
+    org_id: str = "org_default",
+    environment_id: str = "pilot-a",
+) -> dict:
+    revision = copy.deepcopy(_baseline())
+    revision.update(
+        {
+            "org_id": org_id,
+            "environment_id": environment_id,
+            "revision_id": revision_id,
+            "status": "approved",
+            "source": {"type": source_type, "reference": f"approved:{revision_id}"},
+            "approval": {
+                "status": "approved",
+                "approved_by": "design-reviewer",
+                "approved_at": "2026-07-20T03:00:00Z",
+            },
+        }
+    )
+    revision["authority_bindings"] = {
+        domain: {"source": source_type, "mode": "authoritative"}
+        for domain in revision["coverage"]["domains"]
+    }
+    revision["model"]["sites"]["site-101"]["reviewed_marker"] = revision_id
+    return revision
+
+
+def _persist_approved_review(
+    repository: NetworkModelRepository,
+    workspace: WorkspacePaths,
+    *,
+    revision_id: str = "reviewed-002",
+    source_type: str = "manual_review",
+) -> None:
+    repository.create_revision(
+        _approved_reviewed_revision(revision_id=revision_id, source_type=source_type),
+        created_by="usr_admin",
+    )
+    approve_with_git(
+        repository,
+        org_id="org_default",
+        environment_id="pilot-a",
+        revision_id=revision_id,
+        approved_by="usr_admin",
+        git_root=workspace.git_workspace,
+    )
 
 
 def _change(store: PlatformStore, workspace: WorkspacePaths, name: str = "change"):
@@ -471,6 +526,328 @@ def test_rez_bridge_token_can_read_model_but_cannot_approve_it(monkeypatch):
     authorization = "Bearer bridge-secret"
     assert api._is_rez_bridge_request("/api/network-model/active/rez-design", authorization) is True
     assert api._is_rez_bridge_request("/api/network-model/revisions/rev-1/approve", authorization) is False
+
+
+def test_admin_reviewed_intent_update_activates_with_git_audit_and_exact_revision_ids(tmp_path: Path):
+    workspace, store, repository = _setup(tmp_path)
+    repository.create_revision(_baseline(), created_by="marcus")
+    approve_with_git(
+        repository,
+        org_id="org_default",
+        environment_id="pilot-a",
+        revision_id="baseline-001",
+        approved_by="marcus",
+        git_root=workspace.git_workspace,
+    )
+    activate_verified_revision(
+        repository,
+        store,
+        org_id="org_default",
+        environment_id="pilot-a",
+        revision_id="baseline-001",
+        actor="usr_marcus",
+        git_root=workspace.git_workspace,
+        initial_baseline=True,
+    )
+    _persist_approved_review(repository, workspace)
+
+    result = activate_verified_revision(
+        repository,
+        store,
+        org_id="org_default",
+        environment_id="pilot-a",
+        revision_id="reviewed-002",
+        actor="usr_admin",
+        actor_display="admin@example.com",
+        git_root=workspace.git_workspace,
+        reviewed_intent_update=True,
+        expected_current_revision_id="baseline-001",
+    )
+
+    assert result["revision"]["status"] == "active"
+    assert result["verification"]["reviewed_intent_update"] is True
+    assert result["verification"]["verified_by"] == "usr_admin"
+    assert result["verification"]["verified_by_display"] == "admin@example.com"
+    assert result["verification"]["previous_revision_id"] == "baseline-001"
+    assert result["verification"]["activated_revision_id"] == "reviewed-002"
+    assert result["verification"]["approved_source"] == {
+        "type": "manual_review",
+        "reference": "approved:reviewed-002",
+    }
+    assert result["verification"]["approval"]["status"] == "approved"
+    assert result["git"]["commit"]
+    link = next(
+        item
+        for item in repository.list_links("org_default", "pilot-a", "reviewed-002")
+        if item["link_type"] == "git_verification"
+    )
+    assert link["external_id"] == result["git"]["commit"]
+    assert link["metadata"]["previous_revision_id"] == "baseline-001"
+    verification_path = (
+        workspace.git_workspace
+        / "network-model"
+        / "pilot-a"
+        / "revisions"
+        / "reviewed-002"
+        / "verification.json"
+    )
+    assert json.loads(verification_path.read_text())["activated_revision_id"] == "reviewed-002"
+
+
+def test_reviewed_intent_update_rejects_stale_head_and_preserves_active_revision(tmp_path: Path):
+    workspace, store, repository = _setup(tmp_path)
+    repository.create_revision(_baseline(), created_by="marcus")
+    approve_with_git(repository, org_id="org_default", environment_id="pilot-a", revision_id="baseline-001", approved_by="marcus", git_root=workspace.git_workspace)
+    activate_verified_revision(repository, store, org_id="org_default", environment_id="pilot-a", revision_id="baseline-001", actor="usr_marcus", git_root=workspace.git_workspace, initial_baseline=True)
+    _persist_approved_review(repository, workspace)
+
+    with pytest.raises(NetworkModelError, match="changed from stale-001 to baseline-001"):
+        activate_verified_revision(
+            repository,
+            store,
+            org_id="org_default",
+            environment_id="pilot-a",
+            revision_id="reviewed-002",
+            actor="usr_admin",
+            git_root=workspace.git_workspace,
+            reviewed_intent_update=True,
+            expected_current_revision_id="stale-001",
+        )
+
+    assert repository.active_revision("org_default", "pilot-a")["revision_id"] == "baseline-001"
+    assert repository.get_revision("org_default", "pilot-a", "reviewed-002")["status"] == "approved"
+
+
+def test_reviewed_intent_update_rejects_revision_tampered_after_approval(tmp_path: Path):
+    workspace, store, repository = _setup(tmp_path)
+    repository.create_revision(_baseline(), created_by="marcus")
+    approve_with_git(repository, org_id="org_default", environment_id="pilot-a", revision_id="baseline-001", approved_by="marcus", git_root=workspace.git_workspace)
+    activate_verified_revision(repository, store, org_id="org_default", environment_id="pilot-a", revision_id="baseline-001", actor="usr_marcus", git_root=workspace.git_workspace, initial_baseline=True)
+    _persist_approved_review(repository, workspace)
+
+    tampered = repository.get_revision("org_default", "pilot-a", "reviewed-002")["model"]
+    tampered["sites"]["site-101"]["reviewed_marker"] = "tampered-after-approval"
+    with store._connect() as conn:
+        conn.execute(
+            "UPDATE network_model_revisions SET model_json = ? "
+            "WHERE org_id = ? AND environment_id = ? AND revision_id = ?",
+            (json.dumps(tampered, sort_keys=True), "org_default", "pilot-a", "reviewed-002"),
+        )
+
+    with pytest.raises(NetworkModelError, match="content-integrity check"):
+        activate_verified_revision(
+            repository,
+            store,
+            org_id="org_default",
+            environment_id="pilot-a",
+            revision_id="reviewed-002",
+            actor="usr_admin",
+            git_root=workspace.git_workspace,
+            reviewed_intent_update=True,
+            expected_current_revision_id="baseline-001",
+        )
+    assert repository.active_revision("org_default", "pilot-a")["revision_id"] == "baseline-001"
+
+
+def test_atomic_head_compare_and_swap_rejects_a_racing_activation(tmp_path: Path):
+    workspace, _store, repository = _setup(tmp_path)
+    repository.create_revision(_baseline(), created_by="marcus")
+    approve_with_git(repository, org_id="org_default", environment_id="pilot-a", revision_id="baseline-001", approved_by="marcus", git_root=workspace.git_workspace)
+    repository.activate_revision("org_default", "pilot-a", "baseline-001")
+    repository.create_revision(_approved_reviewed_revision(), created_by="usr_admin")
+
+    with pytest.raises(ValueError, match="changed from stale-001 to baseline-001"):
+        repository.activate_revision(
+            "org_default",
+            "pilot-a",
+            "reviewed-002",
+            expected_current_revision_id="stale-001",
+        )
+
+    assert repository.active_revision("org_default", "pilot-a")["revision_id"] == "baseline-001"
+
+    repository.activate_revision(
+        "org_default",
+        "pilot-a",
+        "reviewed-002",
+        expected_current_revision_id="baseline-001",
+    )
+    with pytest.raises(ValueError, match="changed from baseline-001 to reviewed-002"):
+        repository.activate_revision(
+            "org_default",
+            "pilot-a",
+            "reviewed-002",
+            expected_current_revision_id="baseline-001",
+        )
+
+
+def test_atomic_head_compare_and_swap_allows_only_one_concurrent_winner(tmp_path: Path):
+    workspace, _store, repository = _setup(tmp_path)
+    repository.create_revision(_baseline(), created_by="marcus")
+    approve_with_git(repository, org_id="org_default", environment_id="pilot-a", revision_id="baseline-001", approved_by="marcus", git_root=workspace.git_workspace)
+    repository.activate_revision("org_default", "pilot-a", "baseline-001")
+    for revision_id in ("reviewed-a", "reviewed-b"):
+        repository.create_revision(
+            _approved_reviewed_revision(revision_id=revision_id),
+            created_by="usr_admin",
+        )
+
+    ready = threading.Barrier(2)
+
+    def activate(revision_id: str):
+        ready.wait(timeout=5)
+        return repository.activate_revision(
+            "org_default",
+            "pilot-a",
+            revision_id,
+            expected_current_revision_id="baseline-001",
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [executor.submit(activate, revision_id) for revision_id in ("reviewed-a", "reviewed-b")]
+        outcomes: list[object] = []
+        for future in futures:
+            try:
+                outcomes.append(future.result(timeout=10))
+            except Exception as exc:  # The losing compare-and-swap must fail closed.
+                outcomes.append(exc)
+
+    winners = [item for item in outcomes if isinstance(item, dict)]
+    losers = [item for item in outcomes if isinstance(item, ValueError)]
+    assert len(winners) == 1
+    assert len(losers) == 1
+    assert "changed from baseline-001" in str(losers[0])
+    assert repository.active_revision("org_default", "pilot-a")["revision_id"] in {
+        "reviewed-a",
+        "reviewed-b",
+    }
+
+
+def test_netcode_change_revision_cannot_bypass_verified_change_evidence(tmp_path: Path):
+    workspace, store, repository = _setup(tmp_path)
+    repository.create_revision(_baseline(), created_by="marcus")
+    approve_with_git(repository, org_id="org_default", environment_id="pilot-a", revision_id="baseline-001", approved_by="marcus", git_root=workspace.git_workspace)
+    activate_verified_revision(repository, store, org_id="org_default", environment_id="pilot-a", revision_id="baseline-001", actor="usr_marcus", git_root=workspace.git_workspace, initial_baseline=True)
+    _persist_approved_review(repository, workspace, source_type="netcode_change")
+
+    with pytest.raises(NetworkModelError, match="approved Git or manual-review source"):
+        activate_verified_revision(
+            repository,
+            store,
+            org_id="org_default",
+            environment_id="pilot-a",
+            revision_id="reviewed-002",
+            actor="usr_admin",
+            git_root=workspace.git_workspace,
+            reviewed_intent_update=True,
+            expected_current_revision_id="baseline-001",
+        )
+
+
+def test_device_observation_cannot_be_imported_as_approved_intent(tmp_path: Path):
+    _workspace, _store, repository = _setup(tmp_path)
+    with pytest.raises(NetworkModelError, match="observation-only source 'device' authoritative"):
+        repository.create_revision(
+            _approved_reviewed_revision(source_type="device"),
+            created_by="usr_admin",
+        )
+
+
+def test_reviewed_intent_update_rejects_unapproved_and_cross_tenant_revisions(tmp_path: Path):
+    workspace, store, repository = _setup(tmp_path)
+    repository.create_revision(_baseline(), created_by="marcus")
+    approve_with_git(repository, org_id="org_default", environment_id="pilot-a", revision_id="baseline-001", approved_by="marcus", git_root=workspace.git_workspace)
+    activate_verified_revision(repository, store, org_id="org_default", environment_id="pilot-a", revision_id="baseline-001", actor="usr_marcus", git_root=workspace.git_workspace, initial_baseline=True)
+    proposed = _baseline()
+    proposed["revision_id"] = "proposed-002"
+    repository.create_revision(proposed, created_by="usr_admin")
+
+    with pytest.raises(NetworkModelError, match="only an approved revision"):
+        activate_verified_revision(
+            repository,
+            store,
+            org_id="org_default",
+            environment_id="pilot-a",
+            revision_id="proposed-002",
+            actor="usr_admin",
+            git_root=workspace.git_workspace,
+            reviewed_intent_update=True,
+            expected_current_revision_id="baseline-001",
+        )
+    with pytest.raises(KeyError, match="Unknown network model revision"):
+        activate_verified_revision(
+            repository,
+            store,
+            org_id="org_other",
+            environment_id="pilot-a",
+            revision_id="proposed-002",
+            actor="usr_admin",
+            git_root=workspace.git_workspace,
+            reviewed_intent_update=True,
+            expected_current_revision_id="baseline-001",
+        )
+
+
+def test_reviewed_activation_api_binds_actor_to_authenticated_admin_identity(tmp_path: Path, monkeypatch):
+    init_workspace(WorkspacePaths(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    captured: dict[str, object] = {}
+    principal = api.Principal(
+        kind="user",
+        org_id="org_default",
+        role="admin",
+        user_id="usr_admin",
+        email="admin@example.com",
+    )
+    monkeypatch.setattr(api, "_request_principal", lambda _request: principal)
+
+    def activate(*_args, **kwargs):
+        captured.update(kwargs)
+        return {"revision": {"revision_id": "reviewed-002", "status": "active"}}
+
+    monkeypatch.setattr(api, "activate_verified_revision", activate)
+    response = TestClient(api.app).post(
+        "/api/network-model/revisions/reviewed-002/activate",
+        json={
+            "environment_id": "pilot-a",
+            "reviewed_intent_update": True,
+            "expected_current_revision_id": "baseline-001",
+            "reviewed_by": "spoofed-client-actor",
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    assert captured["actor"] == "usr_admin"
+    assert captured["actor_display"] == "admin@example.com"
+    assert captured["org_id"] == "org_default"
+    assert captured["expected_current_revision_id"] == "baseline-001"
+
+
+@pytest.mark.parametrize(
+    ("principal", "status"),
+    [
+        (api.Principal(kind="user", org_id="org_default", role="operator", user_id="usr_operator"), 403),
+        (api.Principal(kind="system", org_id="org_default", role="admin"), 401),
+    ],
+)
+def test_reviewed_activation_api_rejects_non_admin_or_unstable_identity(
+    principal: api.Principal,
+    status: int,
+    tmp_path: Path,
+    monkeypatch,
+):
+    init_workspace(WorkspacePaths(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(api, "_request_principal", lambda _request: principal)
+    response = TestClient(api.app).post(
+        "/api/network-model/revisions/reviewed-002/activate",
+        json={
+            "environment_id": "pilot-a",
+            "reviewed_intent_update": True,
+            "expected_current_revision_id": "baseline-001",
+        },
+    )
+    assert response.status_code == status
 
 
 def test_change_history_is_an_isolated_repo_even_inside_parent_worktree(tmp_path: Path):

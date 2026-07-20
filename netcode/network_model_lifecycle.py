@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import hmac
 import re
 from typing import Any, Mapping, Sequence
 
@@ -11,6 +12,7 @@ from netcode.network_model import (
     NETWORK_MODEL_SCHEMA,
     NetworkModelError,
     prepare_reviewed_approval,
+    revision_content_sha256,
     utc_now,
 )
 from netcode.network_model_store import NetworkModelRepository
@@ -552,11 +554,20 @@ def approve_with_git(
     revision_id: str,
     approved_by: str,
     git_root,
+    preserve_existing_approval: bool = True,
 ) -> dict[str, Any]:
     current = repository.get_revision(org_id, environment_id, revision_id)
     existing_approval = _dict(current.get("approval"))
-    approval_time = str(existing_approval.get("approved_at") or utc_now())
-    approval_actor = str(existing_approval.get("approved_by") or approved_by)
+    approval_time = (
+        str(existing_approval.get("approved_at") or utc_now())
+        if preserve_existing_approval
+        else utc_now()
+    )
+    approval_actor = (
+        str(existing_approval.get("approved_by") or approved_by)
+        if preserve_existing_approval
+        else str(approved_by)
+    )
     preview = prepare_reviewed_approval(
         current,
         approved_by=approval_actor,
@@ -633,11 +644,41 @@ def activate_verified_revision(
     actor: str,
     git_root,
     initial_baseline: bool = False,
+    reviewed_intent_update: bool = False,
+    expected_current_revision_id: str = "",
+    actor_display: str = "",
 ) -> dict[str, Any]:
     revision = repository.get_revision(org_id, environment_id, revision_id)
     if revision["status"] != "approved":
         raise NetworkModelError("only an approved revision can become active")
+    approval = _dict(revision.get("approval"))
+    approved_digest = str(approval.get("content_sha256") or "").strip().lower()
+    actual_digest = revision_content_sha256(revision)
+    if reviewed_intent_update and (
+        not re.fullmatch(r"[a-f0-9]{64}", approved_digest)
+        or not hmac.compare_digest(approved_digest, actual_digest)
+    ):
+        raise NetworkModelError("approved Network Model revision failed its content-integrity check")
     current = repository.active_revision(org_id, environment_id)
+    reviewed_source = str(_dict(revision.get("source")).get("type") or "").strip().lower()
+    reviewed_update_allowed = bool(
+        reviewed_intent_update
+        and current is not None
+        and reviewed_source in {"git", "manual_review"}
+        and expected_current_revision_id
+        and str(current.get("revision_id") or "") == expected_current_revision_id
+    )
+    if reviewed_intent_update and not reviewed_update_allowed:
+        if current is None:
+            raise NetworkModelError("reviewed intent update requires an active Network Model")
+        if reviewed_source not in {"git", "manual_review"}:
+            raise NetworkModelError("reviewed intent update requires an approved Git or manual-review source")
+        if not expected_current_revision_id:
+            raise NetworkModelError("reviewed intent update requires the expected current revision ID")
+        raise NetworkModelError(
+            f"Network Model revision changed from {expected_current_revision_id} "
+            f"to {current.get('revision_id') or 'none'}"
+        )
     evidence = _linked_change_evidence(
         repository,
         platform_store,
@@ -646,20 +687,31 @@ def activate_verified_revision(
         revision_id=revision_id,
         accepted_states=VERIFIED_CHANGE_STATES,
     )
-    if not evidence and not (initial_baseline and current is None):
+    if not evidence and not (initial_baseline and current is None) and not reviewed_update_allowed:
         raise NetworkModelError("activation requires verified linked changes or an explicit first baseline review")
     verification = {
         "schema": "rezonance.network-model-verification.v1",
         "verified_by": actor,
+        "verified_by_display": str(actor_display or actor),
         "verified_at": utc_now(),
         "initial_baseline": bool(initial_baseline and current is None),
+        "reviewed_intent_update": reviewed_update_allowed,
+        "previous_revision_id": (
+            str(current.get("revision_id") or "") if reviewed_update_allowed and current else ""
+        ),
+        "activated_revision_id": str(revision.get("revision_id") or ""),
+        "approved_source": _dict(revision.get("source")),
+        "approval": _dict(revision.get("approval")),
         "changes": evidence,
     }
-    parent_model = (
-        repository.get_revision(org_id, environment_id, str(revision.get("parent_revision_id")))["model"]
-        if revision.get("parent_revision_id")
-        else {}
-    )
+    if reviewed_update_allowed and current is not None:
+        parent_model = current["model"]
+    else:
+        parent_model = (
+            repository.get_revision(org_id, environment_id, str(revision.get("parent_revision_id")))["model"]
+            if revision.get("parent_revision_id")
+            else {}
+        )
     artifact = materialize_model_revision(
         git_root,
         revision=revision,
@@ -673,7 +725,12 @@ def activate_verified_revision(
     )
     if not checkpoint.get("ok") or not checkpoint.get("commit"):
         raise NetworkModelError(str(checkpoint.get("message") or "Git verification checkpoint failed"))
-    active = repository.activate_revision(org_id, environment_id, revision_id)
+    active = repository.activate_revision(
+        org_id,
+        environment_id,
+        revision_id,
+        expected_current_revision_id=(expected_current_revision_id if reviewed_update_allowed else None),
+    )
     repository.link_revision(
         org_id,
         environment_id,

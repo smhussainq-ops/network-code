@@ -137,6 +137,53 @@ def test_approved_rez_design_import_preserves_coverage_and_approval(tmp_path: Pa
     assert revision["model"]["sites"]["site-101"]["archetype"] == "dual-edge-branch"
 
 
+def test_approved_design_api_ignores_client_actor_and_uses_stable_principal(
+    tmp_path: Path,
+    monkeypatch,
+):
+    init_workspace(WorkspacePaths(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    captured: dict[str, object] = {}
+    principal = api.Principal(
+        kind="user",
+        org_id="org_default",
+        role="admin",
+        user_id="usr_admin",
+        email="admin@example.com",
+    )
+    monkeypatch.setattr(api, "_request_principal", lambda _request: principal)
+
+    def imported(_repository, _design, **kwargs):
+        captured["created_by"] = kwargs["created_by"]
+        return {"created": True, "revision": {"revision_id": "design-002"}}
+
+    def approved(_repository, **kwargs):
+        captured["approved_by"] = kwargs["approved_by"]
+        captured["preserve_existing_approval"] = kwargs["preserve_existing_approval"]
+        return {
+            "revision": {"revision_id": "design-002", "status": "approved"},
+            "git": {"ok": True, "commit": "checkpoint"},
+        }
+
+    monkeypatch.setattr(api, "import_approved_network_design", imported)
+    monkeypatch.setattr(api, "approve_with_git", approved)
+    response = TestClient(api.app).post(
+        "/api/network-model/import/approved-design",
+        json={
+            "environment_id": "pilot-a",
+            "reviewed_by": "spoofed-client-actor",
+            "design": {"namespace": "pilot-a"},
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    assert captured == {
+        "created_by": "usr_admin",
+        "approved_by": "usr_admin",
+        "preserve_existing_approval": False,
+    }
+
+
 def test_same_revision_id_with_different_import_content_fails(tmp_path: Path):
     store = _store(tmp_path)
     runner = _runner(store)

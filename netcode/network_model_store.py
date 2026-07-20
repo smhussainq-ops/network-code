@@ -408,9 +408,9 @@ class NetworkModelRepository:
         approved_at: str,
     ) -> dict[str, Any]:
         revision = self.get_revision(org_id, environment_id, revision_id)
-        if revision["status"] in {"approved", "active", "superseded"}:
+        if revision["status"] in {"active", "superseded"}:
             return revision
-        if revision["status"] not in {"proposed", "in_review"}:
+        if revision["status"] not in {"proposed", "in_review", "approved"}:
             raise ValueError(f"revision {revision_id} cannot be approved from {revision['status']}")
         validated = prepare_reviewed_approval(
             revision,
@@ -424,7 +424,7 @@ class NetworkModelRepository:
                 SET status = 'approved', source_type = ?, source_reference = ?,
                     approval_json = ?, authority_json = ?, updated_at = ?
                 WHERE org_id = ? AND environment_id = ? AND revision_id = ?
-                  AND status IN ('proposed', 'in_review')
+                  AND status IN ('proposed', 'in_review', 'approved')
                 """,
                 (
                     validated["source"]["type"], validated["source"]["reference"],
@@ -654,20 +654,48 @@ class NetworkModelRepository:
         revision_id: str,
         *,
         allow_superseded: bool = False,
+        expected_current_revision_id: str | None = None,
     ) -> dict[str, Any]:
         revision = self.get_revision(org_id, environment_id, revision_id)
         allowed = {"approved", "superseded"} if allow_superseded else {"approved"}
-        if revision["status"] == "active":
-            return revision
-        if revision["status"] not in allowed:
+        if revision["status"] != "active" and revision["status"] not in allowed:
             raise ValueError(f"revision {revision_id} cannot become active from {revision['status']}")
         now = utc_now()
         with self.store._connect() as conn:
-            head = conn.execute(
-                "SELECT active_revision_id FROM network_model_heads WHERE org_id = ? AND environment_id = ?",
-                (org_id, environment_id),
-            ).fetchone()
-            prior = str(head["active_revision_id"]) if head else ""
+            head_advanced = False
+            if expected_current_revision_id is not None:
+                moved = conn.execute(
+                    "UPDATE network_model_heads SET active_revision_id = ?, updated_at = ? "
+                    "WHERE org_id = ? AND environment_id = ? AND active_revision_id = ?",
+                    (
+                        revision_id,
+                        now,
+                        org_id,
+                        environment_id,
+                        expected_current_revision_id,
+                    ),
+                )
+                if moved.rowcount != 1:
+                    head = conn.execute(
+                        "SELECT active_revision_id FROM network_model_heads "
+                        "WHERE org_id = ? AND environment_id = ?",
+                        (org_id, environment_id),
+                    ).fetchone()
+                    actual = str(head["active_revision_id"]) if head else ""
+                    raise ValueError(
+                        f"Network Model revision changed from {expected_current_revision_id or 'none'} "
+                        f"to {actual or 'none'}"
+                    )
+                prior = expected_current_revision_id
+                head_advanced = True
+            else:
+                head = conn.execute(
+                    "SELECT active_revision_id FROM network_model_heads WHERE org_id = ? AND environment_id = ?",
+                    (org_id, environment_id),
+                ).fetchone()
+                prior = str(head["active_revision_id"]) if head else ""
+            if revision["status"] == "active":
+                return revision
             if prior and prior != revision_id:
                 conn.execute(
                     "UPDATE network_model_revisions SET status = 'superseded', updated_at = ? "
@@ -679,15 +707,16 @@ class NetworkModelRepository:
                 "WHERE org_id = ? AND environment_id = ? AND revision_id = ?",
                 (now, org_id, environment_id, revision_id),
             )
-            conn.execute(
-                """
-                INSERT INTO network_model_heads (org_id, environment_id, active_revision_id, updated_at)
-                VALUES (?, ?, ?, ?)
-                ON CONFLICT (org_id, environment_id)
-                DO UPDATE SET active_revision_id = ?, updated_at = ?
-                """,
-                (org_id, environment_id, revision_id, now, revision_id, now),
-            )
+            if not head_advanced:
+                conn.execute(
+                    """
+                    INSERT INTO network_model_heads (org_id, environment_id, active_revision_id, updated_at)
+                    VALUES (?, ?, ?, ?)
+                    ON CONFLICT (org_id, environment_id)
+                    DO UPDATE SET active_revision_id = ?, updated_at = ?
+                    """,
+                    (org_id, environment_id, revision_id, now, revision_id, now),
+                )
         return self.get_revision(org_id, environment_id, revision_id)
 
     def list_entities(

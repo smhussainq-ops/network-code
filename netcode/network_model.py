@@ -8,6 +8,8 @@ path can share the same fail-closed validation boundary.
 from __future__ import annotations
 
 import copy
+import hashlib
+import json
 import re
 from datetime import datetime, timezone
 from typing import Any, Mapping
@@ -47,6 +49,34 @@ _SENSITIVE_PARTS = {
     "community_string",
     "api_key",
 }
+
+
+def revision_content_sha256(value: Mapping[str, Any]) -> str:
+    """Fingerprint the immutable intent and provenance covered by one approval."""
+    revision = _dict(value)
+    approval = _dict(revision.get("approval"))
+    protected = {
+        key: revision.get(key)
+        for key in (
+            "schema",
+            "org_id",
+            "environment_id",
+            "revision_id",
+            "parent_revision_id",
+            "source",
+            "coverage",
+            "authority_bindings",
+            "model",
+            "created_by",
+            "created_at",
+        )
+    }
+    protected["approval"] = {
+        key: approval.get(key)
+        for key in ("status", "approved_by", "approved_at")
+    }
+    canonical = json.dumps(protected, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 class NetworkModelError(ValueError):
@@ -259,7 +289,9 @@ def prepare_reviewed_approval(
         }
         for domain, binding in _dict(revision.get("authority_bindings")).items()
     }
-    return validate_model_revision(revision)
+    validated = validate_model_revision(revision)
+    validated["approval"]["content_sha256"] = revision_content_sha256(validated)
+    return validate_model_revision(validated)
 
 
 def validate_observation(value: Mapping[str, Any]) -> dict[str, Any]:

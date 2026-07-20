@@ -1722,7 +1722,7 @@ def api_network_model_import_local_yaml(request: Request, payload: dict[str, obj
 @app.post("/api/network-model/import/approved-design")
 def api_network_model_import_approved_design(request: Request, payload: dict[str, object]) -> dict[str, object]:
     principal = _request_principal(request)
-    delegated_actor = str(payload.get("reviewed_by") or "").strip() if principal.has_role("admin") else ""
+    actor = principal.user_id or principal.email or "system"
     design = payload.get("design")
     if not isinstance(design, dict):
         raise HTTPException(status_code=400, detail="design must be an approved network-design document")
@@ -1733,15 +1733,16 @@ def api_network_model_import_approved_design(request: Request, payload: dict[str
             design,
             org_id=principal.org_id,
             environment_id=str(payload.get("environment_id") or design.get("namespace") or "default"),
-            created_by=delegated_actor or principal.email or principal.user_id or "system",
+            created_by=actor,
         )
         checkpoint = approve_with_git(
             repository,
             org_id=principal.org_id,
             environment_id=str(payload.get("environment_id") or design.get("namespace") or "default"),
             revision_id=result["revision"]["revision_id"],
-            approved_by=delegated_actor or principal.email or principal.user_id or "system",
+            approved_by=actor,
             git_root=paths().git_workspace,
+            preserve_existing_approval=False,
         )
     except (NetworkModelError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -1937,7 +1938,21 @@ def api_network_model_approve(request: Request, revision_id: str, payload: dict[
 @app.post("/api/network-model/revisions/{revision_id}/activate")
 def api_network_model_activate(request: Request, revision_id: str, payload: dict[str, object]) -> dict[str, object]:
     principal = _request_principal(request)
-    delegated_actor = str(payload.get("reviewed_by") or "").strip() if principal.has_role("admin") else ""
+    initial_baseline = payload.get("initial_baseline", False)
+    if not isinstance(initial_baseline, bool):
+        raise HTTPException(status_code=400, detail="initial_baseline must be a boolean")
+    reviewed_intent_update = payload.get("reviewed_intent_update", False)
+    if not isinstance(reviewed_intent_update, bool):
+        raise HTTPException(status_code=400, detail="reviewed_intent_update must be a boolean")
+    if initial_baseline and reviewed_intent_update:
+        raise HTTPException(status_code=400, detail="Choose one network-model activation mode")
+    if reviewed_intent_update and not principal.has_role("admin"):
+        raise HTTPException(status_code=403, detail="Administrator access required for reviewed intent activation")
+    if reviewed_intent_update and (not principal.authenticated or not principal.user_id):
+        raise HTTPException(
+            status_code=401,
+            detail="Reviewed intent activation requires an immutable authenticated user identity",
+        )
     store = PlatformStore(paths())
     try:
         result = activate_verified_revision(
@@ -1946,9 +1961,12 @@ def api_network_model_activate(request: Request, revision_id: str, payload: dict
             org_id=principal.org_id,
             environment_id=str(payload.get("environment_id") or ""),
             revision_id=revision_id,
-            actor=delegated_actor or principal.email or principal.user_id or "system",
+            actor=(principal.user_id if reviewed_intent_update else principal.email or principal.user_id or "system"),
+            actor_display=principal.email or principal.user_id or "system",
             git_root=paths().git_workspace,
-            initial_baseline=bool(payload.get("initial_baseline")),
+            initial_baseline=initial_baseline,
+            reviewed_intent_update=reviewed_intent_update,
+            expected_current_revision_id=str(payload.get("expected_current_revision_id") or "").strip(),
         )
     except (KeyError, NetworkModelError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
