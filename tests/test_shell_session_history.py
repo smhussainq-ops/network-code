@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import json
+import time
 from pathlib import Path
 
 from fastapi.testclient import TestClient
@@ -91,6 +92,152 @@ def test_shell_transcript_survives_process_memory_loss(tmp_path: Path, monkeypat
     assert any("uptime is 1 day" in entry.get("output", "") for entry in body["entries"])
     assert history.status_code == 200
     assert history.json()["sessions"][0]["id"] == session_id
+
+
+def test_service_authenticated_browser_shell_stays_live_and_persists_read_output(
+    tmp_path: Path,
+    monkeypatch,
+):
+    """Exercise the complete browser -> broker -> connector Shell transport."""
+    workspace = WorkspacePaths(tmp_path)
+    init_workspace(workspace)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(api, "get_entitlements", lambda **_kwargs: object())
+    api._SHELL_SESSIONS.clear()
+    api._RUNNER_CHANNELS.clear()
+    api._RUNNER_CHANNEL_POOLS.clear()
+    api._BROWSER_SOCKETS.clear()
+    client = TestClient(api.app)
+    runner_id = "connector-shell-e2e"
+    session_id = "shell-transport-e2e"
+    api._SHELL_SESSIONS[session_id] = {
+        "org_id": DEFAULT_ORG_ID,
+        "device_id": "v2-hq-core",
+        "display_id": "v2-hq-core",
+        "platform": "arista_eos",
+        "runner_id": runner_id,
+        "runner_pool": "pilot",
+        "state": {"mode": "direct", "device_touched": False},
+    }
+    PlatformStore(workspace).create_shell_session(
+        session_id=session_id,
+        org_id=DEFAULT_ORG_ID,
+        device_id="v2-hq-core",
+        display_id="v2-hq-core",
+        platform="arista_eos",
+        runner_id=runner_id,
+        runner_pool="pilot",
+        transcript_path=str(workspace.reports / f"shell-{session_id}.jsonl"),
+    )
+    api._shell_append(
+        workspace,
+        session_id,
+        {
+            "event": "session_opened",
+            "device_id": "v2-hq-core",
+            "org_id": DEFAULT_ORG_ID,
+            "runner_id": runner_id,
+        },
+    )
+    monkeypatch.setenv("NETCODE_AUTH", "1")
+    monkeypatch.setenv("NETCODE_ADMIN_TOKEN", "private-service-token")
+    service_headers = {
+        "Authorization": "Bearer private-service-token",
+        "X-Rezonance-Org-ID": DEFAULT_ORG_ID,
+        "X-Rezonance-User": "community-operator",
+        "X-Rezonance-User-ID": "usr_community_operator",
+        "X-Rezonance-Role": "operator",
+    }
+    encoded_output = base64.b64encode(b"Hostname: v2-hq-core\r\n").decode("ascii")
+
+    class FakeRunnerChannel:
+        def __init__(self):
+            self.frames = []
+
+        async def send_json(self, frame):
+            self.frames.append(frame)
+            sid = str(frame.get("sid") or "")
+            browser = api._BROWSER_SOCKETS.get(sid)
+            if browser is None:
+                return
+            if frame.get("t") == "open":
+                await browser.send_json(
+                    {"t": "status", "sid": sid, "s": "connected"}
+                )
+            elif frame.get("t") == "in":
+                event = {
+                    "t": "event",
+                    "sid": sid,
+                    "e": {
+                        "type": "command",
+                        "line": "show hostname",
+                        "kind": "operational",
+                    },
+                }
+                api._record_shell_command(sid, event["e"])
+                await browser.send_json(event)
+                api._record_shell_output(sid, encoded_output)
+                await browser.send_json(
+                    {"t": "out", "sid": sid, "d": encoded_output}
+                )
+
+    runner_channel = FakeRunnerChannel()
+    api._RUNNER_CHANNELS[runner_id] = runner_channel
+    api._RUNNER_CHANNEL_POOLS[runner_id] = "pilot"
+
+    try:
+        with client.websocket_connect(
+            f"/api/shell/session/{session_id}", headers=service_headers
+        ) as browser_socket:
+            assert browser_socket.receive_json() == {
+                "t": "status",
+                "sid": session_id,
+                "s": "connected",
+            }
+            browser_socket.send_json({"t": "in", "d": "show hostname\r"})
+            assert browser_socket.receive_json()["t"] == "event"
+            assert browser_socket.receive_json() == {
+                "t": "out",
+                "sid": session_id,
+                "d": encoded_output,
+            }
+            browser_socket.close(code=1000)
+
+        assert runner_channel.frames[0] == {
+            "t": "open",
+            "sid": session_id,
+            "device_id": "v2-hq-core",
+            "state": {"mode": "direct", "device_touched": False},
+        }
+        assert runner_channel.frames[1] == {
+            "t": "in",
+            "sid": session_id,
+            "d": "show hostname\r",
+        }
+        for _ in range(50):
+            if runner_channel.frames[-1] == {"t": "close", "sid": session_id}:
+                break
+            time.sleep(0.01)
+        assert runner_channel.frames[-1] == {"t": "close", "sid": session_id}
+
+        transcript = client.get(
+            f"/api/shell/{session_id}/transcript", headers=service_headers
+        )
+        history = client.get("/api/shell/sessions", headers=service_headers)
+        assert transcript.status_code == 200
+        body = transcript.json()
+        assert body["session"]["status"] == "closed"
+        assert body["session"]["command_count"] == 1
+        assert body["session"]["output_bytes"] == len(b"Hostname: v2-hq-core\r\n")
+        assert any(entry.get("command") == "show hostname" for entry in body["entries"])
+        assert any("Hostname: v2-hq-core" in entry.get("output", "") for entry in body["entries"])
+        assert history.status_code == 200
+        assert history.json()["sessions"][0]["id"] == session_id
+    finally:
+        api._SHELL_SESSIONS.clear()
+        api._RUNNER_CHANNELS.clear()
+        api._RUNNER_CHANNEL_POOLS.clear()
+        api._BROWSER_SOCKETS.clear()
 
 
 def test_shell_history_backfills_legacy_transcripts(tmp_path: Path, monkeypatch):
