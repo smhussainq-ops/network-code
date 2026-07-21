@@ -131,10 +131,21 @@ def get_entitlements(*, org_id: str = _DEFAULT_ORG_ID, force: bool = False) -> P
             _CACHE[org] = (now, result)
         return result
     except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, OSError, ValueError, json.JSONDecodeError) as exc:
-        if cached and now - cached[0] <= stale_grace:
+        if not force and cached and now - cached[0] <= stale_grace:
             value = cached[1]
             return PlatformEntitlements(**{**value.__dict__, "stale": True})
         raise EntitlementError("The entitlement authority is unavailable; protected operations fail closed.") from exc
+
+
+def invalidate_cache(*, org_id: str = _DEFAULT_ORG_ID) -> None:
+    """Drop one organization's cached authority response.
+
+    Founder lifecycle transitions use this before suspension/reactivation so a
+    previously active plan cannot remain usable for the normal cache window.
+    """
+    org = canonical_org_id(org_id)
+    with _LOCK:
+        _CACHE.pop(org, None)
 
 
 def require_production_writes(*, org_id: str = _DEFAULT_ORG_ID) -> PlatformEntitlements:

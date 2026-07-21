@@ -89,6 +89,18 @@ def test_authority_outage_fails_closed_without_cache(monkeypatch: pytest.MonkeyP
         entitlements.get_entitlements()
 
 
+def test_forced_authority_check_never_reuses_a_stale_active_cache(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(entitlements.urllib.request, "urlopen", lambda request, timeout: _Response(_payload()))
+    assert entitlements.get_entitlements(org_id="org-retail").platform_available is True
+
+    def offline(*_args, **_kwargs):
+        raise OSError("offline")
+
+    monkeypatch.setattr(entitlements.urllib.request, "urlopen", offline)
+    with pytest.raises(entitlements.EntitlementError, match="fail closed"):
+        entitlements.get_entitlements(org_id="org-retail", force=True)
+
+
 def test_explicit_development_mode_is_unmetered(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("NETCODE_LICENSE_ENFORCEMENT", "0")
     assert entitlements.get_entitlements().source == "development_bypass"

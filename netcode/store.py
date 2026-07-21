@@ -1273,6 +1273,15 @@ class PlatformStore:
                 (token_hash, pool, utc_now(), org_id),
             )
 
+    def invalidate_unused_join_tokens(self, org_id: str) -> int:
+        """Atomically invalidate every unclaimed pairing code for one organization."""
+        with self._connect() as conn:
+            cursor = conn.execute(
+                "UPDATE join_tokens SET used_at = ? WHERE org_id = ? AND used_at IS NULL",
+                (utc_now(), org_id),
+            )
+            return int(cursor.rowcount)
+
     def consume_join_token(self, token_hash: str) -> dict[str, str] | None:
         """Atomically mark a join token used; returns {pool, org_id} or None if invalid/replayed."""
         with self._connect() as conn:
@@ -2369,6 +2378,17 @@ class PlatformStore:
                 (f"Cancelled: {reason}", now, job_id),
             )
             return bool(cursor.rowcount)
+
+    def cancel_queued_jobs_for_org(self, org_id: str, reason: str) -> int:
+        """Fail-close all work that has not crossed the connector claim boundary."""
+        now = utc_now()
+        with self._connect() as conn:
+            cursor = conn.execute(
+                "UPDATE jobs SET status = 'cancelled', message = ?, updated_at = ? "
+                "WHERE org_id = ? AND status = 'queued'",
+                (f"Cancelled: {str(reason or 'organization suspended')[:300]}", now, org_id),
+            )
+        return int(cursor.rowcount or 0)
 
     def cancel_job_for_org(self, job_id: str, org_id: str, *, actor: str, reason: str) -> JobRecord:
         """Cancel only work that has not crossed the connector claim boundary."""

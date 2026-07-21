@@ -38,6 +38,7 @@ from netcode.entitlements import (
     enforce_capacity,
     enforcement_enabled,
     get_entitlements,
+    invalidate_cache as invalidate_entitlement_cache,
     job_requires_production_writes,
     require_production_writes,
 )
@@ -396,6 +397,7 @@ class GitPushRequest(BaseModel):
 
 class JoinTokenRequest(BaseModel):
     pool: str = "store-lab"
+    replace_unused: bool = False
 
 
 class RunnerEnrollRequest(BaseModel):
@@ -2296,6 +2298,8 @@ def api_mint_join_token(request: JoinTokenRequest, http_request: Request, author
         _admin_guard(authorization)
     principal = _request_principal(http_request)
     store = PlatformStore(paths())
+    if request.replace_unused:
+        store.invalidate_unused_join_tokens(principal.org_id)
     enforce_capacity(
         "connectors",
         current=store.active_runner_count(principal.org_id),
@@ -2371,6 +2375,154 @@ async def api_runner_revoke(runner_id: str, request: Request) -> dict[str, objec
         "runner": record_to_dict(runner),
         "message": "Connector credential revoked; re-enrollment is required.",
     }
+
+
+def _require_founder_lifecycle_principal(request: Request, org_id: str) -> Principal:
+    """Allow organization lifecycle changes only through the trusted Rez envelope."""
+    principal = _request_principal(request)
+    canonical = canonical_org_id(org_id)
+    if principal.kind != "system" or not principal.has_role("admin"):
+        raise HTTPException(status_code=403, detail="Trusted platform-owner service access is required.")
+    if principal.org_id != canonical:
+        raise HTTPException(status_code=404, detail="Organization not found.")
+    return principal
+
+
+@app.post("/api/internal/orgs/{org_id}/suspend")
+async def api_internal_suspend_org(org_id: str, request: Request) -> dict[str, object]:
+    """Stop new work and active Shell sessions without revoking connector identity."""
+    principal = _require_founder_lifecycle_principal(request, org_id)
+    store = PlatformStore(paths())
+    invalidate_entitlement_cache(org_id=principal.org_id)
+    invalidated_pairing_codes = store.invalidate_unused_join_tokens(principal.org_id)
+    cancelled = store.cancel_queued_jobs_for_org(principal.org_id, "organization suspended")
+    running = [job for job in store.list_jobs(limit=10_000, org_id=principal.org_id) if job.status == "running"]
+    drained = 0
+    closed_shell_runners = 0
+    for runner in store.list_runners(org_id=principal.org_id):
+        if runner.revoked_at:
+            continue
+        if not runner.drain_requested:
+            store.set_runner_drain(runner.id, principal.org_id, requested=True)
+            drained += 1
+        await _terminate_shells_for_runner(runner.id, "organization_suspended")
+        closed_shell_runners += 1
+        store.record_runner_security_event(
+            runner.id,
+            principal.org_id,
+            "organization_suspended",
+            principal.email or principal.user_id or "platform-owner",
+            {},
+        )
+    return {
+        "ok": not running,
+        "state": "suspended" if not running else "draining",
+        "cancelled_queued_jobs": cancelled,
+        "invalidated_pairing_codes": invalidated_pairing_codes,
+        "running_jobs": len(running),
+        "drained_connectors": drained,
+        "shell_runner_channels_closed": closed_shell_runners,
+    }
+
+
+@app.post("/api/internal/orgs/{org_id}/reactivate")
+def api_internal_reactivate_org(org_id: str, request: Request) -> dict[str, object]:
+    """Resume connector claims only after the license authority confirms access."""
+    principal = _require_founder_lifecycle_principal(request, org_id)
+    invalidate_entitlement_cache(org_id=principal.org_id)
+    entitlement = get_entitlements(org_id=principal.org_id, force=True)
+    store = PlatformStore(paths())
+    resumed = 0
+    for runner in store.list_runners(org_id=principal.org_id):
+        if runner.revoked_at or not runner.drain_requested:
+            continue
+        store.set_runner_drain(runner.id, principal.org_id, requested=False)
+        resumed += 1
+        store.record_runner_security_event(
+            runner.id,
+            principal.org_id,
+            "organization_reactivated",
+            principal.email or principal.user_id or "platform-owner",
+            {},
+        )
+    return {"ok": True, "state": "active", "resumed_connectors": resumed, "plan_id": entitlement.plan_id}
+
+
+@app.post("/api/internal/orgs/{org_id}/revoke")
+async def api_internal_revoke_org(org_id: str, request: Request) -> dict[str, object]:
+    """Permanently revoke connector identities after claimed work has drained."""
+    principal = _require_founder_lifecycle_principal(request, org_id)
+    store = PlatformStore(paths())
+    invalidate_entitlement_cache(org_id=principal.org_id)
+    invalidated_pairing_codes = store.invalidate_unused_join_tokens(principal.org_id)
+    cancelled = store.cancel_queued_jobs_for_org(principal.org_id, "organization revoked")
+    running = [job for job in store.list_jobs(limit=10_000, org_id=principal.org_id) if job.status == "running"]
+    if running:
+        drained = 0
+        closed_shell_runners = 0
+        for runner in store.list_runners(org_id=principal.org_id):
+            if runner.revoked_at:
+                continue
+            if not runner.drain_requested:
+                store.set_runner_drain(runner.id, principal.org_id, requested=True)
+                drained += 1
+            await _terminate_shells_for_runner(runner.id, "organization_revoking")
+            closed_shell_runners += 1
+            store.record_runner_security_event(
+                runner.id,
+                principal.org_id,
+                "organization_revocation_pending",
+                principal.email or principal.user_id or "platform-owner",
+                {"running_jobs": len(running)},
+            )
+        return {
+            "ok": False,
+            "state": "revoking",
+            "cancelled_queued_jobs": cancelled,
+            "invalidated_pairing_codes": invalidated_pairing_codes,
+            "running_jobs": len(running),
+            "drained_connectors": drained,
+            "shell_runner_channels_closed": closed_shell_runners,
+            "revoked_connectors": 0,
+        }
+
+    revoked = 0
+    for runner in store.list_runners(org_id=principal.org_id):
+        if runner.revoked_at:
+            continue
+        store.revoke_runner(runner.id, principal.org_id)
+        await _terminate_shells_for_runner(runner.id, "organization_revoked")
+        channel = _RUNNER_CHANNELS.pop(runner.id, None)
+        _RUNNER_CHANNEL_POOLS.pop(runner.id, None)
+        if channel is not None:
+            try:
+                await channel.close(code=4403)
+            except Exception:  # noqa: BLE001 - the connector may already be disconnected.
+                pass
+        revoked += 1
+        store.record_runner_security_event(
+            runner.id,
+            principal.org_id,
+            "organization_revoked",
+            principal.email or principal.user_id or "platform-owner",
+            {},
+        )
+    return {
+        "ok": True,
+        "state": "revoked",
+        "cancelled_queued_jobs": cancelled,
+        "invalidated_pairing_codes": invalidated_pairing_codes,
+        "running_jobs": 0,
+        "revoked_connectors": revoked,
+    }
+
+
+@app.post("/api/internal/orgs/{org_id}/pairing-codes/revoke-unused")
+def api_internal_revoke_unused_pairing_codes(org_id: str, request: Request) -> dict[str, object]:
+    """Invalidate unclaimed one-time connector codes during saga rollback."""
+    principal = _require_founder_lifecycle_principal(request, org_id)
+    invalidated = PlatformStore(paths()).invalidate_unused_join_tokens(principal.org_id)
+    return {"ok": True, "invalidated_pairing_codes": invalidated}
 
 
 @app.get("/api/runners/{runner_id}/security-events")
