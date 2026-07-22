@@ -2896,6 +2896,81 @@ def _resolve_discovery_runner(
     return None, "Multiple Local Connectors are online. Select the connector for this discovery scan."
 
 
+def _resolve_targeted_refresh_runner(
+    store: PlatformStore,
+    org_id: str,
+    payload: dict[str, object],
+    requested_runner_id: str | None,
+) -> tuple[str | None, str | None]:
+    """Bind a multi-device refresh to one tenant connector or reject it.
+
+    The connector protocol currently executes one refresh job on one runner.
+    A request spanning connector ownership boundaries must be partitioned by
+    the caller rather than falling back to a process-wide pool.
+    """
+    raw_devices = payload.get("devices")
+    device_ids = raw_devices if isinstance(raw_devices, list) else []
+    resolved_runner_ids: set[str] = set()
+    unresolved: list[str] = []
+    for raw_device_id in device_ids:
+        device_id = str(raw_device_id or "").strip()
+        if not device_id:
+            continue
+        catalog_device = store.resolve_device(org_id, device_id)
+        if catalog_device is None:
+            unresolved.append(device_id)
+            continue
+        resolved_runner_ids.add(str(catalog_device.get("runner_id") or "").strip())
+
+    resolved_runner_ids.discard("")
+    if len(resolved_runner_ids) > 1:
+        return None, "Target devices span multiple Local Connectors. Partition the refresh by connector."
+
+    explicit_id = str(requested_runner_id or "").strip()
+    if explicit_id:
+        try:
+            explicit = store.get_runner(explicit_id)
+        except ValueError:
+            return None, "Unknown Local Connector."
+        if explicit.org_id != org_id:
+            return None, "Unknown Local Connector."
+        if explicit.status != "online" or explicit.drain_requested:
+            return None, "The selected Local Connector is not online."
+        if resolved_runner_ids and explicit.id not in resolved_runner_ids:
+            return None, "Target devices are assigned to a different Local Connector."
+        if unresolved and resolved_runner_ids:
+            return None, "Some target devices are not assigned to a Local Connector."
+        return explicit.id, None
+
+    online = [
+        runner
+        for runner in store.list_runners(org_id=org_id)
+        if runner.status == "online" and not runner.drain_requested
+    ]
+    if len(resolved_runner_ids) == 1 and not unresolved:
+        runner_id = next(iter(resolved_runner_ids))
+        try:
+            runner = store.get_runner(runner_id)
+        except ValueError:
+            return None, "Unknown Local Connector."
+        if runner.org_id != org_id:
+            return None, "Unknown Local Connector."
+        if runner.status != "online" or runner.drain_requested:
+            return None, "The assigned Local Connector is not online."
+        return runner.id, None
+
+    if len(online) == 1:
+        sole = online[0]
+        if resolved_runner_ids and sole.id not in resolved_runner_ids:
+            return None, "The assigned Local Connector is not online."
+        return sole.id, None
+    if not online:
+        return None, "No online Local Connector is available for this organization."
+    if unresolved:
+        return None, "Some target devices are not assigned to a Local Connector."
+    return None, "Multiple Local Connectors are online. Partition the refresh by connector."
+
+
 def _runner_read(
     p,
     action: str,
@@ -3184,6 +3259,19 @@ def api_rez_runner_read(request: RunnerReadRequest, http_request: Request, autho
     principal = _request_principal(http_request)
     if request.action == "rez_discover_network":
         target_runner_id, routing_error = _resolve_discovery_runner(
+            store,
+            principal.org_id,
+            payload,
+            target_runner_id,
+        )
+        if routing_error:
+            return {
+                "ok": False,
+                "error": routing_error,
+                "scope_rejected": True,
+            }
+    elif request.action == "rez_refresh_targeted":
+        target_runner_id, routing_error = _resolve_targeted_refresh_runner(
             store,
             principal.org_id,
             payload,

@@ -121,6 +121,192 @@ def test_rez_discovery_bridge_routes_range_to_tenants_sole_online_connector(tmp_
     }
 
 
+def test_targeted_refresh_routes_device_list_to_owning_tenant_connector(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("NETCODE_REZ_BRIDGE_TOKEN", "bridge-token")
+    workspace = WorkspacePaths(tmp_path)
+    init_workspace(workspace)
+    store = PlatformStore(workspace)
+    connector = _online_runner(store, org_id="org-isolated", name="connector-a", pool="pool-a")
+    store.sync_runner_devices(
+        connector,
+        [
+            {"id": "edge-1", "hostname": "edge-1", "host": "192.0.2.1"},
+            {"id": "edge-2", "hostname": "edge-2", "host": "192.0.2.2"},
+        ],
+        revision="inventory-a",
+    )
+    observed = {}
+
+    def fake_runner_read(p, action, payload, org_id, timeout=60.0, *, change_id=None, target_runner_id=None):  # noqa: ANN001
+        observed.update({
+            "action": action,
+            "org_id": org_id,
+            "target_runner_id": target_runner_id,
+        })
+        return {"ok": True, "_runner_id": target_runner_id, "device_states": {}}
+
+    monkeypatch.setattr(api, "_runner_read", fake_runner_read)
+    response = TestClient(api.app).post(
+        "/api/rez/runner-read",
+        headers={
+            "Authorization": "Bearer bridge-token",
+            "X-Rezonance-Org-ID": "org-isolated",
+            "X-Rezonance-User-ID": "usr-isolated",
+        },
+        json={"action": "rez_refresh_targeted", "payload": {"devices": ["edge-1", "edge-2"]}},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["ok"] is True
+    assert observed == {
+        "action": "rez_refresh_targeted",
+        "org_id": "org-isolated",
+        "target_runner_id": connector.id,
+    }
+
+
+def test_targeted_refresh_rejects_devices_spanning_connectors(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("NETCODE_REZ_BRIDGE_TOKEN", "bridge-token")
+    workspace = WorkspacePaths(tmp_path)
+    init_workspace(workspace)
+    store = PlatformStore(workspace)
+    connector_a = _online_runner(store, org_id="org-isolated", name="connector-a", pool="pool-a")
+    connector_b = _online_runner(store, org_id="org-isolated", name="connector-b", pool="pool-b")
+    store.sync_runner_devices(
+        connector_a,
+        [{"id": "edge-1", "hostname": "edge-1", "host": "192.0.2.1"}],
+        revision="inventory-a",
+    )
+    store.sync_runner_devices(
+        connector_b,
+        [{"id": "edge-2", "hostname": "edge-2", "host": "192.0.2.2"}],
+        revision="inventory-b",
+    )
+    monkeypatch.setattr(api, "_runner_read", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("must not queue")))
+
+    response = TestClient(api.app).post(
+        "/api/rez/runner-read",
+        headers={
+            "Authorization": "Bearer bridge-token",
+            "X-Rezonance-Org-ID": "org-isolated",
+            "X-Rezonance-User-ID": "usr-isolated",
+        },
+        json={"action": "rez_refresh_targeted", "payload": {"devices": ["edge-1", "edge-2"]}},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["scope_rejected"] is True
+    assert "span multiple Local Connectors" in response.json()["error"]
+
+
+def test_targeted_refresh_uses_tenants_sole_connector_for_unmapped_devices(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("NETCODE_REZ_BRIDGE_TOKEN", "bridge-token")
+    workspace = WorkspacePaths(tmp_path)
+    init_workspace(workspace)
+    store = PlatformStore(workspace)
+    connector = _online_runner(store, org_id="org-isolated", name="connector-a", pool="pool-a")
+    observed = {}
+
+    def fake_runner_read(p, action, payload, org_id, timeout=60.0, *, change_id=None, target_runner_id=None):  # noqa: ANN001
+        observed["target_runner_id"] = target_runner_id
+        return {"ok": True, "_runner_id": target_runner_id, "device_states": {}}
+
+    monkeypatch.setattr(api, "_runner_read", fake_runner_read)
+    response = TestClient(api.app).post(
+        "/api/rez/runner-read",
+        headers={
+            "Authorization": "Bearer bridge-token",
+            "X-Rezonance-Org-ID": "org-isolated",
+            "X-Rezonance-User-ID": "usr-isolated",
+        },
+        json={"action": "rez_refresh_targeted", "payload": {"devices": ["new-edge"]}},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["ok"] is True
+    assert observed["target_runner_id"] == connector.id
+
+
+def test_targeted_refresh_rejects_cross_tenant_explicit_connector(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("NETCODE_REZ_BRIDGE_TOKEN", "bridge-token")
+    workspace = WorkspacePaths(tmp_path)
+    init_workspace(workspace)
+    other = _online_runner(
+        PlatformStore(workspace),
+        org_id="org-other",
+        name="other",
+        pool="other",
+    )
+    monkeypatch.setattr(api, "_runner_read", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("must not queue")))
+
+    response = TestClient(api.app).post(
+        "/api/rez/runner-read",
+        headers={
+            "Authorization": "Bearer bridge-token",
+            "X-Rezonance-Org-ID": "org-isolated",
+            "X-Rezonance-User-ID": "usr-isolated",
+        },
+        json={
+            "action": "rez_refresh_targeted",
+            "payload": {"devices": ["edge-1"], "connector_id": other.id},
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "ok": False,
+        "error": "Unknown Local Connector.",
+        "scope_rejected": True,
+    }
+
+
+def test_targeted_refresh_rejects_explicit_connector_that_does_not_own_targets(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("NETCODE_REZ_BRIDGE_TOKEN", "bridge-token")
+    workspace = WorkspacePaths(tmp_path)
+    init_workspace(workspace)
+    store = PlatformStore(workspace)
+    owner = _online_runner(store, org_id="org-isolated", name="owner", pool="pool-a")
+    sibling = _online_runner(store, org_id="org-isolated", name="sibling", pool="pool-b")
+    store.sync_runner_devices(
+        owner,
+        [{"id": "edge-1", "hostname": "edge-1", "host": "192.0.2.1"}],
+        revision="inventory-owner",
+    )
+    monkeypatch.setattr(
+        api,
+        "_runner_read",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("must not queue")),
+    )
+
+    response = TestClient(api.app).post(
+        "/api/rez/runner-read",
+        headers={
+            "Authorization": "Bearer bridge-token",
+            "X-Rezonance-Org-ID": "org-isolated",
+            "X-Rezonance-User-ID": "usr-isolated",
+        },
+        json={
+            "action": "rez_refresh_targeted",
+            "payload": {"devices": ["edge-1"], "connector_id": sibling.id},
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "ok": False,
+        "error": "Target devices are assigned to a different Local Connector.",
+        "scope_rejected": True,
+    }
+
+
 def test_rez_discovery_bridge_rejects_ambiguous_connector_selection(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("NETCODE_REZ_BRIDGE_TOKEN", "bridge-token")
