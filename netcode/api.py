@@ -614,11 +614,24 @@ def _request_principal(request: Request) -> Principal:
     return getattr(request.state, "principal", SYSTEM_PRINCIPAL)
 
 
-def _trusted_rez_service_principal(headers, authorization: str | None) -> Principal:
-    """Resolve the Rez proxy identity only inside the private admin-token envelope."""
+def _trusted_rez_service_principal(
+    headers,
+    authorization: str | None,
+    *,
+    allow_read_bridge: bool = False,
+) -> Principal:
+    """Resolve a tenant-bound Rez identity inside a private service envelope."""
     expected = os.environ.get("NETCODE_ADMIN_TOKEN", "").strip()
+    read_bridge = os.environ.get("NETCODE_REZ_BRIDGE_TOKEN", "").strip()
     supplied = (authorization or "").removeprefix("Bearer ").strip()
-    if not expected or not supplied or not hmac.compare_digest(supplied, expected):
+    admin_match = bool(expected and supplied and hmac.compare_digest(supplied, expected))
+    bridge_match = bool(
+        allow_read_bridge
+        and read_bridge
+        and supplied
+        and hmac.compare_digest(supplied, read_bridge)
+    )
+    if not admin_match and not bridge_match:
         raise PermissionError("Trusted Rez service token is invalid.")
     org_id = canonical_org_id(headers.get("x-rezonance-org-id"))
     role = str(headers.get("x-rezonance-role") or "viewer").strip().lower()
@@ -891,9 +904,22 @@ async def _rbac(request: Request, call_next):
     if not authorization and cookie_token:
         authorization = f"Bearer {cookie_token}"
     service_scoped = bool(request.headers.get("x-rezonance-org-id"))
+    bridge_scoped = _is_rez_bridge_request(path, authorization)
+    if _PRODUCTION_RUNTIME and bridge_scoped and (
+        not str(request.headers.get("x-rezonance-org-id") or "").strip()
+        or not str(request.headers.get("x-rezonance-user-id") or "").strip()
+    ):
+        return JSONResponse(
+            {"detail": "Rez read bridges require an authenticated organization and user scope."},
+            status_code=401,
+        )
     if service_scoped:
         try:
-            request.state.principal = _trusted_rez_service_principal(request.headers, authorization)
+            request.state.principal = _trusted_rez_service_principal(
+                request.headers,
+                authorization,
+                allow_read_bridge=bridge_scoped,
+            )
         except PermissionError:
             return JSONResponse({"detail": "Trusted Rez service token is invalid."}, status_code=401)
         except EntitlementError as exc:
@@ -3087,6 +3113,14 @@ def api_rez_runner_read(request: RunnerReadRequest, http_request: Request, autho
     bridge_token = os.environ.get("NETCODE_REZ_BRIDGE_TOKEN", "").strip()
     if bridge_token and authorization != f"Bearer {bridge_token}":
         raise HTTPException(status_code=401, detail="Rez bridge token required.")
+    if _PRODUCTION_RUNTIME and (
+        not str(http_request.headers.get("x-rezonance-org-id") or "").strip()
+        or not str(http_request.headers.get("x-rezonance-user-id") or "").strip()
+    ):
+        raise HTTPException(
+            status_code=401,
+            detail="Rez runner reads require an authenticated organization and user scope.",
+        )
     if request.action not in {
         "rez_ssh_command",
         "rez_api_query",

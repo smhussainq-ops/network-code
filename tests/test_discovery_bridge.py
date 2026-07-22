@@ -85,3 +85,46 @@ def test_rez_discovery_bridge_strips_credential_shaped_fields(tmp_path, monkeypa
     assert "username" not in observed
     assert "password" not in observed
     assert "api_token" not in observed
+
+
+def test_production_rez_bridge_requires_and_uses_authenticated_org_scope(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("NETCODE_REZ_BRIDGE_TOKEN", "bridge-token")
+    monkeypatch.setenv("NETCODE_AUTH", "1")
+    monkeypatch.setattr(api, "_PRODUCTION_RUNTIME", True)
+    init_workspace(WorkspacePaths(tmp_path))
+    observed = {}
+
+    def fake_runner_read(p, action, payload, org_id, timeout=60.0, **kwargs):  # noqa: ANN001
+        observed.update({"org_id": org_id, "action": action})
+        return {"ok": False, "error": "no connector in isolated org"}
+
+    monkeypatch.setattr(api, "_runner_read", fake_runner_read)
+    client = TestClient(api.app)
+    unscoped = client.post(
+        "/api/rez/runner-read",
+        headers={"Authorization": "Bearer bridge-token"},
+        json={"action": "rez_ssh_command", "payload": {"device": "core-1", "command": "show version"}},
+    )
+    assert unscoped.status_code == 401
+
+    scoped = client.post(
+        "/api/rez/runner-read",
+        headers={
+            "Authorization": "Bearer bridge-token",
+            "X-Rezonance-Org-ID": "org-isolated",
+            "X-Rezonance-User-ID": "usr-isolated",
+            "X-Rezonance-User": "operator@example.invalid",
+            "X-Rezonance-Role": "operator",
+        },
+        json={"action": "rez_ssh_command", "payload": {"device": "core-1", "command": "show version"}},
+    )
+    assert scoped.status_code == 200
+    assert observed == {"org_id": "org-isolated", "action": "rez_ssh_command"}
+
+    unscoped_design = client.get(
+        "/api/network-model/active/rez-design",
+        headers={"Authorization": "Bearer bridge-token"},
+        params={"environment_id": "env-production"},
+    )
+    assert unscoped_design.status_code == 401
