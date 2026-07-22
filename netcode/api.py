@@ -2855,6 +2855,47 @@ def _runner_route_for_payload(
     return str(catalog_device["runner_pool"]), str(catalog_device["runner_id"])
 
 
+def _resolve_discovery_runner(
+    store: PlatformStore,
+    org_id: str,
+    payload: dict[str, object],
+    requested_runner_id: str | None,
+) -> tuple[str | None, str | None]:
+    """Resolve recursive discovery to one online connector inside the tenant.
+
+    Range/CIDR seeds cannot be mapped to one catalog row. They must never fall
+    back to the process-wide default pool because tenant connector pools are
+    intentionally independent. An explicit connector wins; otherwise an exact
+    catalog seed or the tenant's sole online connector is safe and unambiguous.
+    """
+    candidate_id = str(requested_runner_id or "").strip()
+    if not candidate_id:
+        _pool, candidate_id = _runner_route_for_payload(store, org_id, payload)
+        candidate_id = str(candidate_id or "").strip()
+
+    if candidate_id:
+        try:
+            runner = store.get_runner(candidate_id)
+        except ValueError:
+            return None, "Unknown Local Connector."
+        if runner.org_id != org_id:
+            return None, "Unknown Local Connector."
+        if runner.status != "online" or runner.drain_requested:
+            return None, "The selected Local Connector is not online."
+        return runner.id, None
+
+    online = [
+        runner
+        for runner in store.list_runners(org_id=org_id)
+        if runner.status == "online" and not runner.drain_requested
+    ]
+    if len(online) == 1:
+        return online[0].id, None
+    if not online:
+        return None, "No online Local Connector is available for this organization."
+    return None, "Multiple Local Connectors are online. Select the connector for this discovery scan."
+
+
 def _runner_read(
     p,
     action: str,
@@ -3141,6 +3182,19 @@ def api_rez_runner_read(request: RunnerReadRequest, http_request: Request, autho
     target_runner_id = str(payload.pop("connector_id", "") or "").strip() or None
     store = PlatformStore(paths())
     principal = _request_principal(http_request)
+    if request.action == "rez_discover_network":
+        target_runner_id, routing_error = _resolve_discovery_runner(
+            store,
+            principal.org_id,
+            payload,
+            target_runner_id,
+        )
+        if routing_error:
+            return {
+                "ok": False,
+                "error": routing_error,
+                "scope_rejected": True,
+            }
     if target_runner_id:
         result = _runner_read(
             paths(),
