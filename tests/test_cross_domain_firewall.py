@@ -145,11 +145,21 @@ def _plan() -> CrossDomainPlan:
     )
 
 
-def _approval(*, approved: bool = True, same_user: bool = False) -> ApprovalProof:
+def _approval(
+    *,
+    approved: bool = True,
+    same_user: bool = False,
+    approval_mode: str = "two_person",
+    operator_acknowledged: bool = False,
+) -> ApprovalProof:
     return ApprovalProof(
         approved=approved,
         requested_by="marcus",
         approved_by="marcus" if same_user else "syed",
+        requested_by_user_id="usr_marcus",
+        approved_by_user_id="usr_marcus" if same_user else "usr_syed",
+        approval_mode=approval_mode,
+        operator_acknowledged=operator_acknowledged,
         workflow_state="approved" if approved else "dry_run_passed",
     )
 
@@ -210,11 +220,31 @@ def test_version_never_implies_unproven_write_capability():
         capabilities.require("deploy")
 
 
-def test_manager_write_requires_second_engineer_approval():
+def test_manager_write_requires_valid_human_approval():
     with pytest.raises(ValidationError, match="approved workflow"):
         ManagerJobRequest.model_validate(_job(approval=_approval(approved=False)))
     with pytest.raises(ValidationError, match="requester cannot approve"):
         ManagerJobRequest.model_validate(_job(approval=_approval(same_user=True)))
+
+
+def test_community_operator_confirmed_manager_write_requires_acknowledgement():
+    with pytest.raises(ValidationError, match="requires explicit"):
+        ManagerJobRequest.model_validate(
+            _job(approval=_approval(same_user=True, approval_mode="operator_confirmed"))
+        )
+
+    request = ManagerJobRequest.model_validate(
+        _job(
+            approval=_approval(
+                same_user=True,
+                approval_mode="operator_confirmed",
+                operator_acknowledged=True,
+            )
+        )
+    )
+
+    assert request.approval.approved_by_user_id == "usr_marcus"
+    assert request.approval.approval_mode == "operator_confirmed"
 
 
 def test_read_only_manager_probe_does_not_require_approval():

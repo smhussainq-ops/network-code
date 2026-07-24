@@ -355,6 +355,7 @@ class FleetRetryRequest(BaseModel):
 
 class ApproveRequest(BaseModel):
     approved_by: str = ""  # used when auth is off; with auth on the principal is the approver
+    operator_ack: bool = False
 
 
 class DriftWatchRequest(BaseModel):
@@ -5030,23 +5031,43 @@ def _approver_identity(
     fallback_name: str,
     requester: str,
     requester_user_id: str | None,
+    *,
+    approval_mode: str = "two_person",
+    operator_ack: bool = False,
 ) -> str:
-    """Resolve who is approving and enforce requester != approver. With auth on,
-    the logged-in principal IS the approver; with auth off, a named approver is
-    required (advisory but still recorded and still must differ)."""
+    """Resolve the immutable approval actor under the licensed approval policy."""
     if auth_enabled():
         if not principal.authenticated or not principal.user_id:
             raise HTTPException(status_code=401, detail="Approval requires an authenticated user identity.")
         if not principal.has_role("operator"):
             raise HTTPException(status_code=403, detail="Approval requires operator or administrator access.")
         approver = principal.email or principal.user_id or ""
-        if principal.user_id and requester_user_id and principal.user_id == requester_user_id:
-            raise HTTPException(status_code=403, detail="The requester cannot approve their own change.")
-        if approver and approver == requester:
-            raise HTTPException(status_code=403, detail="The requester cannot approve their own change.")
         supplied = (fallback_name or "").strip()
         if supplied and supplied != approver:
             raise HTTPException(status_code=403, detail="Approver identity is bound to the authenticated account.")
+        same_principal = bool(
+            (principal.user_id and requester_user_id and principal.user_id == requester_user_id)
+            or (approver and approver == requester)
+        )
+        if same_principal:
+            if approval_mode != "operator_confirmed":
+                raise HTTPException(status_code=403, detail="The requester cannot approve their own change.")
+            if not operator_ack:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "Community operator approval requires explicit confirmation that the "
+                        "operator reviewed the exact commands, dry-run proof, and rollback."
+                    ),
+                )
+        elif approval_mode == "operator_confirmed" and not operator_ack:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Community operator approval requires explicit confirmation that the "
+                    "operator reviewed the exact commands, dry-run proof, and rollback."
+                ),
+            )
         return approver
     approver = (fallback_name or "").strip()
     if not approver:
@@ -5056,10 +5077,32 @@ def _approver_identity(
     return approver
 
 
+def _approval_policy(org_id: str) -> str:
+    mode = get_entitlements(org_id=org_id).approval_mode
+    if mode not in {"operator_confirmed", "two_person"}:
+        raise EntitlementError("The Netcode approval policy is invalid.")
+    return mode
+
+
+def _operator_self_approval(
+    principal: Principal,
+    requester: str,
+    requester_user_id: str | None,
+    approval_mode: str,
+) -> bool:
+    approver = principal.email or principal.user_id or ""
+    return bool(
+        approval_mode == "operator_confirmed"
+        and (
+            (principal.user_id and requester_user_id and principal.user_id == requester_user_id)
+            or (approver and approver == requester)
+        )
+    )
+
+
 @app.post("/api/change/{change_id}/approve")
 def api_change_approve(change_id: str, request: ApproveRequest, http_request: Request) -> dict[str, object]:
-    """Approval gate: a second engineer approves a proven (dry-run-passed) change,
-    unlocking apply. The approver identity is part of the evidence record."""
+    """Approve a dry-run-proven change under the licensed human approval policy."""
     p = paths()
     principal = _request_principal(http_request)
     store = PlatformStore(p)
@@ -5072,11 +5115,20 @@ def api_change_approve(change_id: str, request: ApproveRequest, http_request: Re
     if change.workflow_state != "dry_run_passed":
         raise HTTPException(status_code=400,
                             detail=f"Only a dry-run-proven change can be approved (state: {change.workflow_state}).")
+    approval_mode = _approval_policy(principal.org_id)
     approver = _approver_identity(
         principal,
         request.approved_by,
         change.requested_by,
         change.created_by_user_id,
+        approval_mode=approval_mode,
+        operator_ack=request.operator_ack,
+    )
+    operator_self_approval = _operator_self_approval(
+        principal,
+        change.requested_by,
+        change.created_by_user_id,
+        approval_mode,
     )
     try:
         model_approvals = approve_change_candidates(
@@ -5093,12 +5145,19 @@ def api_change_approve(change_id: str, request: ApproveRequest, http_request: Re
         ) from exc
     store.record_workflow_event(
         change_id, "approve", change.workflow_state, "approved",
-        f"Approved by {approver} (requester: {change.requested_by}).",
+        (
+            f"Approved by {approver} under the Community operator-confirmed policy."
+            if operator_self_approval
+            else f"Approved by {approver} (requester: {change.requested_by})."
+        ),
         {
             "approved_by": approver,
             "approved_by_user_id": principal.user_id,
             "requested_by": change.requested_by,
             "requested_by_user_id": change.created_by_user_id,
+            "approval_mode": approval_mode,
+            "operator_acknowledged": approval_mode == "operator_confirmed",
+            "self_approval": operator_self_approval,
             "network_model_revisions": [
                 item["revision"]["revision_id"] for item in model_approvals
             ],
@@ -5107,6 +5166,9 @@ def api_change_approve(change_id: str, request: ApproveRequest, http_request: Re
     return {"ok": True, "change": record_to_dict(store.get_change(change_id)),
             "approved_by": approver,
             "approved_by_user_id": principal.user_id,
+            "approval_mode": approval_mode,
+            "operator_acknowledged": approval_mode == "operator_confirmed",
+            "self_approval": operator_self_approval,
             "network_model": {
                 "approved_revisions": [item["revision"]["revision_id"] for item in model_approvals]
             },
@@ -5212,16 +5274,22 @@ def api_cross_domain_manager_action(
         raise HTTPException(status_code=400, detail="Cross-domain plan has no manager-owned firewall intent")
 
     approved_by: str | None = None
+    approval_evidence: dict[str, object] = {}
     approvals = [
         event for event in store.list_workflow_events(change.id)
         if event.action in {"approve", "approve_manager", "approve_rollback"}
     ]
     if action in WRITE_ACTIONS:
-        approved_by = str((approvals[-1].evidence or {}).get("approved_by") or "") if approvals else None
+        approval_evidence = dict(approvals[-1].evidence or {}) if approvals else {}
+        approved_by = str(approval_evidence.get("approved_by") or "") or None
     approval = ApprovalProof(
         approved=bool(approved_by),
         requested_by=change.requested_by,
         approved_by=approved_by,
+        requested_by_user_id=change.created_by_user_id,
+        approved_by_user_id=str(approval_evidence.get("approved_by_user_id") or "") or None,
+        approval_mode=str(approval_evidence.get("approval_mode") or "two_person"),
+        operator_acknowledged=bool(approval_evidence.get("operator_acknowledged")),
         workflow_state="approved" if approved_by else change.workflow_state,
     )
     scope = ownership.scope
@@ -5274,11 +5342,20 @@ def api_cross_domain_approve_rollback(
             status_code=409,
             detail=f"Rollback approval requires an applied or failed change (state: {change.workflow_state}).",
         )
+    approval_mode = _approval_policy(principal.org_id)
     approver = _approver_identity(
         principal,
         request.approved_by,
         change.requested_by,
         change.created_by_user_id,
+        approval_mode=approval_mode,
+        operator_ack=request.operator_ack,
+    )
+    operator_self_approval = _operator_self_approval(
+        principal,
+        change.requested_by,
+        change.created_by_user_id,
+        approval_mode,
     )
     store.record_workflow_event(
         change.id,
@@ -5291,12 +5368,16 @@ def api_cross_domain_approve_rollback(
             "approved_by_user_id": principal.user_id,
             "requested_by": change.requested_by,
             "requested_by_user_id": change.created_by_user_id,
+            "approval_mode": approval_mode,
+            "operator_acknowledged": approval_mode == "operator_confirmed",
+            "self_approval": operator_self_approval,
             "rollback_only": True,
         },
     )
     return {
         "ok": True,
         "approved_by": approver,
+        "approval_mode": approval_mode,
         "change": record_to_dict(store.get_change(change.id)),
         "message": "Rollback is approved; the manager rollback action remains runner-gated.",
     }
@@ -5443,11 +5524,14 @@ def api_cross_domain_verify_start(change_id: str, http_request: Request) -> dict
 def api_fleet_rollout_approve(rollout_id: str, request: ApproveRequest, http_request: Request) -> dict[str, object]:
     principal = _request_principal(http_request)
     rollout = _rollout_or_404(rollout_id, principal.org_id)
+    approval_mode = _approval_policy(principal.org_id)
     approver = _approver_identity(
         principal,
         request.approved_by,
         str(rollout.get("requested_by") or ""),
         rollout.get("created_by_user_id"),
+        approval_mode=approval_mode,
+        operator_ack=request.operator_ack,
     )
     try:
         store = PlatformStore(paths())
@@ -5465,7 +5549,14 @@ def api_fleet_rollout_approve(rollout_id: str, request: ApproveRequest, http_req
                 approved_by=approver,
                 git_root=paths().git_workspace,
             )
-        return approve_rollout(paths(), rollout_id, approver)
+        return approve_rollout(
+            paths(),
+            rollout_id,
+            approver,
+            approval_mode=approval_mode,
+            operator_ack=request.operator_ack,
+            approved_by_user_id=principal.user_id,
+        )
     except (KeyError, NetworkModelError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 

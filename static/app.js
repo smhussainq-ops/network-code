@@ -2278,14 +2278,17 @@ function renderFleet() {
   }
   const rollout = appState.fleet.rollout;
   const needsApproval = Boolean(rollout?.approval_required) && !rollout?.approved_by;
-  const canApprove = rollout && rollout.status === "planned" && !rollout.approved_by;
+  const approvalReady = rollout && rollout.status === "planned" && !rollout.approved_by;
+  const approvalAcknowledged = Boolean($("fleet-approval-ack").checked);
+  const canApprove = approvalReady && approvalAcknowledged;
   const canStart = rollout && rollout.status === "planned" && !needsApproval;
   const canHalt = rollout && ["running", "halt_requested"].includes(rollout.status);
   $("fleet-approve").disabled = !canApprove;
   $("fleet-start").disabled = !canStart;
   $("fleet-halt").disabled = !canHalt;
   // Approver name input only matters when there is no logged-in identity.
-  $("fleet-approver-row").hidden = !(canApprove && !appState.authEnabled);
+  $("fleet-approver-row").hidden = !(approvalReady && !appState.authEnabled);
+  $("fleet-approval-ack-row").hidden = !approvalReady;
   if (!rollout) {
     $("fleet-title").textContent = "No rollout planned yet.";
     $("fleet-summary").textContent = "Plan a rollout to see the canary and batch waves before anything touches a device.";
@@ -2387,12 +2390,16 @@ async function fleetApproveRollout() {
   if (!rollout || $("fleet-approve").disabled) return;
   const approvedBy = appState.authEnabled ? "" : ($("fleet-approver").value || "").trim();
   try {
-    appState.fleet.rollout = await postJson(`/api/fleet/rollouts/${rollout.id}/approve`, { approved_by: approvedBy });
+    appState.fleet.rollout = await postJson(`/api/fleet/rollouts/${rollout.id}/approve`, {
+      approved_by: approvedBy,
+      operator_ack: Boolean($("fleet-approval-ack").checked),
+    });
+    $("fleet-approval-ack").checked = false;
     renderFleet();
     setOutcome({ state: "Approved", status: "pass",
       title: `Rollout approved by ${appState.fleet.rollout.approved_by}.`,
-      summary: "A second engineer has signed off; the approval is part of the evidence record.",
-      expected: "Requester and approver are different people.",
+      summary: "An authenticated engineer reviewed and approved the rollout; the approval is part of the evidence record.",
+      expected: "Approval follows the licensed workspace policy and records the review acknowledgement.",
       actual: `Approved by ${appState.fleet.rollout.approved_by} (requested by ${rollout.requested_by}).`,
       artifact: "Approval recorded on the rollout and every per-device change.",
       device: "No device config was changed.",
@@ -3060,6 +3067,7 @@ function bindEvents() {
   $("shell-evidence").addEventListener("click", openShellEvidence);
   $("fleet-plan").addEventListener("click", fleetPlanRollout);
   $("fleet-approve").addEventListener("click", fleetApproveRollout);
+  $("fleet-approval-ack").addEventListener("change", renderFleet);
   $("fleet-start").addEventListener("click", fleetStartRollout);
   $("fleet-halt").addEventListener("click", fleetHaltRollout);
   $("fleet-drift-refresh").addEventListener("click", fleetDriftRefresh);

@@ -29,7 +29,7 @@ def _reset(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("NETCODE_ENTITLEMENT_TOKEN", "secret")
 
 
-def _payload(*, writes: bool = True) -> dict:
+def _payload(*, writes: bool = True, approval_mode: str = "two_person") -> dict:
     return {
         "plan_id": "starter",
         "platform_available": True,
@@ -38,6 +38,7 @@ def _payload(*, writes: bool = True) -> dict:
             "max_connectors": 3,
             "max_workflow_packs": 5,
             "netcode_production_writes": writes,
+            "netcode_approval_mode": approval_mode,
         },
     }
 
@@ -48,6 +49,29 @@ def test_fetches_authoritative_public_limits(monkeypatch: pytest.MonkeyPatch) ->
     assert value.plan_id == "starter"
     assert value.max_devices == 50
     assert value.production_writes is True
+    assert value.approval_mode == "two_person"
+
+
+def test_community_operator_approval_policy_is_authoritative(monkeypatch: pytest.MonkeyPatch) -> None:
+    payload = _payload(approval_mode="operator_confirmed")
+    payload["plan_id"] = "community"
+    monkeypatch.setattr(entitlements.urllib.request, "urlopen", lambda request, timeout: _Response(payload))
+
+    value = entitlements.get_entitlements()
+
+    assert value.plan_id == "community"
+    assert value.approval_mode == "operator_confirmed"
+
+
+def test_invalid_approval_policy_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        entitlements.urllib.request,
+        "urlopen",
+        lambda request, timeout: _Response(_payload(approval_mode="anyone")),
+    )
+
+    with pytest.raises(entitlements.EntitlementError, match="approval policy is invalid"):
+        entitlements.get_entitlements()
 
 
 def test_cache_and_authority_request_are_scoped_by_organization(monkeypatch: pytest.MonkeyPatch) -> None:

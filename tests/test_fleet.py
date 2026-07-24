@@ -322,6 +322,40 @@ def test_rollout_approval_requester_cannot_self_approve(tmp_path: Path, monkeypa
     assert approved["approved_by"] == "reviewer"
 
 
+def test_community_rollout_allows_operator_confirmed_self_approval(tmp_path: Path):
+    paths = _fleet_workspace(tmp_path, device_count=2)
+    rollout = _plan(paths)
+
+    with pytest.raises(ValueError, match="requires confirmation"):
+        fleet.approve_rollout(
+            paths,
+            rollout["id"],
+            "tester",
+            approval_mode="operator_confirmed",
+        )
+
+    approved = fleet.approve_rollout(
+        paths,
+        rollout["id"],
+        "tester",
+        approval_mode="operator_confirmed",
+        operator_ack=True,
+        approved_by_user_id="usr_tester",
+    )
+
+    assert approved["approved_by"] == "tester"
+    event = next(
+        item
+        for item in PlatformStore(paths).list_workflow_events(
+            approved["waves"][0]["targets"][0]["change_id"],
+        )
+        if item.action == "approve"
+    )
+    assert event.evidence["approval_mode"] == "operator_confirmed"
+    assert event.evidence["operator_acknowledged"] is True
+    assert event.evidence["self_approval"] is True
+
+
 def test_rollout_start_requires_approval_when_gate_is_on(tmp_path: Path, monkeypatch):
     paths = _fleet_workspace(tmp_path, device_count=2)
     monkeypatch.setenv("NETCODE_REQUIRE_APPROVAL", "1")

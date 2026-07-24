@@ -541,7 +541,11 @@
                     <label>Canary size<input name="canary_size" type="number" min="1" value="1" /></label>
                     <label>Batch size<input name="batch_size" type="number" min="1" value="3" /></label>
                   </div>
-                  <label id="fleet-approver-row" hidden>Approver (second engineer)<input id="fleet-approver" type="text" placeholder="e.g. jane@corp" autocomplete="off" /></label>
+                  <label id="fleet-approver-row" hidden>Approver<input id="fleet-approver" type="text" placeholder="e.g. jane@corp" autocomplete="off" /></label>
+                  <label id="fleet-approval-ack-row" hidden class="fleet-approval-ack">
+                    <input id="fleet-approval-ack" type="checkbox" />
+                    I reviewed the exact per-device plan, dry-run sequence, rollout groups, and rollback.
+                  </label>
                   <div class="button-row">
                     <button id="fleet-plan" type="button">Plan rollout</button>
                     <button id="fleet-approve" class="secondary" type="button" disabled>Approve</button>

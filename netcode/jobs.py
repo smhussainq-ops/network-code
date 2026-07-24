@@ -38,9 +38,9 @@ def execution_mode() -> str:
 
 
 def approval_required() -> bool:
-    """Apply requires a second engineer's approval. Explicit env wins; otherwise
+    """Apply requires recorded human approval. Explicit env wins; otherwise
     approval is on exactly when auth is on (identities exist to tell requester
-    from approver). Solo/local mode stays frictionless."""
+    from approver and enforce the licensed policy). Solo/local mode stays frictionless."""
     raw = os.environ.get("NETCODE_REQUIRE_APPROVAL", "").strip().lower()
     if raw in ("1", "true", "yes", "on"):
         return True
@@ -128,8 +128,7 @@ class JobRunner:
         intrinsic_gate = intrinsic_approval_required(intent_path)
         needs_approval = approval_required() or intrinsic_gate
         if action == "apply" and needs_approval and change.workflow_state != "approved":
-            message = ("Approval gate: a second engineer must approve this change before apply. "
-                       "The requester cannot approve their own change.")
+            message = "Approval gate: the licensed human-approval policy must be satisfied before apply."
             self.store.record_workflow_event(change.id, "apply", change.workflow_state, change.workflow_state,
                                              message, {"blocked": True, "approval_required": True, "intrinsic_approval_required": intrinsic_gate})
             return {
@@ -333,9 +332,18 @@ class JobRunner:
             require_production_writes(org_id=change.org_id)
             if not approvals:
                 raise ValueError("manager write is blocked: no durable human approval event exists")
-            approved_by = str((approvals[-1].evidence or {}).get("approved_by") or "")
+            approval_evidence = dict(approvals[-1].evidence or {})
+            approved_by = str(approval_evidence.get("approved_by") or "")
             if approved_by != str(request.approval.approved_by or ""):
                 raise ValueError("manager write approval does not match the durable workflow event")
+            if str(approval_evidence.get("approval_mode") or "two_person") != request.approval.approval_mode:
+                raise ValueError("manager write approval policy does not match the durable workflow event")
+            if bool(approval_evidence.get("operator_acknowledged")) != request.approval.operator_acknowledged:
+                raise ValueError("manager write acknowledgement does not match the durable workflow event")
+            if str(approval_evidence.get("approved_by_user_id") or "") != str(
+                request.approval.approved_by_user_id or ""
+            ):
+                raise ValueError("manager write approval identity does not match the durable workflow event")
             if change.workflow_state != "approved" and request.action not in {"discard", "unlock"}:
                 raise ValueError(f"manager {request.action} is blocked in workflow state {change.workflow_state}")
         elif change.workflow_state not in {

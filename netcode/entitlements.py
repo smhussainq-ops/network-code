@@ -35,6 +35,7 @@ class PlatformEntitlements:
     max_workflow_packs: int
     production_writes: bool
     source: str
+    approval_mode: str = "two_person"
     stale: bool = False
 
     def as_dict(self) -> dict[str, Any]:
@@ -45,6 +46,7 @@ class PlatformEntitlements:
             "max_connectors": self.max_connectors,
             "max_workflow_packs": self.max_workflow_packs,
             "netcode_production_writes": self.production_writes,
+            "netcode_approval_mode": self.approval_mode,
             "source": self.source,
             "stale": self.stale,
         }
@@ -76,11 +78,15 @@ def _development_entitlements() -> PlatformEntitlements:
         max_workflow_packs=1_000,
         production_writes=True,
         source="development_bypass",
+        approval_mode="two_person",
     )
 
 
 def _parse(payload: dict[str, Any], *, stale: bool = False) -> PlatformEntitlements:
     values = payload.get("entitlements") if isinstance(payload.get("entitlements"), dict) else {}
+    approval_mode = str(values.get("netcode_approval_mode") or "two_person").strip().lower()
+    if approval_mode not in {"operator_confirmed", "two_person"}:
+        raise EntitlementError("The Netcode approval policy is invalid.")
     result = PlatformEntitlements(
         plan_id=str(payload.get("plan_id") or values.get("plan_id") or "unknown"),
         platform_available=bool(payload.get("platform_available", False)),
@@ -89,6 +95,7 @@ def _parse(payload: dict[str, Any], *, stale: bool = False) -> PlatformEntitleme
         max_workflow_packs=max(0, int(values.get("max_workflow_packs", 0) or 0)),
         production_writes=bool(values.get("netcode_production_writes", False)),
         source="rez_license_authority",
+        approval_mode=approval_mode,
         stale=stale,
     )
     if not result.platform_available:

@@ -30,6 +30,7 @@ def _community_entitlements(**_kwargs) -> PlatformEntitlements:
         max_workflow_packs=1,
         production_writes=True,
         source="test_authority",
+        approval_mode="operator_confirmed",
     )
 
 
@@ -384,6 +385,143 @@ def test_trusted_rez_approval_rejects_same_immutable_requester(monkeypatch) -> N
     assert exc_info.value.status_code == 403
 
 
+def test_community_self_approval_requires_explicit_operator_ack(monkeypatch) -> None:
+    monkeypatch.setenv("NETCODE_AUTH", "1")
+    principal = api.Principal(
+        kind="system",
+        org_id="org-community",
+        role="operator",
+        user_id="usr_marcus",
+        email="marcus@example.com",
+    )
+
+    with pytest.raises(api.HTTPException, match="explicit confirmation") as exc_info:
+        api._approver_identity(
+            principal,
+            "",
+            "marcus@example.com",
+            "usr_marcus",
+            approval_mode="operator_confirmed",
+        )
+
+    assert exc_info.value.status_code == 409
+
+
+def test_community_self_approval_uses_authenticated_operator(monkeypatch) -> None:
+    monkeypatch.setenv("NETCODE_AUTH", "1")
+    principal = api.Principal(
+        kind="system",
+        org_id="org-community",
+        role="operator",
+        user_id="usr_marcus",
+        email="marcus@example.com",
+    )
+
+    approver = api._approver_identity(
+        principal,
+        "marcus@example.com",
+        "marcus@example.com",
+        "usr_marcus",
+        approval_mode="operator_confirmed",
+        operator_ack=True,
+    )
+
+    assert approver == "marcus@example.com"
+
+
+def test_community_operator_approval_is_persisted_with_policy_evidence(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    workspace = WorkspacePaths(tmp_path)
+    init_workspace(workspace)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("NETCODE_AUTH", "1")
+    monkeypatch.setenv("NETCODE_ADMIN_TOKEN", "private-rez-service-token")
+    monkeypatch.setattr(api, "get_entitlements", _community_entitlements)
+    monkeypatch.setattr(api, "approve_change_candidates", lambda *_args, **_kwargs: [])
+    store = PlatformStore(workspace)
+    change = store.create_change(
+        workspace.intents / "examples" / "add_guest_vlan.yaml",
+        "v2-store1",
+        requested_by="marcus@example.com",
+        org_id="org-community",
+        created_by_user_id="usr_marcus",
+    )
+    store.update_change(change.id, "completed", {"status": "pass"}, workflow_state="dry_run_passed")
+    headers = {
+        "Authorization": "Bearer private-rez-service-token",
+        "X-Rezonance-Org-ID": "org-community",
+        "X-Rezonance-User": "marcus@example.com",
+        "X-Rezonance-User-ID": "usr_marcus",
+        "X-Rezonance-Role": "operator",
+    }
+    client = TestClient(api.app)
+
+    rejected = client.post(f"/api/change/{change.id}/approve", headers=headers, json={})
+    approved = client.post(
+        f"/api/change/{change.id}/approve",
+        headers=headers,
+        json={"operator_ack": True},
+    )
+
+    assert rejected.status_code == 409
+    assert approved.status_code == 200, approved.text
+    assert approved.json()["approval_mode"] == "operator_confirmed"
+    assert approved.json()["operator_acknowledged"] is True
+    assert approved.json()["self_approval"] is True
+    event = next(item for item in store.list_workflow_events(change.id) if item.action == "approve")
+    assert event.evidence["approved_by_user_id"] == "usr_marcus"
+    assert event.evidence["approval_mode"] == "operator_confirmed"
+    assert event.evidence["operator_acknowledged"] is True
+    assert event.evidence["self_approval"] is True
+
+
+def test_community_second_operator_can_approve_with_same_acknowledgement(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    workspace = WorkspacePaths(tmp_path)
+    init_workspace(workspace)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("NETCODE_AUTH", "1")
+    monkeypatch.setenv("NETCODE_ADMIN_TOKEN", "private-rez-service-token")
+    monkeypatch.setattr(api, "get_entitlements", _community_entitlements)
+    monkeypatch.setattr(api, "approve_change_candidates", lambda *_args, **_kwargs: [])
+    store = PlatformStore(workspace)
+    change = store.create_change(
+        workspace.intents / "examples" / "add_guest_vlan.yaml",
+        "v2-store1",
+        requested_by="marcus@example.com",
+        org_id="org-community",
+        created_by_user_id="usr_marcus",
+    )
+    store.update_change(change.id, "completed", {"status": "pass"}, workflow_state="dry_run_passed")
+    headers = {
+        "Authorization": "Bearer private-rez-service-token",
+        "X-Rezonance-Org-ID": "org-community",
+        "X-Rezonance-User": "syed@example.com",
+        "X-Rezonance-User-ID": "usr_syed",
+        "X-Rezonance-Role": "operator",
+    }
+
+    approved = TestClient(api.app).post(
+        f"/api/change/{change.id}/approve",
+        headers=headers,
+        json={"operator_ack": True},
+    )
+
+    assert approved.status_code == 200, approved.text
+    assert approved.json()["approved_by_user_id"] == "usr_syed"
+    assert approved.json()["approval_mode"] == "operator_confirmed"
+    assert approved.json()["self_approval"] is False
+    event = next(item for item in store.list_workflow_events(change.id) if item.action == "approve")
+    assert event.evidence["approved_by_user_id"] == "usr_syed"
+    assert event.evidence["requested_by_user_id"] == "usr_marcus"
+    assert event.evidence["operator_acknowledged"] is True
+    assert event.evidence["self_approval"] is False
+
+
 def test_approval_requires_stable_authenticated_identity_and_operator_role(monkeypatch) -> None:
     monkeypatch.setenv("NETCODE_AUTH", "1")
     missing_identity = api.Principal(
@@ -501,3 +639,14 @@ def test_approval_cannot_cross_organization_boundary(tmp_path: Path, monkeypatch
     )
 
     assert response.status_code == 404
+
+
+def test_legacy_fleet_ui_submits_explicit_human_review_acknowledgement() -> None:
+    root = Path(__file__).resolve().parents[1]
+    markup = (root / "static" / "index.html").read_text(encoding="utf-8")
+    script = (root / "static" / "app.js").read_text(encoding="utf-8")
+
+    assert 'id="fleet-approval-ack"' in markup
+    assert "I reviewed the exact per-device plan" in markup
+    assert 'operator_ack: Boolean($("fleet-approval-ack").checked)' in script
+    assert "Requester and approver are different people." not in script

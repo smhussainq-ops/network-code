@@ -315,12 +315,26 @@ class ApprovalProof(BaseModel):
     approved: bool = False
     requested_by: str
     approved_by: str | None = None
+    requested_by_user_id: str | None = None
+    approved_by_user_id: str | None = None
+    approval_mode: Literal["operator_confirmed", "two_person"] = "two_person"
+    operator_acknowledged: bool = False
     workflow_state: str
 
     def require_for_write(self) -> None:
         if not self.approved or self.workflow_state != "approved" or not self.approved_by:
-            raise ValueError("manager write requires an approved workflow and a named second engineer")
-        if self.requested_by.strip().lower() == self.approved_by.strip().lower():
+            raise ValueError("manager write requires a durable human-approved workflow")
+        same_principal = bool(
+            (
+                self.requested_by_user_id
+                and self.approved_by_user_id
+                and self.requested_by_user_id == self.approved_by_user_id
+            )
+            or self.requested_by.strip().lower() == self.approved_by.strip().lower()
+        )
+        if self.approval_mode == "operator_confirmed" and not self.operator_acknowledged:
+            raise ValueError("operator-confirmed manager write requires explicit plan and rollback acknowledgement")
+        if same_principal and self.approval_mode != "operator_confirmed":
             raise ValueError("requester cannot approve their own manager write")
 
 

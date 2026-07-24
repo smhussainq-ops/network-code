@@ -291,7 +291,15 @@ def rollout_status(p: WorkspacePaths, rollout_id: str) -> dict[str, Any]:
 
 # ── Rollout execution ────────────────────────────────────────────────────────
 
-def approve_rollout(p: WorkspacePaths, rollout_id: str, approved_by: str) -> dict[str, Any]:
+def approve_rollout(
+    p: WorkspacePaths,
+    rollout_id: str,
+    approved_by: str,
+    *,
+    approval_mode: str = "two_person",
+    operator_ack: bool = False,
+    approved_by_user_id: str | None = None,
+) -> dict[str, Any]:
     store = PlatformStore(p)
     rollout = store.get_rollout(rollout_id)
     if rollout["status"] != "planned":
@@ -299,8 +307,18 @@ def approve_rollout(p: WorkspacePaths, rollout_id: str, approved_by: str) -> dic
     approver = (approved_by or "").strip()
     if not approver:
         raise ValueError("Approver identity is required.")
-    if approver == rollout["requested_by"]:
+    requester_user_id = str(rollout.get("created_by_user_id") or "") or None
+    self_approval = bool(
+        (approved_by_user_id and requester_user_id and approved_by_user_id == requester_user_id)
+        or approver == rollout["requested_by"]
+    )
+    if self_approval and approval_mode != "operator_confirmed":
         raise ValueError("The requester cannot approve their own rollout — a second engineer must approve.")
+    if approval_mode == "operator_confirmed" and not operator_ack:
+        raise ValueError(
+            "Community operator approval requires confirmation that the exact plan, "
+            "dry-run sequence, and rollback were reviewed."
+        )
     rollout = store.approve_rollout(rollout_id, approver)
     parent_audit_id = rez_change_id(rollout)
     for target in store.list_rollout_targets(rollout_id):
@@ -308,8 +326,22 @@ def approve_rollout(p: WorkspacePaths, rollout_id: str, approved_by: str) -> dic
             change = store.get_change(str(target["change_id"]))
             store.record_workflow_event(
                 str(target["change_id"]), "approve", change.workflow_state, change.workflow_state,
-                f"Approved via {parent_audit_id} by {approver}.",
-                {"rollout_id": rollout_id, "rez_change_id": parent_audit_id, "approved_by": approver},
+                (
+                    f"Approved via {parent_audit_id} by {approver} under the "
+                    "Community operator-confirmed policy."
+                    if approval_mode == "operator_confirmed"
+                    else f"Approved via {parent_audit_id} by {approver}."
+                ),
+                {
+                    "rollout_id": rollout_id,
+                    "rez_change_id": parent_audit_id,
+                    "approved_by": approver,
+                    "approved_by_user_id": approved_by_user_id,
+                    "requested_by_user_id": requester_user_id,
+                    "approval_mode": approval_mode,
+                    "operator_acknowledged": approval_mode == "operator_confirmed",
+                    "self_approval": self_approval,
+                },
             )
     return rollout_status(p, rollout_id)
 
@@ -321,7 +353,7 @@ def start_rollout(p: WorkspacePaths, rollout_id: str) -> dict[str, Any]:
     if rollout["status"] not in ("planned",):
         raise ValueError(f"Rollout is '{rollout['status']}' — only a planned rollout can start.")
     if approval_required() and not rollout.get("approved_by"):
-        raise ValueError("Approval gate: a second engineer must approve this rollout before it can start.")
+        raise ValueError("Approval gate: the licensed human-approval policy must be satisfied before this rollout can start.")
     with _THREADS_LOCK:
         existing = _ROLLOUT_THREADS.get(rollout_id)
         if existing and existing.is_alive():
