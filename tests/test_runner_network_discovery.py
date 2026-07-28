@@ -213,6 +213,56 @@ def test_range_sweep_skips_unknown_closed_addresses_without_marking_partial(tmp_
     assert set(calls) == {"10.20.0.10", "10.20.0.11"}
 
 
+def test_sparse_cidr_sweep_stops_at_successful_device_limit(tmp_path: Path, monkeypatch):
+    inventory_path = tmp_path / "inventory.yaml"
+    write_yaml(inventory_path, {
+        "defaults": {
+            "username": "local-user",
+            "password": "local-secret",
+            "platform": "arista_eos",
+        },
+        "devices": [],
+    })
+    monkeypatch.setattr(runner_agent, "INVENTORY_FILE", inventory_path)
+    calls: list[str] = []
+    _install_fake_rez(monkeypatch, calls)
+    socket_attempts: list[str] = []
+
+    class OpenSocket:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    def sparse_subnet(address, **_kwargs):  # noqa: ANN001
+        host = address[0]
+        socket_attempts.append(host)
+        if host not in {"10.20.0.10", "10.20.0.11"}:
+            raise TimeoutError("closed")
+        return OpenSocket()
+
+    monkeypatch.setattr(runner_agent.socket, "create_connection", sparse_subnet)
+    result = runner_agent._execute_rez_discover_network(
+        {
+            "seed_node": "10.20.0.8/29",
+            "depth": 0,
+            "max_devices": 2,
+            "max_probes": 6,
+            "concurrency": 2,
+            "platform": "arista_eos",
+        }
+    )
+
+    assert result["ok"] is True
+    assert result["status"] == "pass"
+    assert result["collected"] == 2
+    assert result["requested"] == 3
+    assert result["skipped"] == 1
+    assert calls == ["10.20.0.10", "10.20.0.11"]
+    assert socket_attempts == ["10.20.0.9", "10.20.0.10", "10.20.0.11"]
+
+
 def test_explicit_unknown_closed_address_remains_a_failure(tmp_path: Path, monkeypatch):
     inventory_path = tmp_path / "inventory.yaml"
     _write_inventory(inventory_path)

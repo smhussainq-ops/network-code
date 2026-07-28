@@ -18,7 +18,7 @@ from zipfile import ZIP_DEFLATED, ZipFile
 from netcode.shell_desktop import build_desktop_shell_profile
 
 
-PACKAGE_VERSION = "0.3.3-community-preview"
+PACKAGE_VERSION = "0.3.4-community-preview"
 
 
 def _rez_runtime_files() -> dict[str, bytes]:
@@ -101,6 +101,7 @@ def _install_runner_ps1(control_plane_url: str) -> str:
           [string]$PackageSpec = "",
           [string]$ProxyUrl = "",
           [string]$CaBundle = "",
+          [string]$OperatorAccount = "",
           [switch]$AllowInsecureHttpForLab,
           [switch]$RegisterStartupTask,
           [switch]$StartNow,
@@ -108,6 +109,43 @@ def _install_runner_ps1(control_plane_url: str) -> str:
         )
 
         $ErrorActionPreference = "Stop"
+        $Principal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
+        if (-not $Principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {{
+          throw "Run install-runner.ps1 from PowerShell opened as Administrator."
+        }}
+        $ElevatedIdentity = [Security.Principal.WindowsIdentity]::GetCurrent()
+        $OperatorUserSid = $null
+        if ($OperatorAccount) {{
+          try {{
+            $OperatorUserSid = (New-Object Security.Principal.NTAccount($OperatorAccount)).Translate(
+              [Security.Principal.SecurityIdentifier]
+            )
+          }} catch {{
+            throw "OperatorAccount '$OperatorAccount' could not be resolved to a Windows SID."
+          }}
+        }} else {{
+          $InstallerSessionId = (Get-Process -Id $PID).SessionId
+          $Explorer = Get-CimInstance Win32_Process -Filter "Name='explorer.exe'" -ErrorAction SilentlyContinue |
+            Where-Object {{ $_.SessionId -eq $InstallerSessionId }} |
+            Select-Object -First 1
+          if ($Explorer) {{
+            try {{
+              $Owner = Invoke-CimMethod -InputObject $Explorer -MethodName GetOwner -ErrorAction Stop
+              if ($Owner.User) {{
+                $ResolvedAccount = if ($Owner.Domain) {{ "$($Owner.Domain)\$($Owner.User)" }} else {{ $Owner.User }}
+                $OperatorUserSid = (New-Object Security.Principal.NTAccount($ResolvedAccount)).Translate(
+                  [Security.Principal.SecurityIdentifier]
+                )
+              }}
+            }} catch {{}}
+          }}
+          if (-not $OperatorUserSid) {{
+            $OperatorUserSid = $ElevatedIdentity.User
+          }}
+        }}
+        if (-not $OperatorUserSid -or $OperatorUserSid.Value -eq "S-1-5-18") {{
+          throw "Unable to resolve the signed-in Windows operator. Pass -OperatorAccount 'DOMAIN\User'."
+        }}
         & (Join-Path $PSScriptRoot "preflight.ps1") -ControlPlaneUrl $ControlPlaneUrl -AllowInsecureHttpForLab:$AllowInsecureHttpForLab
 
         $Root = Join-Path $env:ProgramData "Rezonance\LocalConnector"
@@ -151,7 +189,7 @@ def _install_runner_ps1(control_plane_url: str) -> str:
           throw "Unable to stop the installed Local Connector process."
         }}
 
-        foreach ($Script in @("start-runner.ps1", "open-connector.ps1", "diagnose-runner.ps1", "uninstall-runner.ps1")) {{
+        foreach ($Script in @("start-runner.ps1", "open-connector.ps1", "diagnose-runner.ps1", "repair-connector.ps1", "uninstall-runner.ps1")) {{
           Copy-Item -Force (Join-Path $PSScriptRoot $Script) (Join-Path $ScriptsRoot $Script)
         }}
         if (-not (Test-Path (Join-Path $RezSource "drivers\collector.py"))) {{
@@ -201,14 +239,19 @@ def _install_runner_ps1(control_plane_url: str) -> str:
           }}
           if ($LASTEXITCODE -ne 0) {{ throw "Connector enrollment failed." }}
         }} else {{
-          Write-Host "Enrollment is required. The Local Connector window will request the one-time join token."
+          Write-Host "Enrollment is required. The Local Connector window will request the one-time pairing code."
         }}
         $IdentityExists = Test-Path $IdentityPath
 
-        # SYSTEM runs the startup task and DPAPI uses machine scope. Restrict the
-        # ProgramData tree to SYSTEM, administrators, and the installing user.
-        $CurrentUser = [Security.Principal.WindowsIdentity]::GetCurrent().Name
-        & icacls.exe $Root /inheritance:r /grant:r "SYSTEM:(OI)(CI)F" "BUILTIN\Administrators:(OI)(CI)F" "${{CurrentUser}}:(OI)(CI)M" | Out-Null
+        # SYSTEM runs the startup task and DPAPI uses machine scope. The task's
+        # executable, scripts, settings, and Rez runtime must never be writable
+        # by the desktop operator. Only the protected data directory needs
+        # operator write access for enrollment and discovery.
+        $OperatorReadExecuteAcl = "*$($OperatorUserSid.Value):(OI)(CI)RX"
+        $OperatorModifyAcl = "*$($OperatorUserSid.Value):(OI)(CI)M"
+        & icacls.exe $Root /inheritance:r /grant:r "SYSTEM:(OI)(CI)F" "BUILTIN\Administrators:(OI)(CI)F" $OperatorReadExecuteAcl | Out-Null
+        if ($LASTEXITCODE -ne 0) {{ throw "Unable to protect Local Connector runtime permissions." }}
+        & icacls.exe $DataRoot /inheritance:r /grant:r "SYSTEM:(OI)(CI)F" "BUILTIN\Administrators:(OI)(CI)F" $OperatorModifyAcl | Out-Null
         if ($LASTEXITCODE -ne 0) {{ throw "Unable to protect Local Connector data permissions." }}
 
         $InstalledStart = Join-Path $ScriptsRoot "start-runner.ps1"
@@ -220,6 +263,70 @@ def _install_runner_ps1(control_plane_url: str) -> str:
           Register-ScheduledTask -TaskName $TaskName -Action $Action -Trigger $Trigger -Principal $Principal -Settings $TaskSettings -Description "Rezonance outbound-only Local Connector" -Force | Out-Null
           if (-not (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue)) {{
             throw "Local Connector startup task registration failed."
+          }}
+          # The task runs as SYSTEM, but the desktop control app runs as the
+          # installing operator. Grant that exact SID read/run rights on this
+          # task only; task modification and deletion remain administrator-only.
+          $TaskService = New-Object -ComObject "Schedule.Service"
+          $TaskService.Connect()
+          $TaskFolder = $TaskService.GetFolder("\")
+          $RegisteredTask = $TaskFolder.GetTask($TaskName)
+          $TaskSecurity = New-Object Security.AccessControl.RawSecurityDescriptor(
+            $RegisteredTask.GetSecurityDescriptor(4)
+          )
+          $TaskUserSid = $OperatorUserSid
+          $BuiltinUsersSid = New-Object Security.Principal.SecurityIdentifier("S-1-5-32-545")
+          $TaskReadExecuteMask = [int]0xA0000000
+          for ($AceIndex = $TaskSecurity.DiscretionaryAcl.Count - 1; $AceIndex -ge 0; $AceIndex--) {{
+            $Ace = $TaskSecurity.DiscretionaryAcl[$AceIndex]
+            if (
+              $Ace.AceQualifier -eq [Security.AccessControl.AceQualifier]::AccessAllowed -and
+              $Ace.SecurityIdentifier -and
+              (
+                $Ace.SecurityIdentifier.Value -eq $BuiltinUsersSid.Value -or
+                $Ace.SecurityIdentifier.Value -eq $TaskUserSid.Value
+              )
+            ) {{
+              $TaskSecurity.DiscretionaryAcl.RemoveAce($AceIndex)
+            }}
+          }}
+          $TaskAce = New-Object Security.AccessControl.CommonAce(
+            [Security.AccessControl.AceFlags]::None,
+            [Security.AccessControl.AceQualifier]::AccessAllowed,
+            $TaskReadExecuteMask,
+            $TaskUserSid,
+            $false,
+            $null
+          )
+          $TaskSecurity.DiscretionaryAcl.InsertAce($TaskSecurity.DiscretionaryAcl.Count, $TaskAce)
+          $RegisteredTask.SetSecurityDescriptor(
+            $TaskSecurity.GetSddlForm([Security.AccessControl.AccessControlSections]::Access),
+            0x10
+          )
+          $VerifiedTask = $TaskFolder.GetTask($TaskName)
+          $VerifiedSecurity = New-Object Security.AccessControl.RawSecurityDescriptor(
+            $VerifiedTask.GetSecurityDescriptor(4)
+          )
+          $VerifiedTaskReadExecute = $false
+          $VerifiedBroadUsersAce = $false
+          foreach ($Ace in $VerifiedSecurity.DiscretionaryAcl) {{
+            if (
+              $Ace.AceQualifier -eq [Security.AccessControl.AceQualifier]::AccessAllowed -and
+              $Ace.SecurityIdentifier
+            ) {{
+              if (
+                $Ace.SecurityIdentifier.Value -eq $TaskUserSid.Value -and
+                $Ace.AccessMask -eq $TaskReadExecuteMask
+              ) {{
+                $VerifiedTaskReadExecute = $true
+              }}
+              if ($Ace.SecurityIdentifier.Value -eq $BuiltinUsersSid.Value) {{
+                $VerifiedBroadUsersAce = $true
+              }}
+            }}
+          }}
+          if (-not $VerifiedTaskReadExecute -or $VerifiedBroadUsersAce) {{
+            throw "Local Connector startup-task permissions could not be verified."
           }}
           Write-Host "Registered startup task: $TaskName"
         }}
@@ -257,11 +364,22 @@ def _install_runner_ps1(control_plane_url: str) -> str:
         $Shortcut.WorkingDirectory = $Root
         if (Test-Path $Executable) {{ $Shortcut.IconLocation = "$Executable,0" }}
         $Shortcut.Save()
+        $RepairShortcutPath = Join-Path $env:ProgramData "Microsoft\Windows\Start Menu\Programs\Rezonance Local Connector Repair.lnk"
+        $RepairShortcut = $Shell.CreateShortcut($RepairShortcutPath)
+        $RepairShortcut.TargetPath = "powershell.exe"
+        $RepairShortcut.Arguments = "-NoProfile -ExecutionPolicy Bypass -File `"$(Join-Path $ScriptsRoot 'repair-connector.ps1')`""
+        $RepairShortcut.WorkingDirectory = $Root
+        if (Test-Path $Executable) {{ $RepairShortcut.IconLocation = "$Executable,0" }}
+        $RepairShortcut.Save()
 
         Write-Host $(if ($IdentityExists -or $JoinToken) {{ "Rezonance Local Connector installed and enrolled." }} else {{ "Rezonance Local Connector installed. Complete enrollment in the control window." }})
         Write-Host "Next: discover local inventory in the Rezonance Local Connector window."
         if (-not $NoOpenControl) {{
-          & (Join-Path $ScriptsRoot "open-connector.ps1")
+          if ($ElevatedIdentity.User.Value -eq $OperatorUserSid.Value) {{
+            & (Join-Path $ScriptsRoot "open-connector.ps1")
+          }} else {{
+            Write-Host "Open Rezonance Local Connector from the signed-in user's Start menu to complete pairing."
+          }}
         }}
         """
     ).strip() + "\n"
@@ -301,8 +419,17 @@ def _start_runner_ps1() -> str:
         $RestartLimit = 3
         $RestartDelaySeconds = 60
         while ($true) {
-          & $Runtime @RuntimeArguments 1>> $StdoutLog 2>> $StderrLog
-          $ExitCode = $LASTEXITCODE
+          # Windows PowerShell can promote native stderr to ErrorRecord. The
+          # connector logs transient network errors to stderr while continuing,
+          # so do not let the wrapper's Stop policy terminate the child process.
+          $PreviousErrorActionPreference = $ErrorActionPreference
+          $ErrorActionPreference = "Continue"
+          try {
+            & $Runtime @RuntimeArguments 1>> $StdoutLog 2>> $StderrLog
+            $ExitCode = $LASTEXITCODE
+          } finally {
+            $ErrorActionPreference = $PreviousErrorActionPreference
+          }
           if ($RestartAttempt -ge $RestartLimit) {
             throw "Local Connector exited with code $ExitCode after $RestartLimit restart attempts. See $StderrLog."
           }
@@ -368,6 +495,109 @@ def _diagnose_runner_ps1() -> str:
     ).strip() + "\n"
 
 
+def _repair_runner_ps1() -> str:
+    return dedent(
+        r"""
+        param([string]$OperatorSid = "")
+        $ErrorActionPreference = "Stop"
+        $Identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+        $Principal = New-Object Security.Principal.WindowsPrincipal($Identity)
+        if (-not $OperatorSid) {
+          $OperatorSid = $Identity.User.Value
+        }
+        if (-not $Principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+          $Arguments = "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`" -OperatorSid `"$OperatorSid`""
+          $Elevated = Start-Process powershell.exe -Verb RunAs -ArgumentList $Arguments -Wait -PassThru
+          exit $Elevated.ExitCode
+        }
+
+        $ResolvedOperatorSid = New-Object Security.Principal.SecurityIdentifier($OperatorSid)
+        if ($ResolvedOperatorSid.Value -eq "S-1-5-18") {
+          throw "The Windows SYSTEM account cannot be the desktop operator."
+        }
+        $Root = Join-Path $env:ProgramData "Rezonance\LocalConnector"
+        $DataRoot = Join-Path $Root "data"
+        if (-not (Test-Path $Root) -or -not (Test-Path $DataRoot)) {
+          throw "Rezonance Local Connector is not installed."
+        }
+        $OperatorReadExecuteAcl = "*$($ResolvedOperatorSid.Value):(OI)(CI)RX"
+        $OperatorModifyAcl = "*$($ResolvedOperatorSid.Value):(OI)(CI)M"
+        & icacls.exe $Root /inheritance:r /grant:r "SYSTEM:(OI)(CI)F" "BUILTIN\Administrators:(OI)(CI)F" $OperatorReadExecuteAcl | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw "Unable to repair Local Connector runtime permissions." }
+        & icacls.exe $DataRoot /inheritance:r /grant:r "SYSTEM:(OI)(CI)F" "BUILTIN\Administrators:(OI)(CI)F" $OperatorModifyAcl | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw "Unable to repair Local Connector data permissions." }
+
+        $TaskName = "RezonanceLocalConnector"
+        $TaskService = New-Object -ComObject "Schedule.Service"
+        $TaskService.Connect()
+        $TaskFolder = $TaskService.GetFolder("\")
+        try {
+          $RegisteredTask = $TaskFolder.GetTask($TaskName)
+        } catch {
+          throw "The Local Connector startup task is not installed."
+        }
+        $TaskSecurity = New-Object Security.AccessControl.RawSecurityDescriptor(
+          $RegisteredTask.GetSecurityDescriptor(4)
+        )
+        $BuiltinUsersSid = New-Object Security.Principal.SecurityIdentifier("S-1-5-32-545")
+        $TaskReadExecuteMask = [int]0xA0000000
+        for ($AceIndex = $TaskSecurity.DiscretionaryAcl.Count - 1; $AceIndex -ge 0; $AceIndex--) {
+          $Ace = $TaskSecurity.DiscretionaryAcl[$AceIndex]
+          if (
+            $Ace.AceQualifier -eq [Security.AccessControl.AceQualifier]::AccessAllowed -and
+            $Ace.SecurityIdentifier -and
+            (
+              $Ace.SecurityIdentifier.Value -eq $BuiltinUsersSid.Value -or
+              $Ace.SecurityIdentifier.Value -eq $ResolvedOperatorSid.Value
+            )
+          ) {
+            $TaskSecurity.DiscretionaryAcl.RemoveAce($AceIndex)
+          }
+        }
+        $TaskAce = New-Object Security.AccessControl.CommonAce(
+          [Security.AccessControl.AceFlags]::None,
+          [Security.AccessControl.AceQualifier]::AccessAllowed,
+          $TaskReadExecuteMask,
+          $ResolvedOperatorSid,
+          $false,
+          $null
+        )
+        $TaskSecurity.DiscretionaryAcl.InsertAce($TaskSecurity.DiscretionaryAcl.Count, $TaskAce)
+        $RegisteredTask.SetSecurityDescriptor(
+          $TaskSecurity.GetSddlForm([Security.AccessControl.AccessControlSections]::Access),
+          0x10
+        )
+
+        $VerifiedTask = $TaskFolder.GetTask($TaskName)
+        $VerifiedSecurity = New-Object Security.AccessControl.RawSecurityDescriptor(
+          $VerifiedTask.GetSecurityDescriptor(4)
+        )
+        $VerifiedOperatorAce = $false
+        $VerifiedBroadUsersAce = $false
+        foreach ($Ace in $VerifiedSecurity.DiscretionaryAcl) {
+          if (
+            $Ace.AceQualifier -eq [Security.AccessControl.AceQualifier]::AccessAllowed -and
+            $Ace.SecurityIdentifier
+          ) {
+            if (
+              $Ace.SecurityIdentifier.Value -eq $ResolvedOperatorSid.Value -and
+              $Ace.AccessMask -eq $TaskReadExecuteMask
+            ) {
+              $VerifiedOperatorAce = $true
+            }
+            if ($Ace.SecurityIdentifier.Value -eq $BuiltinUsersSid.Value) {
+              $VerifiedBroadUsersAce = $true
+            }
+          }
+        }
+        if (-not $VerifiedOperatorAce -or $VerifiedBroadUsersAce) {
+          throw "Local Connector permissions could not be verified after repair."
+        }
+        Write-Host "Rezonance Local Connector permissions repaired for $($ResolvedOperatorSid.Value)."
+        """
+    ).strip() + "\n"
+
+
 def _uninstall_runner_ps1() -> str:
     return dedent(
         r"""
@@ -380,6 +610,7 @@ def _uninstall_runner_ps1() -> str:
         $Root = Join-Path $env:ProgramData "Rezonance\LocalConnector"
         $TaskName = "RezonanceLocalConnector"
         $ShortcutPath = Join-Path $env:ProgramData "Microsoft\Windows\Start Menu\Programs\Rezonance Local Connector.lnk"
+        $RepairShortcutPath = Join-Path $env:ProgramData "Microsoft\Windows\Start Menu\Programs\Rezonance Local Connector Repair.lnk"
         if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
           Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
           Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false
@@ -425,6 +656,7 @@ def _uninstall_runner_ps1() -> str:
           Write-Host "Runtime removed. Protected data and logs remain at $Root. Use -PurgeLocalData to remove them."
         }
         Remove-Item -Force $ShortcutPath -ErrorAction SilentlyContinue
+        Remove-Item -Force $RepairShortcutPath -ErrorAction SilentlyContinue
         """
     ).strip() + "\n"
 
@@ -541,49 +773,40 @@ def _readme(control_plane_url: str) -> str:
         Netcode Automation, Rez Diagnostics, Digital Twin discovery, and Shell.
         No LLM or MCP server runs on the Windows connector.
 
-        ## Pilot install
+        ## Install
 
-        Open PowerShell as Administrator:
+        Extract the ZIP, then open PowerShell as Administrator in the extracted
+        folder:
 
         ```powershell
         Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope Process
-        .\preflight.ps1 -ControlPlaneUrl "{control_plane_url}"
-        .\install-runner.ps1 -JoinToken "<single-use-token>" -RunnerName "windows-gns3-connector" -RegisterStartupTask -StartNow
-        .\diagnose-runner.ps1
+        .\install-runner.ps1 -RegisterStartupTask
         ```
 
-        The installer opens the Local Connector control application. Enter a
-        bounded seed IP, range, or CIDR and local device credentials there.
-        Community discovery is limited to 25 devices. Only devices successfully
-        collected by Rez become local inventory records.
+        The installer opens the Local Connector window. Enter the one-time
+        pairing code supplied by Rezonance. Confirm the exact organization,
+        Community login, and connector name, then select **Connect this device**.
+        On **Overview**, select **Start connector**. On **Discovery**, enter a
+        bounded seed IP, range, or CIDR and local device credentials. Community
+        discovery is limited to 25 devices; only successfully collected devices
+        become protected inventory records.
 
-        To point a Windows/GNS3 pilot at a Mac control plane, pass the Mac LAN
-        URL explicitly and permit HTTP only on that private test network:
-
-        ```powershell
-        .\install-runner.ps1 -JoinToken "<single-use-token>" -ControlPlaneUrl "http://MAC-LAN-IP:8095" -AllowInsecureHttpForLab -RegisterStartupTask -StartNow
-        ```
+        Run `.\diagnose-runner.ps1` from an Administrator PowerShell window when
+        support asks for the connector readiness report. If diagnostics report
+        Windows access denied, select **Rezonance Local Connector Repair** from
+        the Start menu. Repair preserves enrollment, inventory, and runtime state.
 
         ## Security model
 
         - Outbound HTTPS/WSS only in production; no inbound listener is opened.
         - Device access uses SSH/API from this connector to the local network.
         - Windows identity and inventory files use machine-scoped DPAPI.
-        - NTFS access is restricted to SYSTEM and local administrators.
+        - Runtime access is restricted to SYSTEM, local administrators, and the
+          exact signed-in operator; only that operator receives data-directory
+          modify access.
         - The control plane receives public inventory facts and signed job results, never credentials.
         - Rez jobs are read-only. Netcode writes remain plan-, approval-, and verification-gated.
         - Proxy and custom enterprise CA paths can be supplied during install.
-
-        ## Clean-machine executable
-
-        Release engineers build with the licensed compiler environment:
-
-        ```powershell
-        .\build-windows-executable.ps1 -CommercialPython "C:\path\to\commercial-venv\Scripts\python.exe" -Clean
-        ```
-
-        The generated `bin` runtime removes the Python prerequisite. Production
-        distribution still requires Authenticode code signing.
 
         Logs are under `C:\ProgramData\Rezonance\LocalConnector\logs`.
         """
@@ -600,6 +823,7 @@ def build_windows_runner_package(control_plane_url: str, *, runner_pool: str = "
         "start-runner.ps1": _start_runner_ps1(),
         "open-connector.ps1": _open_connector_ps1(),
         "diagnose-runner.ps1": _diagnose_runner_ps1(),
+        "repair-connector.ps1": _repair_runner_ps1(),
         "uninstall-runner.ps1": _uninstall_runner_ps1(),
         "build-windows-executable.ps1": _build_executable_ps1(),
         "windows-entrypoint.py": _windows_entrypoint(),
@@ -647,7 +871,8 @@ def package_manifest(control_plane_url: str, *, runner_pool: str = "default") ->
         "production_code_signing_complete": False,
         "files": [
             "README.md", "preflight.ps1", "install-runner.ps1", "start-runner.ps1",
-            "open-connector.ps1", "diagnose-runner.ps1", "uninstall-runner.ps1",
+            "open-connector.ps1", "diagnose-runner.ps1", "repair-connector.ps1",
+            "uninstall-runner.ps1",
             "build-windows-executable.ps1", "SHA256SUMS.txt",
         ],
         "rez_adapter_bundle": {

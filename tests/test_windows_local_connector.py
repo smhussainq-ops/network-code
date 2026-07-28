@@ -144,6 +144,78 @@ def test_control_snapshot_never_returns_local_secrets(tmp_path: Path, monkeypatc
     assert "device-secret" not in serialized
 
 
+def test_community_control_plane_is_locked_unless_internal_override_is_enabled(monkeypatch):
+    from netcode.windows_connector_control import PRODUCTION_CONTROL_PLANE, control_plane_url
+
+    monkeypatch.setenv("NETCODE_CONTROL_PLANE_URL", "https://untrusted.example.test")
+    monkeypatch.delenv("NETCODE_ALLOW_CONTROL_PLANE_OVERRIDE", raising=False)
+    assert control_plane_url() == PRODUCTION_CONTROL_PLANE
+
+    monkeypatch.setenv("NETCODE_ALLOW_CONTROL_PLANE_OVERRIDE", "1")
+    assert control_plane_url() == "https://untrusted.example.test"
+
+
+def test_diagnostics_verify_exact_customer_identity_without_returning_secrets(
+    tmp_path: Path,
+    monkeypatch,
+):
+    from netcode import windows_connector_control
+
+    identity = tmp_path / "identity.json"
+    inventory = tmp_path / "inventory.yaml"
+    identity.write_text(json.dumps({
+        "server": "https://control.rezonancenetworks.com",
+        "runner_id": "runner-1",
+        "runner_token": "private-runner-token",
+        "hmac_secret": "private-signing-secret",
+        "pool": "private-org-id",
+        "name": "acme-windows-01",
+        "organization_name": "Acme Networks",
+        "operator_email": "owner@acme.example",
+        "identity_verified": True,
+    }), encoding="utf-8")
+    write_yaml(inventory, {
+        "devices": [{
+            "id": "core-1",
+            "hostname": "core-1",
+            "host": "192.0.2.10",
+            "platform": "arista_eos",
+            "username": "device-user",
+            "password": "device-secret",
+        }],
+    })
+    monkeypatch.setattr(runner_agent, "IDENTITY_FILE", identity)
+    monkeypatch.setattr(runner_agent, "INVENTORY_FILE", inventory)
+    monkeypatch.setattr(
+        runner_agent,
+        "connector_identity",
+        lambda **kwargs: {
+            "ok": True,
+            "connector_name": "acme-windows-01",
+            "organization_name": "Acme Networks",
+            "operator_email": "owner@acme.example",
+            "identity_verified": True,
+        },
+    )
+
+    class Completed:
+        returncode = 0
+        stdout = "TaskName: RezonanceLocalConnector"
+        stderr = ""
+
+    monkeypatch.setattr(windows_connector_control.subprocess, "run", lambda *args, **kwargs: Completed())
+
+    report = windows_connector_control.collect_diagnostics(timeout=1.0)
+    serialized = json.dumps(report)
+
+    assert report["ok"] is True
+    assert report["connector"]["organization_name"] == "Acme Networks"
+    assert report["connector"]["operator_email"] == "owner@acme.example"
+    assert next(check for check in report["checks"] if check["id"] == "cloud_identity")["status"] == "pass"
+    for secret in ("private-runner-token", "private-signing-secret", "private-org-id", "device-user", "device-secret"):
+        assert secret not in serialized
+
+
 def test_community_cli_hides_manual_inventory_import():
     completed = subprocess.run(
         [sys.executable, "-m", "netcode.runner_agent", "--help"],
@@ -155,3 +227,34 @@ def test_community_cli_hides_manual_inventory_import():
     assert completed.returncode == 0
     assert "discover-inventory" in completed.stdout
     assert "inventory-import" not in completed.stdout
+
+
+def test_connector_ui_uses_customer_pairing_language():
+    from netcode import windows_connector_control
+
+    source = Path(windows_connector_control.__file__).read_text(encoding="utf-8")
+
+    assert "One-time pairing code" in source
+    assert "Verify code" in source
+    assert "Verified customer" in source
+    assert "Connect this device" in source
+    assert "self.enroll_name" not in source
+    assert "self.enroll_server" not in source
+    assert "one-time join token" not in source
+
+
+def test_connector_ui_explains_startup_task_access_denial(monkeypatch):
+    from netcode import windows_connector_control
+
+    class Completed:
+        returncode = 5
+        stdout = ""
+        stderr = "ERROR: Access is denied."
+
+    monkeypatch.setattr(windows_connector_control.subprocess, "run", lambda *args, **kwargs: Completed())
+
+    ok, message = windows_connector_control._run_task("Run")
+
+    assert ok is False
+    assert "Open Diagnostics" in message
+    assert "Repair permissions" in message

@@ -245,6 +245,10 @@ def test_enroll_persists_rotation_schedule(tmp_path: Path, monkeypatch: pytest.M
             "runner_token": "token-1",
             "hmac_secret": "hmac-1",
             "pool": "pilot",
+            "connector_name": "founder-issued-connector",
+            "organization_name": "Founder Issued Company",
+            "operator_email": "owner@example.com",
+            "identity_verified": True,
             "token_expires_at": "2099-01-01T00:00:00+00:00",
             "token_rotate_after": "2098-01-01T00:00:00+00:00",
         }
@@ -256,5 +260,9 @@ def test_enroll_persists_rotation_schedule(tmp_path: Path, monkeypatch: pytest.M
     saved = json.loads(identity_file.read_text(encoding="utf-8"))
 
     assert result == 0
+    assert saved["name"] == "founder-issued-connector"
+    assert saved["organization_name"] == "Founder Issued Company"
+    assert saved["operator_email"] == "owner@example.com"
+    assert saved["identity_verified"] is True
     assert saved["token_rotate_after"] == "2098-01-01T00:00:00+00:00"
     assert saved["token_pending"] is False

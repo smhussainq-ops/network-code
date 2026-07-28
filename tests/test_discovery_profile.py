@@ -78,11 +78,23 @@ def test_explicit_allow_and_exclusion_are_fail_closed(tmp_path: Path):
 
 
 def test_large_cidr_is_rejected_before_any_scan(tmp_path: Path):
-    with pytest.raises(DiscoveryProfileError, match="above the remaining max_devices"):
+    with pytest.raises(DiscoveryProfileError, match="above the remaining bounded probe budget"):
         DiscoveryProfile.from_payload(
             {"seed_node": "10.0.0.0/8", "max_devices": 100},
             _inventory(tmp_path),
         )
+
+
+def test_sparse_management_cidr_has_separate_device_and_probe_limits(tmp_path: Path):
+    profile = DiscoveryProfile.from_payload(
+        {"seed_node": "192.0.2.0/24", "max_devices": 25},
+        _inventory(tmp_path),
+    )
+
+    assert len(profile.seeds) == 254
+    assert profile.max_devices == 25
+    assert profile.max_probes == 400
+    assert profile.public_dict()["max_probes"] == 400
 
 
 def test_unknown_hostname_requires_local_inventory(tmp_path: Path):
