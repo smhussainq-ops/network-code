@@ -116,6 +116,7 @@ from netcode.runner_hub import (
     mint_join_token,
     poll_for_job,
     prepare_runner_token_rotation,
+    preview_pairing,
     runner_summary,
     submit_job_progress,
     submit_job_result,
@@ -175,7 +176,7 @@ from netcode.ui_config import (
     write_ui_config,
 )
 from netcode.verification import verify_state, verify_vlan_state
-from netcode.windows_runner_package import build_windows_runner_package, package_manifest
+from netcode.windows_runner_package import PACKAGE_VERSION, build_windows_runner_package, package_manifest
 from netcode.workflow import state_after_lab_action, state_after_static_validation, workflow_snapshot
 from netcode.workflow_packs import entitled_change_types, workflow_pack_catalog
 from netcode.yamlio import write_yaml
@@ -399,11 +400,18 @@ class GitPushRequest(BaseModel):
 class JoinTokenRequest(BaseModel):
     pool: str = "store-lab"
     replace_unused: bool = False
+    connector_name: str = ""
+    organization_name: str = ""
+    operator_email: str = ""
 
 
 class RunnerEnrollRequest(BaseModel):
     join_token: str
     name: str = "runner"
+
+
+class PairingPreviewRequest(BaseModel):
+    join_token: str
 
 
 class RunnerPollRequest(BaseModel):
@@ -2333,7 +2341,17 @@ def api_mint_join_token(request: JoinTokenRequest, http_request: Request, author
         additional=1,
         org_id=principal.org_id,
     )
-    return mint_join_token(store, request.pool, org_id=principal.org_id)
+    try:
+        return mint_join_token(
+            store,
+            request.pool,
+            org_id=principal.org_id,
+            connector_name=request.connector_name,
+            organization_name=request.organization_name,
+            operator_email=request.operator_email,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
 @app.get("/api/runners")
@@ -2564,6 +2582,27 @@ def api_runner_security_events(runner_id: str, request: Request) -> dict[str, ob
 def api_runner_enroll(request: RunnerEnrollRequest) -> dict[str, object]:
     store = PlatformStore(paths())
     return enroll_runner(store, request.join_token, request.name)
+
+
+@app.post("/api/runner/pairing/preview")
+def api_runner_pairing_preview(request: PairingPreviewRequest) -> dict[str, object]:
+    return preview_pairing(PlatformStore(paths()), request.join_token)
+
+
+@app.get("/api/runner/me")
+def api_runner_identity(authorization: str | None = Header(default=None)) -> dict[str, object]:
+    runner = _require_runner(PlatformStore(paths()), authorization)
+    return {
+        "ok": True,
+        "connector_name": runner.name,
+        "organization_name": runner.organization_name,
+        "operator_email": runner.operator_email,
+        "identity_verified": runner.identity_verified,
+        "status": runner.status,
+        "last_seen": runner.last_seen,
+        "device_count": runner.device_count,
+        "version": runner.version,
+    }
 
 
 @app.post("/api/runner/token/rotate")
@@ -3833,7 +3872,7 @@ def api_windows_runner_manifest(request: Request) -> dict[str, object]:
     return {
         "ok": True,
         "product": "Rezonance Local Connector",
-        "version": "0.3.3-community-preview",
+        "version": PACKAGE_VERSION,
         "platform": "windows-x64",
         "artifact_kind": "compiled_windows_connector",
         "package_kind": "signed_windows_package",

@@ -82,24 +82,107 @@ def sign_result(secret: str, result: dict[str, Any]) -> str:
     return hmac.new(secret.encode("utf-8"), canonical_json(result).encode("utf-8"), hashlib.sha256).hexdigest()
 
 
-def mint_join_token(store: PlatformStore, pool: str, org_id: str = "org_default") -> dict[str, Any]:
-    pool = pool.strip() or "default"
-    token = f"njt_{secrets.token_urlsafe(32)}"
-    store.create_join_token(_hash(token), pool, org_id=org_id)
+def _pairing_identity(
+    connector_name: str,
+    organization_name: str,
+    operator_email: str,
+) -> tuple[str, str, str]:
+    connector_name = str(connector_name or "").strip()
+    organization_name = str(organization_name or "").strip()
+    operator_email = str(operator_email or "").strip()
+    values = (connector_name, organization_name, operator_email)
+    if not any(values):
+        return "", "", ""
+    if not all(values):
+        raise ValueError(
+            "connector_name, organization_name, and operator_email must be supplied together."
+        )
+    if not re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9._-]{0,62}[A-Za-z0-9])?", connector_name):
+        raise ValueError("connector_name must contain 1-64 letters, numbers, dots, underscores, or hyphens.")
+    if len(organization_name) > 160 or not organization_name.isprintable():
+        raise ValueError("organization_name must be printable and no more than 160 characters.")
+    if len(operator_email) > 254 or not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", operator_email):
+        raise ValueError("operator_email must be a valid email address.")
+    return connector_name, organization_name, operator_email
+
+
+def _safe_pairing_identity(claim: dict[str, str]) -> dict[str, Any]:
+    connector_name = str(claim.get("connector_name") or "").strip()
+    organization_name = str(claim.get("organization_name") or "").strip()
+    operator_email = str(claim.get("operator_email") or "").strip()
     return {
+        "connector_name": connector_name,
+        "organization_name": organization_name,
+        "operator_email": operator_email,
+        "identity_verified": bool(connector_name and organization_name and operator_email),
+    }
+
+
+def mint_join_token(
+    store: PlatformStore,
+    pool: str,
+    org_id: str = "org_default",
+    *,
+    connector_name: str = "",
+    organization_name: str = "",
+    operator_email: str = "",
+) -> dict[str, Any]:
+    pool = pool.strip() or "default"
+    connector_name, organization_name, operator_email = _pairing_identity(
+        connector_name,
+        organization_name,
+        operator_email,
+    )
+    token = f"njt_{secrets.token_urlsafe(32)}"
+    store.create_join_token(
+        _hash(token),
+        pool,
+        org_id=org_id,
+        connector_name=connector_name,
+        organization_name=organization_name,
+        operator_email=operator_email,
+    )
+    response = {
         "ok": True,
         "join_token": token,
         "pool": pool,
         "message": f"Single-use join token for pool '{pool}'. It is shown once — copy it now.",
     }
+    response.update(
+        _safe_pairing_identity(
+            {
+                "connector_name": connector_name,
+                "organization_name": organization_name,
+                "operator_email": operator_email,
+            }
+        )
+    )
+    return response
+
+
+def preview_pairing(store: PlatformStore, join_token: str) -> dict[str, Any]:
+    token = str(join_token or "").strip()
+    claim = store.preview_join_token(_hash(token)) if token else None
+    if claim is None:
+        return {"ok": False, "message": "Pairing code is invalid or already used."}
+    identity = _safe_pairing_identity(claim)
+    if not identity["identity_verified"]:
+        return {
+            "ok": False,
+            "message": "This legacy pairing code cannot verify customer identity. Issue a new code.",
+            "error": "identity_not_bound",
+        }
+    return {"ok": True, **identity}
 
 
 def enroll_runner(store: PlatformStore, join_token: str, name: str) -> dict[str, Any]:
-    name = name.strip() or "runner"
+    requested_name = name.strip() or "runner"
     claim = store.consume_join_token(_hash(join_token.strip()))
     if claim is None:
         return {"ok": False, "message": "Join token is invalid or already used. Mint a new one."}
     pool, org_id = claim["pool"], claim["org_id"]
+    identity = _safe_pairing_identity(claim)
+    name = str(identity["connector_name"]) if identity["identity_verified"] else requested_name
     try:
         enforce_capacity(
             "connectors",
@@ -121,6 +204,8 @@ def enroll_runner(store: PlatformStore, join_token: str, name: str) -> dict[str,
         org_id=org_id,
         token_expires_at=window["token_expires_at"],
         token_rotate_after=window["token_rotate_after"],
+        organization_name=str(identity["organization_name"]),
+        operator_email=str(identity["operator_email"]),
     )
     store.record_runner_security_event(
         runner.id,
@@ -135,6 +220,10 @@ def enroll_runner(store: PlatformStore, join_token: str, name: str) -> dict[str,
         "runner_token": runner_token,
         "hmac_secret": hmac_secret,
         "pool": pool,
+        "connector_name": runner.name,
+        "organization_name": runner.organization_name,
+        "operator_email": runner.operator_email,
+        "identity_verified": runner.identity_verified,
         "token_expires_at": window["token_expires_at"],
         "token_rotate_after": window["token_rotate_after"],
         "message": f"Runner '{name}' enrolled into pool '{pool}'.",

@@ -334,6 +334,9 @@ class RunnerRecord:
     previous_token_expires_at: str | None = None
     pending_token_valid_until: str | None = None
     revoked_at: str | None = None
+    organization_name: str = ""
+    operator_email: str = ""
+    identity_verified: bool = False
 
 
 @dataclass(frozen=True)
@@ -505,6 +508,8 @@ class PlatformStore:
             self._ensure_column(conn, "runners", "pending_token_rotate_after", "TEXT")
             self._ensure_column(conn, "runners", "pending_token_valid_until", "TEXT")
             self._ensure_column(conn, "runners", "revoked_at", "TEXT")
+            self._ensure_column(conn, "runners", "organization_name", "TEXT NOT NULL DEFAULT ''")
+            self._ensure_column(conn, "runners", "operator_email", "TEXT NOT NULL DEFAULT ''")
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS runner_security_events (
@@ -609,6 +614,9 @@ class PlatformStore:
                 )
                 """
             )
+            self._ensure_column(conn, "join_tokens", "connector_name", "TEXT NOT NULL DEFAULT ''")
+            self._ensure_column(conn, "join_tokens", "organization_name", "TEXT NOT NULL DEFAULT ''")
+            self._ensure_column(conn, "join_tokens", "operator_email", "TEXT NOT NULL DEFAULT ''")
             self._ensure_column(conn, "jobs", "pool", "TEXT")
             self._ensure_column(conn, "jobs", "payload_json", "TEXT")
             self._ensure_column(conn, "jobs", "claimed_by", "TEXT")
@@ -1262,15 +1270,41 @@ class PlatformStore:
             previous_token_expires_at=self._col(row, "previous_token_expires_at"),
             pending_token_valid_until=self._col(row, "pending_token_valid_until"),
             revoked_at=self._col(row, "revoked_at"),
+            organization_name=str(self._col(row, "organization_name") or ""),
+            operator_email=str(self._col(row, "operator_email") or ""),
+            identity_verified=bool(
+                str(self._col(row, "organization_name") or "").strip()
+                and str(self._col(row, "operator_email") or "").strip()
+                and str(row["name"] or "").strip()
+            ),
         )
 
     # ── Runner registry & job queue (Phase 0 SaaS split) ──────────────────
 
-    def create_join_token(self, token_hash: str, pool: str, org_id: str = DEFAULT_ORG_ID) -> None:
+    def create_join_token(
+        self,
+        token_hash: str,
+        pool: str,
+        org_id: str = DEFAULT_ORG_ID,
+        *,
+        connector_name: str = "",
+        organization_name: str = "",
+        operator_email: str = "",
+    ) -> None:
         with self._connect() as conn:
             conn.execute(
-                "INSERT INTO join_tokens (token_hash, pool, created_at, used_at, org_id) VALUES (?, ?, ?, NULL, ?)",
-                (token_hash, pool, utc_now(), org_id),
+                "INSERT INTO join_tokens "
+                "(token_hash, pool, created_at, used_at, org_id, connector_name, organization_name, operator_email) "
+                "VALUES (?, ?, ?, NULL, ?, ?, ?, ?)",
+                (
+                    token_hash,
+                    pool,
+                    utc_now(),
+                    org_id,
+                    connector_name,
+                    organization_name,
+                    operator_email,
+                ),
             )
 
     def invalidate_unused_join_tokens(self, org_id: str) -> int:
@@ -1282,8 +1316,26 @@ class PlatformStore:
             )
             return int(cursor.rowcount)
 
+    def preview_join_token(self, token_hash: str) -> dict[str, str] | None:
+        """Return an unused token claim without consuming it."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT pool, org_id, connector_name, organization_name, operator_email "
+                "FROM join_tokens WHERE token_hash = ? AND used_at IS NULL",
+                (token_hash,),
+            ).fetchone()
+        if not row:
+            return None
+        return {
+            "pool": str(row["pool"]),
+            "org_id": str(self._col(row, "org_id") or DEFAULT_ORG_ID),
+            "connector_name": str(self._col(row, "connector_name") or ""),
+            "organization_name": str(self._col(row, "organization_name") or ""),
+            "operator_email": str(self._col(row, "operator_email") or ""),
+        }
+
     def consume_join_token(self, token_hash: str) -> dict[str, str] | None:
-        """Atomically mark a join token used; returns {pool, org_id} or None if invalid/replayed."""
+        """Atomically mark a join token used and return its complete claim."""
         with self._connect() as conn:
             cursor = conn.execute(
                 "UPDATE join_tokens SET used_at = ? WHERE token_hash = ? AND used_at IS NULL",
@@ -1291,10 +1343,22 @@ class PlatformStore:
             )
             if cursor.rowcount != 1:
                 return None
-            row = conn.execute("SELECT pool, org_id FROM join_tokens WHERE token_hash = ?", (token_hash,)).fetchone()
+            row = conn.execute(
+                "SELECT pool, org_id, connector_name, organization_name, operator_email "
+                "FROM join_tokens WHERE token_hash = ?",
+                (token_hash,),
+            ).fetchone()
             if not row:
                 return None
-            return {"pool": row["pool"], "org_id": self._col(row, "org_id") or DEFAULT_ORG_ID}
+            claim = {
+                "pool": str(row["pool"]),
+                "org_id": str(self._col(row, "org_id") or DEFAULT_ORG_ID),
+            }
+            for key in ("connector_name", "organization_name", "operator_email"):
+                value = str(self._col(row, key) or "")
+                if value:
+                    claim[key] = value
+            return claim
 
     def create_runner(
         self,
@@ -1306,14 +1370,16 @@ class PlatformStore:
         *,
         token_expires_at: str | None = None,
         token_rotate_after: str | None = None,
+        organization_name: str = "",
+        operator_email: str = "",
     ) -> RunnerRecord:
         runner_id = str(uuid.uuid4())
         now = utc_now()
         with self._connect() as conn:
             conn.execute(
                 "INSERT INTO runners (id, name, pool, token_hash, hmac_secret, status, version, created_at, "
-                "last_seen, org_id, token_expires_at, token_rotate_after) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "last_seen, org_id, token_expires_at, token_rotate_after, organization_name, operator_email) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     runner_id,
                     name,
@@ -1327,6 +1393,8 @@ class PlatformStore:
                     org_id,
                     token_expires_at,
                     token_rotate_after,
+                    organization_name,
+                    operator_email,
                 ),
             )
         return self.get_runner(runner_id)
