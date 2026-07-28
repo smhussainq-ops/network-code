@@ -15,6 +15,7 @@ from netcode import runner_agent
 
 PRODUCT_NAME = "Rezonance Local Connector"
 TASK_NAME = "RezonanceLocalConnector"
+PRODUCTION_CONTROL_PLANE = "https://control.rezonancenetworks.com"
 PLATFORMS = (
     ("Auto detect", ""),
     ("Cisco IOS / IOS-XE", "cisco_ios"),
@@ -26,6 +27,21 @@ PLATFORMS = (
 )
 
 
+def control_plane_url() -> str:
+    if os.getenv("NETCODE_ALLOW_CONTROL_PLANE_OVERRIDE", "").strip() == "1":
+        return str(os.getenv("NETCODE_CONTROL_PLANE_URL") or PRODUCTION_CONTROL_PLANE).strip().rstrip("/")
+    return PRODUCTION_CONTROL_PLANE
+
+
+def _identity_error(exc: BaseException) -> str:
+    if isinstance(exc, PermissionError) or getattr(exc, "winerror", None) == 5:
+        return (
+            "Windows denied access to the protected connector identity. "
+            "Run Repair Connector as Administrator for this Windows account."
+        )
+    return f"The protected connector identity could not be decrypted ({type(exc).__name__})."
+
+
 def connector_snapshot() -> dict[str, Any]:
     """Return UI-safe local state without identity or device secrets."""
     identity: dict[str, Any] = {}
@@ -34,7 +50,7 @@ def connector_snapshot() -> dict[str, Any]:
         try:
             identity = runner_agent._load_identity()
         except BaseException as exc:  # SystemExit is used by the CLI loader.
-            identity_error = str(exc)
+            identity_error = _identity_error(exc)
 
     inventory_error = ""
     try:
@@ -51,6 +67,9 @@ def connector_snapshot() -> dict[str, Any]:
             "server": str(identity.get("server") or ""),
             "pool": str(identity.get("pool") or ""),
             "version": runner_agent.VERSION,
+            "organization_name": str(identity.get("organization_name") or ""),
+            "operator_email": str(identity.get("operator_email") or ""),
+            "identity_verified": bool(identity.get("identity_verified")),
         },
         "inventory": {
             "configured": runner_agent.INVENTORY_FILE.exists() and not inventory_error,
@@ -76,7 +95,129 @@ def _run_task(command: str) -> tuple[bool, str]:
         check=False,
     )
     message = (completed.stdout or completed.stderr or "").strip()
+    if completed.returncode != 0 and "access is denied" in message.lower():
+        message = (
+            "Windows denied access to the connector startup task. "
+            "Open Diagnostics, select Repair permissions, and approve the Windows prompt."
+        )
     return completed.returncode == 0, message
+
+
+def _task_diagnostic() -> dict[str, str]:
+    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    try:
+        completed = subprocess.run(
+            ["schtasks.exe", "/Query", "/TN", TASK_NAME, "/FO", "LIST"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            creationflags=flags,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return {
+            "id": "startup_task",
+            "status": "fail",
+            "message": f"Windows could not inspect the connector startup task ({type(exc).__name__}).",
+        }
+    detail = (completed.stdout or completed.stderr or "").strip().lower()
+    if completed.returncode == 0:
+        return {
+            "id": "startup_task",
+            "status": "pass",
+            "message": "The Windows connector startup task is installed and accessible.",
+        }
+    if "access is denied" in detail:
+        message = (
+            "Windows denied access to the startup task. "
+            "Run Repair Connector as Administrator for this Windows account."
+        )
+    else:
+        message = "The Windows connector startup task is missing or unavailable."
+    return {"id": "startup_task", "status": "fail", "message": message}
+
+
+def collect_diagnostics(*, timeout: float = 10.0) -> dict[str, Any]:
+    """Collect a redacted support snapshot without returning local credentials."""
+    snapshot = connector_snapshot()
+    connector = snapshot["connector"]
+    checks: list[dict[str, str]] = []
+    if snapshot["errors"]:
+        checks.append({"id": "local_identity", "status": "fail", "message": str(snapshot["errors"][0])})
+    elif snapshot["enrolled"]:
+        checks.append({
+            "id": "local_identity",
+            "status": "pass",
+            "message": "The protected connector identity is readable.",
+        })
+    else:
+        checks.append({
+            "id": "local_identity",
+            "status": "fail",
+            "message": "This connector has not been paired with a customer.",
+        })
+
+    if snapshot["enrolled"] and not snapshot["errors"]:
+        try:
+            remote = runner_agent.connector_identity(timeout=timeout)
+            exact = (
+                bool(remote.get("identity_verified"))
+                and str(remote.get("connector_name") or "") == str(connector.get("name") or "")
+                and str(remote.get("organization_name") or "") == str(connector.get("organization_name") or "")
+                and str(remote.get("operator_email") or "") == str(connector.get("operator_email") or "")
+            )
+            checks.append({
+                "id": "cloud_identity",
+                "status": "pass" if exact else "fail",
+                "message": (
+                    "Organization, Community login, and connector name exactly match Rezonance Cloud."
+                    if exact
+                    else "The local customer identity does not exactly match Rezonance Cloud."
+                ),
+            })
+        except Exception as exc:  # noqa: BLE001
+            detail = str(exc)
+            if "HTTP 401" in detail:
+                message = "Rezonance Cloud rejected this connector credential. Issue a new pairing code."
+            else:
+                message = f"Rezonance Cloud could not be reached ({type(exc).__name__})."
+            checks.append({"id": "cloud_identity", "status": "fail", "message": message})
+
+    checks.append(_task_diagnostic())
+    checks.append({
+        "id": "credential_store",
+        "status": "pass" if snapshot["security"]["dpapi"] else "warn",
+        "message": (
+            "Device credentials and connector identity are protected by Windows DPAPI."
+            if snapshot["security"]["dpapi"]
+            else "This runtime is not using Windows DPAPI."
+        ),
+    })
+    device_count = int(snapshot["inventory"]["device_count"])
+    checks.append({
+        "id": "inventory",
+        "status": "pass" if device_count else "warn",
+        "message": f"{device_count} local device record(s) are available.",
+    })
+    return {
+        "ok": not any(check["status"] == "fail" for check in checks),
+        "product": PRODUCT_NAME,
+        "version": str(connector.get("version") or ""),
+        "connector": {
+            "organization_name": str(connector.get("organization_name") or ""),
+            "operator_email": str(connector.get("operator_email") or ""),
+            "name": str(connector.get("name") or ""),
+            "identity_verified": bool(connector.get("identity_verified")),
+            "server": str(connector.get("server") or control_plane_url()),
+        },
+        "device_count": device_count,
+        "security": {
+            "dpapi": bool(snapshot["security"]["dpapi"]),
+            "outbound_only": True,
+            "credentials_returned": False,
+        },
+        "checks": checks,
+    }
 
 
 def main() -> int:
@@ -95,6 +236,10 @@ def main() -> int:
             self.root.configure(bg="#f5f7f8")
             self.events: queue.Queue[tuple[str, Any]] = queue.Queue()
             self.busy = False
+            self.verified_pairing_code = ""
+            self.verified_pairing_identity: dict[str, Any] = {}
+            self.cloud_check_running = False
+            self.last_diagnostics: dict[str, Any] = {}
             self._configure_style()
             self._build()
             self.refresh()
@@ -113,6 +258,8 @@ def main() -> int:
             style.configure("Section.TLabel", background="#ffffff", foreground="#172126", font=("Segoe UI Semibold", 12))
             style.configure("Metric.TLabel", background="#ffffff", foreground="#172126", font=("Segoe UI Semibold", 22))
             style.configure("Muted.TLabel", background="#ffffff", foreground="#607078", font=("Segoe UI", 9))
+            style.configure("Verified.TLabel", background="#ffffff", foreground="#177653", font=("Segoe UI Semibold", 9))
+            style.configure("Warning.TLabel", background="#ffffff", foreground="#9a5b0a", font=("Segoe UI Semibold", 9))
             style.configure("Accent.TButton", font=("Segoe UI Semibold", 10), padding=(16, 8))
             style.configure("TButton", font=("Segoe UI", 10), padding=(12, 7))
             style.configure("TEntry", padding=6)
@@ -148,12 +295,15 @@ def main() -> int:
             self.overview_tab = ttk.Frame(self.tabs, style="Panel.TFrame", padding=20)
             self.discovery_tab = ttk.Frame(self.tabs, style="Panel.TFrame", padding=20)
             self.inventory_tab = ttk.Frame(self.tabs, style="Panel.TFrame", padding=20)
+            self.diagnostics_tab = ttk.Frame(self.tabs, style="Panel.TFrame", padding=20)
             self.tabs.add(self.overview_tab, text="Overview")
             self.tabs.add(self.discovery_tab, text="Discovery")
             self.tabs.add(self.inventory_tab, text="Inventory")
+            self.tabs.add(self.diagnostics_tab, text="Diagnostics")
             self._build_overview()
             self._build_discovery()
             self._build_inventory()
+            self._build_diagnostics()
 
             footer = tk.Frame(self.root, bg="#e8edef", height=38)
             footer.pack(fill="x")
@@ -186,40 +336,83 @@ def main() -> int:
             ttk.Label(self.connection_panel, text="Cloud connection", style="Section.TLabel").grid(
                 row=0, column=0, columnspan=3, sticky="w", pady=(0, 12)
             )
-            ttk.Label(self.connection_panel, text="Control plane", style="Muted.TLabel").grid(row=1, column=0, sticky="w")
-            self.server_value = ttk.Label(self.connection_panel, text="Not enrolled", style="Panel.TLabel")
-            self.server_value.grid(row=2, column=0, columnspan=2, sticky="w", pady=(2, 16))
+            self.identity_status = ttk.Label(self.connection_panel, text="Checking", style="Warning.TLabel")
+            self.identity_status.grid(row=0, column=2, sticky="e", pady=(0, 12))
+            ttk.Label(self.connection_panel, text="Organization", style="Muted.TLabel").grid(row=1, column=0, sticky="w")
+            self.organization_value = ttk.Label(self.connection_panel, text="-", style="Panel.TLabel")
+            self.organization_value.grid(row=2, column=0, sticky="w", pady=(2, 14))
+            ttk.Label(self.connection_panel, text="Community login", style="Muted.TLabel").grid(row=1, column=1, sticky="w")
+            self.email_value = ttk.Label(self.connection_panel, text="-", style="Panel.TLabel")
+            self.email_value.grid(row=2, column=1, sticky="w", pady=(2, 14))
             ttk.Label(self.connection_panel, text="Connector name", style="Muted.TLabel").grid(row=3, column=0, sticky="w")
             self.name_value = ttk.Label(self.connection_panel, text="-", style="Panel.TLabel")
-            self.name_value.grid(row=4, column=0, sticky="w", pady=(2, 16))
+            self.name_value.grid(row=4, column=0, sticky="w", pady=(2, 14))
+            ttk.Label(self.connection_panel, text="Rezonance Cloud", style="Muted.TLabel").grid(row=3, column=1, sticky="w")
+            self.server_value = ttk.Label(self.connection_panel, text="Not enrolled", style="Panel.TLabel")
+            self.server_value.grid(row=4, column=1, columnspan=2, sticky="w", pady=(2, 14))
             buttons = ttk.Frame(self.connection_panel, style="Panel.TFrame")
             buttons.grid(row=5, column=0, columnspan=3, sticky="w", pady=(8, 0))
             ttk.Button(buttons, text="Start connector", command=self._start_connector, style="Accent.TButton").pack(side="left")
             ttk.Button(buttons, text="Refresh", command=self.refresh).pack(side="left", padx=(10, 0))
+            for column in range(3):
+                self.connection_panel.columnconfigure(column, weight=1)
 
             self.enrollment_panel = ttk.Frame(self.overview_tab, style="Panel.TFrame")
             self.enrollment_panel.grid(row=3, column=0, columnspan=3, sticky="ew")
             ttk.Label(self.enrollment_panel, text="Connect to Rezonance", style="Section.TLabel").grid(
                 row=0, column=0, columnspan=4, sticky="w", pady=(0, 10)
             )
-            self.enroll_server = tk.StringVar(value=os.getenv("NETCODE_CONTROL_PLANE_URL", ""))
-            self.enroll_name = tk.StringVar(value=os.environ.get("COMPUTERNAME") or "windows-connector")
             self.enroll_token = tk.StringVar()
-            self._field(self.enrollment_panel, 1, 0, "Control plane", self.enroll_server, columnspan=2)
-            self._field(self.enrollment_panel, 1, 2, "Connector name", self.enroll_name, columnspan=2)
-            ttk.Label(self.enrollment_panel, text="One-time join token", style="Muted.TLabel").grid(
-                row=3, column=0, columnspan=2, sticky="w", pady=(10, 4)
+            ttk.Label(self.enrollment_panel, text="One-time pairing code", style="Muted.TLabel").grid(
+                row=1, column=0, columnspan=3, sticky="w", pady=(10, 4)
             )
-            ttk.Entry(self.enrollment_panel, textvariable=self.enroll_token, show="*").grid(
-                row=4, column=0, columnspan=2, sticky="ew", padx=(0, 12)
+            self.pairing_entry = ttk.Entry(self.enrollment_panel, textvariable=self.enroll_token, show="*")
+            self.pairing_entry.grid(
+                row=2, column=0, columnspan=3, sticky="ew", padx=(0, 12)
             )
-            self.enroll_button = ttk.Button(
+            self.verify_button = ttk.Button(
                 self.enrollment_panel,
-                text="Enroll connector",
+                text="Verify code",
+                command=self._verify_pairing,
+                style="Accent.TButton",
+            )
+            self.verify_button.grid(row=2, column=3, sticky="ew")
+            self.pairing_entry.bind("<Return>", lambda _event: self._verify_pairing())
+            ttk.Label(
+                self.enrollment_panel,
+                text=f"Rezonance Cloud: {control_plane_url()}",
+                style="Muted.TLabel",
+            ).grid(row=3, column=0, columnspan=4, sticky="w", pady=(8, 0))
+
+            self.pairing_panel = ttk.Frame(self.enrollment_panel, style="Panel.TFrame")
+            self.pairing_panel.grid(row=4, column=0, columnspan=4, sticky="ew", pady=(18, 0))
+            self.pairing_panel.grid_remove()
+            ttk.Label(self.pairing_panel, text="Verified customer", style="Verified.TLabel").grid(
+                row=0, column=0, columnspan=3, sticky="w", pady=(0, 10)
+            )
+            ttk.Label(self.pairing_panel, text="Organization", style="Muted.TLabel").grid(row=1, column=0, sticky="w")
+            ttk.Label(self.pairing_panel, text="Community login", style="Muted.TLabel").grid(row=1, column=1, sticky="w")
+            ttk.Label(self.pairing_panel, text="Connector name", style="Muted.TLabel").grid(row=1, column=2, sticky="w")
+            self.preview_organization = ttk.Label(self.pairing_panel, text="-", style="Panel.TLabel")
+            self.preview_organization.grid(row=2, column=0, sticky="w", pady=(2, 14))
+            self.preview_email = ttk.Label(self.pairing_panel, text="-", style="Panel.TLabel")
+            self.preview_email.grid(row=2, column=1, sticky="w", pady=(2, 14))
+            self.preview_name = ttk.Label(self.pairing_panel, text="-", style="Panel.TLabel")
+            self.preview_name.grid(row=2, column=2, sticky="w", pady=(2, 14))
+            self.enroll_button = ttk.Button(
+                self.pairing_panel,
+                text="Connect this device",
                 command=self._enroll,
                 style="Accent.TButton",
             )
-            self.enroll_button.grid(row=4, column=2, sticky="w")
+            self.enroll_button.grid(row=3, column=0, sticky="w")
+            ttk.Button(
+                self.pairing_panel,
+                text="Use a different code",
+                command=self._use_different_code,
+            ).grid(row=3, column=1, sticky="w", padx=(10, 0))
+            for column in range(3):
+                self.pairing_panel.columnconfigure(column, weight=1)
             for column in range(4):
                 self.enrollment_panel.columnconfigure(column, weight=1, uniform="enroll")
             self.overview_tab.columnconfigure(0, weight=1)
@@ -323,6 +516,31 @@ def main() -> int:
             self.tree.pack(side="left", fill="both", expand=True)
             scrollbar.pack(side="right", fill="y")
 
+        def _build_diagnostics(self) -> None:
+            top = ttk.Frame(self.diagnostics_tab, style="Panel.TFrame")
+            top.pack(fill="x", pady=(0, 12))
+            ttk.Label(top, text="Connector diagnostics", style="Section.TLabel").pack(side="left")
+            ttk.Button(top, text="Run diagnostics", command=self._run_diagnostics).pack(side="right")
+            ttk.Button(top, text="Copy report", command=self._copy_diagnostics).pack(side="right", padx=(0, 10))
+            ttk.Button(top, text="Repair permissions", command=self._repair_permissions).pack(
+                side="right",
+                padx=(0, 10),
+            )
+            columns = ("status", "check", "details")
+            self.diagnostic_tree = ttk.Treeview(
+                self.diagnostics_tab,
+                columns=columns,
+                show="headings",
+                selectmode="none",
+            )
+            self.diagnostic_tree.heading("status", text="Status")
+            self.diagnostic_tree.heading("check", text="Check")
+            self.diagnostic_tree.heading("details", text="Details")
+            self.diagnostic_tree.column("status", width=90, minwidth=80, stretch=False)
+            self.diagnostic_tree.column("check", width=160, minwidth=130, stretch=False)
+            self.diagnostic_tree.column("details", width=620, minwidth=320, stretch=True)
+            self.diagnostic_tree.pack(fill="both", expand=True)
+
         @staticmethod
         def _csv(value: str) -> list[str]:
             return [item.strip() for item in value.split(",") if item.strip()]
@@ -379,23 +597,78 @@ def main() -> int:
                 "discovery_complete",
             )
 
+        def _verify_pairing(self) -> None:
+            code = self.enroll_token.get().strip()
+            if not code:
+                messagebox.showerror(PRODUCT_NAME, "Enter the one-time pairing code.")
+                return
+            self.verify_button.configure(state="disabled")
+            self.activity.configure(text="Verifying customer")
+            self._background(
+                lambda: runner_agent.preview_pairing(control_plane_url(), code),
+                "pairing_verified",
+            )
+
+        def _use_different_code(self) -> None:
+            self.verified_pairing_code = ""
+            self.verified_pairing_identity = {}
+            self.enroll_token.set("")
+            self.pairing_panel.grid_remove()
+            self.pairing_entry.grid()
+            self.verify_button.grid()
+            self.verify_button.configure(state="normal")
+            self.pairing_entry.focus_set()
+            self.activity.configure(text="Ready")
+
         def _enroll(self) -> None:
-            server = self.enroll_server.get().strip().rstrip("/")
-            token = self.enroll_token.get().strip()
-            name = self.enroll_name.get().strip()
-            if not server.startswith("https://"):
-                messagebox.showerror(PRODUCT_NAME, "A production control plane must use HTTPS.")
+            token = self.verified_pairing_code
+            name = str(self.verified_pairing_identity.get("connector_name") or "")
+            if not token or not name or not self.verified_pairing_identity.get("identity_verified"):
+                messagebox.showerror(PRODUCT_NAME, "Verify the one-time pairing code first.")
                 return
-            if not token or not name:
-                messagebox.showerror(PRODUCT_NAME, "Connector name and one-time join token are required.")
-                return
+            server = control_plane_url()
+            self.verified_pairing_code = ""
             self.enroll_token.set("")
             self.enroll_button.configure(state="disabled")
-            self.activity.configure(text="Enrolling connector")
+            self.activity.configure(text="Connecting this device")
             self._background(
                 lambda: runner_agent.enroll(argparse.Namespace(server=server, join_token=token, name=name)),
                 "enrollment_complete",
             )
+
+        def _run_diagnostics(self) -> None:
+            self.activity.configure(text="Running diagnostics")
+            self._background(lambda: collect_diagnostics(timeout=10.0), "diagnostics_complete")
+
+        def _copy_diagnostics(self) -> None:
+            if not self.last_diagnostics:
+                self._run_diagnostics()
+                return
+            self.root.clipboard_clear()
+            self.root.clipboard_append(json.dumps(self.last_diagnostics, indent=2))
+            self.activity.configure(text="Redacted diagnostics copied")
+
+        def _repair_permissions(self) -> None:
+            script = runner_agent.IDENTITY_DIR.parent / "scripts" / "repair-connector.ps1"
+            if not script.is_file():
+                messagebox.showerror(
+                    PRODUCT_NAME,
+                    "Repair is unavailable in this installation. Install the current connector package.",
+                )
+                return
+            flags = getattr(subprocess, "CREATE_NEW_CONSOLE", 0)
+            subprocess.Popen(
+                [
+                    "powershell.exe",
+                    "-NoProfile",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-File",
+                    str(script),
+                ],
+                creationflags=flags,
+            )
+            self.activity.configure(text="Windows permission repair opened")
 
         def _start_connector(self) -> None:
             self.activity.configure(text="Starting connector")
@@ -407,6 +680,33 @@ def main() -> int:
                     event, value = self.events.get_nowait()
                     if event == "progress":
                         self.activity.configure(text=str(value))
+                    elif event == "pairing_verified":
+                        self.verify_button.configure(state="normal")
+                        if value.get("ok") and value.get("identity_verified"):
+                            self.verified_pairing_code = self.enroll_token.get().strip()
+                            self.verified_pairing_identity = {
+                                "organization_name": str(value.get("organization_name") or ""),
+                                "operator_email": str(value.get("operator_email") or ""),
+                                "connector_name": str(value.get("connector_name") or ""),
+                                "identity_verified": True,
+                            }
+                            self.enroll_token.set("")
+                            self.preview_organization.configure(
+                                text=self.verified_pairing_identity["organization_name"]
+                            )
+                            self.preview_email.configure(text=self.verified_pairing_identity["operator_email"])
+                            self.preview_name.configure(text=self.verified_pairing_identity["connector_name"])
+                            self.pairing_entry.grid_remove()
+                            self.verify_button.grid_remove()
+                            self.pairing_panel.grid()
+                            self.activity.configure(text="Customer verified")
+                        else:
+                            self.enroll_token.set("")
+                            self.activity.configure(text="Pairing code could not be verified")
+                            messagebox.showerror(
+                                PRODUCT_NAME,
+                                str(value.get("message") or "The pairing code is invalid or already used."),
+                            )
                     elif event == "discovery_complete":
                         self._set_busy(False, "Discovery complete" if value.get("ok") else "Discovery failed")
                         self.refresh()
@@ -424,14 +724,59 @@ def main() -> int:
                     elif event == "enrollment_complete":
                         self.enroll_button.configure(state="normal")
                         if int(value) == 0:
-                            self.activity.configure(text="Connector enrolled")
+                            self.activity.configure(text="Connector connected")
+                            self.verified_pairing_identity = {}
                             self.refresh()
-                            self.tabs.select(self.discovery_tab)
+                            self.tabs.select(self.overview_tab)
                         else:
-                            self.activity.configure(text="Enrollment failed")
-                            messagebox.showerror(PRODUCT_NAME, "Enrollment failed. Confirm the URL and one-time token.")
+                            self._use_different_code()
+                            self.activity.configure(text="Connector could not be connected")
+                            messagebox.showerror(
+                                PRODUCT_NAME,
+                                "Pairing could not be completed. Ask for a new one-time pairing code.",
+                            )
+                    elif event == "diagnostics_complete":
+                        self.last_diagnostics = dict(value)
+                        for item in self.diagnostic_tree.get_children():
+                            self.diagnostic_tree.delete(item)
+                        for check in value.get("checks") or []:
+                            self.diagnostic_tree.insert(
+                                "",
+                                "end",
+                                values=(
+                                    str(check.get("status") or "").upper(),
+                                    str(check.get("id") or "").replace("_", " ").title(),
+                                    str(check.get("message") or ""),
+                                ),
+                            )
+                        self.activity.configure(
+                            text="Diagnostics passed" if value.get("ok") else "Diagnostics need attention"
+                        )
+                    elif event == "cloud_identity":
+                        self.cloud_check_running = False
+                        if value.get("ok"):
+                            remote = value.get("identity") or {}
+                            snapshot = connector_snapshot()
+                            local = snapshot["connector"]
+                            exact = (
+                                bool(remote.get("identity_verified"))
+                                and str(remote.get("organization_name") or "") == str(local.get("organization_name") or "")
+                                and str(remote.get("operator_email") or "") == str(local.get("operator_email") or "")
+                                and str(remote.get("connector_name") or "") == str(local.get("name") or "")
+                            )
+                            self.identity_status.configure(
+                                text="Verified" if exact else "Identity mismatch",
+                                style="Verified.TLabel" if exact else "Warning.TLabel",
+                            )
+                        else:
+                            self.identity_status.configure(text="Cloud check failed", style="Warning.TLabel")
                     elif event == "error":
-                        self._set_busy(False, "Operation failed")
+                        self.busy = False
+                        self.progress.stop()
+                        self.progress.grid_remove()
+                        self.verify_button.configure(state="normal")
+                        self.enroll_button.configure(state="normal")
+                        self.activity.configure(text="Operation failed")
                         messagebox.showerror(PRODUCT_NAME, str(value))
             except queue.Empty:
                 pass
@@ -441,20 +786,47 @@ def main() -> int:
             snapshot = connector_snapshot()
             enrolled = bool(snapshot["enrolled"])
             devices = list(snapshot["inventory"]["devices"])
-            ready = enrolled and bool(devices) and not snapshot["errors"]
+            identity_verified = bool(snapshot["connector"]["identity_verified"])
+            ready = enrolled and identity_verified and bool(devices) and not snapshot["errors"]
             self.header_status.configure(
-                text="Ready" if ready else ("Inventory needed" if enrolled else "Enrollment needed"),
+                text=(
+                    "Ready"
+                    if ready
+                    else (
+                        "Identity check needed"
+                        if enrolled and not identity_verified
+                        else ("Inventory needed" if enrolled else "Enrollment needed")
+                    )
+                ),
                 bg="#55b58a" if ready else "#d99b3f",
                 fg="#ffffff" if ready else "#172126",
             )
-            self.enrollment_value.configure(text="Active" if enrolled else "Needed")
+            self.enrollment_value.configure(
+                text="Verified" if identity_verified else ("Legacy" if enrolled else "Needed")
+            )
             self.device_value.configure(text=str(len(devices)))
             self.security_value.configure(text="DPAPI" if snapshot["security"]["dpapi"] else "Local file")
             self.server_value.configure(text=snapshot["connector"]["server"] or "Not enrolled")
             self.name_value.configure(text=snapshot["connector"]["name"])
+            self.organization_value.configure(text=snapshot["connector"]["organization_name"] or "Not verified")
+            self.email_value.configure(text=snapshot["connector"]["operator_email"] or "Not verified")
+            self.identity_status.configure(
+                text="Checking cloud" if identity_verified else "Legacy enrollment",
+                style="Verified.TLabel" if identity_verified else "Warning.TLabel",
+            )
             if enrolled:
                 self.enrollment_panel.grid_remove()
                 self.connection_panel.grid()
+                if not self.cloud_check_running and not snapshot["errors"]:
+                    self.cloud_check_running = True
+
+                    def cloud_probe() -> dict[str, Any]:
+                        try:
+                            return {"ok": True, "identity": runner_agent.connector_identity(timeout=8.0)}
+                        except Exception as exc:  # noqa: BLE001
+                            return {"ok": False, "error": type(exc).__name__}
+
+                    self._background(cloud_probe, "cloud_identity")
             else:
                 self.connection_panel.grid_remove()
                 self.enrollment_panel.grid()

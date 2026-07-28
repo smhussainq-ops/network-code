@@ -46,7 +46,7 @@ INVENTORY_FILE = IDENTITY_DIR / ("inventory.dpapi" if _WINDOWS_DPAPI else "inven
 POLICY_FILE = IDENTITY_DIR / "policy.yaml"
 MANAGER_LEDGER_FILE = IDENTITY_DIR / "manager-operations.json"
 OPERATION_LEDGER_FILE = IDENTITY_DIR / "device-operations.db"
-VERSION = "0.7.0-token-lifecycle"
+VERSION = "0.3.4-community-preview"
 COMMUNITY_MAX_DEVICES = 25
 
 _stop = False
@@ -137,11 +137,44 @@ def _post(server: str, path: str, body: dict[str, Any], token: str | None = None
         raise RuntimeError(f"HTTP {exc.code} from {path}: {detail}") from exc
 
 
-def _get(server: str, path: str, timeout: float = 10.0) -> dict[str, Any]:
+def _get(
+    server: str,
+    path: str,
+    timeout: float = 10.0,
+    token: str | None = None,
+) -> dict[str, Any]:
     url = server.rstrip("/") + path
     request = urllib.request.Request(url, method="GET")
-    with urllib.request.urlopen(request, timeout=timeout) as response:
-        return json.loads(response.read().decode("utf-8"))
+    if token:
+        request.add_header("Authorization", f"Bearer {token}")
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", "replace")
+        raise RuntimeError(f"HTTP {exc.code} from {path}: {detail}") from exc
+
+
+def preview_pairing(server: str, join_token: str, *, timeout: float = 15.0) -> dict[str, Any]:
+    return _post(
+        server,
+        "/api/runner/pairing/preview",
+        {"join_token": join_token},
+        timeout=timeout,
+    )
+
+
+def connector_identity(
+    identity: dict[str, Any] | None = None,
+    *,
+    timeout: float = 10.0,
+) -> dict[str, Any]:
+    identity = dict(identity or _load_identity())
+    server = str(identity.get("server") or "").strip()
+    token = str(identity.get("runner_token") or "").strip()
+    if not server or not token:
+        raise RuntimeError("The local connector identity is incomplete.")
+    return _get(server, "/api/runner/me", timeout=timeout, token=token)
 
 
 def enroll(args: argparse.Namespace) -> int:
@@ -150,19 +183,23 @@ def enroll(args: argparse.Namespace) -> int:
         print(f"[runner] Enrollment failed: {(resp or {}).get('message', 'unknown error')}", file=sys.stderr)
         return 1
     IDENTITY_DIR.mkdir(parents=True, exist_ok=True)
+    connector_name = str(resp.get("connector_name") or args.name).strip()
     identity = {
         "server": args.server,
         "runner_id": resp["runner_id"],
         "runner_token": resp["runner_token"],
         "hmac_secret": resp["hmac_secret"],
         "pool": resp["pool"],
-        "name": args.name,
+        "name": connector_name,
+        "organization_name": str(resp.get("organization_name") or "").strip(),
+        "operator_email": str(resp.get("operator_email") or "").strip(),
+        "identity_verified": bool(resp.get("identity_verified")),
         "token_expires_at": resp.get("token_expires_at"),
         "token_rotate_after": resp.get("token_rotate_after"),
         "token_pending": False,
     }
     _write_identity(identity)
-    print(f"[runner] Enrolled '{args.name}' into pool '{resp['pool']}'. Identity saved to {IDENTITY_FILE}")
+    print(f"[runner] Enrolled '{connector_name}'. Identity saved to {IDENTITY_FILE}")
     if not INVENTORY_FILE.exists():
         print("[runner] Next: open the Local Connector control application and run bounded discovery.")
     return 0
@@ -595,8 +632,21 @@ def doctor(args: argparse.Namespace) -> int:
                         else "Legacy connector credential is active and will rotate on service start."
                     ),
                 })
+        except PermissionError:
+            checks.append({
+                "id": "identity",
+                "status": "fail",
+                "message": (
+                    "Windows denied access to the protected connector identity. "
+                    "Run the connector repair as Administrator for this Windows account."
+                ),
+            })
         except Exception as exc:  # noqa: BLE001
-            checks.append({"id": "identity", "status": "fail", "message": f"Identity cannot be read: {exc}"})
+            checks.append({
+                "id": "identity",
+                "status": "fail",
+                "message": f"The protected connector identity could not be decrypted: {type(exc).__name__}.",
+            })
     else:
         checks.append({"id": "identity", "status": "fail", "message": "Connector is not enrolled."})
 
@@ -629,15 +679,56 @@ def doctor(args: argparse.Namespace) -> int:
     server = str(identity.get("server") or "")
     if server:
         try:
-            manifest = _get(server, "/api/runner/download/windows/manifest", timeout=float(args.timeout))
-            reachable = bool(manifest.get("ok"))
+            remote_identity = connector_identity(identity, timeout=float(args.timeout))
+            reachable = bool(remote_identity.get("ok"))
             checks.append({
                 "id": "control_plane",
                 "status": "pass" if reachable else "fail",
-                "message": "Control plane is reachable." if reachable else "Control plane returned an invalid manifest.",
+                "message": (
+                    "Rezonance Cloud accepted this connector identity."
+                    if reachable
+                    else "Rezonance Cloud returned an invalid connector identity response."
+                ),
             })
+            local_name = str(identity.get("name") or "").strip()
+            local_organization = str(identity.get("organization_name") or "").strip()
+            local_email = str(identity.get("operator_email") or "").strip()
+            remote_name = str(remote_identity.get("connector_name") or "").strip()
+            remote_organization = str(remote_identity.get("organization_name") or "").strip()
+            remote_email = str(remote_identity.get("operator_email") or "").strip()
+            verified = bool(remote_identity.get("identity_verified"))
+            if verified:
+                mismatches = [
+                    label
+                    for label, local, remote in (
+                        ("connector name", local_name, remote_name),
+                        ("organization", local_organization, remote_organization),
+                        ("Community login", local_email, remote_email),
+                    )
+                    if local != remote
+                ]
+                checks.append({
+                    "id": "customer_identity",
+                    "status": "fail" if mismatches else "pass",
+                    "message": (
+                        f"Local identity does not match Rezonance Cloud: {', '.join(mismatches)}."
+                        if mismatches
+                        else "Organization, Community login, and connector name match Rezonance Cloud."
+                    ),
+                })
+            else:
+                checks.append({
+                    "id": "customer_identity",
+                    "status": "warn",
+                    "message": "Legacy enrollment is active; issue a new pairing code to verify customer identity.",
+                })
         except Exception as exc:  # noqa: BLE001
-            checks.append({"id": "control_plane", "status": "fail", "message": f"Control plane is unreachable: {exc}"})
+            detail = str(exc)
+            if "HTTP 401" in detail:
+                message = "Rezonance Cloud rejected the connector credential; a new pairing code is required."
+            else:
+                message = f"Rezonance Cloud could not be reached: {type(exc).__name__}."
+            checks.append({"id": "control_plane", "status": "fail", "message": message})
     else:
         checks.append({"id": "control_plane", "status": "fail", "message": "No enrolled control-plane URL is available."})
 
@@ -653,6 +744,12 @@ def doctor(args: argparse.Namespace) -> int:
             "dpapi_machine_scope": IDENTITY_FILE.suffix.lower() == ".dpapi",
             "credentials_returned": False,
             "inbound_listener": False,
+        },
+        "connector": {
+            "name": str(identity.get("name") or ""),
+            "organization_name": str(identity.get("organization_name") or ""),
+            "operator_email": str(identity.get("operator_email") or ""),
+            "identity_verified": bool(identity.get("identity_verified")),
         },
         "inventory": inventory_summary,
         "checks": checks,
@@ -1965,7 +2062,7 @@ def _execute_rez_scan_device(
     # closed endpoint first. When the caller selected a platform, let that
     # adapter own transport validation; API-backed drivers are not required to
     # expose a generic SSH socket and can return a more precise failure.
-    if existing is None and not requested_platform:
+    if existing is None and (not requested_platform or bool(payload.get("optional_probe"))):
         try:
             with socket.create_connection((host, port), timeout=1.0):
                 pass
@@ -2191,14 +2288,24 @@ def _execute_rez_discover_network(
     failures: list[dict[str, Any]] = []
     skipped: list[dict[str, Any]] = []
 
-    while frontier and len(scanned) < profile.max_devices:
+    while (
+        frontier
+        and len(states) < profile.max_devices
+        and len(scanned) < profile.max_probes
+    ):
         current_depth = min(depth for _, depth in frontier)
         if current_depth > profile.max_depth:
             break
-        wave = [item for item in frontier if item[1] == current_depth]
-        frontier = [item for item in frontier if item[1] != current_depth]
-        remaining = profile.max_devices - len(scanned)
-        wave = wave[:remaining]
+        same_depth = [item for item in frontier if item[1] == current_depth]
+        other_depths = [item for item in frontier if item[1] != current_depth]
+        batch_size = min(
+            len(same_depth),
+            profile.concurrency,
+            profile.max_probes - len(scanned),
+            profile.max_devices - len(states),
+        )
+        wave = same_depth[:batch_size]
+        frontier = same_depth[batch_size:] + other_depths
         emit({
             "stage": "wave_started",
             "status": "running",
@@ -2301,7 +2408,7 @@ def _execute_rez_discover_network(
                 neighbor_key = (neighbor.host, neighbor.port)
                 if neighbor_key in scanned or neighbor_key in queued:
                     continue
-                if len(queued) >= profile.max_devices:
+                if len(queued) >= profile.max_probes:
                     break
                 queued.add(neighbor_key)
                 frontier.append((neighbor, current_depth + 1))

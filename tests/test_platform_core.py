@@ -3070,6 +3070,7 @@ def test_windows_runner_package_contains_install_scripts_and_no_secrets():
         "start-runner.ps1",
         "open-connector.ps1",
         "diagnose-runner.ps1",
+        "repair-connector.ps1",
         "uninstall-runner.ps1",
         "build-windows-executable.ps1",
         "windows-entrypoint.py",
@@ -3086,7 +3087,9 @@ def test_windows_runner_package_contains_install_scripts_and_no_secrets():
     assert "wss://netcode.example.com" in combined
     assert "runner_token" not in combined
     assert "hmac_secret" not in combined
-    assert "<single-use-token>" in combined
+    assert "<single-use-token>" not in combined
+    assert "Confirm the exact organization" in combined
+    assert "Connect this device" in combined
     assert "replace-me" not in combined
     assert "NETCODE_REZ_ROOT" in combined
     assert "discover local inventory" in combined
@@ -3113,7 +3116,11 @@ def test_windows_runner_package_contains_install_scripts_and_no_secrets():
     assert "Run uninstall-runner.ps1 from PowerShell opened as Administrator." in combined
     assert 'throw "Runtime removal did not complete:' in combined
     assert '$RuntimeTargets | Where-Object { Test-Path $_ }' in combined
-    assert '[Security.Principal.WindowsIdentity]::GetCurrent().Name' in combined
+    assert "[Security.Principal.WindowsIdentity]::GetCurrent()" in combined
+    assert "$OperatorUserSid.Value" in combined
+    assert "Win32_Process -Filter \"Name='explorer.exe'\"" in combined
+    assert '[string]$OperatorAccount = ""' in combined
+    assert "$VerifiedBroadUsersAce" in combined
     assert "--windows-console-mode=hide" in combined
     assert "--include-package=pydantic" in combined
     assert "--include-package=tenacity" in combined
@@ -3137,6 +3144,10 @@ def test_windows_runner_package_contains_install_scripts_and_no_secrets():
     assert "Start-Process -FilePath $Runtime" not in combined
 
     with zipfile.ZipFile(BytesIO(package), "r") as archive:
+        repair_script = archive.read("repair-connector.ps1").decode("utf-8")
+        assert "Start-Process powershell.exe -Verb RunAs" in repair_script
+        assert "Stop-Process" not in repair_script
+        assert "Remove-Item" not in repair_script
         assert "runner-source/templates/arista/ntp_standardize.j2" in archive.namelist()
         assert "runner-source/templates/cisco_ios/ntp_standardize.j2" in archive.namelist()
         checksums = archive.read("SHA256SUMS.txt").decode("utf-8").splitlines()

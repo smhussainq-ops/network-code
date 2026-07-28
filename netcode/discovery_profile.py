@@ -20,6 +20,9 @@ class DiscoveryProfileError(ValueError):
     """Raised when a discovery request is unsafe or cannot be resolved."""
 
 
+MAX_DISCOVERY_PROBES = 5000
+
+
 @dataclass(frozen=True)
 class DiscoveryTarget:
     host: str
@@ -38,6 +41,7 @@ class DiscoveryTarget:
             "port": self.port,
             "site": self.site,
             "groups": list(self.groups),
+            "optional_probe": self.optional_probe,
         }
 
 
@@ -128,6 +132,7 @@ class DiscoveryProfile:
     excluded_networks: tuple[ipaddress._BaseNetwork, ...]  # type: ignore[name-defined]
     max_depth: int
     max_devices: int
+    max_probes: int
     concurrency: int
     scope_source: str
     default_platform: str = ""
@@ -141,6 +146,10 @@ class DiscoveryProfile:
             max_devices = int(payload.get("max_devices") or 256)
             max_depth = int(payload.get("depth") or 0)
             concurrency = int(payload.get("concurrency") or 8)
+            max_probes = int(
+                payload.get("max_probes")
+                or max(max_devices, min(1024, max_devices * 16))
+            )
         except (TypeError, ValueError) as exc:
             raise DiscoveryProfileError("Discovery limits must be integers.") from exc
         if not 1 <= max_devices <= 5000:
@@ -149,6 +158,10 @@ class DiscoveryProfile:
             raise DiscoveryProfileError("depth must be between 0 and 10.")
         if not 1 <= concurrency <= 32:
             raise DiscoveryProfileError("concurrency must be between 1 and 32.")
+        if not max_devices <= max_probes <= MAX_DISCOVERY_PROBES:
+            raise DiscoveryProfileError(
+                f"max_probes must be between max_devices and {MAX_DISCOVERY_PROBES}."
+            )
 
         explicit_allowed = _parse_networks(payload.get("allowed_cidrs") or [], field="allowed")
         excluded = _parse_networks(payload.get("excluded_cidrs") or [], field="excluded")
@@ -226,8 +239,8 @@ class DiscoveryProfile:
                 allowed.append(_host_network(host))
 
         for token in raw_tokens:
-            if len(targets) >= max_devices:
-                raise DiscoveryProfileError("Discovery seeds exceed max_devices.")
+            if len(targets) >= max_probes:
+                raise DiscoveryProfileError("Discovery seeds exceed max_probes.")
             host_token, requested_port = _split_host_port(token)
             known = inventory.find_device(host_token)
             if known:
@@ -243,9 +256,10 @@ class DiscoveryProfile:
                 host_count = int(network.num_addresses)
                 if network.version == 4 and network.prefixlen < 31:
                     host_count = max(0, host_count - 2)
-                if host_count > max_devices - len(targets):
+                if host_count > max_probes - len(targets):
                     raise DiscoveryProfileError(
-                        f"Discovery CIDR '{host_token}' contains {host_count} hosts, above the remaining max_devices limit."
+                        f"Discovery CIDR '{host_token}' contains {host_count} hosts, "
+                        "above the remaining bounded probe budget."
                     )
                 if not explicit_allowed:
                     allowed.append(network)
@@ -256,7 +270,7 @@ class DiscoveryProfile:
                         optional_probe=True,
                     )
                 continue
-            expanded = _expand_ip_range(host_token, remaining=max_devices - len(targets))
+            expanded = _expand_ip_range(host_token, remaining=max_probes - len(targets))
             if expanded is not None:
                 for host in expanded:
                     add_host(
@@ -274,6 +288,7 @@ class DiscoveryProfile:
             excluded_networks=excluded,
             max_depth=max_depth,
             max_devices=max_devices,
+            max_probes=max_probes,
             concurrency=concurrency,
             scope_source=scope_source,
             default_platform=requested_platform,
@@ -303,6 +318,7 @@ class DiscoveryProfile:
             "excluded_cidrs": [str(network) for network in self.excluded_networks],
             "depth": self.max_depth,
             "max_devices": self.max_devices,
+            "max_probes": self.max_probes,
             "concurrency": self.concurrency,
             "scope_source": self.scope_source,
             "platform": self.default_platform or "auto",
