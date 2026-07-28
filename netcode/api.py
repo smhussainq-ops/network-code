@@ -2615,6 +2615,40 @@ def _runner_route_for_payload(
     Discovery of a not-yet-known host intentionally falls back to the configured
     pool; existing catalog devices must never be claimed by a sibling connector.
     """
+    requested_devices = payload.get("devices")
+    if isinstance(requested_devices, list):
+        identifiers = [
+            str(identifier).strip()
+            for identifier in requested_devices
+            if str(identifier).strip()
+        ]
+        if identifiers:
+            resolved = [store.resolve_device(org_id, identifier) for identifier in identifiers]
+            unresolved = [
+                identifier
+                for identifier, device in zip(identifiers, resolved)
+                if device is None
+            ]
+            if unresolved:
+                raise ValueError(
+                    "Targeted refresh contains devices that are not assigned to "
+                    "an enrolled Local Connector."
+                )
+            routes = {
+                (
+                    str(device.get("runner_pool") or ""),
+                    str(device.get("runner_id") or ""),
+                )
+                for device in resolved
+                if isinstance(device, dict)
+            }
+            if len(routes) != 1 or any(not value for route in routes for value in route):
+                raise ValueError(
+                    "Targeted refresh spans multiple Local Connectors. "
+                    "Split the request by connector."
+                )
+            return next(iter(routes))
+
     identifier = str(
         payload.get("device")
         or payload.get("device_id")
@@ -2655,7 +2689,10 @@ def _runner_read(
             return {"ok": False, "error": "Unknown Local Connector."}
         pool = target_runner.pool
     else:
-        pool, target_runner_id = _runner_route_for_payload(store, org_id, payload)
+        try:
+            pool, target_runner_id = _runner_route_for_payload(store, org_id, payload)
+        except ValueError as exc:
+            return {"ok": False, "error": str(exc)}
     job = store.create_read_job(
         org_id,
         pool,

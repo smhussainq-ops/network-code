@@ -4,6 +4,7 @@ import json
 import time
 from pathlib import Path
 
+import pytest
 from fastapi.testclient import TestClient
 
 from netcode import api, runner_agent
@@ -241,6 +242,68 @@ def test_catalog_read_routes_to_exact_connector_even_when_pool_is_shared(tmp_pat
     claimed = store.claim_next_job(DEFAULT_ORG_ID, "shared", assigned_runner.id)
     assert claimed is not None
     assert claimed.id == job.id
+
+
+def test_targeted_refresh_routes_all_devices_to_their_exact_connector(tmp_path: Path):
+    workspace = WorkspacePaths(tmp_path)
+    init_workspace(workspace)
+    store = PlatformStore(workspace)
+    wrong_runner, _ = _runner(store, "connector-a", "shared")
+    assigned_runner, _ = _runner(store, "connector-b", "shared")
+    store.sync_runner_devices(wrong_runner, [_device("edge-a", "192.0.2.10")], revision="a")
+    store.sync_runner_devices(
+        assigned_runner,
+        [
+            _device("v2-campus-core", "192.0.2.20"),
+            _device("v2-campus-edge-1", "192.0.2.21"),
+        ],
+        revision="b",
+    )
+
+    pool, target_runner_id = api._runner_route_for_payload(
+        store,
+        DEFAULT_ORG_ID,
+        {"devices": ["V2-CAMPUS-CORE", "v2-campus-edge-1"]},
+    )
+
+    assert pool == "shared"
+    assert target_runner_id == assigned_runner.id
+
+
+def test_targeted_refresh_rejects_devices_across_connectors(tmp_path: Path):
+    workspace = WorkspacePaths(tmp_path)
+    init_workspace(workspace)
+    store = PlatformStore(workspace)
+    first_runner, _ = _runner(store, "connector-a", "shared")
+    second_runner, _ = _runner(store, "connector-b", "shared")
+    store.sync_runner_devices(first_runner, [_device("edge-a", "192.0.2.10")], revision="a")
+    store.sync_runner_devices(second_runner, [_device("edge-b", "192.0.2.20")], revision="b")
+
+    with pytest.raises(ValueError, match="spans multiple Local Connectors"):
+        api._runner_route_for_payload(
+            store,
+            DEFAULT_ORG_ID,
+            {"devices": ["edge-a", "edge-b"]},
+        )
+
+
+def test_targeted_refresh_rejects_unassigned_device(tmp_path: Path):
+    workspace = WorkspacePaths(tmp_path)
+    init_workspace(workspace)
+    store = PlatformStore(workspace)
+    assigned_runner, _ = _runner(store, "connector-a", "shared")
+    store.sync_runner_devices(
+        assigned_runner,
+        [_device("edge-a", "192.0.2.10")],
+        revision="a",
+    )
+
+    with pytest.raises(ValueError, match="not assigned to an enrolled Local Connector"):
+        api._runner_route_for_payload(
+            store,
+            DEFAULT_ORG_ID,
+            {"devices": ["edge-a", "unknown-edge"]},
+        )
 
 
 def test_device_search_is_metadata_only_and_marks_only_live_connector_connectable(tmp_path: Path, monkeypatch):
