@@ -46,7 +46,7 @@ INVENTORY_FILE = IDENTITY_DIR / ("inventory.dpapi" if _WINDOWS_DPAPI else "inven
 POLICY_FILE = IDENTITY_DIR / "policy.yaml"
 MANAGER_LEDGER_FILE = IDENTITY_DIR / "manager-operations.json"
 OPERATION_LEDGER_FILE = IDENTITY_DIR / "device-operations.db"
-VERSION = "0.3.4-community-preview"
+VERSION = "0.3.5-community-preview"
 COMMUNITY_MAX_DEVICES = 25
 
 _stop = False
@@ -164,6 +164,15 @@ def preview_pairing(server: str, join_token: str, *, timeout: float = 15.0) -> d
     )
 
 
+def preview_replacement(server: str, pairing_code: str, *, timeout: float = 15.0) -> dict[str, Any]:
+    return _post(
+        server,
+        "/api/runner/replacement/preview",
+        {"pairing_code": pairing_code},
+        timeout=timeout,
+    )
+
+
 def connector_identity(
     identity: dict[str, Any] | None = None,
     *,
@@ -203,6 +212,194 @@ def enroll(args: argparse.Namespace) -> int:
     if not INVENTORY_FILE.exists():
         print("[runner] Next: open the Local Connector control application and run bounded discovery.")
     return 0
+
+
+def _finalize_pending_replacement(identity: dict[str, Any], response: dict[str, Any]) -> dict[str, Any]:
+    runner_id = str(identity.get("runner_id") or "").strip()
+    if str(response.get("runner_id") or "") != runner_id:
+        raise RuntimeError("Rezonance Cloud returned a different connector identity.")
+    connector_name = str(response.get("connector_name") or "").strip()
+    organization_name = str(response.get("organization_name") or "").strip()
+    operator_email = str(response.get("operator_email") or "").strip()
+    if not (connector_name and organization_name and operator_email and response.get("identity_verified")):
+        raise RuntimeError("Rezonance Cloud did not return a complete verified customer identity.")
+    finalized = dict(identity)
+    finalized.update(
+        {
+            "name": connector_name,
+            "organization_name": organization_name,
+            "operator_email": operator_email,
+            "identity_verified": True,
+            "token_pending": False,
+        }
+    )
+    finalized.pop("replacement_pending", None)
+    finalized.pop("replacement_pairing_code", None)
+    finalized.pop("replacement_fallback_identity", None)
+    _write_identity(finalized)
+    return finalized
+
+
+def _commit_pending_replacement(identity: dict[str, Any]) -> dict[str, Any]:
+    if not identity.get("replacement_pending"):
+        return identity
+    pairing_code = str(identity.get("replacement_pairing_code") or "").strip()
+    pending_token = str(identity.get("runner_token") or "").strip()
+    fallback = dict(identity.get("replacement_fallback_identity") or {})
+    if not pairing_code or not pending_token or not fallback:
+        raise RuntimeError("The saved connector repair is incomplete.")
+    try:
+        response = _post(
+            str(identity["server"]),
+            "/api/runner/replacement/commit",
+            {"pairing_code": pairing_code},
+            token=pending_token,
+        )
+    except Exception as exc:
+        if fallback and _pending_token_rejected(exc):
+            _write_identity(fallback)
+        raise
+    return _finalize_pending_replacement(identity, dict(response or {}))
+
+
+def _safe_replacement_result(identity: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "ok": True,
+        "runner_id": str(identity["runner_id"]),
+        "connector_name": str(identity["name"]),
+        "organization_name": str(identity["organization_name"]),
+        "operator_email": str(identity["operator_email"]),
+        "identity_verified": bool(identity.get("identity_verified")),
+    }
+
+
+def resume_pending_repair(identity: dict[str, Any] | None = None) -> dict[str, Any]:
+    current = dict(identity or _load_identity())
+    if not current.get("replacement_pending"):
+        return {
+            "ok": False,
+            "error": "repair_not_pending",
+            "message": "No protected connector repair is awaiting confirmation.",
+        }
+    try:
+        return _safe_replacement_result(_commit_pending_replacement(current))
+    except Exception as exc:  # noqa: BLE001 - the scheduled connector will retry when cloud access returns.
+        return {
+            "ok": False,
+            "pending": True,
+            "error": "repair_commit_pending",
+            "message": f"Connector repair is still awaiting Rezonance Cloud ({type(exc).__name__}).",
+        }
+
+
+def repair_pairing(
+    server: str,
+    pairing_code: str,
+    identity: dict[str, Any] | None = None,
+    *,
+    timeout: float = 40.0,
+) -> dict[str, Any]:
+    """Repair exact customer identity while preserving the existing local inventory."""
+    current = dict(identity or _load_identity())
+    if current.get("replacement_pending"):
+        return resume_pending_repair(current)
+    current_token = str(current.get("runner_token") or "").strip()
+    runner_id = str(current.get("runner_id") or "").strip()
+    if not current_token or not runner_id:
+        return {
+            "ok": False,
+            "error": "local_identity_incomplete",
+            "message": "The existing connector identity is incomplete. Open Diagnostics before pairing again.",
+        }
+    try:
+        try:
+            prepared_response = _post(
+                server,
+                "/api/runner/replacement/prepare",
+                {"pairing_code": pairing_code},
+                token=current_token,
+                timeout=timeout,
+            )
+        except Exception as exc:
+            if not _pending_token_rejected(exc):
+                raise
+            prepared_response = _post(
+                server,
+                "/api/runner/replacement/prepare",
+                {"pairing_code": pairing_code},
+                timeout=timeout,
+            )
+        prepared = dict(prepared_response or {})
+    except Exception as exc:  # noqa: BLE001 - convert transport failures to a UI-safe result.
+        return {
+            "ok": False,
+            "error": "repair_prepare_failed",
+            "message": f"Rezonance Cloud did not prepare the repair ({type(exc).__name__}).",
+        }
+    if str(prepared.get("runner_id") or "") != runner_id:
+        return {
+            "ok": False,
+            "error": "runner_identity_changed",
+            "message": "Rezonance Cloud selected a different connector. No local changes were saved.",
+        }
+    required = (
+        "runner_token",
+        "hmac_secret",
+        "pool",
+        "connector_name",
+        "organization_name",
+        "operator_email",
+    )
+    if not prepared.get("identity_verified") or any(not str(prepared.get(key) or "").strip() for key in required):
+        return {
+            "ok": False,
+            "error": "identity_not_verified",
+            "message": "Rezonance Cloud did not return a complete verified customer identity.",
+        }
+
+    pending = dict(current)
+    pending.update(
+        {
+            "server": server,
+            "runner_token": str(prepared["runner_token"]),
+            "hmac_secret": str(prepared["hmac_secret"]),
+            "pool": str(prepared["pool"]),
+            "name": str(prepared["connector_name"]),
+            "organization_name": str(prepared["organization_name"]),
+            "operator_email": str(prepared["operator_email"]),
+            "identity_verified": True,
+            "token_expires_at": prepared.get("token_expires_at"),
+            "token_rotate_after": prepared.get("token_rotate_after"),
+            "token_pending": False,
+            "replacement_pending": True,
+            "replacement_pairing_code": pairing_code,
+            "replacement_fallback_identity": current,
+        }
+    )
+    try:
+        _write_identity(pending)
+    except Exception:  # noqa: BLE001 - the current server credential remains active.
+        return {
+            "ok": False,
+            "error": "local_identity_write_failed",
+            "message": (
+                "Windows could not protect the prepared connector identity. "
+                "Open Diagnostics and run Repair permissions; the existing connector is unchanged."
+            ),
+        }
+    try:
+        finalized = _commit_pending_replacement(pending)
+    except Exception as exc:  # noqa: BLE001 - startup recovery will retry the protected pending transition.
+        return {
+            "ok": False,
+            "pending": True,
+            "error": "repair_commit_pending",
+            "message": (
+                "The repair is protected on this PC and will finish automatically when Rezonance Cloud is reachable "
+                f"({type(exc).__name__})."
+            ),
+        }
+    return _safe_replacement_result(finalized)
 
 
 def _write_identity(identity: dict[str, Any]) -> None:
@@ -610,7 +807,13 @@ def doctor(args: argparse.Namespace) -> int:
             checks.append({"id": "identity", "status": "pass", "message": "Connector is enrolled."})
             expiry = _identity_time(identity.get("token_expires_at"))
             now = datetime.now(timezone.utc)
-            if bool(identity.get("token_pending")):
+            if bool(identity.get("replacement_pending")):
+                checks.append({
+                    "id": "connector_token",
+                    "status": "warn",
+                    "message": "Connector identity repair is protected locally and awaiting cloud confirmation.",
+                })
+            elif bool(identity.get("token_pending")):
                 checks.append({
                     "id": "connector_token",
                     "status": "warn",
@@ -2976,6 +3179,12 @@ class _RunnerPaths:
 
 def run(args: argparse.Namespace) -> int:
     identity = _load_identity()
+    if bool(identity.get("replacement_pending")):
+        try:
+            identity = _commit_pending_replacement(identity)
+        except Exception as exc:  # noqa: BLE001 - retry on the next scheduled task launch.
+            print(f"[runner] Identity repair confirmation deferred: {exc}", file=sys.stderr)
+            return 1
     try:
         identity = _maintain_runner_token(identity)
     except Exception as exc:  # noqa: BLE001 - existing token remains available for retry.
@@ -3003,8 +3212,15 @@ def run(args: argparse.Namespace) -> int:
     while not _stop:
         if time.monotonic() >= token_maintenance_at:
             try:
+                saved_identity = _load_identity()
+                if saved_identity.get("runner_token") != identity.get("runner_token"):
+                    identity = saved_identity
+                if bool(identity.get("replacement_pending")):
+                    identity = _commit_pending_replacement(identity)
                 identity = _maintain_runner_token(identity)
                 token = identity["runner_token"]
+                secret = identity["hmac_secret"]
+                pool = identity["pool"]
             except Exception as exc:  # noqa: BLE001 - retain current identity and retry later.
                 print(f"[runner] Token maintenance deferred: {exc}", file=sys.stderr)
             token_maintenance_at = time.monotonic() + 60.0

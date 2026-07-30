@@ -18,7 +18,7 @@ from zipfile import ZIP_DEFLATED, ZipFile
 from netcode.shell_desktop import build_desktop_shell_profile
 
 
-PACKAGE_VERSION = "0.3.4-community-preview"
+PACKAGE_VERSION = "0.3.5-community-preview"
 
 
 def _rez_runtime_files() -> dict[str, bytes]:
@@ -788,10 +788,16 @@ def _readme(control_plane_url: str) -> str:
         The installer opens the Local Connector window. Enter the one-time
         pairing code supplied by Rezonance. Confirm the exact organization,
         Community login, and connector name, then select **Connect this device**.
-        On **Overview**, select **Start connector**. On **Discovery**, enter a
-        bounded seed IP, range, or CIDR and local device credentials. Community
+        The connector starts automatically after pairing. On **Discovery**, enter
+        a bounded seed IP, range, or CIDR and local device credentials. Community
         discovery is limited to 25 devices; only successfully collected devices
         become protected inventory records.
+
+        **Overview** always shows the server-verified organization, Community login email,
+        connector name, and cloud address. If identity verification
+        needs attention, select **Repair identity** and use the replacement
+        pairing code issued for that connector. Repair preserves the protected
+        local inventory and restarts only the connector process.
 
         Run `.\diagnose-runner.ps1` from an Administrator PowerShell window when
         support asks for the connector readiness report. If diagnostics report

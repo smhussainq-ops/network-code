@@ -3090,6 +3090,9 @@ def test_windows_runner_package_contains_install_scripts_and_no_secrets():
     assert "<single-use-token>" not in combined
     assert "Confirm the exact organization" in combined
     assert "Connect this device" in combined
+    assert "Repair identity" in combined
+    assert "Community login email" in combined
+    assert "restarts only the connector process" in combined
     assert "replace-me" not in combined
     assert "NETCODE_REZ_ROOT" in combined
     assert "discover local inventory" in combined

@@ -6,6 +6,8 @@ from pathlib import Path
 import subprocess
 import sys
 
+import pytest
+
 from netcode import runner_agent
 from netcode.yamlio import read_yaml, write_yaml
 
@@ -229,6 +231,201 @@ def test_community_cli_hides_manual_inventory_import():
     assert "inventory-import" not in completed.stdout
 
 
+def test_pairing_repair_prepares_saves_commits_and_preserves_existing_identity(monkeypatch):
+    current = {
+        "server": "https://control.rezonancenetworks.com",
+        "runner_id": "runner-legacy",
+        "runner_token": "current-runner-token",
+        "hmac_secret": "current-hmac-secret",
+        "pool": "pilot",
+        "name": "windows-gns3-01",
+        "organization_name": "",
+        "operator_email": "",
+        "identity_verified": False,
+    }
+    posts: list[dict[str, object]] = []
+    writes: list[dict[str, object]] = []
+
+    def fake_post(server, path, body, token=None, timeout=40.0):
+        posts.append({"server": server, "path": path, "body": body, "token": token, "timeout": timeout})
+        if path.endswith("/prepare"):
+            return {
+                "ok": True,
+                "runner_id": "runner-legacy",
+                "runner_token": "pending-runner-token",
+                "hmac_secret": "pending-hmac-secret",
+                "pool": "org-community",
+                "connector_name": "acme-windows-01",
+                "organization_name": "Acme Networks",
+                "operator_email": "owner@acme.example",
+                "identity_verified": True,
+                "token_expires_at": "2026-08-01T00:00:00+00:00",
+                "token_rotate_after": "2026-07-31T00:00:00+00:00",
+            }
+        return {
+            "ok": True,
+            "runner_id": "runner-legacy",
+            "connector_name": "acme-windows-01",
+            "organization_name": "Acme Networks",
+            "operator_email": "owner@acme.example",
+            "identity_verified": True,
+        }
+
+    monkeypatch.setattr(runner_agent, "_post", fake_post)
+    monkeypatch.setattr(runner_agent, "_write_identity", lambda identity: writes.append(dict(identity)))
+
+    result = runner_agent.repair_pairing(
+        "https://control.rezonancenetworks.com",
+        "one-time-repair-code",
+        current,
+    )
+
+    assert result["ok"] is True
+    assert [post["path"] for post in posts] == [
+        "/api/runner/replacement/prepare",
+        "/api/runner/replacement/commit",
+    ]
+    assert posts[0]["token"] == "current-runner-token"
+    assert posts[1]["token"] == "pending-runner-token"
+    assert posts[0]["body"] == posts[1]["body"] == {"pairing_code": "one-time-repair-code"}
+    assert writes[0]["replacement_pending"] is True
+    assert writes[0]["replacement_fallback_identity"]["runner_token"] == "current-runner-token"
+    assert writes[-1]["runner_id"] == "runner-legacy"
+    assert writes[-1]["runner_token"] == "pending-runner-token"
+    assert writes[-1]["hmac_secret"] == "pending-hmac-secret"
+    assert writes[-1]["pool"] == "org-community"
+    assert writes[-1]["name"] == "acme-windows-01"
+    assert "replacement_pairing_code" not in writes[-1]
+    assert "replacement_fallback_identity" not in writes[-1]
+    serialized = json.dumps(result)
+    for secret in (
+        "one-time-repair-code",
+        "current-runner-token",
+        "current-hmac-secret",
+        "pending-runner-token",
+        "pending-hmac-secret",
+    ):
+        assert secret not in serialized
+
+
+def test_pending_pairing_repair_is_recoverable_after_interruption(monkeypatch):
+    pending = {
+        "server": "https://control.rezonancenetworks.com",
+        "runner_id": "runner-legacy",
+        "runner_token": "pending-runner-token",
+        "hmac_secret": "pending-hmac-secret",
+        "pool": "org-community",
+        "name": "acme-windows-01",
+        "organization_name": "Acme Networks",
+        "operator_email": "owner@acme.example",
+        "identity_verified": True,
+        "replacement_pending": True,
+        "replacement_pairing_code": "one-time-repair-code",
+        "replacement_fallback_identity": {
+            "runner_id": "runner-legacy",
+            "runner_token": "current-runner-token",
+            "hmac_secret": "current-hmac-secret",
+        },
+    }
+    writes: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        runner_agent,
+        "_post",
+        lambda *args, **kwargs: {
+            "ok": True,
+            "runner_id": "runner-legacy",
+            "connector_name": "acme-windows-01",
+            "organization_name": "Acme Networks",
+            "operator_email": "owner@acme.example",
+            "identity_verified": True,
+            "already_committed": True,
+        },
+    )
+    monkeypatch.setattr(runner_agent, "_write_identity", lambda identity: writes.append(dict(identity)))
+
+    recovered = runner_agent._commit_pending_replacement(pending)
+
+    assert "replacement_pending" not in recovered
+    assert recovered["runner_token"] == "pending-runner-token"
+    assert "replacement_pairing_code" not in writes[-1]
+
+
+def test_pairing_repair_uses_founder_bound_claim_when_old_token_is_rejected(monkeypatch):
+    calls: list[str | None] = []
+
+    def fake_post(server, path, body, token=None, timeout=40.0):
+        calls.append(token)
+        if path.endswith("/prepare") and token:
+            raise RuntimeError("HTTP 401 from replacement prepare")
+        if path.endswith("/prepare"):
+            return {
+                "ok": True,
+                "runner_id": "runner-legacy",
+                "runner_token": "pending-runner-token",
+                "hmac_secret": "pending-hmac-secret",
+                "pool": "org-community",
+                "connector_name": "acme-windows-01",
+                "organization_name": "Acme Networks",
+                "operator_email": "owner@acme.example",
+                "identity_verified": True,
+            }
+        return {
+            "ok": True,
+            "runner_id": "runner-legacy",
+            "connector_name": "acme-windows-01",
+            "organization_name": "Acme Networks",
+            "operator_email": "owner@acme.example",
+            "identity_verified": True,
+        }
+
+    monkeypatch.setattr(runner_agent, "_post", fake_post)
+    monkeypatch.setattr(runner_agent, "_write_identity", lambda identity: None)
+
+    result = runner_agent.repair_pairing(
+        "https://control.rezonancenetworks.com",
+        "founder-bound-repair-code",
+        {
+            "server": "https://control.rezonancenetworks.com",
+            "runner_id": "runner-legacy",
+            "runner_token": "rejected-runner-token",
+            "hmac_secret": "current-hmac-secret",
+            "pool": "pilot",
+            "name": "windows-gns3-01",
+        },
+    )
+
+    assert result["ok"] is True
+    assert calls == ["rejected-runner-token", None, "pending-runner-token"]
+
+
+def test_rejected_pending_repair_restores_the_previous_connector_identity(monkeypatch):
+    fallback = {
+        "runner_id": "runner-legacy",
+        "runner_token": "current-runner-token",
+        "hmac_secret": "current-hmac-secret",
+    }
+    pending = {
+        **fallback,
+        "server": "https://control.rezonancenetworks.com",
+        "runner_token": "stale-pending-token",
+        "replacement_pending": True,
+        "replacement_pairing_code": "one-time-repair-code",
+        "replacement_fallback_identity": fallback,
+    }
+    writes: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        runner_agent,
+        "_post",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("HTTP 401 from replacement commit")),
+    )
+    monkeypatch.setattr(runner_agent, "_write_identity", lambda identity: writes.append(dict(identity)))
+
+    with pytest.raises(RuntimeError, match="HTTP 401"):
+        runner_agent._commit_pending_replacement(pending)
+
+    assert writes == [fallback]
+
+
 def test_connector_ui_uses_customer_pairing_language():
     from netcode import windows_connector_control
 
@@ -238,9 +435,35 @@ def test_connector_ui_uses_customer_pairing_language():
     assert "Verify code" in source
     assert "Verified customer" in source
     assert "Connect this device" in source
+    assert "Pair again" in source
+    assert "Repair identity" in source
+    assert "Repair this connector" in source
+    assert "Open customer portal" in source
+    assert "Community login" in source
+    assert "https://app.rezonancenetworks.com" in source
+    assert "preview_replacement" in source
     assert "self.enroll_name" not in source
     assert "self.enroll_server" not in source
     assert "one-time join token" not in source
+    assert "Show password" not in source
+    assert "runner_token" not in source
+
+
+def test_connector_activation_restarts_only_after_identity_repair(monkeypatch):
+    from netcode import windows_connector_control
+
+    calls: list[str] = []
+    monkeypatch.setattr(
+        windows_connector_control,
+        "_run_task",
+        lambda command: (calls.append(command) or True, ""),
+    )
+
+    result = windows_connector_control._activate_connector(restart=True)
+
+    assert result["ok"] is True
+    assert result["restarted"] is True
+    assert calls == ["End", "Run"]
 
 
 def test_connector_ui_explains_startup_task_access_denial(monkeypatch):

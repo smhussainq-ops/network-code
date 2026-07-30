@@ -8,6 +8,7 @@ import os
 import queue
 import subprocess
 import threading
+import webbrowser
 from typing import Any, Callable
 
 from netcode import runner_agent
@@ -16,6 +17,7 @@ from netcode import runner_agent
 PRODUCT_NAME = "Rezonance Local Connector"
 TASK_NAME = "RezonanceLocalConnector"
 PRODUCTION_CONTROL_PLANE = "https://control.rezonancenetworks.com"
+CUSTOMER_PORTAL = "https://app.rezonancenetworks.com"
 PLATFORMS = (
     ("Auto detect", ""),
     ("Cisco IOS / IOS-XE", "cisco_ios"),
@@ -70,6 +72,7 @@ def connector_snapshot() -> dict[str, Any]:
             "organization_name": str(identity.get("organization_name") or ""),
             "operator_email": str(identity.get("operator_email") or ""),
             "identity_verified": bool(identity.get("identity_verified")),
+            "repair_pending": bool(identity.get("replacement_pending")),
         },
         "inventory": {
             "configured": runner_agent.INVENTORY_FILE.exists() and not inventory_error,
@@ -101,6 +104,13 @@ def _run_task(command: str) -> tuple[bool, str]:
             "Open Diagnostics, select Repair permissions, and approve the Windows prompt."
         )
     return completed.returncode == 0, message
+
+
+def _activate_connector(*, restart: bool) -> dict[str, Any]:
+    if restart:
+        _run_task("End")
+    ok, message = _run_task("Run")
+    return {"ok": ok, "message": message, "restarted": restart}
 
 
 def _task_diagnostic() -> dict[str, str]:
@@ -238,7 +248,9 @@ def main() -> int:
             self.busy = False
             self.verified_pairing_code = ""
             self.verified_pairing_identity: dict[str, Any] = {}
+            self.identity_repair_mode = False
             self.cloud_check_running = False
+            self.repair_recovery_running = False
             self.last_diagnostics: dict[str, Any] = {}
             self._configure_style()
             self._build()
@@ -354,14 +366,35 @@ def main() -> int:
             buttons.grid(row=5, column=0, columnspan=3, sticky="w", pady=(8, 0))
             ttk.Button(buttons, text="Start connector", command=self._start_connector, style="Accent.TButton").pack(side="left")
             ttk.Button(buttons, text="Refresh", command=self.refresh).pack(side="left", padx=(10, 0))
+            ttk.Button(buttons, text="Open customer portal", command=self._open_customer_portal).pack(
+                side="left", padx=(10, 0)
+            )
+            self.repair_identity_button = ttk.Button(
+                buttons,
+                text="Pair again",
+                command=self._begin_identity_repair,
+            )
+            self.repair_identity_button.pack(side="left", padx=(10, 0))
             for column in range(3):
                 self.connection_panel.columnconfigure(column, weight=1)
 
             self.enrollment_panel = ttk.Frame(self.overview_tab, style="Panel.TFrame")
             self.enrollment_panel.grid(row=3, column=0, columnspan=3, sticky="ew")
-            ttk.Label(self.enrollment_panel, text="Connect to Rezonance", style="Section.TLabel").grid(
-                row=0, column=0, columnspan=4, sticky="w", pady=(0, 10)
+            self.enrollment_title = ttk.Label(
+                self.enrollment_panel,
+                text="Connect to Rezonance",
+                style="Section.TLabel",
             )
+            self.enrollment_title.grid(
+                row=0, column=0, columnspan=3, sticky="w", pady=(0, 10)
+            )
+            self.cancel_repair_button = ttk.Button(
+                self.enrollment_panel,
+                text="Cancel",
+                command=self._cancel_identity_repair,
+            )
+            self.cancel_repair_button.grid(row=0, column=3, sticky="e", pady=(0, 10))
+            self.cancel_repair_button.grid_remove()
             self.enroll_token = tk.StringVar()
             ttk.Label(self.enrollment_panel, text="One-time pairing code", style="Muted.TLabel").grid(
                 row=1, column=0, columnspan=3, sticky="w", pady=(10, 4)
@@ -604,10 +637,37 @@ def main() -> int:
                 return
             self.verify_button.configure(state="disabled")
             self.activity.configure(text="Verifying customer")
+            preview = (
+                runner_agent.preview_replacement
+                if self.identity_repair_mode and connector_snapshot()["enrolled"]
+                else runner_agent.preview_pairing
+            )
             self._background(
-                lambda: runner_agent.preview_pairing(control_plane_url(), code),
+                lambda: preview(control_plane_url(), code),
                 "pairing_verified",
             )
+
+        def _open_customer_portal(self) -> None:
+            webbrowser.open_new_tab(CUSTOMER_PORTAL)
+            self.activity.configure(text="Customer portal opened")
+
+        def _begin_identity_repair(self) -> None:
+            self.identity_repair_mode = True
+            self.enrollment_title.configure(text="Repair connector identity")
+            self.enroll_button.configure(text="Repair this connector")
+            self.repair_identity_button.configure(text="Repair identity")
+            self.cancel_repair_button.grid()
+            self._use_different_code()
+            self.enrollment_panel.grid(row=4, column=0, columnspan=3, sticky="ew", pady=(20, 0))
+
+        def _cancel_identity_repair(self) -> None:
+            self.identity_repair_mode = False
+            self._use_different_code()
+            self.enrollment_panel.grid_remove()
+            self.enrollment_title.configure(text="Connect to Rezonance")
+            self.enroll_button.configure(text="Connect this device")
+            self.cancel_repair_button.grid_remove()
+            self.activity.configure(text="Ready")
 
         def _use_different_code(self) -> None:
             self.verified_pairing_code = ""
@@ -620,19 +680,29 @@ def main() -> int:
             self.pairing_entry.focus_set()
             self.activity.configure(text="Ready")
 
+        def _complete_pairing(self, token: str, name: str, *, repair: bool) -> dict[str, Any]:
+            server = control_plane_url()
+            if repair:
+                return runner_agent.repair_pairing(server, token)
+            return {
+                "ok": runner_agent.enroll(
+                    argparse.Namespace(server=server, join_token=token, name=name)
+                )
+                == 0,
+                "message": "Pairing could not be completed.",
+            }
+
         def _enroll(self) -> None:
             token = self.verified_pairing_code
             name = str(self.verified_pairing_identity.get("connector_name") or "")
             if not token or not name or not self.verified_pairing_identity.get("identity_verified"):
                 messagebox.showerror(PRODUCT_NAME, "Verify the one-time pairing code first.")
                 return
-            server = control_plane_url()
-            self.verified_pairing_code = ""
-            self.enroll_token.set("")
             self.enroll_button.configure(state="disabled")
-            self.activity.configure(text="Connecting this device")
+            repair = self.identity_repair_mode and connector_snapshot()["enrolled"]
+            self.activity.configure(text="Repairing connector identity" if repair else "Connecting this device")
             self._background(
-                lambda: runner_agent.enroll(argparse.Namespace(server=server, join_token=token, name=name)),
+                lambda: self._complete_pairing(token, name, repair=repair),
                 "enrollment_complete",
             )
 
@@ -723,18 +793,65 @@ def main() -> int:
                             messagebox.showerror(PRODUCT_NAME, message or "The startup task is not installed.")
                     elif event == "enrollment_complete":
                         self.enroll_button.configure(state="normal")
-                        if int(value) == 0:
-                            self.activity.configure(text="Connector connected")
+                        if value.get("ok"):
+                            repaired = self.identity_repair_mode
+                            self.activity.configure(
+                                text="Connector identity repaired" if repaired else "Connector connected"
+                            )
+                            self.verified_pairing_code = ""
+                            self.enroll_token.set("")
                             self.verified_pairing_identity = {}
+                            self.identity_repair_mode = False
+                            self.enrollment_title.configure(text="Connect to Rezonance")
+                            self.enroll_button.configure(text="Connect this device")
+                            self.cancel_repair_button.grid_remove()
                             self.refresh()
                             self.tabs.select(self.overview_tab)
+                            self._background(
+                                lambda: _activate_connector(restart=repaired),
+                                "pairing_activation_complete",
+                            )
                         else:
-                            self._use_different_code()
-                            self.activity.configure(text="Connector could not be connected")
+                            self.activity.configure(
+                                text=(
+                                    "Connector repair awaiting cloud confirmation"
+                                    if value.get("pending")
+                                    else "Connector identity could not be repaired"
+                                )
+                            )
                             messagebox.showerror(
                                 PRODUCT_NAME,
-                                "Pairing could not be completed. Ask for a new one-time pairing code.",
+                                str(
+                                    value.get("message")
+                                    or "Pairing could not be completed. The code was not accepted."
+                                ),
                             )
+                    elif event == "pairing_activation_complete":
+                        if value.get("ok"):
+                            self.activity.configure(
+                                text=(
+                                    "Connector repaired and running"
+                                    if value.get("restarted")
+                                    else "Connector connected and running"
+                                )
+                            )
+                        else:
+                            self.activity.configure(text="Connector is paired but could not start")
+                            messagebox.showerror(
+                                PRODUCT_NAME,
+                                str(value.get("message") or "Open Diagnostics and repair Windows permissions."),
+                            )
+                    elif event == "repair_recovery_complete":
+                        self.repair_recovery_running = False
+                        if value.get("ok"):
+                            self.activity.configure(text="Connector identity repair completed")
+                            self.refresh()
+                            self._background(
+                                lambda: _activate_connector(restart=True),
+                                "pairing_activation_complete",
+                            )
+                        else:
+                            self.activity.configure(text="Connector repair will retry automatically")
                     elif event == "diagnostics_complete":
                         self.last_diagnostics = dict(value)
                         for item in self.diagnostic_tree.get_children():
@@ -768,8 +885,19 @@ def main() -> int:
                                 text="Verified" if exact else "Identity mismatch",
                                 style="Verified.TLabel" if exact else "Warning.TLabel",
                             )
+                            self.repair_identity_button.configure(
+                                text="Pair again" if exact else "Repair identity"
+                            )
+                            if not exact and not self.identity_repair_mode:
+                                self._begin_identity_repair()
                         else:
-                            self.identity_status.configure(text="Cloud check failed", style="Warning.TLabel")
+                            if value.get("authorization_rejected"):
+                                self.identity_status.configure(text="Pair again required", style="Warning.TLabel")
+                                self.repair_identity_button.configure(text="Pair again")
+                                if not self.identity_repair_mode:
+                                    self._begin_identity_repair()
+                            else:
+                                self.identity_status.configure(text="Cloud unavailable", style="Warning.TLabel")
                     elif event == "error":
                         self.busy = False
                         self.progress.stop()
@@ -787,22 +915,31 @@ def main() -> int:
             enrolled = bool(snapshot["enrolled"])
             devices = list(snapshot["inventory"]["devices"])
             identity_verified = bool(snapshot["connector"]["identity_verified"])
-            ready = enrolled and identity_verified and bool(devices) and not snapshot["errors"]
+            repair_pending = bool(snapshot["connector"]["repair_pending"])
+            ready = enrolled and identity_verified and not repair_pending and bool(devices) and not snapshot["errors"]
             self.header_status.configure(
                 text=(
                     "Ready"
                     if ready
                     else (
-                        "Identity check needed"
-                        if enrolled and not identity_verified
-                        else ("Inventory needed" if enrolled else "Enrollment needed")
+                        "Finishing identity repair"
+                        if repair_pending
+                        else (
+                            "Identity check needed"
+                            if enrolled and not identity_verified
+                            else ("Inventory needed" if enrolled else "Enrollment needed")
+                        )
                     )
                 ),
                 bg="#55b58a" if ready else "#d99b3f",
                 fg="#ffffff" if ready else "#172126",
             )
             self.enrollment_value.configure(
-                text="Verified" if identity_verified else ("Legacy" if enrolled else "Needed")
+                text=(
+                    "Repair pending"
+                    if repair_pending
+                    else ("Verified" if identity_verified else ("Legacy" if enrolled else "Needed"))
+                )
             )
             self.device_value.configure(text=str(len(devices)))
             self.security_value.configure(text="DPAPI" if snapshot["security"]["dpapi"] else "Local file")
@@ -811,25 +948,57 @@ def main() -> int:
             self.organization_value.configure(text=snapshot["connector"]["organization_name"] or "Not verified")
             self.email_value.configure(text=snapshot["connector"]["operator_email"] or "Not verified")
             self.identity_status.configure(
-                text="Checking cloud" if identity_verified else "Legacy enrollment",
-                style="Verified.TLabel" if identity_verified else "Warning.TLabel",
+                text=(
+                    "Finishing repair"
+                    if repair_pending
+                    else ("Checking cloud" if identity_verified else "Legacy enrollment")
+                ),
+                style="Verified.TLabel" if identity_verified and not repair_pending else "Warning.TLabel",
             )
             if enrolled:
-                self.enrollment_panel.grid_remove()
                 self.connection_panel.grid()
-                if not self.cloud_check_running and not snapshot["errors"]:
+                self.repair_identity_button.configure(
+                    text="Pair again" if identity_verified else "Repair identity"
+                )
+                if repair_pending:
+                    self.enrollment_panel.grid_remove()
+                    if not self.repair_recovery_running:
+                        self.repair_recovery_running = True
+                        self._background(runner_agent.resume_pending_repair, "repair_recovery_complete")
+                elif not identity_verified and not self.identity_repair_mode:
+                    self._begin_identity_repair()
+                elif self.identity_repair_mode:
+                    self.enrollment_panel.grid(
+                        row=4,
+                        column=0,
+                        columnspan=3,
+                        sticky="ew",
+                        pady=(20, 0),
+                    )
+                else:
+                    self.enrollment_panel.grid_remove()
+                if not repair_pending and not self.cloud_check_running and not snapshot["errors"]:
                     self.cloud_check_running = True
 
                     def cloud_probe() -> dict[str, Any]:
                         try:
                             return {"ok": True, "identity": runner_agent.connector_identity(timeout=8.0)}
                         except Exception as exc:  # noqa: BLE001
-                            return {"ok": False, "error": type(exc).__name__}
+                            message = str(exc)
+                            return {
+                                "ok": False,
+                                "error": type(exc).__name__,
+                                "authorization_rejected": "HTTP 401" in message or "HTTP 403" in message,
+                            }
 
                     self._background(cloud_probe, "cloud_identity")
             else:
+                self.identity_repair_mode = False
                 self.connection_panel.grid_remove()
-                self.enrollment_panel.grid()
+                self.enrollment_title.configure(text="Connect to Rezonance")
+                self.enroll_button.configure(text="Connect this device")
+                self.cancel_repair_button.grid_remove()
+                self.enrollment_panel.grid(row=3, column=0, columnspan=3, sticky="ew")
             self.inventory_count.configure(text=f"{len(devices)} device{'s' if len(devices) != 1 else ''}")
             self.tabs.tab(self.discovery_tab, state="normal" if enrolled else "disabled")
             for item in self.tree.get_children():
