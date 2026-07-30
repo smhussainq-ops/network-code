@@ -3114,7 +3114,12 @@ def test_windows_runner_package_contains_install_scripts_and_no_secrets():
     assert "Get-CimInstance Win32_Process" in combined
     assert '$ConnectorProcess.SessionId -eq 0' in combined
     assert '$ParentProcess.SessionId -eq 0' in combined
-    assert 'Wait-Process -Id $ConnectorProcess.Id -Timeout 15' in combined
+    assert "$TaskStopDeadline = (Get-Date).AddSeconds(30)" in combined
+    assert "$ConnectorStopDeadline = (Get-Date).AddSeconds(30)" in combined
+    assert "Start-Sleep -Milliseconds 250" in combined
+    assert 'Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue' in combined
+    assert "Unable to stop the Local Connector startup task." in combined
+    assert 'Wait-Process -Id $ConnectorProcess.Id -Timeout 15' not in combined
     assert "Unable to stop the installed Local Connector process." in combined
     assert "Run uninstall-runner.ps1 from PowerShell opened as Administrator." in combined
     assert 'throw "Runtime removal did not complete:' in combined
@@ -3149,6 +3154,17 @@ def test_windows_runner_package_contains_install_scripts_and_no_secrets():
     with zipfile.ZipFile(BytesIO(package), "r") as archive:
         install_script = archive.read("install-runner.ps1").decode("utf-8")
         repair_script = archive.read("repair-connector.ps1").decode("utf-8")
+        uninstall_script = archive.read("uninstall-runner.ps1").decode("utf-8")
+        for script in (install_script, uninstall_script):
+            assert "$TaskStopDeadline = (Get-Date).AddSeconds(30)" in script
+            assert "$ConnectorStopDeadline = (Get-Date).AddSeconds(30)" in script
+            assert script.count(
+                'Get-Process -Name "RezonanceLocalConnector"'
+            ) >= 3
+            assert (
+                'Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue'
+                in script
+            )
         for script in (install_script, repair_script):
             assert "$TaskStoredReadExecuteMask = [int]0x001200A9" in script
             assert (

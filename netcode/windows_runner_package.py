@@ -162,29 +162,46 @@ def _install_runner_ps1(control_plane_url: str) -> str:
 
         $TaskName = "RezonanceLocalConnector"
         $ExistingTask = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
-        if ($ExistingTask) {{ Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue }}
-        $ConnectorProcesses = @(Get-Process -Name "RezonanceLocalConnector" -ErrorAction SilentlyContinue)
-        $SupervisorIds = @()
-        foreach ($ConnectorProcess in $ConnectorProcesses) {{
-          try {{
-            if ($ConnectorProcess.SessionId -eq 0) {{
-              $CimProcess = Get-CimInstance Win32_Process -Filter "ProcessId=$($ConnectorProcess.Id)" -ErrorAction SilentlyContinue
-              $ParentProcess = if ($CimProcess) {{ Get-Process -Id $CimProcess.ParentProcessId -ErrorAction SilentlyContinue }} else {{ $null }}
-              if ($ParentProcess -and $ParentProcess.SessionId -eq 0 -and $ParentProcess.ProcessName -in @("powershell", "pwsh")) {{
-                $SupervisorIds += $ParentProcess.Id
-              }}
-            }}
-          }} catch {{}}
-        }}
-        $SupervisorIds | Select-Object -Unique | ForEach-Object {{
-          Stop-Process -Id $_ -Force -ErrorAction SilentlyContinue
-        }}
-        foreach ($ConnectorProcess in $ConnectorProcesses) {{
-          if (Get-Process -Id $ConnectorProcess.Id -ErrorAction SilentlyContinue) {{
-            Stop-Process -Id $ConnectorProcess.Id -Force -ErrorAction Stop
-            Wait-Process -Id $ConnectorProcess.Id -Timeout 15 -ErrorAction SilentlyContinue
+        if ($ExistingTask) {{
+          Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+          $TaskStopDeadline = (Get-Date).AddSeconds(30)
+          do {{
+            Start-Sleep -Milliseconds 250
+            $TaskState = (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue).State
+          }} while ($TaskState -eq "Running" -and (Get-Date) -lt $TaskStopDeadline)
+          if ($TaskState -eq "Running") {{
+            throw "Unable to stop the Local Connector startup task."
           }}
         }}
+
+        # Task Scheduler shutdown is asynchronous. Re-enumerate both the
+        # supervisor and connector until late child processes have drained.
+        $ConnectorStopDeadline = (Get-Date).AddSeconds(30)
+        do {{
+          $ConnectorProcesses = @(Get-Process -Name "RezonanceLocalConnector" -ErrorAction SilentlyContinue)
+          $SupervisorIds = @()
+          foreach ($ConnectorProcess in $ConnectorProcesses) {{
+            try {{
+              if ($ConnectorProcess.SessionId -eq 0) {{
+                $CimProcess = Get-CimInstance Win32_Process -Filter "ProcessId=$($ConnectorProcess.Id)" -ErrorAction SilentlyContinue
+                $ParentProcess = if ($CimProcess) {{ Get-Process -Id $CimProcess.ParentProcessId -ErrorAction SilentlyContinue }} else {{ $null }}
+                if ($ParentProcess -and $ParentProcess.SessionId -eq 0 -and $ParentProcess.ProcessName -in @("powershell", "pwsh")) {{
+                  $SupervisorIds += $ParentProcess.Id
+                }}
+              }}
+            }} catch {{}}
+          }}
+          $SupervisorIds | Select-Object -Unique | ForEach-Object {{
+            Stop-Process -Id $_ -Force -ErrorAction SilentlyContinue
+          }}
+          $ConnectorProcesses | ForEach-Object {{
+            Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue
+          }}
+          Start-Sleep -Milliseconds 250
+        }} while (
+          (Get-Process -Name "RezonanceLocalConnector" -ErrorAction SilentlyContinue) -and
+          (Get-Date) -lt $ConnectorStopDeadline
+        )
         if (Get-Process -Name "RezonanceLocalConnector" -ErrorAction SilentlyContinue) {{
           throw "Unable to stop the installed Local Connector process."
         }}
@@ -613,32 +630,48 @@ def _uninstall_runner_ps1() -> str:
         $TaskName = "RezonanceLocalConnector"
         $ShortcutPath = Join-Path $env:ProgramData "Microsoft\Windows\Start Menu\Programs\Rezonance Local Connector.lnk"
         $RepairShortcutPath = Join-Path $env:ProgramData "Microsoft\Windows\Start Menu\Programs\Rezonance Local Connector Repair.lnk"
-        if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
+        $ExistingTask = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+        if ($ExistingTask) {
           Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+          $TaskStopDeadline = (Get-Date).AddSeconds(30)
+          do {
+            Start-Sleep -Milliseconds 250
+            $TaskState = (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue).State
+          } while ($TaskState -eq "Running" -and (Get-Date) -lt $TaskStopDeadline)
+          if ($TaskState -eq "Running") {
+            throw "Unable to stop the Local Connector startup task."
+          }
           Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false
         }
-        $ConnectorProcesses = @(Get-Process -Name "RezonanceLocalConnector" -ErrorAction SilentlyContinue)
-        $SupervisorIds = @()
-        foreach ($ConnectorProcess in $ConnectorProcesses) {
-          try {
-            if ($ConnectorProcess.SessionId -eq 0) {
-              $CimProcess = Get-CimInstance Win32_Process -Filter "ProcessId=$($ConnectorProcess.Id)" -ErrorAction SilentlyContinue
-              $ParentProcess = if ($CimProcess) { Get-Process -Id $CimProcess.ParentProcessId -ErrorAction SilentlyContinue } else { $null }
-              if ($ParentProcess -and $ParentProcess.SessionId -eq 0 -and $ParentProcess.ProcessName -in @("powershell", "pwsh")) {
-                $SupervisorIds += $ParentProcess.Id
+
+        # Task Scheduler shutdown is asynchronous. Re-enumerate both the
+        # supervisor and connector until late child processes have drained.
+        $ConnectorStopDeadline = (Get-Date).AddSeconds(30)
+        do {
+          $ConnectorProcesses = @(Get-Process -Name "RezonanceLocalConnector" -ErrorAction SilentlyContinue)
+          $SupervisorIds = @()
+          foreach ($ConnectorProcess in $ConnectorProcesses) {
+            try {
+              if ($ConnectorProcess.SessionId -eq 0) {
+                $CimProcess = Get-CimInstance Win32_Process -Filter "ProcessId=$($ConnectorProcess.Id)" -ErrorAction SilentlyContinue
+                $ParentProcess = if ($CimProcess) { Get-Process -Id $CimProcess.ParentProcessId -ErrorAction SilentlyContinue } else { $null }
+                if ($ParentProcess -and $ParentProcess.SessionId -eq 0 -and $ParentProcess.ProcessName -in @("powershell", "pwsh")) {
+                  $SupervisorIds += $ParentProcess.Id
+                }
               }
-            }
-          } catch {}
-        }
-        $SupervisorIds | Select-Object -Unique | ForEach-Object {
-          Stop-Process -Id $_ -Force -ErrorAction SilentlyContinue
-        }
-        foreach ($ConnectorProcess in $ConnectorProcesses) {
-          if (Get-Process -Id $ConnectorProcess.Id -ErrorAction SilentlyContinue) {
-            Stop-Process -Id $ConnectorProcess.Id -Force -ErrorAction Stop
-            Wait-Process -Id $ConnectorProcess.Id -Timeout 15 -ErrorAction SilentlyContinue
+            } catch {}
           }
-        }
+          $SupervisorIds | Select-Object -Unique | ForEach-Object {
+            Stop-Process -Id $_ -Force -ErrorAction SilentlyContinue
+          }
+          $ConnectorProcesses | ForEach-Object {
+            Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue
+          }
+          Start-Sleep -Milliseconds 250
+        } while (
+          (Get-Process -Name "RezonanceLocalConnector" -ErrorAction SilentlyContinue) -and
+          (Get-Date) -lt $ConnectorStopDeadline
+        )
         if (Get-Process -Name "RezonanceLocalConnector" -ErrorAction SilentlyContinue) {
           throw "Unable to stop the installed Local Connector process."
         }
