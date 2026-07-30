@@ -3144,7 +3144,17 @@ def test_windows_runner_package_contains_install_scripts_and_no_secrets():
     assert "Start-Process -FilePath $Runtime" not in combined
 
     with zipfile.ZipFile(BytesIO(package), "r") as archive:
+        install_script = archive.read("install-runner.ps1").decode("utf-8")
         repair_script = archive.read("repair-connector.ps1").decode("utf-8")
+        for script in (install_script, repair_script):
+            assert "$TaskStoredReadExecuteMask = [int]0x001200A9" in script
+            assert (
+                "$Ace.AccessMask -in @($TaskReadExecuteMask, $TaskStoredReadExecuteMask)"
+                in script
+            )
+            assert 'SecurityIdentifier("S-1-5-32-545")' in script
+            assert "$VerifiedBroadUsersAce = $true" in script
+            assert "-or $VerifiedBroadUsersAce" in script
         assert "Start-Process powershell.exe -Verb RunAs" in repair_script
         assert "Stop-Process" not in repair_script
         assert "Remove-Item" not in repair_script

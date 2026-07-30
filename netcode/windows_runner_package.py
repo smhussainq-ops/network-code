@@ -277,6 +277,7 @@ def _install_runner_ps1(control_plane_url: str) -> str:
           $TaskUserSid = $OperatorUserSid
           $BuiltinUsersSid = New-Object Security.Principal.SecurityIdentifier("S-1-5-32-545")
           $TaskReadExecuteMask = [int]0xA0000000
+          $TaskStoredReadExecuteMask = [int]0x001200A9
           for ($AceIndex = $TaskSecurity.DiscretionaryAcl.Count - 1; $AceIndex -ge 0; $AceIndex--) {{
             $Ace = $TaskSecurity.DiscretionaryAcl[$AceIndex]
             if (
@@ -316,7 +317,7 @@ def _install_runner_ps1(control_plane_url: str) -> str:
             ) {{
               if (
                 $Ace.SecurityIdentifier.Value -eq $TaskUserSid.Value -and
-                $Ace.AccessMask -eq $TaskReadExecuteMask
+                $Ace.AccessMask -in @($TaskReadExecuteMask, $TaskStoredReadExecuteMask)
               ) {{
                 $VerifiedTaskReadExecute = $true
               }}
@@ -541,6 +542,7 @@ def _repair_runner_ps1() -> str:
         )
         $BuiltinUsersSid = New-Object Security.Principal.SecurityIdentifier("S-1-5-32-545")
         $TaskReadExecuteMask = [int]0xA0000000
+        $TaskStoredReadExecuteMask = [int]0x001200A9
         for ($AceIndex = $TaskSecurity.DiscretionaryAcl.Count - 1; $AceIndex -ge 0; $AceIndex--) {
           $Ace = $TaskSecurity.DiscretionaryAcl[$AceIndex]
           if (
@@ -581,7 +583,7 @@ def _repair_runner_ps1() -> str:
           ) {
             if (
               $Ace.SecurityIdentifier.Value -eq $ResolvedOperatorSid.Value -and
-              $Ace.AccessMask -eq $TaskReadExecuteMask
+              $Ace.AccessMask -in @($TaskReadExecuteMask, $TaskStoredReadExecuteMask)
             ) {
               $VerifiedOperatorAce = $true
             }
