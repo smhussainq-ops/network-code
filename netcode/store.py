@@ -671,6 +671,28 @@ class PlatformStore:
                 )
                 """
             )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS legal_acceptances (
+                    id TEXT PRIMARY KEY,
+                    org_id TEXT NOT NULL,
+                    user_id TEXT NOT NULL,
+                    email_snapshot TEXT NOT NULL,
+                    document_id TEXT NOT NULL,
+                    document_version TEXT NOT NULL,
+                    document_sha256 TEXT NOT NULL,
+                    accepted_at TEXT NOT NULL,
+                    source TEXT NOT NULL,
+                    user_agent TEXT NOT NULL DEFAULT '',
+                    remote_address TEXT NOT NULL DEFAULT '',
+                    UNIQUE(org_id, user_id, document_id, document_version)
+                )
+                """
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_legal_acceptances_subject "
+                "ON legal_acceptances (org_id, user_id, document_id, accepted_at)"
+            )
             # Fleet rollouts: one intent orchestrated over many devices as
             # canary -> batch waves. Each target device gets its OWN change record,
             # so the whole single-change safety spine (plan/dry-run/apply/verify,
@@ -3054,6 +3076,64 @@ class PlatformStore:
     def revoke_session(self, token_hash: str) -> None:
         with self._connect() as conn:
             conn.execute("UPDATE sessions SET revoked_at = ? WHERE token_hash = ?", (utc_now(), token_hash))
+
+    def legal_acceptance(
+        self,
+        org_id: str,
+        user_id: str,
+        document_id: str,
+        document_version: str,
+    ) -> dict[str, Any] | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM legal_acceptances "
+                "WHERE org_id = ? AND user_id = ? AND document_id = ? AND document_version = ?",
+                (org_id, user_id, document_id, document_version),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def record_legal_acceptance(
+        self,
+        *,
+        org_id: str,
+        user_id: str,
+        email_snapshot: str,
+        document_id: str,
+        document_version: str,
+        document_sha256: str,
+        source: str,
+        user_agent: str = "",
+        remote_address: str = "",
+    ) -> dict[str, Any]:
+        """Record immutable clickwrap evidence once for this user and version."""
+        acceptance_id = str(uuid.uuid4())
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT INTO legal_acceptances "
+                "(id, org_id, user_id, email_snapshot, document_id, document_version, "
+                "document_sha256, accepted_at, source, user_agent, remote_address) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT (org_id, user_id, document_id, document_version) DO NOTHING",
+                (
+                    acceptance_id,
+                    org_id,
+                    user_id,
+                    email_snapshot.strip().lower(),
+                    document_id,
+                    document_version,
+                    document_sha256,
+                    utc_now(),
+                    source,
+                    user_agent[:512],
+                    remote_address[:128],
+                ),
+            )
+        recorded = self.legal_acceptance(org_id, user_id, document_id, document_version)
+        if recorded is None:
+            raise RuntimeError("Legal acceptance could not be persisted.")
+        if str(recorded.get("document_sha256") or "") != document_sha256:
+            raise ValueError("The recorded agreement version does not match the current document.")
+        return recorded
 
     def _workflow_event(self, row: sqlite3.Row) -> WorkflowEventRecord:
         evidence = json.loads(row["evidence_json"]) if row["evidence_json"] else None

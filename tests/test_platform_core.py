@@ -3167,6 +3167,13 @@ def test_windows_runner_download_endpoint_blocks_unsigned_package_by_default(tmp
     assert manifest["build_scripts_included"] is False
     assert manifest["sample_workflows_included"] is False
     assert manifest["unsigned_download_public"] is False
+    assert manifest["download_requires_authenticated_acceptance"] is True
+    assert manifest["agreement_required"] is True
+    assert manifest["agreement"]["document_id"] == "community-software-license-and-services-agreement"
+    assert manifest["agreement"]["version"] == "community-2026-07-29-v1"
+    assert len(manifest["agreement"]["sha256"]) == 64
+    assert manifest["agreement"]["public_url"].endswith("/software-agreement.html")
+    assert manifest["privacy_notice_url"].endswith("/privacy.html")
     assert manifest["production_code_signing_complete"] is False
     assert manifest["available"] is False
     assert manifest["download_status"] == "blocked_pending_signed_package"
@@ -3197,28 +3204,267 @@ def test_windows_runner_download_endpoint_stays_blocked_without_signed_artifact(
 
 
 def test_windows_runner_download_endpoint_returns_only_configured_signed_artifact(tmp_path: Path, monkeypatch):
+    from netcode.auth import hash_password
+    from netcode.store import DEFAULT_ORG_ID
+
     init_workspace(WorkspacePaths(tmp_path))
     monkeypatch.chdir(tmp_path)
     signed = tmp_path / "RezonanceLocalConnector-0.3.3-signed.zip"
     signed.write_bytes(b"signed-package-placeholder")
     monkeypatch.setenv("NETCODE_RUNNER_POOL", "pilot")
+    monkeypatch.setenv("NETCODE_AUTH", "1")
     monkeypatch.setenv("NETCODE_WINDOWS_DOWNLOAD_ENABLED", "true")
     monkeypatch.setenv("NETCODE_WINDOWS_SIGNED_ARTIFACT_PATH", str(signed))
 
+    store = PlatformStore(WorkspacePaths(tmp_path.resolve()))
+    store.create_user(DEFAULT_ORG_ID, "engineer@example.com", hash_password("strong-test-password"), role="operator")
     client = TestClient(api.app)
     manifest = client.get(
         "/api/runner/download/windows/manifest",
         headers={"host": "control.rezonancenetworks.com", "x-forwarded-proto": "http"},
     ).json()
+    login = client.post(
+        "/api/auth/login",
+        json={"email": "engineer@example.com", "password": "strong-test-password"},
+    )
+    agreement_status = client.get("/api/legal/software-agreement/status")
+    blocked = client.get("/api/runner/download/windows")
+    agreement = agreement_status.json()["agreement"]
+    accepted = client.post(
+        "/api/legal/software-agreement/accept",
+        json={
+            "document_id": agreement["document_id"],
+            "document_version": agreement["version"],
+            "accepted": True,
+        },
+    )
+    repeated = client.post(
+        "/api/legal/software-agreement/accept",
+        json={
+            "document_id": agreement["document_id"],
+            "document_version": agreement["version"],
+            "accepted": True,
+        },
+    )
     response = client.get("/api/runner/download/windows")
 
     assert manifest["control_plane_url"] == "https://control.rezonancenetworks.com"
     assert manifest["available"] is True
     assert manifest["production_code_signing_complete"] is True
     assert manifest["download_status"] == "available"
+    assert login.status_code == 200
+    assert agreement_status.status_code == 200
+    assert agreement_status.json()["accepted"] is False
+    assert agreement_status.json()["download_available"] is True
+    assert blocked.status_code == 403
+    assert blocked.json()["error"] == "software_agreement_acceptance_required"
+    assert accepted.status_code == 200
+    assert accepted.json()["accepted"] is True
+    assert repeated.status_code == 200
+    assert repeated.json()["accepted_at"] == accepted.json()["accepted_at"]
+    with store._connect() as conn:
+        acceptance_count = conn.execute(
+            "SELECT COUNT(*) AS total FROM legal_acceptances"
+        ).fetchone()["total"]
+    assert acceptance_count == 1
     assert response.status_code == 200
     assert response.headers["content-disposition"] == f'attachment; filename="{signed.name}"'
     assert response.content == b"signed-package-placeholder"
+
+
+def test_windows_download_clickwrap_is_explicit_current_and_user_scoped(tmp_path: Path, monkeypatch):
+    from netcode.auth import hash_password
+    from netcode.store import DEFAULT_ORG_ID
+
+    init_workspace(WorkspacePaths(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    signed = tmp_path / "RezonanceLocalConnector-signed.zip"
+    signed.write_bytes(b"signed")
+    monkeypatch.setenv("NETCODE_AUTH", "1")
+    monkeypatch.setenv("NETCODE_WINDOWS_DOWNLOAD_ENABLED", "true")
+    monkeypatch.setenv("NETCODE_WINDOWS_SIGNED_ARTIFACT_PATH", str(signed))
+    monkeypatch.setenv("NETCODE_ADMIN_TOKEN", "break-glass-test-token")
+
+    store = PlatformStore(WorkspacePaths(tmp_path.resolve()))
+    store.create_user(DEFAULT_ORG_ID, "first@example.com", hash_password("first-password"), role="operator")
+    store.create_user(DEFAULT_ORG_ID, "second@example.com", hash_password("second-password"), role="operator")
+    first = TestClient(api.app)
+    second = TestClient(api.app)
+    first.post("/api/auth/login", json={"email": "first@example.com", "password": "first-password"})
+    second.post("/api/auth/login", json={"email": "second@example.com", "password": "second-password"})
+
+    agreement = first.get("/api/legal/software-agreement/status").json()["agreement"]
+    rejected_false = first.post(
+        "/api/legal/software-agreement/accept",
+        json={
+            "document_id": agreement["document_id"],
+            "document_version": agreement["version"],
+            "accepted": False,
+        },
+    )
+    rejected_stale = first.post(
+        "/api/legal/software-agreement/accept",
+        json={
+            "document_id": agreement["document_id"],
+            "document_version": "superseded-version",
+            "accepted": True,
+        },
+    )
+    accepted = first.post(
+        "/api/legal/software-agreement/accept",
+        json={
+            "document_id": agreement["document_id"],
+            "document_version": agreement["version"],
+            "accepted": True,
+        },
+    )
+
+    assert rejected_false.status_code == 400
+    assert rejected_stale.status_code == 409
+    assert accepted.status_code == 200
+    assert first.get("/api/runner/download/windows").status_code == 200
+    assert second.get("/api/legal/software-agreement/status").json()["accepted"] is False
+    assert second.get("/api/runner/download/windows").status_code == 403
+    assert TestClient(api.app).get(
+        "/api/runner/download/windows",
+        headers={"Authorization": "Bearer break-glass-test-token"},
+    ).status_code == 401
+
+
+def test_trusted_rez_clickwrap_records_the_authenticated_account_email(tmp_path: Path, monkeypatch):
+    init_workspace(WorkspacePaths(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("NETCODE_AUTH", "1")
+    monkeypatch.setenv("NETCODE_ADMIN_TOKEN", "trusted-rez-service-token")
+
+    headers = {
+        "Authorization": "Bearer trusted-rez-service-token",
+        "X-Rezonance-Org-ID": "org-legal",
+        "X-Rezonance-User": "legal-operator",
+        "X-Rezonance-User-ID": "usr-legal-operator",
+        "X-Rezonance-Role": "operator",
+        "X-Rezonance-Email": "Legal.Operator@Example.com",
+    }
+    client = TestClient(api.app)
+    agreement = client.get(
+        "/api/legal/software-agreement/status",
+        headers=headers,
+    ).json()["agreement"]
+    accepted = client.post(
+        "/api/legal/software-agreement/accept",
+        headers=headers,
+        json={
+            "document_id": agreement["document_id"],
+            "document_version": agreement["version"],
+            "accepted": True,
+        },
+    )
+
+    assert accepted.status_code == 200
+    with PlatformStore(WorkspacePaths(tmp_path.resolve()))._connect() as conn:
+        record = conn.execute(
+            """
+            SELECT org_id, user_id, email_snapshot, source
+            FROM legal_acceptances
+            """
+        ).fetchone()
+    assert dict(record) == {
+        "org_id": "org-legal",
+        "user_id": "usr-legal-operator",
+        "email_snapshot": "legal.operator@example.com",
+        "source": "rez_product_ui",
+    }
+
+
+def test_trusted_rez_clickwrap_rejects_missing_or_malformed_account_email(tmp_path: Path, monkeypatch):
+    init_workspace(WorkspacePaths(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("NETCODE_AUTH", "1")
+    monkeypatch.setenv("NETCODE_ADMIN_TOKEN", "trusted-rez-service-token")
+
+    headers = {
+        "Authorization": "Bearer trusted-rez-service-token",
+        "X-Rezonance-Org-ID": "org-legal",
+        "X-Rezonance-User": "legal-operator",
+        "X-Rezonance-User-ID": "usr-legal-operator",
+        "X-Rezonance-Role": "operator",
+    }
+    client = TestClient(api.app)
+    missing = client.get("/api/legal/software-agreement/status", headers=headers)
+    malformed = client.get(
+        "/api/legal/software-agreement/status",
+        headers={**headers, "X-Rezonance-Email": "not-an-email"},
+    )
+
+    assert missing.status_code == 401
+    assert "account email" in missing.json()["detail"]
+    assert malformed.status_code == 401
+    assert malformed.json()["detail"] == "Trusted Rez service token is invalid."
+
+
+def test_software_agreement_version_change_requires_new_acceptance(tmp_path: Path, monkeypatch):
+    from netcode.auth import hash_password
+    from netcode.legal import LegalDocument
+    from netcode.store import DEFAULT_ORG_ID
+
+    init_workspace(WorkspacePaths(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    signed = tmp_path / "RezonanceLocalConnector-signed.zip"
+    signed.write_bytes(b"signed")
+    monkeypatch.setenv("NETCODE_AUTH", "1")
+    monkeypatch.setenv("NETCODE_WINDOWS_DOWNLOAD_ENABLED", "true")
+    monkeypatch.setenv("NETCODE_WINDOWS_SIGNED_ARTIFACT_PATH", str(signed))
+    store = PlatformStore(WorkspacePaths(tmp_path.resolve()))
+    store.create_user(DEFAULT_ORG_ID, "versioned@example.com", hash_password("version-password"), role="operator")
+    client = TestClient(api.app)
+    client.post("/api/auth/login", json={"email": "versioned@example.com", "password": "version-password"})
+
+    first = client.get("/api/legal/software-agreement/status").json()["agreement"]
+    assert client.post(
+        "/api/legal/software-agreement/accept",
+        json={
+            "document_id": first["document_id"],
+            "document_version": first["version"],
+            "accepted": True,
+        },
+    ).status_code == 200
+    assert client.get("/api/runner/download/windows").status_code == 200
+
+    second_document = LegalDocument(
+        document_id=first["document_id"],
+        title=first["title"],
+        version="community-2026-08-01-v2",
+        effective_date="2026-08-01",
+        sha256="b" * 64,
+        public_url=first["public_url"],
+    )
+    monkeypatch.setattr(api, "software_agreement", lambda: second_document)
+
+    second_status = client.get("/api/legal/software-agreement/status")
+    blocked = client.get("/api/runner/download/windows")
+    accepted = client.post(
+        "/api/legal/software-agreement/accept",
+        json={
+            "document_id": second_document.document_id,
+            "document_version": second_document.version,
+            "accepted": True,
+        },
+    )
+
+    assert second_status.status_code == 200
+    assert second_status.json()["accepted"] is False
+    assert blocked.status_code == 403
+    assert accepted.status_code == 200
+    assert accepted.json()["accepted"] is True
+    assert client.get("/api/runner/download/windows").status_code == 200
+    with store._connect() as conn:
+        rows = conn.execute(
+            "SELECT document_version, document_sha256 FROM legal_acceptances ORDER BY accepted_at"
+        ).fetchall()
+    assert [(row["document_version"], row["document_sha256"]) for row in rows] == [
+        ("community-2026-07-29-v1", first["sha256"]),
+        ("community-2026-08-01-v2", "b" * 64),
+    ]
 
 
 def test_ui_config_persists_editable_options_and_catalog(tmp_path: Path, monkeypatch):

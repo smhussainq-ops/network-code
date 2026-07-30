@@ -97,6 +97,7 @@ from netcode.inventory import Inventory
 from netcode.intent_utils import lab_write_supported, plan_metadata, production_write_supported, rollback_config
 from netcode.jobs import JobRunner, execution_mode, runner_pool
 from netcode.lab import AristaEOSLabAdapter, lab_status, run_arista_end_to_end, run_lab_action
+from netcode.legal import privacy_notice_url, software_agreement
 from netcode.auth import (
     Principal,
     SYSTEM_PRINCIPAL,
@@ -483,6 +484,12 @@ class LoginRequest(BaseModel):
     org_id: str = ""
 
 
+class LegalAcceptanceRequest(BaseModel):
+    document_id: str
+    document_version: str
+    accepted: bool
+
+
 class NetBoxRequest(BaseModel):
     url: str = ""
     token: str = ""
@@ -652,7 +659,14 @@ def _trusted_rez_service_principal(
     user_id = str(headers.get("x-rezonance-user-id") or "").strip()[:128]
     if user_id and not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}", user_id):
         raise PermissionError("Trusted Rez user identity is invalid.")
-    return Principal(kind="system", org_id=org_id, role=role, user_id=user_id or None, email=actor)
+    email_header = str(headers.get("x-rezonance-email") or "").strip().lower()
+    if email_header and (
+        len(email_header) > 254
+        or not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", email_header)
+    ):
+        raise PermissionError("Trusted Rez user email is invalid.")
+    email = email_header or actor
+    return Principal(kind="system", org_id=org_id, role=role, user_id=user_id or None, email=email)
 
 
 def _websocket_principal(ws: WebSocket) -> Principal:
@@ -3865,10 +3879,97 @@ def api_shell_desktop_profile(request: Request) -> dict[str, object]:
     return build_desktop_shell_profile(str(request.base_url).rstrip("/"), runner_pool=runner_pool())
 
 
+def _require_legal_human(request: Request) -> Principal:
+    principal = _request_principal(request)
+    email = str(principal.email or "").strip().lower()
+    if (
+        not principal.authenticated
+        or not principal.user_id
+        or not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", email)
+    ):
+        raise HTTPException(
+            status_code=401,
+            detail="Software agreement acceptance requires an authenticated human user with an account email.",
+        )
+    return principal
+
+
+def _software_agreement_status(request: Request) -> dict[str, object]:
+    principal = _require_legal_human(request)
+    document = software_agreement()
+    acceptance = PlatformStore(paths()).legal_acceptance(
+        principal.org_id,
+        str(principal.user_id),
+        document.document_id,
+        document.version,
+    )
+    enabled, _artifact_path = _signed_windows_artifact()
+    return {
+        "ok": True,
+        "agreement": document.as_dict(),
+        "privacy_notice_url": privacy_notice_url(),
+        "acceptance_required": True,
+        "accepted": bool(
+            acceptance
+            and str(acceptance.get("document_sha256") or "") == document.sha256
+        ),
+        "accepted_at": str(acceptance.get("accepted_at") or "") if acceptance else None,
+        "download_available": enabled,
+        "download_status": "available" if enabled else "blocked_pending_signed_package",
+    }
+
+
+@app.get("/api/legal/software-agreement")
+def api_software_agreement(request: Request) -> dict[str, object]:
+    return _software_agreement_status(request)
+
+
+@app.get("/api/legal/software-agreement/status")
+def api_software_agreement_acceptance_status(request: Request) -> dict[str, object]:
+    return _software_agreement_status(request)
+
+
+@app.post("/api/legal/software-agreement/accept")
+def api_accept_software_agreement(
+    acceptance_request: LegalAcceptanceRequest,
+    request: Request,
+) -> dict[str, object]:
+    principal = _require_legal_human(request)
+    document = software_agreement()
+    if not acceptance_request.accepted:
+        raise HTTPException(status_code=400, detail="Agreement acceptance must be explicit.")
+    if (
+        acceptance_request.document_id != document.document_id
+        or acceptance_request.document_version != document.version
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail="The software agreement has changed. Review and accept the current version.",
+        )
+    forwarded_for = str(request.headers.get("x-forwarded-for") or "").split(",", 1)[0].strip()
+    remote_address = forwarded_for or (request.client.host if request.client else "")
+    source = "rez_product_ui" if request.headers.get("x-rezonance-org-id") else "netcode_product_ui"
+    recorded = PlatformStore(paths()).record_legal_acceptance(
+        org_id=principal.org_id,
+        user_id=str(principal.user_id),
+        email_snapshot=str(principal.email),
+        document_id=document.document_id,
+        document_version=document.version,
+        document_sha256=document.sha256,
+        source=source,
+        user_agent=str(request.headers.get("user-agent") or ""),
+        remote_address=remote_address,
+    )
+    status = _software_agreement_status(request)
+    status["accepted_at"] = str(recorded["accepted_at"])
+    return status
+
+
 @app.get("/api/runner/download/windows/manifest")
 def api_windows_runner_manifest(request: Request) -> dict[str, object]:
     base_url = _public_base_url(request)
     enabled, _artifact_path = _signed_windows_artifact()
+    agreement = software_agreement()
     return {
         "ok": True,
         "product": "Rezonance Local Connector",
@@ -3886,6 +3987,10 @@ def api_windows_runner_manifest(request: Request) -> dict[str, object]:
         "build_scripts_included": False,
         "sample_workflows_included": False,
         "unsigned_download_public": False,
+        "download_requires_authenticated_acceptance": True,
+        "agreement_required": True,
+        "agreement": agreement.as_dict(),
+        "privacy_notice_url": privacy_notice_url(),
         "production_code_signing_complete": enabled,
         "available": enabled,
         "download_status": "available" if enabled else "blocked_pending_signed_package",
@@ -3902,6 +4007,28 @@ def api_windows_runner_download(request: Request) -> Response:
                 "ok": False,
                 "error": "windows_download_not_available",
                 "message": "Windows Local Connector downloads are blocked until a signed package is configured.",
+            },
+        )
+    principal = _require_legal_human(request)
+    agreement = software_agreement()
+    acceptance = PlatformStore(paths()).legal_acceptance(
+        principal.org_id,
+        str(principal.user_id),
+        agreement.document_id,
+        agreement.version,
+    )
+    if (
+        acceptance is None
+        or str(acceptance.get("document_sha256") or "") != agreement.sha256
+    ):
+        return JSONResponse(
+            status_code=403,
+            content={
+                "ok": False,
+                "error": "software_agreement_acceptance_required",
+                "message": "Accept the current Software License and Services Agreement before downloading.",
+                "agreement": agreement.as_dict(),
+                "privacy_notice_url": privacy_notice_url(),
             },
         )
     package = artifact_path.read_bytes()
