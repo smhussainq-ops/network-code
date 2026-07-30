@@ -30,6 +30,7 @@ from netcode.store import (
     JobRecord,
     PlatformStore,
     RunnerRecord,
+    RunnerReplacementClaimRecord,
     TERMINAL_JOB_STATUSES,
     execution_phase_for_job,
     record_to_dict,
@@ -59,6 +60,10 @@ def runner_token_pending_seconds() -> int:
 
 def runner_token_grace_seconds() -> int:
     return _bounded_env_seconds("NETCODE_RUNNER_TOKEN_GRACE_SECONDS", 5 * 60, 30, 3600)
+
+
+def runner_replacement_claim_seconds() -> int:
+    return _bounded_env_seconds("NETCODE_RUNNER_REPLACEMENT_CLAIM_SECONDS", 30 * 60, 300, 24 * 3600)
 
 
 def _runner_token_window() -> dict[str, str]:
@@ -177,17 +182,18 @@ def preview_pairing(store: PlatformStore, join_token: str) -> dict[str, Any]:
 
 def enroll_runner(store: PlatformStore, join_token: str, name: str) -> dict[str, Any]:
     requested_name = name.strip() or "runner"
-    claim = store.consume_join_token(_hash(join_token.strip()))
+    pairing_hash = _hash(join_token.strip())
+    claim = store.preview_join_token(pairing_hash)
     if claim is None:
         return {"ok": False, "message": "Join token is invalid or already used. Mint a new one."}
     pool, org_id = claim["pool"], claim["org_id"]
     identity = _safe_pairing_identity(claim)
     name = str(identity["connector_name"]) if identity["identity_verified"] else requested_name
     try:
-        enforce_capacity(
+        entitlements = enforce_capacity(
             "connectors",
-            current=store.active_runner_count(org_id),
-            additional=1,
+            current=0,
+            additional=0,
             org_id=org_id,
         )
     except EntitlementError as exc:
@@ -195,18 +201,26 @@ def enroll_runner(store: PlatformStore, join_token: str, name: str) -> dict[str,
     runner_token = f"nrt_{secrets.token_urlsafe(32)}"
     hmac_secret = secrets.token_urlsafe(32)
     window = _runner_token_window()
-    # The runner's tenant is decided exactly once, here, from the join token's org.
-    runner = store.create_runner(
-        name=name,
-        pool=pool,
-        token_hash=_hash(runner_token),
+    runner, consumed_claim, failure = store.enroll_runner_from_join_token(
+        pairing_hash,
+        requested_name=name,
+        runner_token_hash=_hash(runner_token),
         hmac_secret=hmac_secret,
-        org_id=org_id,
+        max_connectors=entitlements.max_connectors,
         token_expires_at=window["token_expires_at"],
         token_rotate_after=window["token_rotate_after"],
-        organization_name=str(identity["organization_name"]),
-        operator_email=str(identity["operator_email"]),
     )
+    if failure == "capacity":
+        return {
+            "ok": False,
+            "message": (
+                f"The {entitlements.plan_id} plan allows {entitlements.max_connectors} connectors; "
+                f"this operation would use {store.active_runner_count(org_id) + 1}."
+            ),
+            "error": "connector_limit_reached",
+        }
+    if failure or runner is None or consumed_claim is None:
+        return {"ok": False, "message": "Join token is invalid or already used. Mint a new one."}
     store.record_runner_security_event(
         runner.id,
         runner.org_id,
@@ -230,11 +244,202 @@ def enroll_runner(store: PlatformStore, join_token: str, name: str) -> dict[str,
     }
 
 
-def authenticate_runner(store: PlatformStore, bearer_token: str) -> RunnerRecord | None:
+def _safe_runner_replacement_claim(
+    claim: RunnerReplacementClaimRecord,
+    *,
+    include_internal_identity: bool = False,
+) -> dict[str, Any]:
+    result: dict[str, Any] = {
+        "state": claim.state,
+        "expires_at": claim.expires_at,
+        "prepared_at": claim.prepared_at,
+        "committed_at": claim.committed_at,
+        "connector_name": claim.connector_name,
+        "organization_name": claim.organization_name,
+        "operator_email": claim.operator_email,
+        "identity_verified": bool(
+            claim.connector_name and claim.organization_name and claim.operator_email
+        ),
+    }
+    if include_internal_identity:
+        result.update(
+            {
+                "claim_id": claim.id,
+                "org_id": claim.org_id,
+                "runner_id": claim.runner_id,
+            }
+        )
+    return result
+
+
+def mint_runner_replacement_claim(
+    store: PlatformStore,
+    *,
+    org_id: str,
+    runner_id: str,
+    connector_name: str,
+    organization_name: str,
+    operator_email: str,
+    actor: str,
+    replace_pending: bool = True,
+) -> dict[str, Any]:
+    connector_name, organization_name, operator_email = _pairing_identity(
+        connector_name,
+        organization_name,
+        operator_email,
+    )
+    active_count = store.active_runner_count(org_id)
+    enforce_capacity(
+        "connectors",
+        current=max(0, active_count - 1),
+        additional=1,
+        org_id=org_id,
+    )
+    raw_code = f"nrc_{secrets.token_urlsafe(32)}"
+    claim_id = f"rrc_{uuid.uuid4().hex}"
+    expires_at = (
+        datetime.now(timezone.utc) + timedelta(seconds=runner_replacement_claim_seconds())
+    ).isoformat()
+    claim = store.create_runner_replacement_claim(
+        claim_id=claim_id,
+        token_hash=_hash(raw_code),
+        org_id=org_id,
+        runner_id=runner_id,
+        connector_name=connector_name,
+        organization_name=organization_name,
+        operator_email=operator_email,
+        created_by=actor,
+        expires_at=expires_at,
+        replace_pending=replace_pending,
+    )
+    return {
+        "ok": True,
+        "pairing_code": raw_code,
+        "replacement": _safe_runner_replacement_claim(
+            claim,
+            include_internal_identity=True,
+        ),
+    }
+
+
+def preview_runner_replacement(store: PlatformStore, pairing_code: str) -> dict[str, Any]:
+    code = str(pairing_code or "").strip()
+    claim = store.replacement_claim_by_token_hash(_hash(code)) if code else None
+    if claim is None:
+        return {"ok": False, "error": "invalid_repair_code", "message": "Connector repair code is invalid."}
+    if claim.state == "committed":
+        return {
+            "ok": False,
+            "error": "repair_code_consumed",
+            "message": "Connector repair code has already been consumed.",
+        }
+    if claim.state not in {"pending", "prepared"}:
+        return {
+            "ok": False,
+            "error": "repair_code_inactive",
+            "message": "Connector repair code is no longer active.",
+        }
+    if claim.expires_at <= datetime.now(timezone.utc).isoformat():
+        return {
+            "ok": False,
+            "error": "repair_code_expired",
+            "message": "Connector repair code has expired.",
+        }
+    return {"ok": True, **_safe_runner_replacement_claim(claim)}
+
+
+def prepare_runner_replacement(
+    store: PlatformStore,
+    *,
+    pairing_code: str,
+    current_runner_token: str | None,
+) -> dict[str, Any]:
+    pairing_hash = _hash(str(pairing_code or "").strip())
+    claim = store.replacement_claim_by_token_hash(pairing_hash)
+    if claim is None:
+        raise PermissionError("Connector repair code is invalid.")
+    active_count = store.active_runner_count(claim.org_id)
+    enforce_capacity(
+        "connectors",
+        current=max(0, active_count - 1),
+        additional=1,
+        org_id=claim.org_id,
+    )
+    pending_token = f"nrt_{secrets.token_urlsafe(32)}"
+    pending_hmac = secrets.token_urlsafe(32)
+    window = _runner_token_window()
+    runner, prepared_claim = store.prepare_runner_replacement(
+        pairing_token_hash=pairing_hash,
+        presented_current_token_hash=(
+            _hash(current_runner_token) if current_runner_token is not None else None
+        ),
+        pending_token_hash=_hash(pending_token),
+        pending_hmac_secret=pending_hmac,
+        pending_token_expires_at=window["token_expires_at"],
+        pending_token_rotate_after=window["token_rotate_after"],
+        pending_token_valid_until=window["pending_token_valid_until"],
+    )
+    return {
+        "ok": True,
+        "runner_id": runner.id,
+        "runner_token": pending_token,
+        "hmac_secret": pending_hmac,
+        "pool": runner.pool,
+        "connector_name": prepared_claim.connector_name,
+        "organization_name": prepared_claim.organization_name,
+        "operator_email": prepared_claim.operator_email,
+        "identity_verified": True,
+        "token_expires_at": window["token_expires_at"],
+        "token_rotate_after": window["token_rotate_after"],
+        "pending_token_valid_until": window["pending_token_valid_until"],
+        "confirmation_required": True,
+    }
+
+
+def commit_runner_replacement(
+    store: PlatformStore,
+    *,
+    pairing_code: str,
+    pending_runner_token: str,
+) -> dict[str, Any]:
+    pairing_hash = _hash(str(pairing_code or "").strip())
+    claim = store.replacement_claim_by_token_hash(pairing_hash)
+    if claim is None:
+        raise PermissionError("Connector repair code is invalid.")
+    active_count = store.active_runner_count(claim.org_id)
+    enforce_capacity(
+        "connectors",
+        current=max(0, active_count - 1),
+        additional=1,
+        org_id=claim.org_id,
+    )
+    runner, committed_claim, already_committed = store.commit_runner_replacement(
+        pairing_token_hash=pairing_hash,
+        presented_pending_token_hash=_hash(pending_runner_token),
+    )
+    return {
+        "ok": True,
+        "runner_id": runner.id,
+        "connector_name": runner.name,
+        "organization_name": runner.organization_name,
+        "operator_email": runner.operator_email,
+        "identity_verified": runner.identity_verified,
+        "state": committed_claim.state,
+        "committed_at": committed_claim.committed_at,
+        "already_committed": already_committed,
+    }
+
+
+def authenticate_runner(
+    store: PlatformStore,
+    bearer_token: str,
+    *,
+    allow_pending: bool = False,
+) -> RunnerRecord | None:
     token = bearer_token.strip()
     if not token:
         return None
-    return store.runner_by_token_hash(_hash(token))
+    return store.runner_by_token_hash(_hash(token), include_pending=allow_pending)
 
 
 def prepare_runner_token_rotation(

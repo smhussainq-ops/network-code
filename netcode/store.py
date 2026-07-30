@@ -340,6 +340,22 @@ class RunnerRecord:
 
 
 @dataclass(frozen=True)
+class RunnerReplacementClaimRecord:
+    id: str
+    org_id: str
+    runner_id: str
+    connector_name: str
+    organization_name: str
+    operator_email: str
+    state: str
+    created_by: str
+    created_at: str
+    expires_at: str
+    prepared_at: str | None = None
+    committed_at: str | None = None
+
+
+@dataclass(frozen=True)
 class UserRecord:
     id: str
     org_id: str
@@ -510,6 +526,8 @@ class PlatformStore:
             self._ensure_column(conn, "runners", "revoked_at", "TEXT")
             self._ensure_column(conn, "runners", "organization_name", "TEXT NOT NULL DEFAULT ''")
             self._ensure_column(conn, "runners", "operator_email", "TEXT NOT NULL DEFAULT ''")
+            self._ensure_column(conn, "runners", "pending_hmac_secret", "TEXT")
+            self._ensure_column(conn, "runners", "pending_replacement_claim_id", "TEXT")
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS runner_security_events (
@@ -617,6 +635,29 @@ class PlatformStore:
             self._ensure_column(conn, "join_tokens", "connector_name", "TEXT NOT NULL DEFAULT ''")
             self._ensure_column(conn, "join_tokens", "organization_name", "TEXT NOT NULL DEFAULT ''")
             self._ensure_column(conn, "join_tokens", "operator_email", "TEXT NOT NULL DEFAULT ''")
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS runner_replacement_claims (
+                    id TEXT PRIMARY KEY,
+                    token_hash TEXT NOT NULL UNIQUE,
+                    org_id TEXT NOT NULL,
+                    runner_id TEXT NOT NULL,
+                    connector_name TEXT NOT NULL,
+                    organization_name TEXT NOT NULL,
+                    operator_email TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    created_by TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    expires_at TEXT NOT NULL,
+                    prepared_at TEXT,
+                    committed_at TEXT
+                )
+                """
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_runner_replacement_claims_latest "
+                "ON runner_replacement_claims (org_id, runner_id, created_at DESC)"
+            )
             self._ensure_column(conn, "jobs", "pool", "TEXT")
             self._ensure_column(conn, "jobs", "payload_json", "TEXT")
             self._ensure_column(conn, "jobs", "claimed_by", "TEXT")
@@ -1301,6 +1342,22 @@ class PlatformStore:
             ),
         )
 
+    def _runner_replacement_claim(self, row: sqlite3.Row) -> RunnerReplacementClaimRecord:
+        return RunnerReplacementClaimRecord(
+            id=str(row["id"]),
+            org_id=str(row["org_id"]),
+            runner_id=str(row["runner_id"]),
+            connector_name=str(row["connector_name"]),
+            organization_name=str(row["organization_name"]),
+            operator_email=str(row["operator_email"]),
+            state=str(row["state"]),
+            created_by=str(row["created_by"]),
+            created_at=str(row["created_at"]),
+            expires_at=str(row["expires_at"]),
+            prepared_at=self._col(row, "prepared_at"),
+            committed_at=self._col(row, "committed_at"),
+        )
+
     # ── Runner registry & job queue (Phase 0 SaaS split) ──────────────────
 
     def create_join_token(
@@ -1332,11 +1389,27 @@ class PlatformStore:
     def invalidate_unused_join_tokens(self, org_id: str) -> int:
         """Atomically invalidate every unclaimed pairing code for one organization."""
         with self._connect() as conn:
-            cursor = conn.execute(
+            if self.engine == "sqlite":
+                conn.execute("BEGIN IMMEDIATE")
+            join_cursor = conn.execute(
                 "UPDATE join_tokens SET used_at = ? WHERE org_id = ? AND used_at IS NULL",
                 (utc_now(), org_id),
             )
-            return int(cursor.rowcount)
+            conn.execute(
+                "UPDATE runners SET pending_token_hash = NULL, pending_token_expires_at = NULL, "
+                "pending_token_rotate_after = NULL, pending_token_valid_until = NULL, "
+                "pending_hmac_secret = NULL, pending_replacement_claim_id = NULL "
+                "WHERE org_id = ? AND pending_replacement_claim_id IN ("
+                "SELECT id FROM runner_replacement_claims "
+                "WHERE org_id = ? AND state IN ('pending', 'prepared'))",
+                (org_id, org_id),
+            )
+            replacement_cursor = conn.execute(
+                "UPDATE runner_replacement_claims SET state = 'revoked' "
+                "WHERE org_id = ? AND state IN ('pending', 'prepared')",
+                (org_id,),
+            )
+            return int(join_cursor.rowcount) + int(replacement_cursor.rowcount)
 
     def preview_join_token(self, token_hash: str) -> dict[str, str] | None:
         """Return an unused token claim without consuming it."""
@@ -1381,6 +1454,431 @@ class PlatformStore:
                 if value:
                     claim[key] = value
             return claim
+
+    def enroll_runner_from_join_token(
+        self,
+        token_hash: str,
+        *,
+        requested_name: str,
+        runner_token_hash: str,
+        hmac_secret: str,
+        max_connectors: int,
+        token_expires_at: str,
+        token_rotate_after: str,
+    ) -> tuple[RunnerRecord | None, dict[str, str] | None, str | None]:
+        """Consume one join token only if the connector can be created atomically."""
+        runner_id = str(uuid.uuid4())
+        now = utc_now()
+        claim: dict[str, str] | None = None
+        reason: str | None = None
+        with self._connect() as conn:
+            if self.engine == "sqlite":
+                conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT * FROM join_tokens WHERE token_hash = ? AND used_at IS NULL"
+                + (" FOR UPDATE" if self.engine == "postgres" else ""),
+                (token_hash,),
+            ).fetchone()
+            if not row:
+                return None, None, "invalid"
+            org_id = str(self._col(row, "org_id") or DEFAULT_ORG_ID)
+            if self.engine == "postgres":
+                conn.execute("SELECT id FROM orgs WHERE id = ? FOR UPDATE", (org_id,)).fetchone()
+            current = conn.execute(
+                "SELECT COUNT(*) AS total FROM runners WHERE org_id = ? AND revoked_at IS NULL",
+                (org_id,),
+            ).fetchone()
+            if int(current["total"] if current else 0) + 1 > max(0, int(max_connectors)):
+                return None, None, "capacity"
+            claim = {
+                "pool": str(row["pool"]),
+                "org_id": org_id,
+                "connector_name": str(self._col(row, "connector_name") or ""),
+                "organization_name": str(self._col(row, "organization_name") or ""),
+                "operator_email": str(self._col(row, "operator_email") or ""),
+            }
+            name = claim["connector_name"] or requested_name
+            conn.execute(
+                "INSERT INTO runners (id, name, pool, token_hash, hmac_secret, status, version, created_at, "
+                "last_seen, org_id, token_expires_at, token_rotate_after, organization_name, operator_email) "
+                "VALUES (?, ?, ?, ?, ?, 'enrolled', '', ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    runner_id,
+                    name,
+                    claim["pool"],
+                    runner_token_hash,
+                    hmac_secret,
+                    now,
+                    now,
+                    org_id,
+                    token_expires_at,
+                    token_rotate_after,
+                    claim["organization_name"],
+                    claim["operator_email"],
+                ),
+            )
+            consumed = conn.execute(
+                "UPDATE join_tokens SET used_at = ? WHERE token_hash = ? AND used_at IS NULL",
+                (now, token_hash),
+            )
+            if consumed.rowcount != 1:
+                raise RuntimeError("Pairing code consumption raced with connector enrollment")
+        if reason:
+            return None, claim, reason
+        return self.get_runner(runner_id), claim, None
+
+    @staticmethod
+    def _assert_runner_replacement_preconditions(
+        conn: _EngineConn,
+        *,
+        org_id: str,
+        runner_id: str,
+        connector_name: str,
+    ) -> Any:
+        active = conn.execute(
+            "SELECT * FROM runners WHERE org_id = ? AND revoked_at IS NULL ORDER BY created_at, id",
+            (org_id,),
+        ).fetchall()
+        if len(active) != 1 or str(active[0]["id"]) != runner_id:
+            raise RuntimeError(
+                "Connector repair requires exactly one unambiguous active connector in the customer organization."
+            )
+        runner = active[0]
+        if str(runner["name"]).strip().lower() != connector_name.strip().lower():
+            raise PermissionError("The replacement claim does not match the selected connector name.")
+        if bool(runner["drain_requested"]):
+            raise RuntimeError("The selected connector is draining and cannot be repaired.")
+        active_job = conn.execute(
+            "SELECT id FROM jobs WHERE org_id = ? AND status IN ('running', 'completing') "
+            "AND (claimed_by = ? OR target_runner_id = ?) LIMIT 1",
+            (org_id, runner_id, runner_id),
+        ).fetchone()
+        if active_job:
+            raise RuntimeError("Connector repair is blocked while connector work is running.")
+        active_shell = conn.execute(
+            "SELECT id FROM shell_sessions WHERE org_id = ? AND runner_id = ? "
+            "AND status IN ('opened', 'active') LIMIT 1",
+            (org_id, runner_id),
+        ).fetchone()
+        if active_shell:
+            raise RuntimeError("Connector repair is blocked while a Shell session is open.")
+        return runner
+
+    def create_runner_replacement_claim(
+        self,
+        *,
+        claim_id: str,
+        token_hash: str,
+        org_id: str,
+        runner_id: str,
+        connector_name: str,
+        organization_name: str,
+        operator_email: str,
+        created_by: str,
+        expires_at: str,
+        replace_pending: bool = True,
+    ) -> RunnerReplacementClaimRecord:
+        now = utc_now()
+        with self._connect() as conn:
+            if self.engine == "sqlite":
+                conn.execute("BEGIN IMMEDIATE")
+            elif self.engine == "postgres":
+                conn.execute("SELECT id FROM orgs WHERE id = ? FOR UPDATE", (org_id,)).fetchone()
+            self._assert_runner_replacement_preconditions(
+                conn,
+                org_id=org_id,
+                runner_id=runner_id,
+                connector_name=connector_name,
+            )
+            existing = conn.execute(
+                "SELECT id FROM runner_replacement_claims WHERE org_id = ? AND runner_id = ? "
+                "AND state IN ('pending', 'prepared') ORDER BY created_at DESC",
+                (org_id, runner_id),
+            ).fetchall()
+            if existing and not replace_pending:
+                raise RuntimeError("A connector replacement claim is already pending.")
+            if existing:
+                conn.execute(
+                    "UPDATE runner_replacement_claims SET state = 'superseded' "
+                    "WHERE org_id = ? AND runner_id = ? AND state IN ('pending', 'prepared')",
+                    (org_id, runner_id),
+                )
+                conn.execute(
+                    "UPDATE runners SET pending_token_hash = NULL, pending_token_expires_at = NULL, "
+                    "pending_token_rotate_after = NULL, pending_token_valid_until = NULL, "
+                    "pending_hmac_secret = NULL, pending_replacement_claim_id = NULL "
+                    "WHERE id = ? AND org_id = ?",
+                    (runner_id, org_id),
+                )
+            conn.execute(
+                "INSERT INTO runner_replacement_claims "
+                "(id, token_hash, org_id, runner_id, connector_name, organization_name, operator_email, "
+                "state, created_by, created_at, expires_at, prepared_at, committed_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, NULL, NULL)",
+                (
+                    claim_id,
+                    token_hash,
+                    org_id,
+                    runner_id,
+                    connector_name,
+                    organization_name,
+                    operator_email,
+                    created_by,
+                    now,
+                    expires_at,
+                ),
+            )
+            conn.execute(
+                "INSERT INTO runner_security_events "
+                "(id, runner_id, org_id, event, actor, created_at, metadata_json) "
+                "VALUES (?, ?, ?, 'identity_repair_claim_issued', ?, ?, ?)",
+                (
+                    str(uuid.uuid4()),
+                    runner_id,
+                    org_id,
+                    created_by,
+                    now,
+                    json.dumps({"claim_id": claim_id, "expires_at": expires_at}, sort_keys=True),
+                ),
+            )
+        return self.get_runner_replacement_claim(claim_id, org_id=org_id)
+
+    def get_runner_replacement_claim(
+        self,
+        claim_id: str,
+        *,
+        org_id: str | None = None,
+    ) -> RunnerReplacementClaimRecord:
+        with self._connect() as conn:
+            if org_id is None:
+                row = conn.execute(
+                    "SELECT * FROM runner_replacement_claims WHERE id = ?",
+                    (claim_id,),
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    "SELECT * FROM runner_replacement_claims WHERE id = ? AND org_id = ?",
+                    (claim_id, org_id),
+                ).fetchone()
+        if not row:
+            raise ValueError(f"Unknown connector replacement claim {claim_id}")
+        return self._runner_replacement_claim(row)
+
+    def replacement_claim_by_token_hash(
+        self,
+        token_hash: str,
+    ) -> RunnerReplacementClaimRecord | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM runner_replacement_claims WHERE token_hash = ?",
+                (token_hash,),
+            ).fetchone()
+        return self._runner_replacement_claim(row) if row else None
+
+    def latest_runner_replacement_claim(
+        self,
+        org_id: str,
+        runner_id: str,
+    ) -> RunnerReplacementClaimRecord | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM runner_replacement_claims WHERE org_id = ? AND runner_id = ? "
+                "ORDER BY created_at DESC LIMIT 1",
+                (org_id, runner_id),
+            ).fetchone()
+        return self._runner_replacement_claim(row) if row else None
+
+    def prepare_runner_replacement(
+        self,
+        *,
+        pairing_token_hash: str,
+        presented_current_token_hash: str | None,
+        pending_token_hash: str,
+        pending_hmac_secret: str,
+        pending_token_expires_at: str,
+        pending_token_rotate_after: str,
+        pending_token_valid_until: str,
+    ) -> tuple[RunnerRecord, RunnerReplacementClaimRecord]:
+        now = utc_now()
+        claim_id = ""
+        runner_id = ""
+        org_id = ""
+        with self._connect() as conn:
+            if self.engine == "sqlite":
+                conn.execute("BEGIN IMMEDIATE")
+            claim = conn.execute(
+                "SELECT * FROM runner_replacement_claims WHERE token_hash = ?"
+                + (" FOR UPDATE" if self.engine == "postgres" else ""),
+                (pairing_token_hash,),
+            ).fetchone()
+            if not claim:
+                raise PermissionError("Connector repair code is invalid.")
+            claim_id = str(claim["id"])
+            runner_id = str(claim["runner_id"])
+            org_id = str(claim["org_id"])
+            state = str(claim["state"])
+            if state == "committed":
+                raise PermissionError("Connector repair code has already been consumed.")
+            if state not in {"pending", "prepared"}:
+                raise PermissionError("Connector repair code is no longer active.")
+            if str(claim["expires_at"]) <= now:
+                conn.execute(
+                    "UPDATE runner_replacement_claims SET state = 'expired' WHERE id = ?",
+                    (claim_id,),
+                )
+                raise PermissionError("Connector repair code has expired.")
+            runner = self._assert_runner_replacement_preconditions(
+                conn,
+                org_id=org_id,
+                runner_id=runner_id,
+                connector_name=str(claim["connector_name"]),
+            )
+            if presented_current_token_hash is not None and not hmac.compare_digest(
+                str(runner["token_hash"]),
+                presented_current_token_hash,
+            ):
+                raise PermissionError("The current connector authorization does not match the selected connector.")
+            conn.execute(
+                "UPDATE runners SET pending_token_hash = ?, pending_token_expires_at = ?, "
+                "pending_token_rotate_after = ?, pending_token_valid_until = ?, "
+                "pending_hmac_secret = ?, pending_replacement_claim_id = ? "
+                "WHERE id = ? AND org_id = ?",
+                (
+                    pending_token_hash,
+                    pending_token_expires_at,
+                    pending_token_rotate_after,
+                    pending_token_valid_until,
+                    pending_hmac_secret,
+                    claim_id,
+                    runner_id,
+                    org_id,
+                ),
+            )
+            conn.execute(
+                "UPDATE runner_replacement_claims SET state = 'prepared', prepared_at = ? WHERE id = ?",
+                (now, claim_id),
+            )
+            conn.execute(
+                "INSERT INTO runner_security_events "
+                "(id, runner_id, org_id, event, actor, created_at, metadata_json) "
+                "VALUES (?, ?, ?, 'identity_repair_prepared', ?, ?, ?)",
+                (
+                    str(uuid.uuid4()),
+                    runner_id,
+                    org_id,
+                    str(claim["created_by"]),
+                    now,
+                    json.dumps({"claim_id": claim_id}, sort_keys=True),
+                ),
+            )
+        return self.get_runner(runner_id), self.get_runner_replacement_claim(claim_id, org_id=org_id)
+
+    def commit_runner_replacement(
+        self,
+        *,
+        pairing_token_hash: str,
+        presented_pending_token_hash: str,
+    ) -> tuple[RunnerRecord, RunnerReplacementClaimRecord, bool]:
+        now = utc_now()
+        claim_id = ""
+        runner_id = ""
+        org_id = ""
+        already_committed = False
+        with self._connect() as conn:
+            if self.engine == "sqlite":
+                conn.execute("BEGIN IMMEDIATE")
+            claim = conn.execute(
+                "SELECT * FROM runner_replacement_claims WHERE token_hash = ?"
+                + (" FOR UPDATE" if self.engine == "postgres" else ""),
+                (pairing_token_hash,),
+            ).fetchone()
+            if not claim:
+                raise PermissionError("Connector repair code is invalid.")
+            claim_id = str(claim["id"])
+            runner_id = str(claim["runner_id"])
+            org_id = str(claim["org_id"])
+            runner = conn.execute(
+                "SELECT * FROM runners WHERE id = ? AND org_id = ?"
+                + (" FOR UPDATE" if self.engine == "postgres" else ""),
+                (runner_id, org_id),
+            ).fetchone()
+            if not runner or self._col(runner, "revoked_at"):
+                raise PermissionError("The selected connector is unavailable.")
+            if str(claim["state"]) == "committed":
+                if not hmac.compare_digest(str(runner["token_hash"]), presented_pending_token_hash):
+                    raise PermissionError("Connector repair confirmation does not match the committed connector.")
+                already_committed = True
+            else:
+                if str(claim["state"]) != "prepared":
+                    raise RuntimeError("Connector repair must be prepared before it can be committed.")
+                if str(claim["expires_at"]) <= now:
+                    conn.execute(
+                        "UPDATE runner_replacement_claims SET state = 'expired' WHERE id = ?",
+                        (claim_id,),
+                    )
+                    raise PermissionError("Connector repair code has expired.")
+                runner = self._assert_runner_replacement_preconditions(
+                    conn,
+                    org_id=org_id,
+                    runner_id=runner_id,
+                    connector_name=str(claim["connector_name"]),
+                )
+                if (
+                    str(self._col(runner, "pending_replacement_claim_id") or "") != claim_id
+                    or not hmac.compare_digest(
+                        str(self._col(runner, "pending_token_hash") or ""),
+                        presented_pending_token_hash,
+                    )
+                ):
+                    raise PermissionError("The prepared connector credential does not match this repair claim.")
+                pending_until = str(self._col(runner, "pending_token_valid_until") or "")
+                if not pending_until or pending_until <= now:
+                    raise PermissionError("The prepared connector credential has expired.")
+                pending_hmac = str(self._col(runner, "pending_hmac_secret") or "")
+                if not pending_hmac:
+                    raise RuntimeError("The prepared connector credential is incomplete.")
+                conn.execute(
+                    "UPDATE runners SET name = ?, pool = ?, organization_name = ?, operator_email = ?, "
+                    "token_hash = pending_token_hash, hmac_secret = pending_hmac_secret, "
+                    "token_expires_at = pending_token_expires_at, token_rotate_after = pending_token_rotate_after, "
+                    "token_rotated_at = ?, status = 'enrolled', "
+                    "previous_token_hash = NULL, previous_token_expires_at = NULL, "
+                    "pending_token_hash = NULL, pending_token_expires_at = NULL, "
+                    "pending_token_rotate_after = NULL, pending_token_valid_until = NULL, "
+                    "pending_hmac_secret = NULL, pending_replacement_claim_id = NULL "
+                    "WHERE id = ? AND org_id = ?",
+                    (
+                        str(claim["connector_name"]),
+                        org_id,
+                        str(claim["organization_name"]),
+                        str(claim["operator_email"]),
+                        now,
+                        runner_id,
+                        org_id,
+                    ),
+                )
+                conn.execute(
+                    "UPDATE runner_replacement_claims SET state = 'committed', committed_at = ? WHERE id = ?",
+                    (now, claim_id),
+                )
+                conn.execute(
+                    "INSERT INTO runner_security_events "
+                    "(id, runner_id, org_id, event, actor, created_at, metadata_json) "
+                    "VALUES (?, ?, ?, 'identity_repair_committed', ?, ?, ?)",
+                    (
+                        str(uuid.uuid4()),
+                        runner_id,
+                        org_id,
+                        str(claim["created_by"]),
+                        now,
+                        json.dumps({"claim_id": claim_id}, sort_keys=True),
+                    ),
+                )
+        return (
+            self.get_runner(runner_id),
+            self.get_runner_replacement_claim(claim_id, org_id=org_id),
+            already_committed,
+        )
 
     def create_runner(
         self,
@@ -1428,16 +1926,29 @@ class PlatformStore:
             raise ValueError(f"Unknown runner {runner_id}")
         return self._runner(row)
 
-    def runner_by_token_hash(self, token_hash: str) -> RunnerRecord | None:
+    def runner_by_token_hash(
+        self,
+        token_hash: str,
+        *,
+        include_pending: bool = False,
+    ) -> RunnerRecord | None:
         now = utc_now()
         with self._connect() as conn:
-            row = conn.execute(
-                "SELECT * FROM runners WHERE revoked_at IS NULL AND ("
-                "(token_hash = ? AND (token_expires_at IS NULL OR token_expires_at > ?)) OR "
-                "(previous_token_hash = ? AND previous_token_expires_at > ?) OR "
-                "(pending_token_hash = ? AND pending_token_valid_until > ?))",
-                (token_hash, now, token_hash, now, token_hash, now),
-            ).fetchone()
+            if include_pending:
+                row = conn.execute(
+                    "SELECT * FROM runners WHERE revoked_at IS NULL AND ("
+                    "(token_hash = ? AND (token_expires_at IS NULL OR token_expires_at > ?)) OR "
+                    "(previous_token_hash = ? AND previous_token_expires_at > ?) OR "
+                    "(pending_token_hash = ? AND pending_token_valid_until > ?))",
+                    (token_hash, now, token_hash, now, token_hash, now),
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    "SELECT * FROM runners WHERE revoked_at IS NULL AND ("
+                    "(token_hash = ? AND (token_expires_at IS NULL OR token_expires_at > ?)) OR "
+                    "(previous_token_hash = ? AND previous_token_expires_at > ?))",
+                    (token_hash, now, token_hash, now),
+                ).fetchone()
         return self._runner(row) if row else None
 
     def prepare_runner_token_rotation(

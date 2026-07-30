@@ -112,12 +112,16 @@ from netcode.models import load_intent, load_intent_data
 from netcode.change_types import spec_for
 from netcode.runner_hub import (
     authenticate_runner,
+    commit_runner_replacement,
     confirm_runner_token_rotation,
     enroll_runner,
     mint_join_token,
+    mint_runner_replacement_claim,
     poll_for_job,
+    prepare_runner_replacement,
     prepare_runner_token_rotation,
     preview_pairing,
+    preview_runner_replacement,
     runner_summary,
     submit_job_progress,
     submit_job_result,
@@ -413,6 +417,17 @@ class RunnerEnrollRequest(BaseModel):
 
 class PairingPreviewRequest(BaseModel):
     join_token: str
+
+
+class RunnerReplacementClaimRequest(BaseModel):
+    connector_name: str
+    organization_name: str
+    operator_email: str
+    replace_pending: bool = True
+
+
+class RunnerReplacementRequest(BaseModel):
+    pairing_code: str
 
 
 class RunnerPollRequest(BaseModel):
@@ -2280,9 +2295,14 @@ def _runner_bearer_token(authorization: str | None) -> str:
     return (authorization or "").removeprefix("Bearer ").strip()
 
 
-def _require_runner(store: PlatformStore, authorization: str | None):
+def _require_runner(
+    store: PlatformStore,
+    authorization: str | None,
+    *,
+    allow_pending: bool = False,
+):
     token = _runner_bearer_token(authorization)
-    runner = authenticate_runner(store, token)
+    runner = authenticate_runner(store, token, allow_pending=allow_pending)
     if runner is None:
         raise HTTPException(status_code=401, detail="Runner token is invalid or revoked.")
     return runner
@@ -2584,6 +2604,87 @@ def api_internal_revoke_unused_pairing_codes(org_id: str, request: Request) -> d
     return {"ok": True, "invalidated_pairing_codes": invalidated}
 
 
+def _safe_replacement_status(claim) -> dict[str, object]:
+    state = str(claim.state)
+    if state in {"pending", "prepared"} and str(claim.expires_at) <= datetime.now(timezone.utc).isoformat():
+        state = "expired"
+    return {
+        "claim_id": claim.id,
+        "org_id": claim.org_id,
+        "runner_id": claim.runner_id,
+        "connector_name": claim.connector_name,
+        "organization_name": claim.organization_name,
+        "operator_email": claim.operator_email,
+        "state": state,
+        "active": state in {"pending", "prepared"},
+        "consumed": state == "committed",
+        "created_at": claim.created_at,
+        "expires_at": claim.expires_at,
+        "prepared_at": claim.prepared_at,
+        "committed_at": claim.committed_at,
+    }
+
+
+@app.post("/api/internal/orgs/{org_id}/runners/{runner_id}/replacement-claims")
+def api_internal_issue_runner_replacement_claim(
+    org_id: str,
+    runner_id: str,
+    payload: RunnerReplacementClaimRequest,
+    request: Request,
+) -> dict[str, object]:
+    principal = _require_founder_lifecycle_principal(request, org_id)
+    store = PlatformStore(paths())
+    try:
+        runner = store.get_runner(runner_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail="Connector not found.") from exc
+    if runner.org_id != principal.org_id:
+        raise HTTPException(status_code=404, detail="Connector not found.")
+    actor = principal.user_id or principal.email or "platform-owner"
+    try:
+        return mint_runner_replacement_claim(
+            store,
+            org_id=principal.org_id,
+            runner_id=runner_id,
+            connector_name=payload.connector_name,
+            organization_name=payload.organization_name,
+            operator_email=payload.operator_email,
+            actor=actor,
+            replace_pending=payload.replace_pending,
+        )
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except (RuntimeError, ValueError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.get("/api/internal/orgs/{org_id}/runners/{runner_id}/replacement-claims/latest")
+def api_internal_latest_runner_replacement_claim(
+    org_id: str,
+    runner_id: str,
+    request: Request,
+) -> dict[str, object]:
+    principal = _require_founder_lifecycle_principal(request, org_id)
+    store = PlatformStore(paths())
+    try:
+        runner = store.get_runner(runner_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail="Connector not found.") from exc
+    if runner.org_id != principal.org_id:
+        raise HTTPException(status_code=404, detail="Connector not found.")
+    claim = store.latest_runner_replacement_claim(principal.org_id, runner_id)
+    events = [
+        event
+        for event in store.list_runner_security_events(runner_id, principal.org_id, limit=25)
+        if str(event.get("event") or "").startswith("identity_repair_")
+    ]
+    return {
+        "ok": True,
+        "replacement": _safe_replacement_status(claim) if claim else None,
+        "audit_events": events,
+    }
+
+
 @app.get("/api/runners/{runner_id}/security-events")
 def api_runner_security_events(runner_id: str, request: Request) -> dict[str, object]:
     store, _runner = _admin_runner_for_request(runner_id, request)
@@ -2601,6 +2702,63 @@ def api_runner_enroll(request: RunnerEnrollRequest) -> dict[str, object]:
 @app.post("/api/runner/pairing/preview")
 def api_runner_pairing_preview(request: PairingPreviewRequest) -> dict[str, object]:
     return preview_pairing(PlatformStore(paths()), request.join_token)
+
+
+@app.post("/api/runner/replacement/preview")
+def api_runner_replacement_preview(request: RunnerReplacementRequest) -> dict[str, object]:
+    return preview_runner_replacement(PlatformStore(paths()), request.pairing_code)
+
+
+@app.post("/api/runner/replacement/prepare")
+def api_runner_replacement_prepare(
+    request: RunnerReplacementRequest,
+    authorization: str | None = Header(default=None),
+) -> dict[str, object]:
+    current_token = None if authorization is None else _runner_bearer_token(authorization)
+    try:
+        return prepare_runner_replacement(
+            PlatformStore(paths()),
+            pairing_code=request.pairing_code,
+            current_runner_token=current_token,
+        )
+    except EntitlementError:
+        raise
+    except PermissionError as exc:
+        raise HTTPException(status_code=401, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.post("/api/runner/replacement/commit")
+async def api_runner_replacement_commit(
+    request: RunnerReplacementRequest,
+    authorization: str | None = Header(default=None),
+) -> dict[str, object]:
+    store = PlatformStore(paths())
+    pending_token = _runner_bearer_token(authorization)
+    if not pending_token:
+        raise HTTPException(status_code=401, detail="Prepared connector authorization is required.")
+    try:
+        result = commit_runner_replacement(
+            store,
+            pairing_code=request.pairing_code,
+            pending_runner_token=pending_token,
+        )
+    except EntitlementError:
+        raise
+    except PermissionError as exc:
+        raise HTTPException(status_code=401, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    runner_id = str(result["runner_id"])
+    channel = _RUNNER_CHANNELS.pop(runner_id, None)
+    _RUNNER_CHANNEL_POOLS.pop(runner_id, None)
+    if channel is not None:
+        try:
+            await channel.close(code=4401)
+        except Exception:  # noqa: BLE001 - the old connector may already be disconnected.
+            pass
+    return result
 
 
 @app.get("/api/runner/me")
@@ -2636,7 +2794,7 @@ def api_runner_token_rotate(authorization: str | None = Header(default=None)) ->
 def api_runner_token_confirm(authorization: str | None = Header(default=None)) -> dict[str, object]:
     store = PlatformStore(paths())
     token = _runner_bearer_token(authorization)
-    runner = _require_runner(store, authorization)
+    runner = _require_runner(store, authorization, allow_pending=True)
     try:
         return confirm_runner_token_rotation(store, runner, token)
     except (PermissionError, ValueError) as exc:
@@ -4401,7 +4559,7 @@ async def ws_runner_stream(ws: WebSocket) -> None:
         auth = await ws.receive_json()
         token = str(auth.get("token", ""))
         store = PlatformStore(paths())
-        runner = authenticate_runner(store, token)
+        runner = authenticate_runner(store, token, allow_pending=False)
         if runner is None:
             await ws.close(code=4401)
             return

@@ -249,7 +249,7 @@ def test_community_device_26_is_rejected_without_corrupting_first_25(tmp_path: P
     assert store.resolve_device("org_default", "access-sw-26") is None
 
 
-def test_community_second_connector_fails_after_join_token_claim(tmp_path: Path, monkeypatch) -> None:
+def test_community_second_connector_failure_does_not_consume_join_token(tmp_path: Path, monkeypatch) -> None:
     workspace = WorkspacePaths(tmp_path)
     init_workspace(workspace)
     monkeypatch.setattr(entitlement_module, "get_entitlements", _community_entitlements)
@@ -268,6 +268,13 @@ def test_community_second_connector_fails_after_join_token_claim(tmp_path: Path,
     assert result["ok"] is False
     assert result["error"] == "connector_limit_reached"
     assert len(store.list_runners(org_id="org_default")) == 1
+    assert store.preview_join_token(
+        runner_hub._hash(str(join["join_token"]))  # noqa: SLF001 - assert durable one-time boundary.
+    ) is not None
+
+    store.revoke_runner(store.list_runners(org_id="org_default")[0].id, "org_default")
+    retried = runner_hub.enroll_runner(store, join["join_token"], "connector-b")
+    assert retried["ok"] is True
 
 
 def test_revoked_community_connector_can_be_replaced(tmp_path: Path, monkeypatch) -> None:

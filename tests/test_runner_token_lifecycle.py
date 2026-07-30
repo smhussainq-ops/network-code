@@ -45,7 +45,7 @@ def test_two_phase_rotation_preserves_access_and_expires_overlap(tmp_path: Path)
     pending_token = str(prepared["runner_token"])
     assert pending_token != old_token
     assert authenticate_runner(store, old_token) is not None
-    pending_runner = authenticate_runner(store, pending_token)
+    pending_runner = authenticate_runner(store, pending_token, allow_pending=True)
     assert pending_runner is not None
 
     confirmed = confirm_runner_token_rotation(store, pending_runner, pending_token)
@@ -54,7 +54,7 @@ def test_two_phase_rotation_preserves_access_and_expires_overlap(tmp_path: Path)
     assert authenticate_runner(store, old_token) is not None
     repeated = confirm_runner_token_rotation(
         store,
-        authenticate_runner(store, pending_token),
+        authenticate_runner(store, pending_token, allow_pending=True),
         pending_token,
     )
     assert repeated["already_confirmed"] is True
@@ -94,7 +94,11 @@ def test_revoke_invalidates_current_previous_and_pending_tokens(tmp_path: Path) 
     runner = authenticate_runner(store, old_token)
     first_pending = prepare_runner_token_rotation(store, runner, old_token)
     first_token = str(first_pending["runner_token"])
-    confirm_runner_token_rotation(store, authenticate_runner(store, first_token), first_token)
+    confirm_runner_token_rotation(
+        store,
+        authenticate_runner(store, first_token, allow_pending=True),
+        first_token,
+    )
     current_runner = authenticate_runner(store, first_token)
     second_pending = prepare_runner_token_rotation(store, current_runner, first_token)
     second_token = str(second_pending["runner_token"])
