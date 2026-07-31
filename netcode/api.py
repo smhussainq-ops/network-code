@@ -13,6 +13,7 @@ import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, TimeoutError
 from datetime import datetime, timedelta, timezone
+from ipaddress import ip_network
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -488,6 +489,7 @@ class RcaRemediationProposalRequest(BaseModel):
     title: str = ""
     environment_id: str = ""
     model_revision_id: str = ""
+    evidence_contract: dict[str, object] = {}
     intent_reviewed: bool = False
     reviewed_by: str = ""
     review_candidate_id: str = ""
@@ -778,6 +780,533 @@ def _require_confirmed_rca_provenance(request: RcaRemediationProposalRequest) ->
             )
 
 
+def _canonical_json(value: object) -> str:
+    return json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    )
+
+
+def _inverse_redistribution_operation(
+    forward: dict[str, object],
+    rollback: dict[str, object],
+) -> bool:
+    forward_op = str(forward.get("op") or "")
+    rollback_op = str(rollback.get("op") or "")
+    if forward_op == "add_prefix_list_entry":
+        return (
+            rollback_op == "remove_prefix_list_entry"
+            and forward.get("name") == rollback.get("name")
+            and forward.get("sequence") == rollback.get("sequence")
+        )
+    if forward_op == "add_route_map_sequence":
+        return (
+            rollback_op == "remove_route_map_sequence"
+            and forward.get("name") == rollback.get("name")
+            and forward.get("sequence") == rollback.get("sequence")
+        )
+    shared = (
+        "from_protocol",
+        "to_protocol",
+        "target_process",
+        "address_family",
+        "source_process",
+        "subnets",
+    )
+    if forward_op == "add_redistribution_statement":
+        return (
+            rollback_op == "remove_redistribution_statement"
+            and all(forward.get(key) == rollback.get(key) for key in shared)
+            and forward.get("route_map") == rollback.get("route_map")
+        )
+    if forward_op == "replace_redistribution_statement":
+        return (
+            rollback_op == "restore_redistribution_statement"
+            and all(forward.get(key) == rollback.get(key) for key in shared)
+            and forward.get("after_route_map") == rollback.get("current_route_map")
+            and forward.get("before_route_map") == rollback.get("restore_route_map")
+        )
+    return False
+
+
+def _model_records(value: object) -> list[dict[str, object]]:
+    if isinstance(value, list):
+        return [dict(item) for item in value if isinstance(item, dict)]
+    if isinstance(value, dict):
+        records: list[dict[str, object]] = []
+        for key, item in value.items():
+            if not isinstance(item, dict):
+                continue
+            record = dict(item)
+            record.setdefault("id", str(key))
+            records.append(record)
+        return records
+    return []
+
+
+def _approved_redistribution_boundary(
+    *,
+    store: PlatformStore,
+    org_id: str,
+    request: RcaRemediationProposalRequest,
+    proposed: dict[str, object],
+    proof: dict[str, object],
+) -> tuple[dict[str, object], str]:
+    environment_id = request.environment_id.strip()
+    revision_id = request.model_revision_id.strip()
+    active = NetworkModelRepository(store).active_revision(org_id, environment_id)
+    if (
+        not active
+        or active.get("status") != "active"
+        or active.get("revision_id") != revision_id
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail="Redistribution evidence must reference the current active approved model.",
+        )
+    model = active.get("model") if isinstance(active.get("model"), dict) else {}
+    sites = model.get("sites") if isinstance(model.get("sites"), dict) else {}
+    site_id = str(proposed.get("site") or "").strip()
+    site = sites.get(site_id) if isinstance(sites.get(site_id), dict) else {}
+    if not site:
+        raise HTTPException(
+            status_code=400,
+            detail="The approved model does not contain the proposed site.",
+        )
+    boundary_id = str(proof.get("boundary_id") or "").strip()
+    target_device = request.target_device.strip()
+    candidates = [
+        boundary
+        for boundary in _model_records(site.get("redistribution_boundaries"))
+        if str(boundary.get("id") or "").strip() == boundary_id
+        and target_device in {
+            str(item).strip()
+            for item in (
+                boundary.get("devices")
+                if isinstance(boundary.get("devices"), list)
+                else []
+            )
+        }
+    ]
+    if len(candidates) != 1:
+        raise HTTPException(
+            status_code=400,
+            detail="The active approved model does not contain one exact target redistribution boundary.",
+        )
+    boundary = candidates[0]
+    if not str(boundary.get("source_process") or "").strip():
+        site_devices = (
+            site.get("devices")
+            if isinstance(site.get("devices"), dict)
+            else {}
+        )
+        target_roles = {
+            str(
+                (
+                    site_devices.get(str(device_id))
+                    if isinstance(site_devices.get(str(device_id)), dict)
+                    else {}
+                ).get("role")
+                or ""
+            ).strip().lower()
+            for device_id in (
+                boundary.get("devices")
+                if isinstance(boundary.get("devices"), list)
+                else []
+            )
+        }
+        target_roles.discard("")
+        source_candidates: set[str] = set()
+        if target_roles:
+            for domain in _model_records(site.get("routing_domains")):
+                if str(domain.get("protocol") or "").strip().lower() != str(
+                    boundary.get("from_protocol") or ""
+                ).strip().lower():
+                    continue
+                domain_roles = {
+                    str(role).strip().lower()
+                    for role in (
+                        domain.get("roles")
+                        if isinstance(domain.get("roles"), list)
+                        else []
+                    )
+                    if str(role).strip()
+                }
+                if not target_roles.issubset(domain_roles):
+                    continue
+                value = domain.get("process")
+                if value in (None, "") and str(
+                    boundary.get("from_protocol") or ""
+                ).strip().lower() == "bgp":
+                    value = domain.get("asn")
+                if str(value or "").strip():
+                    source_candidates.add(str(value).strip())
+        if len(source_candidates) == 1:
+            boundary["source_process"] = next(iter(source_candidates))
+    prefix_classes = (
+        model.get("prefix_classes")
+        if isinstance(model.get("prefix_classes"), dict)
+        else {}
+    )
+    approved_prefixes = [
+        str(item).strip()
+        for item in (
+            boundary.get("prefixes")
+            if isinstance(boundary.get("prefixes"), list)
+            else []
+        )
+        if str(item).strip()
+    ]
+    if not approved_prefixes:
+        for class_name in (
+            boundary.get("prefix_classes")
+            if isinstance(boundary.get("prefix_classes"), list)
+            else []
+        ):
+            values = prefix_classes.get(str(class_name))
+            if isinstance(values, list):
+                approved_prefixes.extend(
+                    str(item).strip() for item in values if str(item).strip()
+                )
+    boundary["prefixes"] = list(dict.fromkeys(approved_prefixes))
+    boundary["vrf"] = str(boundary.get("vrf") or "default").strip().lower()
+
+    model_devices = model.get("devices") if isinstance(model.get("devices"), dict) else {}
+    model_device = (
+        model_devices.get(target_device)
+        if isinstance(model_devices.get(target_device), dict)
+        else {}
+    )
+    site_devices = site.get("devices") if isinstance(site.get("devices"), dict) else {}
+    site_device = (
+        site_devices.get(target_device)
+        if isinstance(site_devices.get(target_device), dict)
+        else {}
+    )
+    modeled_platform = str(
+        site_device.get("platform") or model_device.get("platform") or ""
+    ).strip().lower()
+    catalog_device = store.resolve_device(org_id, target_device)
+    catalog_platform = str(
+        (catalog_device or {}).get("platform") or ""
+    ).strip().lower()
+    if modeled_platform and catalog_platform and modeled_platform != catalog_platform:
+        raise HTTPException(
+            status_code=409,
+            detail="The approved model and current catalog disagree on target platform.",
+        )
+    platform = catalog_platform or modeled_platform
+    if not platform:
+        raise HTTPException(
+            status_code=400,
+            detail="The target platform is not proven by the approved model or connector catalog.",
+        )
+    return boundary, platform
+
+
+def _require_operations_within_approved_boundary(
+    *,
+    operations: list[object],
+    boundary: dict[str, object],
+) -> None:
+    approved_prefixes = [
+        ip_network(str(value), strict=False)
+        for value in (
+            boundary.get("prefixes")
+            if isinstance(boundary.get("prefixes"), list)
+            else []
+        )
+    ]
+    route_map = str(boundary.get("route_map") or "")
+    prefix_list = str(boundary.get("prefix_list") or "")
+    from_protocol = str(boundary.get("from_protocol") or "").lower()
+    to_protocol = str(boundary.get("to_protocol") or "").lower()
+    target_process = str(boundary.get("target_process") or "")
+    source_process = str(boundary.get("source_process") or "")
+    route_tag = boundary.get("route_tag")
+    for raw in operations:
+        if not isinstance(raw, dict):
+            raise HTTPException(status_code=400, detail="Invalid redistribution operation.")
+        operation = dict(raw)
+        op = str(operation.get("op") or "")
+        if op in {"add_prefix_list_entry", "remove_prefix_list_entry"}:
+            if str(operation.get("name") or "") != prefix_list:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Redistribution operation references an unapproved prefix list.",
+                )
+            if op == "add_prefix_list_entry":
+                try:
+                    prefix = ip_network(str(operation.get("prefix") or ""), strict=False)
+                except ValueError as exc:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="Redistribution operation contains an invalid prefix.",
+                    ) from exc
+                if (
+                    prefix.version != 4
+                    or prefix.prefixlen == 0
+                    or not any(prefix.subnet_of(allowed) for allowed in approved_prefixes)
+                ):
+                    raise HTTPException(
+                        status_code=400,
+                        detail="Redistribution operation exceeds the approved prefix scope.",
+                    )
+        elif op in {"add_route_map_sequence", "remove_route_map_sequence"}:
+            if str(operation.get("name") or "") != route_map:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Redistribution operation references an unapproved route map.",
+                )
+            if op == "add_route_map_sequence":
+                if str(operation.get("match_prefix_list") or "") != prefix_list:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="Route-map operation is not bound to the approved prefix list.",
+                    )
+                if to_protocol == "ospf" and operation.get("set_tag") != route_tag:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="Route-map operation does not preserve the approved route tag.",
+                    )
+        else:
+            if (
+                str(operation.get("from_protocol") or "").lower() != from_protocol
+                or str(operation.get("to_protocol") or "").lower() != to_protocol
+                or str(operation.get("target_process") or "") != target_process
+                or str(operation.get("source_process") or "") != source_process
+            ):
+                raise HTTPException(
+                    status_code=400,
+                    detail="Redistribution statement operation exceeds the approved protocol boundary.",
+                )
+            operation_route_maps = {
+                str(operation.get(key) or "")
+                for key in (
+                    "route_map",
+                    "after_route_map",
+                    "current_route_map",
+                )
+                if operation.get(key) not in (None, "")
+            }
+            if operation_route_maps and operation_route_maps != {route_map}:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Redistribution statement operation references an unapproved route map.",
+                )
+
+
+def _require_redistribution_evidence(
+    request: RcaRemediationProposalRequest,
+    *,
+    store: PlatformStore,
+    org_id: str,
+) -> str:
+    proposed = _safe_proposal_dict(request.proposed_intent)
+    if str(proposed.get("change_type") or "") != "routing_redistribution":
+        return ""
+    if request.proposal_source.strip() != "site_operational_context":
+        raise HTTPException(
+            status_code=400,
+            detail="Typed redistribution drafts require site operational evidence.",
+        )
+    proof = _safe_proposal_dict(request.evidence_contract)
+    embedded = _safe_proposal_dict(proposed.get("evidence_contract"))
+    if (
+        proof.get("schema") != "rez.redistribution-evidence.v1"
+        or proof.get("sufficient_for_draft") is not True
+        or proof.get("fresh") is not True
+        or proof.get("live_root_confirmed") is not True
+        or proof.get("approved_direction_confirmed") is not True
+        or proof.get("missing_proof") not in ([], ())
+        or request.root_atom_id.strip().upper() != "CP_REDISTRIBUTION_GAP"
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="Exact fresh approved redistribution evidence is required.",
+        )
+    if not embedded or not hmac.compare_digest(
+        _canonical_json(proof),
+        _canonical_json(embedded),
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="The redistribution evidence contract does not match the proposed intent.",
+        )
+
+    boundary, target_platform = _approved_redistribution_boundary(
+        store=store,
+        org_id=org_id,
+        request=request,
+        proposed=proposed,
+        proof=proof,
+    )
+    if (
+        str(proof.get("platform") or "").strip().lower() != target_platform
+        or str(proof.get("site") or "").strip() != str(proposed.get("site") or "").strip()
+        or str(proof.get("vrf") or "default").strip().lower() != "default"
+        or str(boundary.get("vrf") or "default").strip().lower() != "default"
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="Redistribution evidence is not bound to the approved site, platform, and default VRF.",
+        )
+
+    targets = _proposal_targets(request)
+    target_ids = targets.get("device_ids")
+    if (
+        not isinstance(target_ids, list)
+        or len(target_ids) != 1
+        or str(target_ids[0]) != request.target_device.strip()
+        or str(proof.get("device_id") or "") != request.target_device.strip()
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="Redistribution evidence must bind exactly one target device.",
+        )
+    if (
+        not request.environment_id.strip()
+        or not request.model_revision_id.strip()
+        or str(proof.get("environment_id") or "") != request.environment_id.strip()
+        or str(proof.get("model_revision_id") or "")
+        != request.model_revision_id.strip()
+        or str(proof.get("root_atom_id") or "").upper()
+        != request.root_atom_id.strip().upper()
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="Redistribution evidence is not bound to this environment, model, and root.",
+        )
+
+    redistribution = _safe_proposal_dict(proposed.get("redistribution"))
+    direction = _safe_proposal_dict(proof.get("direction"))
+    approved = _safe_proposal_dict(proof.get("approved_policy"))
+    exact_fields = (
+        ("from_protocol", direction),
+        ("to_protocol", direction),
+        ("target_process", direction),
+        ("route_map", approved),
+        ("prefix_list", approved),
+    )
+    if any(
+        str(redistribution.get(field) or "") != str(source.get(field) or "")
+        for field, source in exact_fields
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="Redistribution intent does not match the approved evidence boundary.",
+        )
+    if sorted(str(item) for item in redistribution.get("prefixes") or []) != sorted(
+        str(item) for item in approved.get("prefixes") or []
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="Redistribution prefixes do not match approved policy scope.",
+        )
+    if redistribution.get("route_tag") != approved.get("route_tag"):
+        raise HTTPException(
+            status_code=400,
+            detail="Redistribution route tag does not match approved policy.",
+        )
+    approved_model_fields = {
+        "from_protocol": str(boundary.get("from_protocol") or "").lower(),
+        "to_protocol": str(boundary.get("to_protocol") or "").lower(),
+        "target_process": str(boundary.get("target_process") or ""),
+        "route_map": str(boundary.get("route_map") or ""),
+        "prefix_list": str(boundary.get("prefix_list") or ""),
+    }
+    if any(
+        str(direction.get(key) or "").lower()
+        != approved_model_fields[key].lower()
+        for key in ("from_protocol", "to_protocol", "target_process")
+    ) or any(
+        str(approved.get(key) or "") != approved_model_fields[key]
+        for key in ("route_map", "prefix_list")
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="Redistribution evidence does not match the active approved boundary.",
+        )
+    if str(approved.get("route_tag")) != str(boundary.get("route_tag")):
+        raise HTTPException(
+            status_code=400,
+            detail="Redistribution evidence route tag does not match the active approved boundary.",
+        )
+
+    try:
+        approved_networks = [
+            ip_network(str(value), strict=False)
+            for value in approved.get("prefixes") or []
+        ]
+        affected_networks = [
+            ip_network(str(value), strict=False)
+            for value in proof.get("affected_prefixes") or []
+        ]
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail="Redistribution evidence contains an invalid prefix.",
+        ) from exc
+    if not approved_networks or not affected_networks or any(
+        network.version != 4
+        or network.prefixlen == 0
+        or not any(network.subnet_of(allowed) for allowed in approved_networks)
+        for network in affected_networks
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="Affected prefixes are not contained by approved redistribution scope.",
+        )
+    model_networks = sorted(
+        str(ip_network(str(value), strict=False))
+        for value in (
+            boundary.get("prefixes")
+            if isinstance(boundary.get("prefixes"), list)
+            else []
+        )
+    )
+    if sorted(str(network) for network in approved_networks) != model_networks:
+        raise HTTPException(
+            status_code=400,
+            detail="Redistribution evidence prefix scope does not match the active approved model.",
+        )
+
+    operations = proof.get("operations")
+    rollback = proof.get("rollback_operations")
+    proposed_operations = proposed.get("operations")
+    proposed_rollback = proposed.get("rollback_operations")
+    if (
+        not isinstance(operations, list)
+        or not isinstance(rollback, list)
+        or not operations
+        or len(operations) != len(rollback)
+        or _canonical_json(operations) != _canonical_json(proposed_operations)
+        or _canonical_json(rollback) != _canonical_json(proposed_rollback)
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="Redistribution operations require an exact reversible evidence delta.",
+        )
+    _require_operations_within_approved_boundary(
+        operations=operations,
+        boundary=boundary,
+    )
+    for raw_forward, raw_rollback in zip(operations, reversed(rollback)):
+        if not isinstance(raw_forward, dict) or not isinstance(raw_rollback, dict):
+            raise HTTPException(status_code=400, detail="Invalid redistribution operation.")
+        if not _inverse_redistribution_operation(
+            dict(raw_forward),
+            dict(raw_rollback),
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail="Redistribution rollback is not the exact reverse-ordered inverse of the evidence delta.",
+            )
+    return target_platform
+
+
 def _proposal_targets(request: RcaRemediationProposalRequest) -> dict[str, object]:
     raw_targets = request.proposed_intent.get("targets")
     if isinstance(raw_targets, dict):
@@ -831,6 +1360,12 @@ def _typed_proposal_section(change_type: str, proposed: dict[str, object]) -> di
                 typed["reverse_redistribution"] = _safe_proposal_dict(proposed.get("reverse_redistribution"))
             if isinstance(proposed.get("reachability_checks"), list):
                 typed["reachability_checks"] = _strip_sensitive_proposal_fields(proposed.get("reachability_checks"))
+            if isinstance(proposed.get("operations"), list):
+                typed["operations"] = _strip_sensitive_proposal_fields(proposed.get("operations"))
+            if isinstance(proposed.get("rollback_operations"), list):
+                typed["rollback_operations"] = _strip_sensitive_proposal_fields(proposed.get("rollback_operations"))
+            if isinstance(proposed.get("evidence_contract"), dict):
+                typed["evidence_contract"] = _safe_proposal_dict(proposed.get("evidence_contract"))
         return typed
     # Some callers may send the same field values used by desired-state plans.
     # Use the registry builder to produce a typed section without copying extra keys.
@@ -5983,7 +6518,13 @@ def api_change_from_rca(request: RcaRemediationProposalRequest, http_request: Re
         raise HTTPException(status_code=400, detail="incident_id is required.")
     p = paths()
     principal = _request_principal(http_request)
+    store = PlatformStore(p)
     _require_confirmed_rca_provenance(request)
+    target_platform = _require_redistribution_evidence(
+        request,
+        store=store,
+        org_id=principal.org_id,
+    )
     if request.proposal_source.strip() == "human_reviewed_rca":
         actor = str(principal.email or principal.user_id or "").strip()
         if not principal.has_role("operator") or not actor or actor != request.reviewed_by.strip():
@@ -5991,7 +6532,6 @@ def api_change_from_rca(request: RcaRemediationProposalRequest, http_request: Re
                 status_code=403,
                 detail="The authenticated operator must match the expected-state reviewer.",
             )
-    store = PlatformStore(p)
     intent = _intent_from_rca_proposal(request)
     try:
         load_intent_data(intent)
@@ -6001,7 +6541,12 @@ def api_change_from_rca(request: RcaRemediationProposalRequest, http_request: Re
     incident_slug = _safe_slug(request.incident_id)
     intent_path = p.intents / "rca" / f"{incident_slug}-{uuid.uuid4().hex[:8]}.yaml"
     write_yaml(intent_path, intent)
-    pipeline = run_static_pipeline(p, intent_path, org_id=principal.org_id)
+    pipeline = run_static_pipeline(
+        p,
+        intent_path,
+        org_id=principal.org_id,
+        platform=target_platform or "arista_eos",
+    )
 
     title = request.title.strip() or f"Rez RCA remediation for {request.incident_id.strip()}"
     target_device = request.target_device.strip() or None

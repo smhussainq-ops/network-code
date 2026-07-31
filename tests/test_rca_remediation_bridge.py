@@ -1,10 +1,17 @@
+import copy
 from pathlib import Path
 import json
 
+import pytest
 from fastapi.testclient import TestClient
+from pydantic import ValidationError
 
 from netcode import api
 from netcode.bootstrap import init_workspace
+from netcode.network_model import NETWORK_MODEL_SCHEMA
+from netcode.network_model_lifecycle import activate_verified_revision, approve_with_git
+from netcode.network_model_store import NetworkModelRepository
+from netcode.models import RoutingRedistributionOperation
 from netcode.paths import WorkspacePaths
 from netcode.store import PlatformStore
 from netcode.yamlio import read_yaml
@@ -18,6 +25,259 @@ def _confirmed_proposal(payload: dict) -> dict:
         "root_atom_id": "CONFIG_EXACT_REMEDIATION_REQUIRED",
         **payload,
     }
+
+
+def _evidence_scoped_redistribution_proposal() -> dict:
+    operation = {
+        "op": "add_prefix_list_entry",
+        "name": "ENTERPRISE-REMOTE-LOOPBACKS",
+        "sequence": 20,
+        "action": "permit",
+        "prefix": "1.1.1.0/24",
+        "le": 32,
+    }
+    rollback = {
+        "op": "remove_prefix_list_entry",
+        "name": "ENTERPRISE-REMOTE-LOOPBACKS",
+        "sequence": 20,
+    }
+    proof = {
+        "schema": "rez.redistribution-evidence.v1",
+        "platform": "arista_eos",
+        "site": "campus",
+        "boundary_id": "campus-bgp-to-ospf",
+        "vrf": "default",
+        "device_id": "v2-store1",
+        "environment_id": "env-campus",
+        "model_revision_id": "campus-approved-v1",
+        "root_atom_id": "CP_REDISTRIBUTION_GAP",
+        "dependency_id": "design:campus:redistribution:campus-bgp-to-ospf:v2-store1",
+        "direction": {
+            "from_protocol": "bgp",
+            "to_protocol": "ospf",
+            "target_process": "1",
+        },
+        "approved_policy": {
+            "route_map": "CAMPUS-BGP-TO-OSPF",
+            "prefix_list": "ENTERPRISE-REMOTE-LOOPBACKS",
+            "prefixes": ["1.1.1.0/24"],
+            "route_tag": 65002,
+        },
+        "observed_statement": {
+            "target_process": "1",
+            "route_map": "CAMPUS-BGP-TO-OSPF",
+            "statement_sha256": "a" * 64,
+        },
+        "classification": "prefix_policy_scope_gap",
+        "affected_prefixes": ["1.1.1.1/32"],
+        "operations": [operation],
+        "rollback_operations": [rollback],
+        "missing_proof": [],
+        "sufficient_for_draft": True,
+        "fresh": True,
+        "live_root_confirmed": True,
+        "approved_direction_confirmed": True,
+    }
+    return _confirmed_proposal({
+        "root_atom_id": "CP_REDISTRIBUTION_GAP",
+        "proposal_source": "site_operational_context",
+        "source": "rez",
+        "incident_id": "INC-CAMPUS-REDIST",
+        "target_device": "v2-store1",
+        "suggested_pack": "routing_redistribution",
+        "rationale": "Approved BGP-to-OSPF policy omits an affected approved prefix class.",
+        "evidence_refs": ["approved-design:campus-bgp-to-ospf", "live:ssh"],
+        "environment_id": "env-campus",
+        "model_revision_id": "campus-approved-v1",
+        "evidence_contract": copy.deepcopy(proof),
+        "proposed_intent": {
+            "change_type": "routing_redistribution",
+            "site": "campus",
+            "targets": {"device_ids": ["v2-store1"]},
+            "redistribution": {
+                "from_protocol": "bgp",
+                "to_protocol": "ospf",
+                "target_process": "1",
+                "route_map": "CAMPUS-BGP-TO-OSPF",
+                "prefix_list": "ENTERPRISE-REMOTE-LOOPBACKS",
+                "prefixes": ["1.1.1.0/24"],
+                "route_tag": 65002,
+            },
+            "operations": [operation],
+            "rollback_operations": [rollback],
+            "evidence_contract": copy.deepcopy(proof),
+        },
+    })
+
+
+def _statement_gap_proposal() -> dict:
+    payload = copy.deepcopy(_evidence_scoped_redistribution_proposal())
+    operations = [
+        {
+            "op": "add_prefix_list_entry",
+            "name": "ENTERPRISE-REMOTE-LOOPBACKS",
+            "sequence": 20,
+            "action": "permit",
+            "prefix": "1.1.1.0/24",
+            "le": 32,
+        },
+        {
+            "op": "add_route_map_sequence",
+            "name": "CAMPUS-BGP-TO-OSPF",
+            "sequence": 20,
+            "action": "permit",
+            "match_prefix_list": "ENTERPRISE-REMOTE-LOOPBACKS",
+            "set_tag": 65002,
+        },
+        {
+            "op": "add_redistribution_statement",
+            "from_protocol": "bgp",
+            "to_protocol": "ospf",
+            "target_process": "1",
+            "source_process": "65002",
+            "address_family": "ipv4-unicast",
+            "route_map": "CAMPUS-BGP-TO-OSPF",
+            "subnets": False,
+        },
+    ]
+    rollback = [
+        {
+            "op": "remove_redistribution_statement",
+            "from_protocol": "bgp",
+            "to_protocol": "ospf",
+            "target_process": "1",
+            "source_process": "65002",
+            "address_family": "ipv4-unicast",
+            "route_map": "CAMPUS-BGP-TO-OSPF",
+            "subnets": False,
+        },
+        {
+            "op": "remove_route_map_sequence",
+            "name": "CAMPUS-BGP-TO-OSPF",
+            "sequence": 20,
+        },
+        {
+            "op": "remove_prefix_list_entry",
+            "name": "ENTERPRISE-REMOTE-LOOPBACKS",
+            "sequence": 20,
+        },
+    ]
+    for contract in (
+        payload["evidence_contract"],
+        payload["proposed_intent"]["evidence_contract"],
+    ):
+        contract["classification"] = "statement_or_binding_gap"
+        contract["operations"] = copy.deepcopy(operations)
+        contract["rollback_operations"] = copy.deepcopy(rollback)
+    payload["proposed_intent"]["operations"] = copy.deepcopy(operations)
+    payload["proposed_intent"]["rollback_operations"] = copy.deepcopy(rollback)
+    return payload
+
+
+def test_statement_operation_requires_exact_source_process() -> None:
+    with pytest.raises(ValidationError, match="exact source process"):
+        RoutingRedistributionOperation.model_validate({
+            "op": "add_redistribution_statement",
+            "from_protocol": "ospf",
+            "to_protocol": "bgp",
+            "target_process": "65000",
+            "route_map": "HQ-OSPF-TO-BGP",
+        })
+
+
+def _activate_evidence_model(
+    tmp_path: Path,
+    *,
+    include_source_process: bool = True,
+    routing_domain_roles: list[str] | None = None,
+) -> None:
+    workspace = WorkspacePaths(tmp_path.resolve())
+    store = PlatformStore(workspace)
+    repository = NetworkModelRepository(store)
+    boundary = {
+        "id": "campus-bgp-to-ospf",
+        "devices": ["v2-store1"],
+        "from_protocol": "bgp",
+        "to_protocol": "ospf",
+        "target_process": "1",
+        "vrf": "default",
+        "route_map": "CAMPUS-BGP-TO-OSPF",
+        "prefix_list": "ENTERPRISE-REMOTE-LOOPBACKS",
+        "prefix_classes": ["enterprise_remote_loopbacks"],
+        "route_tag": 65002,
+    }
+    if include_source_process:
+        boundary["source_process"] = "65002"
+    routing_domains = []
+    if routing_domain_roles is not None:
+        routing_domains.append({
+            "protocol": "bgp",
+            "asn": 65002,
+            "roles": routing_domain_roles,
+        })
+    repository.create_revision(
+        {
+            "schema": NETWORK_MODEL_SCHEMA,
+            "org_id": "org_default",
+            "environment_id": "env-campus",
+            "revision_id": "campus-approved-v1",
+            "status": "proposed",
+            "source": {
+                "type": "manual_review",
+                "reference": "approved:campus-approved-v1",
+            },
+            "coverage": {
+                "domains": ["identity", "sites", "routing", "route_propagation"]
+            },
+            "authority_bindings": {
+                domain: {"source": "manual_review", "mode": "propose"}
+                for domain in ("identity", "sites", "routing", "route_propagation")
+            },
+            "model": {
+                "prefix_classes": {
+                    "enterprise_remote_loopbacks": ["1.1.1.0/24"],
+                },
+                "sites": {
+                    "campus": {
+                        "devices": {
+                            "v2-store1": {
+                                "role": "edge",
+                                "platform": "arista_eos",
+                            }
+                        },
+                        "routing_domains": routing_domains,
+                        "redistribution_boundaries": [boundary],
+                    }
+                },
+                "devices": {
+                    "v2-store1": {
+                        "site": "campus",
+                        "role": "edge",
+                        "platform": "arista_eos",
+                    },
+                },
+            },
+        },
+        created_by="evidence-reviewer",
+    )
+    approve_with_git(
+        repository,
+        org_id="org_default",
+        environment_id="env-campus",
+        revision_id="campus-approved-v1",
+        approved_by="evidence-reviewer",
+        git_root=workspace.git_workspace,
+    )
+    activate_verified_revision(
+        repository,
+        store,
+        org_id="org_default",
+        environment_id="env-campus",
+        revision_id="campus-approved-v1",
+        actor="evidence-reviewer",
+        git_root=workspace.git_workspace,
+        initial_baseline=True,
+    )
 
 
 def test_rca_remediation_runs_static_validation_without_jobs(tmp_path: Path, monkeypatch):
@@ -263,35 +523,13 @@ def test_site_context_redistribution_remediation_is_typed_validated_and_human_ga
     tmp_path: Path, monkeypatch
 ):
     init_workspace(WorkspacePaths(tmp_path))
+    _activate_evidence_model(tmp_path)
     monkeypatch.chdir(tmp_path)
     client = TestClient(api.app)
 
     response = client.post(
         "/api/changes/from-rca",
-        json=_confirmed_proposal({
-            "root_atom_id": "CP_REDISTRIBUTION_GAP",
-            "proposal_source": "site_operational_context",
-            "source": "rez",
-            "incident_id": "INC-CAMPUS-REDIST",
-            "target_device": "v2-store1",
-            "suggested_pack": "routing_redistribution",
-            "rationale": "Approved BGP-to-OSPF boundary is absent and scoped reachability failed.",
-            "evidence_refs": ["approved-design:campus-bgp-to-ospf", "live:ssh"],
-            "proposed_intent": {
-                "change_type": "routing_redistribution",
-                "site": "campus",
-                "targets": {"device_ids": ["v2-store1"]},
-                "redistribution": {
-                    "from_protocol": "bgp",
-                    "to_protocol": "ospf",
-                    "target_process": "1",
-                    "route_map": "CAMPUS-BGP-TO-OSPF",
-                    "prefix_list": "ENTERPRISE-REMOTE-LOOPBACKS",
-                    "prefixes": ["1.1.1.0/24", "2.2.2.0/24", "4.4.4.0/24", "5.5.5.0/24"],
-                    "route_tag": 65002,
-                },
-            },
-        }),
+        json=_evidence_scoped_redistribution_proposal(),
     )
 
     assert response.status_code == 200, response.text
@@ -302,13 +540,142 @@ def test_site_context_redistribution_remediation_is_typed_validated_and_human_ga
     assert body["intent"]["change_type"] == "routing_redistribution"
     assert body["intent"]["redistribution"]["route_map"] == "CAMPUS-BGP-TO-OSPF"
     commands = body["change"]["result"]["plan"]["commands"]
-    assert "ip prefix-list ENTERPRISE-REMOTE-LOOPBACKS" in commands
-    assert "route-map CAMPUS-BGP-TO-OSPF permit 10" in commands
-    assert "router ospf 1" in commands
-    assert "redistribute bgp route-map CAMPUS-BGP-TO-OSPF" in commands
+    assert commands == (
+        "ip prefix-list ENTERPRISE-REMOTE-LOOPBACKS "
+        "seq 20 permit 1.1.1.0/24 le 32\n"
+    )
     rollback = body["change"]["result"]["plan"]["rollback"]
-    assert "no redistribute bgp route-map CAMPUS-BGP-TO-OSPF" in rollback
+    assert rollback == "no ip prefix-list ENTERPRISE-REMOTE-LOOPBACKS seq 20\n"
     assert PlatformStore(WorkspacePaths(tmp_path.resolve())).list_jobs() == []
+
+
+def test_exact_source_process_statement_passes_static_pipeline(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    init_workspace(WorkspacePaths(tmp_path))
+    _activate_evidence_model(tmp_path)
+    monkeypatch.chdir(tmp_path)
+
+    response = TestClient(api.app).post(
+        "/api/changes/from-rca",
+        json=_statement_gap_proposal(),
+    )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    checks = body["change"]["result"]["pipeline"]["validation"]["checks"]
+    assert all(check["status"] == "pass" for check in checks), checks
+    commands = body["change"]["result"]["plan"]["commands"]
+    assert (
+        "redistribute bgp 65002 route-map CAMPUS-BGP-TO-OSPF"
+        in commands
+    )
+    assert PlatformStore(WorkspacePaths(tmp_path.resolve())).list_jobs() == []
+
+
+def test_source_process_inference_rejects_wrong_target_role(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    init_workspace(WorkspacePaths(tmp_path))
+    _activate_evidence_model(
+        tmp_path,
+        include_source_process=False,
+        routing_domain_roles=["core"],
+    )
+    monkeypatch.chdir(tmp_path)
+
+    response = TestClient(api.app).post(
+        "/api/changes/from-rca",
+        json=_statement_gap_proposal(),
+    )
+
+    assert response.status_code == 400
+    assert "protocol boundary" in response.json()["detail"].lower()
+    store = PlatformStore(WorkspacePaths(tmp_path.resolve()))
+    assert store.list_changes() == []
+    assert store.list_jobs() == []
+
+
+@pytest.mark.parametrize(
+    "tamper",
+    [
+        "missing_proof",
+        "stale",
+        "wrong_device",
+        "wrong_direction",
+        "outside_prefix",
+        "operation_outside_prefix",
+        "wrong_model_boundary",
+        "wrong_route_tag",
+        "non_default_vrf",
+        "platform_mismatch",
+        "rollback_mismatch",
+        "embedded_mismatch",
+    ],
+)
+def test_site_context_redistribution_rejects_unproven_or_tampered_evidence(
+    tmp_path: Path,
+    monkeypatch,
+    tamper: str,
+):
+    init_workspace(WorkspacePaths(tmp_path))
+    _activate_evidence_model(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    payload = copy.deepcopy(_evidence_scoped_redistribution_proposal())
+    proof = payload["evidence_contract"]
+    embedded = payload["proposed_intent"]["evidence_contract"]
+    if tamper == "missing_proof":
+        proof["missing_proof"] = ["routing_policy_collection"]
+        embedded["missing_proof"] = ["routing_policy_collection"]
+    elif tamper == "stale":
+        proof["fresh"] = False
+        embedded["fresh"] = False
+    elif tamper == "wrong_device":
+        proof["device_id"] = "another-edge"
+        embedded["device_id"] = "another-edge"
+    elif tamper == "wrong_direction":
+        proof["direction"]["from_protocol"] = "ospf"
+        proof["direction"]["to_protocol"] = "bgp"
+        embedded["direction"]["from_protocol"] = "ospf"
+        embedded["direction"]["to_protocol"] = "bgp"
+    elif tamper == "outside_prefix":
+        proof["affected_prefixes"] = ["203.0.113.1/32"]
+        embedded["affected_prefixes"] = ["203.0.113.1/32"]
+    elif tamper == "operation_outside_prefix":
+        for contract in (proof, embedded):
+            contract["operations"][0]["prefix"] = "0.0.0.0/1"
+        payload["proposed_intent"]["operations"][0]["prefix"] = "0.0.0.0/1"
+    elif tamper == "wrong_model_boundary":
+        proof["boundary_id"] = "unapproved-boundary"
+        embedded["boundary_id"] = "unapproved-boundary"
+    elif tamper == "wrong_route_tag":
+        for contract in (proof, embedded):
+            contract["approved_policy"]["route_tag"] = 65003
+        payload["proposed_intent"]["redistribution"]["route_tag"] = 65003
+    elif tamper == "non_default_vrf":
+        proof["vrf"] = "customer-a"
+        embedded["vrf"] = "customer-a"
+    elif tamper == "platform_mismatch":
+        proof["platform"] = "cisco_ios"
+        embedded["platform"] = "cisco_ios"
+    elif tamper == "rollback_mismatch":
+        proof["rollback_operations"][0]["sequence"] = 30
+        embedded["rollback_operations"][0]["sequence"] = 30
+        payload["proposed_intent"]["rollback_operations"][0]["sequence"] = 30
+    elif tamper == "embedded_mismatch":
+        embedded["classification"] = "statement_or_binding_gap"
+
+    response = TestClient(api.app).post(
+        "/api/changes/from-rca",
+        json=payload,
+    )
+
+    assert response.status_code == 400
+    store = PlatformStore(WorkspacePaths(tmp_path.resolve()))
+    assert store.list_changes() == []
+    assert store.list_jobs() == []
 
 
 def test_site_context_bidirectional_exchange_is_typed_scoped_and_human_gated(
@@ -358,22 +725,55 @@ def test_site_context_bidirectional_exchange_is_typed_scoped_and_human_gated(
         }),
     )
 
-    assert response.status_code == 200, response.text
-    body = response.json()
-    assert body["change"]["workflow_state"] == "validated"
-    assert body["draft_only"] is True
-    assert body["human_approval_required"] is True
-    intent = body["intent"]
-    assert intent["reverse_redistribution"]["route_map"] == "CAMPUS-OSPF-TO-BGP"
-    assert intent["reachability_checks"][0]["source_device"] == "v2-store1"
-    commands = body["change"]["result"]["plan"]["commands"]
-    assert "redistribute bgp route-map CAMPUS-BGP-TO-OSPF" in commands
-    assert "router bgp 65002" in commands
-    assert "address-family ipv4" in commands
-    assert "redistribute ospf route-map CAMPUS-OSPF-TO-BGP" in commands
-    rollback = body["change"]["result"]["plan"]["rollback"]
-    assert "no redistribute ospf route-map CAMPUS-OSPF-TO-BGP" in rollback
-    assert "no redistribute bgp route-map CAMPUS-BGP-TO-OSPF" in rollback
+    assert response.status_code == 400
+    assert "evidence" in response.json()["detail"].lower()
+    assert PlatformStore(WorkspacePaths(tmp_path.resolve())).list_jobs() == []
+
+
+def test_redistribution_rollback_must_follow_reverse_dependency_order(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    init_workspace(WorkspacePaths(tmp_path))
+    _activate_evidence_model(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    payload = copy.deepcopy(_evidence_scoped_redistribution_proposal())
+    route_map_operation = {
+        "op": "add_route_map_sequence",
+        "name": "CAMPUS-BGP-TO-OSPF",
+        "sequence": 20,
+        "action": "permit",
+        "match_prefix_list": "ENTERPRISE-REMOTE-LOOPBACKS",
+        "set_tag": 65002,
+    }
+    route_map_rollback = {
+        "op": "remove_route_map_sequence",
+        "name": "CAMPUS-BGP-TO-OSPF",
+        "sequence": 20,
+    }
+    for contract in (
+        payload["evidence_contract"],
+        payload["proposed_intent"]["evidence_contract"],
+    ):
+        contract["operations"].append(copy.deepcopy(route_map_operation))
+        contract["rollback_operations"] = [
+            copy.deepcopy(contract["rollback_operations"][0]),
+            copy.deepcopy(route_map_rollback),
+        ]
+    payload["proposed_intent"]["operations"].append(
+        copy.deepcopy(route_map_operation)
+    )
+    payload["proposed_intent"]["rollback_operations"] = copy.deepcopy(
+        payload["evidence_contract"]["rollback_operations"]
+    )
+
+    response = TestClient(api.app).post(
+        "/api/changes/from-rca",
+        json=payload,
+    )
+
+    assert response.status_code == 400
+    assert "reverse-ordered" in response.json()["detail"]
     assert PlatformStore(WorkspacePaths(tmp_path.resolve())).list_jobs() == []
 
 
@@ -424,28 +824,9 @@ def test_multitarget_site_context_exchange_creates_canary_rollout_without_jobs(
         }),
     )
 
-    assert response.status_code == 200, response.text
-    body = response.json()
-    assert body["rollout_id"]
-    assert body["rez_change_id"] == body["rollout"]["rez_change_id"]
-    assert body["rollout"]["status"] == "planned"
-    assert body["rollout"]["device_count"] == 2
-    assert len(body["rollout"]["waves"][0]["targets"]) == 1
-    assert len(body["rollout"]["waves"][1]["targets"]) == 1
-    assert body["rollout"].get("approved_by") is None
-
-    store = PlatformStore(WorkspacePaths(tmp_path.resolve()))
-    assert store.list_jobs() == []
-    for wave in body["rollout"]["waves"]:
-        for target in wave["targets"]:
-            target_intent = read_yaml(Path(target["intent_path"]))
-            assert target_intent["targets"]["device_ids"] == [target["device_id"]]
-            assert target_intent["reverse_redistribution"]["route_map"] == "CAMPUS-OSPF-TO-BGP"
-            assert target_intent["reachability_checks"][0]["destination"] == "1.1.1.2"
-            target_change = store.get_change(target["change_id"])
-            assert target_change.workflow_state == "validated"
-            assert target_change.result["source"] == "rez_rca"
-            assert target_change.result["rollout_id"] == body["rollout_id"]
+    assert response.status_code == 400
+    assert "evidence" in response.json()["detail"].lower()
+    assert PlatformStore(WorkspacePaths(tmp_path.resolve())).list_jobs() == []
 
 
 def test_rez_rca_validated_draft_can_enter_dry_run_queue(tmp_path: Path, monkeypatch):

@@ -65,7 +65,17 @@ BGP_NEIGHBOR_TEMPLATE = """router bgp {{ bgp.asn }}
 """
 
 
-ROUTING_REDISTRIBUTION_TEMPLATE = """{% macro render_boundary(item) -%}
+ROUTING_REDISTRIBUTION_TEMPLATE = """{% macro render_statement(item, negate=false) -%}
+{% if item.to_protocol == "ospf" %}
+router ospf {{ item.target_process }}
+   {% if negate %}no {% endif %}redistribute {{ item.from_protocol }}{% if item.source_process %} {{ item.source_process }}{% endif %}{% if item.subnets %} subnets{% endif %}{% if item.route_map %} route-map {{ item.route_map }}{% endif %}
+{% else %}
+router bgp {{ item.target_process }}
+   address-family ipv4
+      {% if negate %}no {% endif %}redistribute {{ item.from_protocol }}{% if item.source_process %} {{ item.source_process }}{% endif %}{% if item.subnets %} subnets{% endif %}{% if item.route_map %} route-map {{ item.route_map }}{% endif %}
+{% endif %}
+{%- endmacro %}
+{% macro render_boundary(item) -%}
 {% for prefix in item.prefixes %}
 ip prefix-list {{ item.prefix_list }} seq {{ loop.index * 10 }} permit {{ prefix }} le 32
 {% endfor %}
@@ -81,9 +91,30 @@ router bgp {{ item.target_process }}
       redistribute {{ item.from_protocol }} route-map {{ item.route_map }}
 {% endif %}
 {%- endmacro %}
+{% if operations %}
+{% for item in operations %}
+{% if item.op == "add_prefix_list_entry" %}
+ip prefix-list {{ item.name }} seq {{ item.sequence }} permit {{ item.prefix }}{% if item.ge %} ge {{ item.ge }}{% endif %} le {{ item.le }}
+{% elif item.op == "add_route_map_sequence" %}
+route-map {{ item.name }} permit {{ item.sequence }}
+   match ip address prefix-list {{ item.match_prefix_list }}
+{% if item.set_tag %}
+   set tag {{ item.set_tag }}
+{% endif %}
+{% elif item.op == "add_redistribution_statement" %}
+{{ render_statement(item) }}
+{% elif item.op == "replace_redistribution_statement" %}
+{% set before = {"from_protocol": item.from_protocol, "to_protocol": item.to_protocol, "target_process": item.target_process, "source_process": item.source_process, "subnets": item.subnets, "route_map": item.before_route_map} %}
+{{ render_statement(before, true) }}
+{% set after = {"from_protocol": item.from_protocol, "to_protocol": item.to_protocol, "target_process": item.target_process, "source_process": item.source_process, "subnets": item.subnets, "route_map": item.after_route_map} %}
+{{ render_statement(after) }}
+{% endif %}
+{% endfor %}
+{% else %}
 {{ render_boundary(redistribution) }}
 {% if reverse_redistribution %}
 {{ render_boundary(reverse_redistribution) }}
+{% endif %}
 {% endif %}
 """
 

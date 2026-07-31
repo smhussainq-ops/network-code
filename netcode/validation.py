@@ -262,6 +262,82 @@ class StaticValidator:
     def _routing_redistribution_policy(self, intent, render: RenderResult) -> CheckResult:
         items = redistribution_items(intent)
         supported = {("bgp", "ospf"), ("ospf", "bgp")}
+        if intent.operations:
+            if (
+                intent.evidence_contract.get("schema")
+                != "rez.redistribution-evidence.v1"
+                or intent.evidence_contract.get("sufficient_for_draft") is not True
+            ):
+                return self._fail(
+                    "routing_redistribution_policy",
+                    "Route Redistribution Policy",
+                    "Evidence-scoped redistribution requires an approved sufficiency contract.",
+                )
+            expected_fragments: list[str] = []
+            for operation in intent.operations:
+                if operation.op == "add_prefix_list_entry":
+                    fragment = (
+                        f"ip prefix-list {operation.name} seq {operation.sequence} "
+                        f"permit {operation.prefix}"
+                    )
+                    if operation.ge is not None:
+                        fragment += f" ge {operation.ge}"
+                    fragment += f" le {operation.le}"
+                    expected_fragments.append(fragment)
+                elif operation.op == "add_route_map_sequence":
+                    expected_fragments.extend([
+                        f"route-map {operation.name} permit {operation.sequence}",
+                        f"match ip address prefix-list {operation.match_prefix_list}",
+                    ])
+                    if operation.set_tag is not None:
+                        expected_fragments.append(f"set tag {operation.set_tag}")
+                elif operation.op == "add_redistribution_statement":
+                    statement = (
+                        f"redistribute {operation.from_protocol} "
+                        f"{operation.source_process}"
+                    )
+                    if operation.subnets:
+                        statement += " subnets"
+                    statement += f" route-map {operation.route_map}"
+                    expected_fragments.append(statement)
+                elif operation.op == "replace_redistribution_statement":
+                    before = (
+                        f"redistribute {operation.from_protocol} "
+                        f"{operation.source_process}"
+                    )
+                    if operation.subnets:
+                        before += " subnets"
+                    if operation.before_route_map:
+                        before += f" route-map {operation.before_route_map}"
+                    after = (
+                        f"redistribute {operation.from_protocol} "
+                        f"{operation.source_process}"
+                    )
+                    if operation.subnets:
+                        after += " subnets"
+                    after += f" route-map {operation.after_route_map}"
+                    expected_fragments.extend([
+                        f"no {before}",
+                        after,
+                    ])
+            missing = [
+                fragment for fragment in expected_fragments
+                if fragment not in render.config
+            ]
+            if missing:
+                return self._fail(
+                    "routing_redistribution_policy",
+                    "Route Redistribution Policy",
+                    "Rendered config does not match the exact evidence-scoped delta.",
+                    missing_fragments=missing,
+                )
+            return self._pass(
+                "routing_redistribution_policy",
+                "Route Redistribution Policy",
+                "Rendered config is limited to an exact approved evidence delta with an exact rollback.",
+                operation_count=len(intent.operations),
+                evidence_schema=intent.evidence_contract.get("schema"),
+            )
         for item in items:
             if (item.from_protocol, item.to_protocol) not in supported:
                 return self._fail(

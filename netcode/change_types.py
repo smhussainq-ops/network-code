@@ -276,7 +276,72 @@ def redistribution_items(intent: RoutingRedistributionIntent) -> list:
     return items
 
 
+def _redistribution_statement_lines(
+    operation: Any,
+    *,
+    negate: bool,
+    route_map: str,
+) -> list[str]:
+    source = operation.from_protocol
+    if operation.source_process:
+        source = f"{source} {operation.source_process}"
+    if operation.subnets:
+        source = f"{source} subnets"
+    if route_map:
+        source = f"{source} route-map {route_map}"
+    statement = f"{'no ' if negate else ''}redistribute {source}"
+    if operation.to_protocol == "bgp":
+        return [
+            f"router bgp {operation.target_process}",
+            "   address-family ipv4",
+            f"      {statement}",
+        ]
+    return [
+        f"router ospf {operation.target_process}",
+        f"   {statement}",
+    ]
+
+
+def _rollback_evidence_scoped_redistribution(
+    intent: RoutingRedistributionIntent,
+) -> str:
+    lines: list[str] = []
+    for operation in intent.rollback_operations:
+        if operation.op == "remove_prefix_list_entry":
+            lines.append(
+                f"no ip prefix-list {operation.name} seq {operation.sequence}"
+            )
+        elif operation.op == "remove_route_map_sequence":
+            lines.append(
+                f"no route-map {operation.name} permit {operation.sequence}"
+            )
+        elif operation.op == "remove_redistribution_statement":
+            lines.extend(_redistribution_statement_lines(
+                operation,
+                negate=True,
+                route_map=operation.route_map,
+            ))
+        elif operation.op == "restore_redistribution_statement":
+            lines.extend(_redistribution_statement_lines(
+                operation,
+                negate=True,
+                route_map=operation.current_route_map,
+            ))
+            lines.extend(_redistribution_statement_lines(
+                operation,
+                negate=False,
+                route_map=operation.restore_route_map,
+            ))
+        else:
+            raise ValueError(
+                f"Unsupported redistribution rollback operation {operation.op}"
+            )
+    return "\n".join(lines) + ("\n" if lines else "")
+
+
 def _rollback_routing_redistribution(intent: RoutingRedistributionIntent) -> str:
+    if intent.operations:
+        return _rollback_evidence_scoped_redistribution(intent)
     blocks: list[str] = []
     for item in reversed(redistribution_items(intent)):
         if item.to_protocol == "bgp":
@@ -363,10 +428,16 @@ register(ChangeTypeSpec(
         "   match ip address prefix-list ",
         "   set tag ",
         "router ospf ",
-        "   redistribute bgp route-map ",
+        "redistribute bgp ",
+        "no redistribute bgp ",
+        "   redistribute bgp ",
+        "   no redistribute bgp ",
         "router bgp ",
         "   address-family ipv4",
-        "      redistribute ospf route-map ",
+        "redistribute ospf ",
+        "no redistribute ospf ",
+        "      redistribute ospf ",
+        "      no redistribute ospf ",
     ],
     block_carveouts=[
         "router ospf", "redistribute bgp", "router bgp", "address-family ipv4",

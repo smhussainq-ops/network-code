@@ -25,6 +25,12 @@ from netcode.firewall_managers import (
     ManagerScope,
     capabilities_from_probe,
 )
+from netcode.network_model import NETWORK_MODEL_SCHEMA
+from netcode.network_model_lifecycle import (
+    activate_verified_revision,
+    approve_with_git,
+)
+from netcode.network_model_store import NetworkModelRepository
 from netcode.paths import WorkspacePaths
 from netcode.runner_hub import sign_result, submit_job_result
 from netcode.store import PlatformStore
@@ -192,6 +198,93 @@ def run_story(workspace: Path) -> dict[str, Any]:
     from netcode import api  # Import after the workspace and static tree exist.
 
     store = PlatformStore(paths)
+    model_repository = NetworkModelRepository(store)
+    model_repository.create_revision(
+        {
+            "schema": NETWORK_MODEL_SCHEMA,
+            "org_id": "org_default",
+            "environment_id": "env-marcus-cross-domain",
+            "revision_id": "marcus-cross-domain-approved-v1",
+            "status": "proposed",
+            "source": {
+                "type": "manual_review",
+                "reference": "approved:marcus-cross-domain-approved-v1",
+            },
+            "coverage": {
+                "domains": [
+                    "identity",
+                    "sites",
+                    "routing",
+                    "route_propagation",
+                ]
+            },
+            "authority_bindings": {
+                domain: {"source": "manual_review", "mode": "propose"}
+                for domain in (
+                    "identity",
+                    "sites",
+                    "routing",
+                    "route_propagation",
+                )
+            },
+            "model": {
+                "prefix_classes": {
+                    "branch204-return": ["10.204.20.0/24"],
+                },
+                "sites": {
+                    "Data-Center": {
+                        "devices": {
+                            "dc-core-01": {
+                                "role": "core",
+                                "platform": "arista_eos",
+                            }
+                        },
+                        "redistribution_boundaries": [
+                            {
+                                "id": "branch204-return",
+                                "devices": ["dc-core-01"],
+                                "from_protocol": "ospf",
+                                "to_protocol": "bgp",
+                                "target_process": "65010",
+                                "source_process": "1",
+                                "vrf": "default",
+                                "route_map": "BR204-RETURN",
+                                "prefix_list": "BR204-RETURN",
+                                "prefix_classes": ["branch204-return"],
+                                "route_tag": 20420,
+                            }
+                        ],
+                    }
+                },
+                "devices": {
+                    "dc-core-01": {
+                        "site": "Data-Center",
+                        "role": "core",
+                        "platform": "arista_eos",
+                    },
+                },
+            },
+        },
+        created_by="network-architecture",
+    )
+    approve_with_git(
+        model_repository,
+        org_id="org_default",
+        environment_id="env-marcus-cross-domain",
+        revision_id="marcus-cross-domain-approved-v1",
+        approved_by="network-architecture",
+        git_root=paths.git_workspace,
+    )
+    activate_verified_revision(
+        model_repository,
+        store,
+        org_id="org_default",
+        environment_id="env-marcus-cross-domain",
+        revision_id="marcus-cross-domain-approved-v1",
+        actor="network-architecture",
+        git_root=paths.git_workspace,
+        initial_baseline=True,
+    )
     runner = store.create_runner("branch-runner", "branch", "runner-token-hash", "runner-hmac")
     ownership = manager_ownership().public_dict()
     store.sync_runner_devices(
@@ -289,12 +382,65 @@ def run_story(workspace: Path) -> dict[str, Any]:
         }
     )
 
+    remediation_operation = {
+        "op": "add_prefix_list_entry",
+        "name": "BR204-RETURN",
+        "sequence": 20,
+        "action": "permit",
+        "prefix": "10.204.20.0/24",
+        "le": 32,
+    }
+    remediation_rollback = {
+        "op": "remove_prefix_list_entry",
+        "name": "BR204-RETURN",
+        "sequence": 20,
+    }
+    remediation_evidence = {
+        "schema": "rez.redistribution-evidence.v1",
+        "platform": "arista_eos",
+        "site": "Data-Center",
+        "boundary_id": "branch204-return",
+        "vrf": "default",
+        "device_id": "dc-core-01",
+        "environment_id": "env-marcus-cross-domain",
+        "model_revision_id": "marcus-cross-domain-approved-v1",
+        "root_atom_id": "CP_REDISTRIBUTION_GAP",
+        "dependency_id": (
+            "design:Data-Center:redistribution:"
+            "branch204-return:dc-core-01"
+        ),
+        "direction": {
+            "from_protocol": "ospf",
+            "to_protocol": "bgp",
+            "target_process": "65010",
+        },
+        "approved_policy": {
+            "route_map": "BR204-RETURN",
+            "prefix_list": "BR204-RETURN",
+            "prefixes": ["10.204.20.0/24"],
+            "route_tag": 20420,
+        },
+        "observed_statement": {
+            "target_process": "65010",
+            "route_map": "BR204-RETURN",
+            "statement_sha256": "a" * 64,
+        },
+        "classification": "prefix_policy_scope_gap",
+        "affected_prefixes": ["10.204.20.0/24"],
+        "operations": [remediation_operation],
+        "rollback_operations": [remediation_rollback],
+        "missing_proof": [],
+        "sufficient_for_draft": True,
+        "fresh": True,
+        "live_root_confirmed": True,
+        "approved_direction_confirmed": True,
+    }
     remediation_payload = {
         "source": "rez",
         "proposal_schema": "netcode.remediation.v1",
-        "proposal_source": "rez_structured_rca",
+        "proposal_source": "site_operational_context",
         "root_confirmed": True,
-        "root_atom_id": "CONFIG_ROUTE_REDISTRIBUTION_MISSING",
+        "root_atom_id": "CP_REDISTRIBUTION_GAP",
         "incident_id": "INC-2048",
         "target_device": "dc-core-01",
         "suggested_pack": "routing_redistribution",
@@ -303,6 +449,9 @@ def run_story(workspace: Path) -> dict[str, Any]:
         "rationale": "Fresh exact-flow evidence confirmed that firewall policy, NAT, and SD-WAN pass while the return route is absent.",
         "confidence": 0.98,
         "evidence_refs": [failed_evidence_job, deploy_job["id"], "live:return_route:Branch-204"],
+        "environment_id": "env-marcus-cross-domain",
+        "model_revision_id": "marcus-cross-domain-approved-v1",
+        "evidence_contract": remediation_evidence,
         "proposed_intent": {
             "change_type": "routing_redistribution",
             "site": "Data-Center",
@@ -316,6 +465,9 @@ def run_story(workspace: Path) -> dict[str, Any]:
                 "prefixes": ["10.204.20.0/24"],
                 "route_tag": 20420,
             },
+            "operations": [remediation_operation],
+            "rollback_operations": [remediation_rollback],
+            "evidence_contract": remediation_evidence,
             "reachability_checks": [
                 {"source_device": "branch-edge-03", "source_ip": "10.204.20.10", "destination": "10.40.8.25"}
             ],

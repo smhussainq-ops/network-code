@@ -222,6 +222,97 @@ class RoutingReachabilityCheck(BaseModel):
         return str(address)
 
 
+class RoutingRedistributionOperation(BaseModel):
+    op: Literal[
+        "add_prefix_list_entry",
+        "remove_prefix_list_entry",
+        "add_route_map_sequence",
+        "remove_route_map_sequence",
+        "add_redistribution_statement",
+        "remove_redistribution_statement",
+        "replace_redistribution_statement",
+        "restore_redistribution_statement",
+    ]
+    name: str = ""
+    sequence: int | None = None
+    action: Literal["permit", "deny"] | None = None
+    prefix: str = ""
+    ge: int | None = None
+    le: int | None = None
+    match_prefix_list: str = ""
+    set_tag: int | None = None
+    from_protocol: Literal["bgp", "ospf"] | None = None
+    to_protocol: Literal["bgp", "ospf"] | None = None
+    target_process: str = ""
+    address_family: str = "ipv4-unicast"
+    route_map: str = ""
+    before_route_map: str = ""
+    after_route_map: str = ""
+    restore_route_map: str = ""
+    current_route_map: str = ""
+    source_process: str = ""
+    subnets: bool = False
+
+    @model_validator(mode="after")
+    def exact_safe_operation(self) -> "RoutingRedistributionOperation":
+        identifiers = (
+            self.name,
+            self.match_prefix_list,
+            self.target_process,
+            self.route_map,
+            self.before_route_map,
+            self.after_route_map,
+            self.restore_route_map,
+            self.current_route_map,
+            self.source_process,
+        )
+        if any(
+            value and not all(character.isalnum() or character in "_.-" for character in value)
+            for value in identifiers
+        ):
+            raise ValueError("redistribution operation identifiers contain unsupported characters")
+        if self.op in {"add_prefix_list_entry", "remove_prefix_list_entry"}:
+            if not self.name or self.sequence is None or self.sequence < 1:
+                raise ValueError("prefix-list operations require an exact name and positive sequence")
+            if self.op == "add_prefix_list_entry":
+                network = ip_network(self.prefix, strict=False)
+                if (
+                    self.action != "permit"
+                    or network.version != 4
+                    or network.prefixlen == 0
+                    or self.le != 32
+                ):
+                    raise ValueError("prefix-list additions require a scoped IPv4 permit through /32")
+        elif self.op in {"add_route_map_sequence", "remove_route_map_sequence"}:
+            if not self.name or self.sequence is None or self.sequence < 1:
+                raise ValueError("route-map operations require an exact name and positive sequence")
+            if self.op == "add_route_map_sequence" and (
+                self.action != "permit" or not self.match_prefix_list
+            ):
+                raise ValueError("route-map additions require a permit and bound prefix-list")
+        else:
+            if (
+                self.from_protocol is None
+                or self.to_protocol is None
+                or self.from_protocol == self.to_protocol
+                or not self.target_process
+            ):
+                raise ValueError("redistribution statement operations require an exact protocol boundary")
+            if not self.source_process:
+                raise ValueError(
+                    "redistribution statement operations require an exact source process"
+                )
+            if self.address_family != "ipv4-unicast":
+                raise ValueError("only the normalized ipv4-unicast address family is supported")
+            if self.op in {"add_redistribution_statement", "remove_redistribution_statement"} and not self.route_map:
+                raise ValueError("redistribution add/remove operations require an exact route-map")
+            if self.op == "replace_redistribution_statement" and not self.after_route_map:
+                raise ValueError("redistribution replacement requires the approved route-map")
+            if self.op == "restore_redistribution_statement" and not self.current_route_map:
+                raise ValueError("redistribution restoration requires the currently applied route-map")
+        return self
+
+
 class RoutingRedistributionIntent(BaseModel):
     change_type: Literal["routing_redistribution"] = "routing_redistribution"
     site: str
@@ -229,6 +320,9 @@ class RoutingRedistributionIntent(BaseModel):
     redistribution: RoutingRedistributionSpec
     reverse_redistribution: RoutingRedistributionSpec | None = None
     reachability_checks: list[RoutingReachabilityCheck] = Field(default_factory=list)
+    operations: list[RoutingRedistributionOperation] = Field(default_factory=list)
+    rollback_operations: list[RoutingRedistributionOperation] = Field(default_factory=list)
+    evidence_contract: dict[str, Any] = Field(default_factory=dict)
     policy: PolicySpec = Field(default_factory=PolicySpec)
     metadata: IntentMetadata = Field(default_factory=IntentMetadata)
 
@@ -245,6 +339,10 @@ class RoutingRedistributionIntent(BaseModel):
                 or reverse.to_protocol != self.redistribution.from_protocol
             ):
                 raise ValueError("reverse_redistribution must reverse the primary protocol direction")
+        if bool(self.operations) != bool(self.rollback_operations):
+            raise ValueError("evidence-scoped operations require exact rollback operations")
+        if self.operations and len(self.operations) != len(self.rollback_operations):
+            raise ValueError("every evidence-scoped operation requires one exact rollback")
         return self
 
 
