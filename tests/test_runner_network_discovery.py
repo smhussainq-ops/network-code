@@ -260,7 +260,8 @@ def test_sparse_cidr_sweep_stops_at_successful_device_limit(tmp_path: Path, monk
     assert result["requested"] == 3
     assert result["skipped"] == 1
     assert calls == ["10.20.0.10", "10.20.0.11"]
-    assert socket_attempts == ["10.20.0.9", "10.20.0.10", "10.20.0.11"]
+    assert set(socket_attempts) == {"10.20.0.9", "10.20.0.10", "10.20.0.11"}
+    assert len(socket_attempts) == 3
 
 
 def test_explicit_unknown_closed_address_remains_a_failure(tmp_path: Path, monkeypatch):

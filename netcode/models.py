@@ -398,6 +398,7 @@ class CustomConfigSpec(BaseModel):
     config_lines: str
     rollback_lines: str = ""
     verify_contains: str = ""
+    verify_absent: bool = False
     description: str = ""
     acknowledge_no_rollback: bool = False
 

@@ -280,6 +280,132 @@ def _activate_evidence_model(
     )
 
 
+def _activate_route_shadow_model(tmp_path: Path) -> None:
+    workspace = WorkspacePaths(tmp_path.resolve())
+    store = PlatformStore(workspace)
+    repository = NetworkModelRepository(store)
+    repository.create_revision(
+        {
+            "schema": NETWORK_MODEL_SCHEMA,
+            "org_id": "org_default",
+            "environment_id": "env-route-shadow",
+            "revision_id": "route-shadow-approved-v1",
+            "status": "proposed",
+            "source": {
+                "type": "manual_review",
+                "reference": "approved:route-shadow-approved-v1",
+            },
+            "coverage": {
+                "domains": ["identity", "sites", "routing", "address_plan"]
+            },
+            "authority_bindings": {
+                domain: {"source": "manual_review", "mode": "propose"}
+                for domain in ("identity", "sites", "routing", "address_plan")
+            },
+            "model": {
+                "sites": {
+                    "remote4": {
+                        "devices": {
+                            "v2-store1": {
+                                "role": "branch",
+                                "platform": "arista_eos",
+                            },
+                        },
+                        "address_plan": [{
+                            "name": "remote4-users",
+                            "prefix": "10.90.90.0/24",
+                            "ownership": "site",
+                        }],
+                    },
+                    "store5": {
+                        "devices": {
+                            "v2-store3": {
+                                "role": "branch",
+                                "platform": "arista_eos",
+                            },
+                        },
+                    },
+                },
+                "devices": {
+                    "v2-store1": {
+                        "site": "remote4",
+                        "role": "branch",
+                        "platform": "arista_eos",
+                    },
+                    "v2-store3": {
+                        "site": "store5",
+                        "role": "branch",
+                        "platform": "arista_eos",
+                    },
+                },
+            },
+        },
+        created_by="route-reviewer",
+    )
+    approve_with_git(
+        repository,
+        org_id="org_default",
+        environment_id="env-route-shadow",
+        revision_id="route-shadow-approved-v1",
+        approved_by="route-reviewer",
+        git_root=workspace.git_workspace,
+    )
+    activate_verified_revision(
+        repository,
+        store,
+        org_id="org_default",
+        environment_id="env-route-shadow",
+        revision_id="route-shadow-approved-v1",
+        actor="route-reviewer",
+        git_root=workspace.git_workspace,
+        initial_baseline=True,
+    )
+
+
+def _route_shadow_proposal() -> dict:
+    observed = "ip route 10.90.90.0/25 Null0"
+    proof = {
+        "schema": "rez.route-shadow-evidence.v1",
+        "sufficient_for_draft": True,
+        "fresh": True,
+        "live_root_confirmed": True,
+        "root_atom_id": "L3_ROUTE_SOURCE_SHADOW",
+        "device_id": "v2-store3",
+        "vrf": "default",
+        "specific_prefix": "10.90.90.0/25",
+        "broad_prefix": "10.90.90.0/24",
+        "discard_next_hop": "null0",
+        "approved_owner_site": "remote4",
+        "approved_owner_device": "v2-store1",
+        "observed_config_line": observed,
+        "removal_line": f"no {observed}",
+        "rollback_line": observed,
+        "environment_id": "env-route-shadow",
+        "model_revision_id": "route-shadow-approved-v1",
+    }
+    return _confirmed_proposal({
+        "root_atom_id": "L3_ROUTE_SOURCE_SHADOW",
+        "proposal_source": "site_operational_context",
+        "source": "rez",
+        "incident_id": "INC-ROUTE-SHADOW",
+        "target_device": "v2-store3",
+        "suggested_pack": "custom_config",
+        "rationale": "Remove the proven more-specific discard route.",
+        "environment_id": "env-route-shadow",
+        "model_revision_id": "route-shadow-approved-v1",
+        "evidence_contract": proof,
+        "proposed_intent": {
+            "change_type": "custom_config",
+            "site": "store5",
+            "targets": {"device_ids": ["v2-store3"]},
+            "config_lines": f"no {observed}",
+            "rollback_lines": observed,
+            "verify_contains": observed,
+            "verify_absent": True,
+        },
+    })
+
+
 def test_rca_remediation_runs_static_validation_without_jobs(tmp_path: Path, monkeypatch):
     init_workspace(WorkspacePaths(tmp_path))
     monkeypatch.chdir(tmp_path)
@@ -343,6 +469,87 @@ def test_rca_remediation_runs_static_validation_without_jobs(tmp_path: Path, mon
     assert len(events) == 1
     assert events[0].action == "rca_proposal"
     assert events[0].to_state == "blocked"
+
+
+def test_route_shadow_remediation_is_exact_reversible_and_draft_only(
+    tmp_path: Path,
+    monkeypatch,
+):
+    init_workspace(WorkspacePaths(tmp_path))
+    _activate_route_shadow_model(tmp_path)
+    monkeypatch.chdir(tmp_path)
+
+    response = TestClient(api.app).post(
+        "/api/changes/from-rca",
+        json=_route_shadow_proposal(),
+    )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["draft_only"] is True
+    assert body["human_approval_required"] is True
+    failed_checks = [
+        check
+        for check in body["change"]["result"]["pipeline"]["validation"]["checks"]
+        if check["status"] == "fail"
+    ]
+    assert body["change"]["workflow_state"] == "validated", failed_checks
+    assert body["intent"]["custom"] == {
+        "config_lines": "no ip route 10.90.90.0/25 Null0",
+        "rollback_lines": "ip route 10.90.90.0/25 Null0",
+        "verify_contains": "ip route 10.90.90.0/25 Null0",
+        "verify_absent": True,
+        "description": "Remove the proven more-specific discard route.",
+        "acknowledge_no_rollback": False,
+    }
+    assert body["change"]["result"]["plan"]["commands"] == (
+        "no ip route 10.90.90.0/25 Null0\n"
+    )
+    assert body["change"]["result"]["plan"]["rollback"] == (
+        "ip route 10.90.90.0/25 Null0\n"
+    )
+    assert PlatformStore(WorkspacePaths(tmp_path.resolve())).list_jobs() == []
+
+
+@pytest.mark.parametrize(
+    ("mutator", "expected_detail"),
+    [
+        (
+            lambda payload: payload["proposed_intent"].update(
+                {"config_lines": "no ip route 10.90.90.0/24 Null0"}
+            ),
+            "exact reversible inverse",
+        ),
+        (
+            lambda payload: payload["evidence_contract"].update(
+                {"approved_owner_device": "v2-store3"}
+            ),
+            "one exact owner",
+        ),
+        (
+            lambda payload: payload["proposed_intent"].update(
+                {"verify_absent": False}
+            ),
+            "exact reversible inverse",
+        ),
+    ],
+)
+def test_route_shadow_remediation_rejects_tampered_scope_or_commands(
+    tmp_path: Path,
+    monkeypatch,
+    mutator,
+    expected_detail: str,
+):
+    init_workspace(WorkspacePaths(tmp_path))
+    _activate_route_shadow_model(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    payload = _route_shadow_proposal()
+    mutator(payload)
+
+    response = TestClient(api.app).post("/api/changes/from-rca", json=payload)
+
+    assert response.status_code == 400
+    assert expected_detail in response.json()["detail"]
 
 
 def test_rca_remediation_preserves_known_typed_intent(tmp_path: Path, monkeypatch):

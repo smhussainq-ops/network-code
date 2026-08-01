@@ -831,17 +831,25 @@ class AristaEOSLabAdapter(ExecutionAdapter):
         command = "show running-config"
         output = self.show(command)
         found = needle in output if needle else False
-        seen = found if present else not found
+        expected_found = present != intent.custom.verify_absent
+        seen = found is expected_found
+        expected_state = "present" if expected_found else "absent"
         return LabResult(
             status="pass" if seen else "fail",
             action="verify" if present else "verify_rollback",
             device_id=self.device.id,
             message=(
-                f"Custom config fragment {'is present' if found else 'is absent'} in running-config: {needle!r}."
+                f"Custom config fragment {'is present' if found else 'is absent'} in running-config; "
+                f"expected {expected_state}: {needle!r}."
                 if needle
                 else "No verify fragment available for this custom config."
             ),
-            evidence={"command": command, "needle": needle, "found": found},
+            evidence={
+                "command": command,
+                "needle": needle,
+                "found": found,
+                "expected_found": expected_found,
+            },
         )
 
 

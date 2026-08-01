@@ -516,6 +516,7 @@ def _build_custom(common: dict, values: dict, device_id: str) -> dict:
         "config_lines": str(values.get("config_lines", "")),
         "rollback_lines": str(values.get("rollback_lines", "")),
         "verify_contains": str(values.get("verify_contains", "")),
+        "verify_absent": bool(values.get("verify_absent", False)),
         "description": str(values.get("description", "")),
         "acknowledge_no_rollback": bool(values.get("acknowledge_no_rollback", False)),
     }
@@ -540,9 +541,10 @@ def _rollback_confidence_custom(intent: CustomConfigIntent) -> dict:
 
 def _checks_custom(intent: CustomConfigIntent) -> dict:
     needle = intent.custom.verify_contains.strip() or _custom_first_line(intent)
+    expectation = "does not contain" if intent.custom.verify_absent else "contains"
     return {
         "pre": [{"id": "rollback_supplied", "description": "Rollback commands are supplied (or no-rollback is explicitly acknowledged).", "executable": True}],
-        "post": [{"id": "running_config_contains", "description": f"Running config contains: {needle}", "executable": True}],
+        "post": [{"id": "running_config_matches", "description": f"Running config {expectation}: {needle}", "executable": True}],
     }
 
 
@@ -554,7 +556,10 @@ register(ChangeTypeSpec(
     rollback=lambda i: f"{i.custom.rollback_lines.strip()}\n" if i.custom.rollback_lines.strip() else "",
     rollback_confidence=_rollback_confidence_custom,
     blast_objects=_blast_custom, checks=_checks_custom,
-    verification_hint=lambda i: {"check": "running_config_contains", "params": {"section": i.custom.verify_contains.strip() or _custom_first_line(i)}},
+    verification_hint=lambda i: {
+        "check": "running_config_absent" if i.custom.verify_absent else "running_config_contains",
+        "params": {"section": i.custom.verify_contains.strip() or _custom_first_line(i)},
+    },
     policy_checks=["_custom_config_policy"], verify_method="_verify_custom",
     allow_prefixes=[],
 ))

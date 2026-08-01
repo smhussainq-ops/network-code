@@ -718,6 +718,12 @@ _RCA_PROPOSAL_SOURCES = {
     "site_operational_context",
     "human_reviewed_rca",
 }
+_RCA_ROUTE_SHADOW_EVIDENCE_SCHEMA = "rez.route-shadow-evidence.v1"
+_RCA_ROUTE_SHADOW_ROOTS = {
+    "CP_ROUTE_BLACKHOLE",
+    "L3_ROUTE_SOURCE_SHADOW",
+    "L3_ROUTE_SPECIFICITY_OVERRIDE",
+}
 _RCA_NON_ACTIONABLE_ROOTS = {"AGENT_VALIDATED_FINDING"}
 _RCA_NON_ACTIONABLE_PREFIXES = ("CI_", "DATA_GAP", "XL_")
 
@@ -1307,6 +1313,198 @@ def _require_redistribution_evidence(
     return target_platform
 
 
+def _parse_static_discard_line(value: object) -> tuple[str, str] | None:
+    line = re.sub(r"\s+", " ", str(value or "")).strip()
+    match = re.fullmatch(
+        r"ip route(?: vrf (?P<vrf>\S+))? "
+        r"(?P<network>\d{1,3}(?:\.\d{1,3}){3})"
+        r"(?:(?:/(?P<prefixlen>\d{1,2}))|(?: (?P<mask>\d{1,3}(?:\.\d{1,3}){3}))) "
+        r"(?P<next_hop>Null0|null|discard|blackhole|reject)",
+        line,
+        re.IGNORECASE,
+    )
+    if match is None:
+        return None
+    try:
+        prefix = str(
+            ip_network(
+                (
+                    f"{match.group('network')}/{match.group('prefixlen')}"
+                    if match.group("prefixlen")
+                    else f"{match.group('network')}/{match.group('mask')}"
+                ),
+                strict=False,
+            )
+        )
+    except ValueError:
+        return None
+    return prefix, str(match.group("vrf") or "default").strip().lower()
+
+
+def _require_route_shadow_evidence(
+    request: RcaRemediationProposalRequest,
+    *,
+    store: PlatformStore,
+    org_id: str,
+) -> str:
+    root_atom = request.root_atom_id.strip().upper()
+    if root_atom not in _RCA_ROUTE_SHADOW_ROOTS:
+        return ""
+    proposed = _safe_proposal_dict(request.proposed_intent)
+    proof = _safe_proposal_dict(request.evidence_contract)
+    if (
+        request.proposal_source.strip() != "site_operational_context"
+        or str(proposed.get("change_type") or "") != "custom_config"
+        or proof.get("schema") != _RCA_ROUTE_SHADOW_EVIDENCE_SCHEMA
+        or proof.get("sufficient_for_draft") is not True
+        or proof.get("fresh") is not True
+        or proof.get("live_root_confirmed") is not True
+        or str(proof.get("root_atom_id") or "").strip().upper() != root_atom
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="Exact fresh approved route-shadow evidence is required.",
+        )
+
+    environment_id = request.environment_id.strip()
+    revision_id = request.model_revision_id.strip()
+    if (
+        not environment_id
+        or not revision_id
+        or str(proof.get("environment_id") or "") != environment_id
+        or str(proof.get("model_revision_id") or "") != revision_id
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="Route-shadow evidence is not bound to this environment and model.",
+        )
+    active = NetworkModelRepository(store).active_revision(org_id, environment_id)
+    if (
+        not active
+        or active.get("status") != "active"
+        or active.get("revision_id") != revision_id
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail="Route-shadow evidence must reference the current active approved model.",
+        )
+
+    target_device = request.target_device.strip()
+    targets = _proposal_targets(request)
+    target_ids = targets.get("device_ids")
+    if (
+        not target_device
+        or not isinstance(target_ids, list)
+        or target_ids != [target_device]
+        or str(proof.get("device_id") or "") != target_device
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="Route-shadow evidence must bind exactly one target device.",
+        )
+
+    observed_line = re.sub(
+        r"\s+",
+        " ",
+        str(proof.get("observed_config_line") or ""),
+    ).strip()
+    parsed = _parse_static_discard_line(observed_line)
+    specific_prefix = str(proof.get("specific_prefix") or "").strip()
+    broad_prefix = str(proof.get("broad_prefix") or "").strip()
+    if parsed is None or parsed[0] != specific_prefix:
+        raise HTTPException(
+            status_code=400,
+            detail="Route-shadow evidence lacks one exact static discard route.",
+        )
+    try:
+        specific_network = ip_network(specific_prefix, strict=False)
+        broad_network = ip_network(broad_prefix, strict=False)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail="Route-shadow evidence contains an invalid prefix.",
+        ) from exc
+    if (
+        specific_network.version != 4
+        or broad_network.version != 4
+        or specific_network.prefixlen <= broad_network.prefixlen
+        or not specific_network.subnet_of(broad_network)
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="The discard route is not a more-specific of the approved owner prefix.",
+        )
+
+    expected_remove = f"no {observed_line}"
+    if (
+        str(proof.get("removal_line") or "").strip() != expected_remove
+        or str(proof.get("rollback_line") or "").strip() != observed_line
+        or _proposal_lines(proposed.get("config_lines")) != expected_remove
+        or _proposal_lines(proposed.get("rollback_lines")) != observed_line
+        or str(proposed.get("verify_contains") or "").strip() != observed_line
+        or proposed.get("verify_absent") is not True
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="Route-shadow commands are not the exact reversible inverse of live evidence.",
+        )
+
+    model = active.get("model") if isinstance(active.get("model"), dict) else {}
+    sites = model.get("sites") if isinstance(model.get("sites"), dict) else {}
+    owner_site = str(proof.get("approved_owner_site") or "").strip()
+    owner_device = str(proof.get("approved_owner_device") or "").strip()
+    owner = sites.get(owner_site) if isinstance(sites.get(owner_site), dict) else {}
+    owner_devices = owner.get("devices") if isinstance(owner.get("devices"), dict) else {}
+    owner_prefixes = []
+    for item in _model_records(owner.get("address_plan")):
+        if str(item.get("ownership") or "site").strip().lower() != "site":
+            continue
+        try:
+            owner_prefixes.append(ip_network(str(item.get("prefix") or ""), strict=False))
+        except ValueError:
+            continue
+    if (
+        not owner
+        or owner_device not in owner_devices
+        or owner_prefixes.count(broad_network) != 1
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="The active model does not prove one exact owner for the shadowed prefix.",
+        )
+
+    target_site = str(proposed.get("site") or "").strip()
+    target = sites.get(target_site) if isinstance(sites.get(target_site), dict) else {}
+    target_devices = target.get("devices") if isinstance(target.get("devices"), dict) else {}
+    if target_device not in target_devices:
+        raise HTTPException(
+            status_code=400,
+            detail="The target device is not part of the proposed approved site.",
+        )
+    modeled_platform = str(
+        (
+            target_devices.get(target_device)
+            if isinstance(target_devices.get(target_device), dict)
+            else {}
+        ).get("platform")
+        or ""
+    ).strip().lower()
+    catalog_device = store.resolve_device(org_id, target_device)
+    catalog_platform = str((catalog_device or {}).get("platform") or "").strip().lower()
+    if modeled_platform and catalog_platform and modeled_platform != catalog_platform:
+        raise HTTPException(
+            status_code=409,
+            detail="The approved model and current catalog disagree on target platform.",
+        )
+    platform = catalog_platform or modeled_platform
+    if not platform:
+        raise HTTPException(
+            status_code=400,
+            detail="The route-shadow target platform is not proven.",
+        )
+    return platform
+
+
 def _proposal_targets(request: RcaRemediationProposalRequest) -> dict[str, object]:
     raw_targets = request.proposed_intent.get("targets")
     if isinstance(raw_targets, dict):
@@ -1444,6 +1642,7 @@ def _intent_from_rca_proposal(request: RcaRemediationProposalRequest) -> dict[st
                 "config_lines": config_lines,
                 "rollback_lines": rollback_lines,
                 "verify_contains": str(proposed.get("verify_contains") or "").strip(),
+                "verify_absent": bool(proposed.get("verify_absent", False)),
                 "description": request.rationale.strip() or request.title.strip() or "Draft created from Rez RCA.",
                 "acknowledge_no_rollback": not bool(rollback_lines.strip()),
             },
@@ -6530,6 +6729,11 @@ def api_change_from_rca(request: RcaRemediationProposalRequest, http_request: Re
     store = PlatformStore(p)
     _require_confirmed_rca_provenance(request)
     target_platform = _require_redistribution_evidence(
+        request,
+        store=store,
+        org_id=principal.org_id,
+    )
+    target_platform = target_platform or _require_route_shadow_evidence(
         request,
         store=store,
         org_id=principal.org_id,
