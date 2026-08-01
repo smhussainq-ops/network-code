@@ -169,7 +169,7 @@ def test_shell_termination_is_runner_scoped_and_persists_reason(tmp_path: Path) 
             runner_id=runner_id,
             runner_pool="pilot",
             transcript_path=str(tmp_path / f"{session_id}.jsonl"),
-            status="active",
+            status="open" if session_id == "shell-a" else "active",
         )
 
     terminated = store.terminate_active_shell_sessions(

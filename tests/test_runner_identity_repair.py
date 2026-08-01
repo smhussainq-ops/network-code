@@ -153,7 +153,7 @@ def test_repair_is_two_phase_recoverable_and_keeps_one_runner(
         runner_id=runner.id,
         runner_pool=runner.pool,
         transcript_path=str(tmp_path / "shell.jsonl"),
-        status="active",
+        status="open",
     )
     shell_block = client.post(
         "/api/runner/replacement/prepare",

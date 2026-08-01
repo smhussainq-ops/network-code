@@ -59,6 +59,14 @@ def test_shell_session_can_explicitly_clear_touch_state(tmp_path: Path):
     assert updated["device_touched"] is False
 
 
+def test_runner_shell_statuses_are_canonicalized() -> None:
+    for status in ("open", "opened", "connected", "online", "active"):
+        assert api._canonical_shell_transport_status(status) == "active"
+    for status in ("closed", "terminated", "error"):
+        assert api._canonical_shell_transport_status(status) == status
+    assert api._canonical_shell_transport_status("unexpected") == "active"
+
+
 def test_shell_transcript_survives_process_memory_loss(tmp_path: Path, monkeypatch):
     workspace = WorkspacePaths(tmp_path)
     init_workspace(workspace)

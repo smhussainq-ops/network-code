@@ -5067,6 +5067,15 @@ _RUNNER_CHANNEL_POOLS: dict[str, str] = {}           # runner_id -> pool
 _BROWSER_SOCKETS: dict[str, WebSocket] = {}          # session_id -> browser WS
 
 
+def _canonical_shell_transport_status(value: object) -> str:
+    status = str(value or "").strip().lower()
+    if status in {"open", "opened", "connected", "online", "active"}:
+        return "active"
+    if status in {"closed", "terminated", "error"}:
+        return status
+    return "active"
+
+
 async def _terminate_shells_for_runner(runner_id: str, reason: str) -> None:
     store = PlatformStore(paths())
     sessions = store.terminate_active_shell_sessions(reason=reason, runner_id=runner_id)
@@ -5116,7 +5125,7 @@ async def ws_runner_stream(ws: WebSocket) -> None:
             if frame.get("t") == "out":
                 _record_shell_output(sid, str(frame.get("d") or ""))
             elif frame.get("t") == "status":
-                shell_status = str(frame.get("s") or "active")
+                shell_status = _canonical_shell_transport_status(frame.get("s"))
                 PlatformStore(paths()).update_shell_session(sid, status=shell_status)
             if frame.get("t") == "event":
                 ev = frame.get("e") or {}

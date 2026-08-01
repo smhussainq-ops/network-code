@@ -1557,7 +1557,7 @@ class PlatformStore:
             raise RuntimeError("Connector repair is blocked while connector work is running.")
         active_shell = conn.execute(
             "SELECT id FROM shell_sessions WHERE org_id = ? AND runner_id = ? "
-            "AND status IN ('opened', 'active') LIMIT 1",
+            "AND status IN ('open', 'opened', 'active') LIMIT 1",
             (org_id, runner_id),
         ).fetchone()
         if active_shell:
@@ -2695,7 +2695,9 @@ class PlatformStore:
         reason: str,
         runner_id: str | None = None,
     ) -> list[dict[str, Any]]:
-        clauses = ["status IN ('opened', 'active')"]
+        # Older runners reported "open"; treat it as live so restarts and
+        # connector lifecycle actions cannot leave a phantom session behind.
+        clauses = ["status IN ('open', 'opened', 'active')"]
         params: list[Any] = []
         if runner_id:
             clauses.append("runner_id = ?")
