@@ -154,13 +154,13 @@ def _refresh_integrity(payload: dict) -> dict:
     return payload
 
 
-def _proposal() -> dict:
+def _proposal(*, root_atom_id: str = "NORMALIZED_CONFIRMED_ROOT") -> dict:
     payload = {
         "source": "rez",
         "proposal_schema": "netcode.remediation.v1",
         "proposal_source": "rez_agent_recommendation",
         "root_confirmed": True,
-        "root_atom_id": "NORMALIZED_CONFIRMED_ROOT",
+        "root_atom_id": root_atom_id,
         "incident_id": "INC-AGENT-RECOMMENDATION",
         "target_device": DEVICE_ID,
         "suggested_pack": "interface_config",
@@ -184,7 +184,7 @@ def _proposal() -> dict:
             "sufficient_for_draft": True,
             "fresh": True,
             "live_root_confirmed": True,
-            "root_atom_id": "NORMALIZED_CONFIRMED_ROOT",
+            "root_atom_id": root_atom_id,
             "root_digest": "a" * 64,
             "target_device": DEVICE_ID,
             "change_type": "interface_config",
@@ -244,6 +244,28 @@ def test_agent_desired_state_compiles_to_one_draft_with_rollback_and_risk(
     assert record.json()["plan"]["risk_assessment"] == risk
     store = PlatformStore(WorkspacePaths(tmp_path.resolve()))
     assert len(store.list_changes(org_id=ORG_ID)) == 1
+    assert store.list_jobs(org_id=ORG_ID) == []
+
+
+def test_real_interface_admin_down_payload_reaches_compiler_without_resigning(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    init_workspace(WorkspacePaths(tmp_path))
+    _activate_model(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    client = TestClient(api.app)
+    payload = _proposal(root_atom_id="L1_INTERFACE_ADMIN_DOWN")
+
+    response = client.post("/api/changes/from-rca", json=payload)
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["change"]["workflow_state"] == "validated"
+    assert "interface Ethernet3" in body["change"]["result"]["plan"]["commands"]
+    assert "no shutdown" in body["change"]["result"]["plan"]["commands"]
+    assert "shutdown" in body["change"]["result"]["plan"]["rollback"]
+    store = PlatformStore(WorkspacePaths(tmp_path.resolve()))
     assert store.list_jobs(org_id=ORG_ID) == []
 
 
