@@ -2127,8 +2127,19 @@ def _intent_from_rca_proposal(request: RcaRemediationProposalRequest) -> dict[st
             "enabled": True,
             "apply_scope": "admin_state",
         }
-    requested_type = str(proposed.get("change_type") or request.suggested_pack or "custom_config").strip()
-    change_type = requested_type if requested_type in _RCA_ALLOWED_CHANGE_TYPES else "custom_config"
+    requested_type = str(
+        proposed.get("change_type") or request.suggested_pack or "custom_config"
+    ).strip()
+    if requested_type not in _RCA_ALLOWED_CHANGE_TYPES:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Unsupported Netcode change type: {requested_type}. "
+                "The Rez recommendation remains advisory until an explicitly "
+                "supported change type or reviewed custom configuration is supplied."
+            ),
+        )
+    change_type = requested_type
     targets = _proposal_targets(request)
     site = str(proposed.get("site") or proposed.get("scope") or "rca-remediation").strip() or "rca-remediation"
     policy = _safe_proposal_dict(proposed.get("policy")) if isinstance(proposed.get("policy"), dict) else {}
@@ -2155,9 +2166,24 @@ def _intent_from_rca_proposal(request: RcaRemediationProposalRequest) -> dict[st
             _proposal_lines(proposed.get("config_lines"))
             or _proposal_lines(proposed.get("commands"))
             or _proposal_lines(proposed.get("config"))
-            or "! Rez RCA draft requires engineer command review before apply"
         )
         rollback_lines = _proposal_lines(proposed.get("rollback_lines") or proposed.get("rollback"))
+        verify_contains = str(proposed.get("verify_contains") or "").strip()
+        if not config_lines:
+            raise HTTPException(
+                status_code=400,
+                detail="Rez custom configuration requires explicit forward configuration.",
+            )
+        if not rollback_lines:
+            raise HTTPException(
+                status_code=400,
+                detail="Rez custom configuration requires explicit rollback configuration.",
+            )
+        if not verify_contains:
+            raise HTTPException(
+                status_code=400,
+                detail="Rez custom configuration requires an explicit post-change verification target.",
+            )
         return {
             "change_type": "custom_config",
             "site": site,
@@ -2165,10 +2191,10 @@ def _intent_from_rca_proposal(request: RcaRemediationProposalRequest) -> dict[st
             "custom": {
                 "config_lines": config_lines,
                 "rollback_lines": rollback_lines,
-                "verify_contains": str(proposed.get("verify_contains") or "").strip(),
+                "verify_contains": verify_contains,
                 "verify_absent": bool(proposed.get("verify_absent", False)),
                 "description": request.rationale.strip() or request.title.strip() or "Draft created from Rez RCA.",
-                "acknowledge_no_rollback": not bool(rollback_lines.strip()),
+                "acknowledge_no_rollback": False,
             },
             "policy": policy,
             "metadata": metadata,

@@ -406,7 +406,10 @@ def _route_shadow_proposal() -> dict:
     })
 
 
-def test_rca_remediation_runs_static_validation_without_jobs(tmp_path: Path, monkeypatch):
+def test_rca_remediation_rejects_unknown_change_type_without_fallback(
+    tmp_path: Path,
+    monkeypatch,
+):
     init_workspace(WorkspacePaths(tmp_path))
     monkeypatch.chdir(tmp_path)
     client = TestClient(api.app)
@@ -436,39 +439,11 @@ def test_rca_remediation_runs_static_validation_without_jobs(tmp_path: Path, mon
         }),
     )
 
-    assert response.status_code == 200
-    body = response.json()
-    assert body["ok"] is True
-    assert body["draft_only"] is True
-    assert body["human_approval_required"] is True
-    assert body["rez_change_id"] == body["change"]["rez_change_id"]
-    assert body["rez_change_id"].startswith("REZ-CHG-")
-    assert body["rez_change_id"].endswith(body["change_id"].replace("-", "").upper()[:12])
-
     store = PlatformStore(WorkspacePaths(tmp_path.resolve()))
-    change = store.get_change(body["change_id"])
-    assert change.status == "blocked"
-    assert change.workflow_state == "blocked"
-    assert change.device_id == "Branch-EDGE-03"
-    assert change.last_job_id is None
+    assert response.status_code == 400
+    assert "Unsupported Netcode change type: firewall_policy" in response.json()["detail"]
+    assert store.list_changes() == []
     assert store.list_jobs() == []
-    assert change.result["plan"]["commands"]
-    assert change.result["pipeline"]["render"]["config"]
-    assert change.result["pipeline"]["artifacts"]["report_json_path"]
-    assert any(check["status"] == "fail" for check in change.result["pipeline"]["validation"]["checks"])
-
-    intent = read_yaml(Path(change.intent_path))
-    assert intent["change_type"] == "custom_config"
-    assert intent["targets"] == {"device_ids": ["Branch-EDGE-03"]}
-    assert "set nat enable" in intent["custom"]["config_lines"]
-    assert intent["custom"]["rollback_lines"]
-    assert intent["metadata"]["source"] == "rez_rca"
-    assert intent["metadata"]["human_approval_required"] is True
-
-    events = store.list_workflow_events(change.id)
-    assert len(events) == 1
-    assert events[0].action == "rca_proposal"
-    assert events[0].to_state == "blocked"
 
 
 def test_route_shadow_remediation_is_exact_reversible_and_draft_only(
@@ -509,6 +484,50 @@ def test_route_shadow_remediation_is_exact_reversible_and_draft_only(
         "ip route 10.90.90.0/25 Null0\n"
     )
     assert PlatformStore(WorkspacePaths(tmp_path.resolve())).list_jobs() == []
+
+
+@pytest.mark.parametrize(
+    ("missing_field", "expected_detail"),
+    [
+        ("config_lines", "forward configuration"),
+        ("rollback_lines", "rollback configuration"),
+        ("verify_contains", "post-change verification target"),
+    ],
+)
+def test_rez_custom_config_requires_forward_rollback_and_verification(
+    tmp_path: Path,
+    monkeypatch,
+    missing_field: str,
+    expected_detail: str,
+):
+    init_workspace(WorkspacePaths(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    proposed_intent = {
+        "change_type": "custom_config",
+        "site": "store-1842",
+        "config_lines": "vlan 992\n   name RCA_DRYRUN\n",
+        "rollback_lines": "no vlan 992\n",
+        "verify_contains": "vlan 992",
+    }
+    proposed_intent.pop(missing_field)
+
+    response = TestClient(api.app).post(
+        "/api/changes/from-rca",
+        json=_confirmed_proposal({
+            "source": "rez",
+            "incident_id": f"INC-MISSING-{missing_field.upper()}",
+            "target_device": "v2-store1",
+            "suggested_pack": "custom_config",
+            "rationale": "Rez proposed a reviewed configuration draft.",
+            "proposed_intent": proposed_intent,
+        }),
+    )
+
+    store = PlatformStore(WorkspacePaths(tmp_path.resolve()))
+    assert response.status_code == 400
+    assert expected_detail in response.json()["detail"]
+    assert store.list_changes() == []
+    assert store.list_jobs() == []
 
 
 @pytest.mark.parametrize(
@@ -1054,6 +1073,7 @@ def test_rez_rca_validated_draft_can_enter_dry_run_queue(tmp_path: Path, monkeyp
                 "site": "store-1842",
                 "config_lines": "vlan 992\n   name RCA_DRYRUN\n",
                 "rollback_lines": "no vlan 992\n",
+                "verify_contains": "vlan 992",
             },
         }),
     )
@@ -1145,6 +1165,7 @@ def test_rez_rca_draft_requires_approval_even_when_global_gate_off(tmp_path: Pat
                 "site": "store-1842",
                 "config_lines": "vlan 991\n   name RCA_REVIEWED\n",
                 "rollback_lines": "no vlan 991\n",
+                "verify_contains": "vlan 991",
             },
         }),
     )
