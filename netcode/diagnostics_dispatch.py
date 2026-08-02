@@ -7,7 +7,12 @@ import json
 import os
 import urllib.error
 import urllib.request
+import re
 from typing import Any
+
+
+_ORG_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
+_ENVIRONMENT_ID = re.compile(r"^[A-Za-z0-9_.-]{1,200}$")
 
 
 def dispatch_verification_handoff(handoff: dict[str, Any]) -> dict[str, Any]:
@@ -19,11 +24,18 @@ def dispatch_verification_handoff(handoff: dict[str, Any]) -> dict[str, Any]:
     """
     base_url = os.environ.get("NETCODE_REZ_TRIGGER_URL", "").strip().rstrip("/")
     token = os.environ.get("NETCODE_REZ_TRIGGER_TOKEN", "").strip()
-    environment = os.environ.get("NETCODE_REZ_ENVIRONMENT_ID", "").strip()
-    if not base_url or not token or not environment:
+    if not base_url or not token:
         return {
             "status": "disabled",
-            "reason": "NETCODE_REZ_TRIGGER_URL, NETCODE_REZ_TRIGGER_TOKEN, and NETCODE_REZ_ENVIRONMENT_ID are required",
+            "reason": "NETCODE_REZ_TRIGGER_URL and NETCODE_REZ_TRIGGER_TOKEN are required",
+        }
+    context = handoff.get("context") if isinstance(handoff.get("context"), dict) else {}
+    organization = str(context.get("org_id") or "").strip()
+    environment = str(context.get("environment_id") or "").strip()
+    if not _ORG_ID.fullmatch(organization) or not _ENVIRONMENT_ID.fullmatch(environment):
+        return {
+            "status": "disabled",
+            "reason": "A persisted change organization and environment binding are required",
         }
 
     dispatch_id = hashlib.sha256(
@@ -31,6 +43,7 @@ def dispatch_verification_handoff(handoff: dict[str, Any]) -> dict[str, Any]:
     ).hexdigest()[:16]
     payload = {
         "dispatch_id": dispatch_id,
+        "organization_binding": organization,
         "environment_binding": environment,
         "handoff": handoff,
     }

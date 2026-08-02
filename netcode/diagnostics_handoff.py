@@ -8,6 +8,26 @@ from typing import Any
 PASS_STATUSES = {"pass", "passed", "ok", "success", "true"}
 
 
+def change_environment_binding(change: Any) -> str:
+    """Return one unambiguous environment persisted on a change record."""
+    result = change.result if isinstance(getattr(change, "result", None), dict) else {}
+    candidates: set[str] = set()
+    for path in (
+        ("environment_id",),
+        ("network_model", "environment_id"),
+        ("pipeline", "network_model", "environment_id"),
+        ("plan", "environment_id"),
+        ("service_assurance", "environment_id"),
+    ):
+        value: Any = result
+        for key in path:
+            value = value.get(key) if isinstance(value, dict) else None
+        normalized = str(value or "").strip()
+        if normalized:
+            candidates.add(normalized)
+    return next(iter(candidates)) if len(candidates) == 1 else ""
+
+
 def _labeled_sentence(label: str, value: str) -> str:
     text = value.strip()
     return f" {label}: {text}{'' if text.endswith(('.', '!', '?')) else '.'}"
@@ -34,6 +54,8 @@ def build_verification_handoff(
     verification: dict[str, Any] | None = None,
     change_id: str = "",
     intent_path: str = "",
+    org_id: str = "",
+    environment_id: str = "",
 ) -> dict[str, Any]:
     """Create a deterministic, read-only Rez Diagnostics handoff.
 
@@ -68,6 +90,8 @@ def build_verification_handoff(
         "verification": verification,
         "change_id": str(change_id or ""),
         "intent_path": str(intent_path or ""),
+        "org_id": str(org_id or "").strip(),
+        "environment_id": str(environment_id or "").strip(),
         "failed": failed,
         "read_only": True,
     }
@@ -108,6 +132,10 @@ def attach_verification_handoff(
     """
     if not change_id or not verification_failed(verification):
         return None
+    try:
+        change = store.get_change(change_id)
+    except Exception:
+        return None
     handoff = build_verification_handoff(
         device_id=device_id,
         check=check,
@@ -116,11 +144,9 @@ def attach_verification_handoff(
         verification=verification,
         change_id=change_id,
         intent_path=intent_path,
+        org_id=str(change.org_id or ""),
+        environment_id=change_environment_binding(change),
     )
-    try:
-        change = store.get_change(change_id)
-    except Exception:
-        return None
     from netcode.diagnostics_dispatch import dispatch_verification_handoff
 
     handoff["dispatch"] = dispatch_verification_handoff(handoff)

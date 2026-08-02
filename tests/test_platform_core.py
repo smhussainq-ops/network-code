@@ -1841,8 +1841,8 @@ def test_verification_handoff_builds_rez_context_without_writes(tmp_path: Path, 
             "expected": "VLAN 210 present on uplink",
             "actual": "VLAN 210 missing from trunk allowed list",
             "verification": {"ok": False, "status": "fail", "message": "VLAN 210 not found"},
-            "change_id": "chg-2048",
             "intent_path": "intents/chg-2048.yaml",
+            "environment_id": "env_store",
         },
     )
 
@@ -1855,12 +1855,45 @@ def test_verification_handoff_builds_rez_context_without_writes(tmp_path: Path, 
     assert ".." not in body["question"]
     assert body["context"]["failed"] is True
     assert body["context"]["read_only"] is True
+    assert body["context"]["org_id"] == "org_default"
+    assert body["context"]["environment_id"] == "env_store"
     assert body["remediation_plan"]["status"] == "not_created"
     assert body["remediation_plan"]["direct_write_allowed"] is False
     assert body["safety"]["device_writes"] == "none"
 
     after_changes = client.get("/api/changes").json()["changes"]
     assert after_changes == before_changes
+
+
+def test_verification_handoff_rejects_cross_tenant_change_id(
+    tmp_path: Path,
+    monkeypatch,
+):
+    monkeypatch.chdir(tmp_path)
+    workspace = WorkspacePaths(tmp_path)
+    init_workspace(workspace)
+    other_change = PlatformStore(workspace).create_change(
+        tmp_path / "other-tenant.yaml",
+        "edge-other-01",
+        org_id="org_other",
+    )
+    client = TestClient(api.app)
+
+    response = client.post(
+        "/api/diagnostics/verification-handoff",
+        json={
+            "device_id": "edge-other-01",
+            "check": "reachability",
+            "expected": "reachable",
+            "actual": "unreachable",
+            "verification": {"ok": False, "status": "fail"},
+            "change_id": other_change.id,
+            "environment_id": "env_other",
+        },
+    )
+
+    assert response.status_code == 404
+    assert response.json()["detail"] == "Unknown change"
 
 
 def test_failed_intent_verify_attaches_read_only_handoff_to_change(tmp_path: Path, monkeypatch):

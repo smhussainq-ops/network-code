@@ -32,7 +32,11 @@ from netcode.adapters.registry import AdapterRegistry
 from netcode.adapters.rez import READ_TRANSPORTS
 from netcode.bootstrap import init_workspace
 from netcode.discovery import DiscoveryService
-from netcode.diagnostics_handoff import attach_verification_handoff, build_verification_handoff
+from netcode.diagnostics_handoff import (
+    attach_verification_handoff,
+    build_verification_handoff,
+    change_environment_binding,
+)
 from netcode.entitlements import (
     EntitlementError,
     canonical_org_id,
@@ -306,6 +310,7 @@ class VerificationHandoffRequest(BaseModel):
     verification: dict[str, object] = {}
     change_id: str = ""
     intent_path: str = ""
+    environment_id: str = ""
 
 
 class ShellOpenRequest(BaseModel):
@@ -2696,6 +2701,7 @@ def desired_state_plan(request: DesiredStatePlanRequest, http_request: Request) 
         result_payload["plan"] = metadata
         if model_context is not None:
             result_payload["network_model"] = {
+                "environment_id": str(active_model["environment_id"]),
                 "revision_id": model_context["revision_id"],
                 "device_id": model_context["device_id"],
                 "site_id": model_context["site_id"],
@@ -5264,8 +5270,24 @@ def api_troubleshoot_run(request: TroubleshootRequest, http_request: Request) ->
 
 
 @app.post("/api/diagnostics/verification-handoff")
-def api_diagnostics_verification_handoff(request: VerificationHandoffRequest) -> dict[str, object]:
+def api_diagnostics_verification_handoff(
+    request: VerificationHandoffRequest,
+    http_request: Request,
+) -> dict[str, object]:
     """Build a read-only Rez Diagnostics handoff from a failed Netcode verification."""
+    principal = _request_principal(http_request)
+    environment_id = request.environment_id.strip()
+    if request.change_id:
+        try:
+            change = PlatformStore(paths()).get_change(request.change_id)
+        except Exception as exc:
+            raise HTTPException(status_code=404, detail="Unknown change") from exc
+        if change.org_id != principal.org_id:
+            raise HTTPException(status_code=404, detail="Unknown change")
+        persisted_environment = change_environment_binding(change)
+        if environment_id and persisted_environment and environment_id != persisted_environment:
+            raise HTTPException(status_code=409, detail="Environment does not match the persisted change")
+        environment_id = persisted_environment or environment_id
     return build_verification_handoff(
         device_id=request.device_id,
         check=request.check,
@@ -5274,6 +5296,8 @@ def api_diagnostics_verification_handoff(request: VerificationHandoffRequest) ->
         verification=dict(request.verification or {}),
         change_id=request.change_id,
         intent_path=request.intent_path,
+        org_id=principal.org_id,
+        environment_id=environment_id,
     )
 
 

@@ -32,7 +32,6 @@ def _valid_env() -> dict[str, str]:
         "NETCODE_ENTITLEMENT_TOKEN": "entitlement-token-with-at-least-32-characters",
         "NETCODE_REZ_TRIGGER_URL": "http://rez.internal:8080",
         "NETCODE_REZ_TRIGGER_TOKEN": "trigger-token-with-at-least-32-characters",
-        "NETCODE_REZ_ENVIRONMENT_ID": "env_customer_1",
         "WEB_CONCURRENCY": "1",
         "NETCODE_BOOTSTRAP_ADMIN_EMAIL": "pilot@example.com",
         "NETCODE_BOOTSTRAP_ADMIN_PASSWORD": "a-long-random-bootstrap-secret",
@@ -180,7 +179,6 @@ def test_production_requires_postgres_licensing_and_rez_handoff():
             "NETCODE_LICENSE_ENFORCEMENT": "false",
             "NETCODE_ENTITLEMENT_URL": "",
             "NETCODE_REZ_TRIGGER_URL": "",
-            "NETCODE_REZ_ENVIRONMENT_ID": "",
         }
     )
 
@@ -190,7 +188,6 @@ def test_production_requires_postgres_licensing_and_rez_handoff():
     assert "NETCODE_LICENSE_ENFORCEMENT must be enabled" in issues
     assert "NETCODE_ENTITLEMENT_URL must be an http(s) URL" in issues
     assert "NETCODE_REZ_TRIGGER_URL must be an http(s) URL" in issues
-    assert "NETCODE_REZ_ENVIRONMENT_ID is required" in issues
 
 
 def test_production_requires_explicit_allowed_hosts():

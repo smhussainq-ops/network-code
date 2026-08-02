@@ -149,8 +149,6 @@ def collect_netcode_production_issues(
         issues.append("NETCODE_REZ_TRIGGER_URL must be an http(s) URL")
     if not _strong_service_secret(_value(env, "NETCODE_REZ_TRIGGER_TOKEN")):
         issues.append("NETCODE_REZ_TRIGGER_TOKEN must contain at least 32 characters")
-    if not _value(env, "NETCODE_REZ_ENVIRONMENT_ID"):
-        issues.append("NETCODE_REZ_ENVIRONMENT_ID is required")
 
     for worker_env in ("WEB_CONCURRENCY", "UVICORN_WORKERS"):
         worker_count = _value(env, worker_env)
