@@ -159,6 +159,7 @@ from netcode.network_model_lifecycle import (
     rollback_active_revision,
 )
 from netcode.store import (
+    ChangeRecord,
     DEFAULT_ORG_ID,
     JobQueueFullError,
     TERMINAL_JOB_STATUSES,
@@ -717,6 +718,7 @@ _RCA_PROPOSAL_SOURCES = {
     "rez_structured_rca",
     "site_operational_context",
     "human_reviewed_rca",
+    "rez_agent_recommendation",
 }
 _RCA_ROUTE_SHADOW_EVIDENCE_SCHEMA = "rez.route-shadow-evidence.v1"
 _RCA_ROUTE_SHADOW_ROOTS = {
@@ -750,6 +752,62 @@ _RCA_SENSITIVE_KEY_PARTS = (
     "privatekey",
     "passphrase",
 )
+_RCA_EXECUTABLE_FIELD_NAMES = {
+    "command",
+    "commands",
+    "config",
+    "config_line",
+    "config_lines",
+    "rollback",
+    "rollback_line",
+    "rollback_lines",
+    "cli",
+}
+_RCA_AGENT_REQUIRED_VALUE_FIELDS = {
+    "add_vlan": {"vlan_id", "name", "subnet", "svi_enabled"},
+    "interface_config": {"interface", "enabled", "apply_scope"},
+    "bgp_neighbor": {"asn", "neighbor", "remote_as", "shutdown"},
+    "acl_rule": {
+        "acl_name",
+        "sequence",
+        "action",
+        "protocol",
+        "source",
+        "destination",
+    },
+    "ntp_standardize": {"servers", "prefer_first"},
+}
+_RCA_AGENT_ALLOWED_VALUE_FIELDS = {
+    "add_vlan": {
+        "vlan_id",
+        "name",
+        "subnet",
+        "svi_enabled",
+        "purpose",
+        "gateway_ip",
+    },
+    "interface_config": {"interface", "enabled", "apply_scope"},
+    "bgp_neighbor": {
+        "asn",
+        "neighbor",
+        "remote_as",
+        "shutdown",
+        "router_id",
+        "description",
+        "update_source",
+    },
+    "acl_rule": {
+        "acl_name",
+        "sequence",
+        "action",
+        "protocol",
+        "source",
+        "destination",
+        "destination_port",
+        "remark",
+    },
+    "ntp_standardize": {"servers", "prefer_first"},
+}
 
 
 def _safe_slug(value: str, default: str = "rca-remediation") -> str:
@@ -784,6 +842,467 @@ def _require_confirmed_rca_provenance(request: RcaRemediationProposalRequest) ->
                 status_code=400,
                 detail="Human-reviewed RCA drafts are limited to typed interface administrative-state changes.",
             )
+
+
+def _require_agent_recommendation_evidence(
+    request: RcaRemediationProposalRequest,
+    *,
+    store: PlatformStore,
+    org_id: str,
+) -> str:
+    """Verify an agent recommendation before Netcode compiles desired state."""
+    if request.proposal_source.strip() != "rez_agent_recommendation":
+        return ""
+    proof = _safe_proposal_dict(request.evidence_contract)
+    proposed = _safe_proposal_dict(request.proposed_intent)
+    change_type = str(proposed.get("change_type") or "").strip()
+
+    secret = (
+        os.environ.get("REZ_REMEDIATION_REVIEW_SECRET", "").strip()
+        or os.environ.get("NETCODE_ADMIN_TOKEN", "").strip()
+    ).encode("utf-8")
+    supplied_signature = str(proof.get("signature") or "").strip().lower()
+    unsigned_proof = {
+        key: value for key, value in proof.items() if key != "signature"
+    }
+    expected_signature = (
+        hmac.new(
+            secret,
+            _canonical_json(unsigned_proof).encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
+        if secret
+        else ""
+    )
+    if not expected_signature:
+        raise HTTPException(
+            status_code=503,
+            detail="Agent recommendation verification is not configured.",
+        )
+    if (
+        proof.get("signature_algorithm") != "hmac-sha256"
+        or not re.fullmatch(r"[0-9a-f]{64}", supplied_signature)
+        or not hmac.compare_digest(supplied_signature, expected_signature)
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="The agent recommendation evidence signature is invalid.",
+        )
+    if str(proof.get("org_id") or "").strip() != org_id:
+        raise HTTPException(
+            status_code=403,
+            detail="The agent recommendation evidence belongs to another organization.",
+        )
+
+    def contains_executable_field(value: object) -> bool:
+        if isinstance(value, dict):
+            return any(
+                str(key).strip().lower() in _RCA_EXECUTABLE_FIELD_NAMES
+                or contains_executable_field(child)
+                for key, child in value.items()
+            )
+        if isinstance(value, list):
+            return any(contains_executable_field(child) for child in value)
+        return False
+
+    def contains_control_text(value: object) -> bool:
+        if isinstance(value, dict):
+            return any(contains_control_text(child) for child in value.values())
+        if isinstance(value, list):
+            return any(contains_control_text(child) for child in value)
+        return isinstance(value, str) and any(
+            char in value for char in ("\r", "\n", "\x00")
+        )
+
+    if (
+        proof.get("schema") != "rez.agent-remediation-evidence.v1"
+        or proof.get("sufficient_for_draft") is not True
+        or proof.get("fresh") is not True
+        or proof.get("live_root_confirmed") is not True
+        or str(proof.get("root_atom_id") or "").strip() != request.root_atom_id.strip()
+        or str(proof.get("target_device") or "").strip() != request.target_device.strip()
+        or str(proof.get("change_type") or "").strip() != change_type
+        or not isinstance(proof.get("evidence_refs"), list)
+        or not proof.get("evidence_refs")
+        or not isinstance(proof.get("verification_checks"), list)
+        or not proof.get("verification_checks")
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="Exact fresh agent recommendation evidence is required.",
+        )
+    if change_type not in _RCA_ALLOWED_CHANGE_TYPES or change_type == "custom_config":
+        raise HTTPException(
+            status_code=400,
+            detail="Agent recommendations must use a supported typed Netcode change.",
+        )
+    values = proposed.get("values")
+    required_fields = _RCA_AGENT_REQUIRED_VALUE_FIELDS.get(change_type)
+    allowed_fields = _RCA_AGENT_ALLOWED_VALUE_FIELDS.get(change_type)
+    if not isinstance(values, dict) or not required_fields or not allowed_fields:
+        raise HTTPException(
+            status_code=400,
+            detail="Agent recommendations require an explicitly supported typed values object.",
+        )
+    unexpected_sections = sorted(
+        set(proposed) - {"change_type", "site", "targets", "values"}
+    )
+    unexpected_fields = sorted(set(values) - allowed_fields)
+    if unexpected_sections or unexpected_fields:
+        unexpected = unexpected_sections + [
+            f"values.{field}" for field in unexpected_fields
+        ]
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Agent recommendation contains unsupported desired-state fields: "
+                + ", ".join(unexpected)
+            ),
+        )
+    missing_fields = sorted(
+        field
+        for field in required_fields
+        if field not in values or values.get(field) in (None, "")
+    )
+    if missing_fields:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Agent recommendation omitted explicit required values: "
+                + ", ".join(missing_fields)
+            ),
+        )
+    scalar_type_checks = {
+        "add_vlan": {
+            "vlan_id": int,
+            "name": str,
+            "subnet": str,
+            "svi_enabled": bool,
+        },
+        "interface_config": {
+            "interface": str,
+            "enabled": bool,
+            "apply_scope": str,
+        },
+        "bgp_neighbor": {
+            "asn": int,
+            "neighbor": str,
+            "remote_as": int,
+            "shutdown": bool,
+        },
+        "acl_rule": {
+            "acl_name": str,
+            "sequence": int,
+            "action": str,
+            "protocol": str,
+            "source": str,
+            "destination": str,
+        },
+        "ntp_standardize": {"prefer_first": bool},
+    }
+    invalid_types = sorted(
+        field
+        for field, expected_type in scalar_type_checks.get(change_type, {}).items()
+        if type(values.get(field)) is not expected_type
+    )
+    if invalid_types:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Agent recommendation values use invalid types: "
+                + ", ".join(invalid_types)
+            ),
+        )
+    optional_scalar_types = {
+        "add_vlan": {"purpose": str, "gateway_ip": str},
+        "bgp_neighbor": {
+            "router_id": str,
+            "description": str,
+            "update_source": str,
+        },
+        "acl_rule": {"destination_port": str, "remark": str},
+    }
+    invalid_optional_types = sorted(
+        field
+        for field, expected_type in optional_scalar_types.get(change_type, {}).items()
+        if field in values
+        and values.get(field) is not None
+        and type(values.get(field)) is not expected_type
+    )
+    if invalid_optional_types:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Agent recommendation optional values use invalid types: "
+                + ", ".join(invalid_optional_types)
+            ),
+        )
+    if change_type == "interface_config" and (
+        values.get("apply_scope") != "admin_state"
+        or not isinstance(values.get("enabled"), bool)
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Agent interface recommendations are limited to an explicit "
+                "reversible administrative-state change."
+            ),
+        )
+    if change_type == "ntp_standardize" and not (
+        isinstance(values.get("servers"), list)
+        and all(type(item) is str and item.strip() for item in values["servers"])
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="Agent NTP recommendations require an explicit non-empty server list.",
+        )
+    if contains_executable_field(proposed):
+        raise HTTPException(
+            status_code=400,
+            detail="Agent recommendations must contain desired state only; Netcode generates commands and rollback.",
+        )
+    if contains_control_text(proposed):
+        raise HTTPException(
+            status_code=400,
+            detail="Agent recommendation values cannot contain multiline or control-character content.",
+        )
+    environment_id = request.environment_id.strip()
+    revision_id = request.model_revision_id.strip()
+    if (
+        not environment_id
+        or not revision_id
+        or str(proof.get("environment_id") or "").strip() != environment_id
+        or str(proof.get("model_revision_id") or "").strip() != revision_id
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="Agent recommendation evidence is not bound to this environment and model.",
+        )
+    intent_digest = hashlib.sha256(_canonical_json(proposed).encode("utf-8")).hexdigest()
+    if not hmac.compare_digest(
+        str(proof.get("intent_digest") or ""),
+        intent_digest,
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="The recommended desired state does not match its evidence digest.",
+        )
+    root_digest = str(proof.get("root_digest") or "").strip().lower()
+    recommendation_fingerprint = str(
+        proof.get("recommendation_fingerprint") or ""
+    ).strip().lower()
+    expected_fingerprint = hashlib.sha256(
+        "|".join(
+            (
+                request.incident_id.strip(),
+                request.root_atom_id.strip(),
+                request.target_device.strip(),
+                root_digest,
+                intent_digest,
+            )
+        ).encode("utf-8")
+    ).hexdigest()
+    if (
+        not re.fullmatch(r"[0-9a-f]{64}", root_digest)
+        or not hmac.compare_digest(recommendation_fingerprint, expected_fingerprint)
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="The recommendation fingerprint does not match its incident and evidence.",
+        )
+
+    active = NetworkModelRepository(store).active_revision(org_id, environment_id)
+    if (
+        not active
+        or active.get("status") != "active"
+        or active.get("revision_id") != revision_id
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail="Agent recommendation evidence must reference the current active approved model.",
+        )
+    model = active.get("model") if isinstance(active.get("model"), dict) else {}
+    sites = model.get("sites") if isinstance(model.get("sites"), dict) else {}
+    site_id = str(proposed.get("site") or "").strip()
+    site = sites.get(site_id) if isinstance(sites.get(site_id), dict) else {}
+    site_devices = site.get("devices") if isinstance(site.get("devices"), dict) else {}
+    target_device = request.target_device.strip()
+    targets = _proposal_targets(request)
+    if (
+        not site
+        or target_device not in site_devices
+        or targets.get("device_ids") != [target_device]
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="The recommended target is not one exact device in the approved site.",
+        )
+    modeled_device = (
+        site_devices.get(target_device)
+        if isinstance(site_devices.get(target_device), dict)
+        else {}
+    )
+    modeled_platform = str(modeled_device.get("platform") or "").strip().lower()
+    catalog_device = store.resolve_device(org_id, target_device)
+    catalog_platform = str((catalog_device or {}).get("platform") or "").strip().lower()
+    if modeled_platform and catalog_platform and modeled_platform != catalog_platform:
+        raise HTTPException(
+            status_code=409,
+            detail="The approved model and connector catalog disagree on target platform.",
+        )
+    platform = catalog_platform or modeled_platform
+    if not platform:
+        raise HTTPException(
+            status_code=400,
+            detail="The recommended target platform is not proven.",
+        )
+    return platform
+
+
+def _model_dependency_count(model: object, target_device: str) -> int:
+    """Count modeled records that explicitly reference the target device."""
+    count = 0
+
+    def walk(value: object, *, in_devices: bool = False) -> None:
+        nonlocal count
+        if isinstance(value, dict):
+            for raw_key, child in value.items():
+                key = str(raw_key)
+                if in_devices and key == target_device:
+                    continue
+                if key in {
+                    "device",
+                    "device_id",
+                    "source_device",
+                    "destination_device",
+                    "peer_device",
+                    "gateway_device",
+                    "controller_device",
+                } and str(child).strip() == target_device:
+                    count += 1
+                elif key in {
+                    "devices",
+                    "dependency_devices",
+                    "path_devices",
+                    "member_devices",
+                } and isinstance(child, list) and target_device in {
+                    str(item).strip() for item in child
+                }:
+                    count += 1
+                walk(child, in_devices=(key == "devices"))
+        elif isinstance(value, list):
+            for child in value:
+                walk(child, in_devices=in_devices)
+
+    walk(model)
+    return count
+
+
+def _rca_plan_risk_assessment(
+    *,
+    request: RcaRemediationProposalRequest,
+    intent: dict[str, object],
+    pipeline: object,
+    store: PlatformStore,
+    org_id: str,
+) -> dict[str, object]:
+    """Build deterministic, honest risk metadata for the exact compiled plan."""
+    typed_intent = load_intent_data(intent)
+    metadata = plan_metadata(typed_intent)
+    validation = getattr(pipeline, "validation", None)
+    validation_checks = list(getattr(validation, "checks", None) or [])
+    failed_checks = [
+        str(getattr(check, "id", "") or "")
+        for check in validation_checks
+        if str(getattr(check, "status", "") or "").lower() == "fail"
+    ]
+    rollback = str((metadata.get("rollback") or {}).get("commands") or "").strip()
+    post_checks = list((metadata.get("checks") or {}).get("post") or [])
+    active = (
+        NetworkModelRepository(store).active_revision(
+            org_id,
+            request.environment_id.strip(),
+        )
+        if request.environment_id.strip()
+        else None
+    )
+    model = active.get("model") if isinstance(active, dict) and isinstance(active.get("model"), dict) else {}
+    dependency_count = _model_dependency_count(model, request.target_device.strip())
+    risk_text = str(metadata.get("risk") or "").lower()
+    if getattr(pipeline, "status", "") != "pass":
+        level = "BLOCKED"
+    elif "critical" in risk_text or "high" in risk_text:
+        level = "HIGH"
+    elif "medium" in risk_text:
+        level = "MEDIUM"
+    else:
+        level = "LOW"
+    unknowns = []
+    if dependency_count == 0:
+        unknowns.append("No downstream dependency explicitly references the target in the approved model.")
+    if not rollback:
+        unknowns.append("No deterministic rollback commands were generated.")
+    if not post_checks:
+        unknowns.append("No deterministic post-change verification is available.")
+    if request.proposal_source.strip() == "rez_agent_recommendation":
+        unknowns.append(
+            "The reviewer must confirm the recommended desired state matches approved intent; "
+            "Netcode validated target scope, syntax, policy, and reversibility."
+        )
+    return {
+        "schema": "netcode.change-risk.v1",
+        "level": level,
+        "status": "blocked" if level == "BLOCKED" else "review_required",
+        "model_revision_id": request.model_revision_id.strip(),
+        "targets": list((metadata.get("blast_radius") or {}).get("devices") or []),
+        "site": str((metadata.get("blast_radius") or {}).get("site") or ""),
+        "changed_objects": list((metadata.get("blast_radius") or {}).get("objects") or []),
+        "modeled_dependency_count": dependency_count,
+        "rollback_available": bool(rollback),
+        "rollback_confidence": dict((metadata.get("rollback") or {}).get("confidence") or {}),
+        "verification_check_count": len(post_checks),
+        "validation_status": str(getattr(pipeline, "status", "") or ""),
+        "failed_checks": failed_checks,
+        "unknowns": unknowns,
+        "human_approval_required": True,
+        "device_write_performed": False,
+    }
+
+
+def _existing_agent_recommendation_change(
+    *,
+    store: PlatformStore,
+    org_id: str,
+    request: RcaRemediationProposalRequest,
+) -> ChangeRecord | None:
+    """Return a tenant-scoped draft created from the same immutable recommendation."""
+    if request.proposal_source.strip() != "rez_agent_recommendation":
+        return None
+    fingerprint = str(
+        _safe_proposal_dict(request.evidence_contract).get(
+            "recommendation_fingerprint"
+        )
+        or ""
+    ).strip()
+    if not fingerprint:
+        return None
+    for record in store.list_changes(limit=500, org_id=org_id):
+        result = record.result if isinstance(record.result, dict) else {}
+        proof = (
+            result.get("recommendation_evidence")
+            if isinstance(result.get("recommendation_evidence"), dict)
+            else {}
+        )
+        if (
+            str(result.get("incident_id") or "").strip()
+            == request.incident_id.strip()
+            and hmac.compare_digest(
+                str(proof.get("recommendation_fingerprint") or "").strip(),
+                fingerprint,
+            )
+        ):
+            return record
+    return None
 
 
 def _canonical_json(value: object) -> str:
@@ -6728,12 +7247,25 @@ def api_change_from_rca(request: RcaRemediationProposalRequest, http_request: Re
     principal = _request_principal(http_request)
     store = PlatformStore(p)
     _require_confirmed_rca_provenance(request)
+    if (
+        request.proposal_source.strip() == "rez_agent_recommendation"
+        and not principal.has_role("operator")
+    ):
+        raise HTTPException(
+            status_code=403,
+            detail="An authenticated operator is required to create a recommendation draft.",
+        )
     target_platform = _require_redistribution_evidence(
         request,
         store=store,
         org_id=principal.org_id,
     )
     target_platform = target_platform or _require_route_shadow_evidence(
+        request,
+        store=store,
+        org_id=principal.org_id,
+    )
+    target_platform = target_platform or _require_agent_recommendation_evidence(
         request,
         store=store,
         org_id=principal.org_id,
@@ -6750,6 +7282,30 @@ def api_change_from_rca(request: RcaRemediationProposalRequest, http_request: Re
         load_intent_data(intent)
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"Invalid remediation intent: {exc}") from exc
+    existing = _existing_agent_recommendation_change(
+        store=store,
+        org_id=principal.org_id,
+        request=request,
+    )
+    if existing is not None:
+        existing_result = (
+            existing.result if isinstance(existing.result, dict) else {}
+        )
+        serialized = record_to_dict(existing)
+        return {
+            "ok": True,
+            "idempotent_replay": True,
+            "draft_only": True,
+            "human_approval_required": True,
+            "rez_change_id": serialized["rez_change_id"],
+            "change_id": existing.id,
+            "change": serialized,
+            "intent_path": existing.intent_path,
+            "intent": intent,
+            "workflow": workflow_snapshot(existing.workflow_state).as_dict(),
+            "network_model": existing_result.get("network_model"),
+            "risk_assessment": existing_result.get("risk_assessment"),
+        }
 
     incident_slug = _safe_slug(request.incident_id)
     intent_path = p.intents / "rca" / f"{incident_slug}-{uuid.uuid4().hex[:8]}.yaml"
@@ -6759,6 +7315,13 @@ def api_change_from_rca(request: RcaRemediationProposalRequest, http_request: Re
         intent_path,
         org_id=principal.org_id,
         platform=target_platform or "arista_eos",
+    )
+    risk_assessment = _rca_plan_risk_assessment(
+        request=request,
+        intent=intent,
+        pipeline=pipeline,
+        store=store,
+        org_id=principal.org_id,
     )
 
     title = request.title.strip() or f"Rez RCA remediation for {request.incident_id.strip()}"
@@ -6914,6 +7477,8 @@ def api_change_from_rca(request: RcaRemediationProposalRequest, http_request: Re
         "rationale": request.rationale,
         "confidence": request.confidence,
         "evidence_refs": request.evidence_refs,
+        "recommendation_evidence": _safe_proposal_dict(request.evidence_contract),
+        "risk_assessment": risk_assessment,
         "network_model": {
             "environment_id": environment_id,
             "parent_revision_id": model_revision_id,
@@ -6926,6 +7491,7 @@ def api_change_from_rca(request: RcaRemediationProposalRequest, http_request: Re
             "validation_status": pipeline.status,
             "checks": [check.model_dump() for check in pipeline.validation.checks],
             "artifacts": pipeline.artifacts.model_dump() if pipeline.artifacts else None,
+            "risk_assessment": risk_assessment,
         },
     }
     workflow = state_after_static_validation(pipeline.status == "pass")
@@ -6956,6 +7522,7 @@ def api_change_from_rca(request: RcaRemediationProposalRequest, http_request: Re
         "intent": intent,
         "workflow": workflow_snapshot(change.workflow_state).as_dict(),
         "network_model": evidence["network_model"],
+        "risk_assessment": risk_assessment,
     }
 
 
@@ -7204,6 +7771,11 @@ def api_change_record(change_id: str, request: Request) -> dict[str, object]:
             "commands": render.get("config") or "",
             "risk": plan.get("risk"),
             "blast_radius": plan.get("blast_radius") or {},
+            "risk_assessment": (
+                result.get("risk_assessment")
+                or (result.get("plan") or {}).get("risk_assessment")
+                or {}
+            ),
             "rollback": rollback_plan,
             "checks": plan.get("checks") or {},
             "suggested_branch": plan.get("suggested_branch"),

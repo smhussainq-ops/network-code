@@ -491,6 +491,7 @@ class StaticValidator:
         # Allow-list and per-type block-list carve-outs come from the registry; a policy
         # YAML override (`<type>_allowed_prefixes`) still wins if present.
         allowed = tuple(scope.get(f"{intent.change_type}_allowed_prefixes", spec.allow_prefixes))
+        allowed_patterns = tuple(re.compile(pattern) for pattern in spec.allow_patterns)
         carveouts = {c.lower() for c in spec.block_carveouts}
         blocked = [str(v).lower() for v in scope.get("blocked_fragments", []) if str(v).lower() not in carveouts]
         unexpected_lines: list[str] = []
@@ -502,7 +503,11 @@ class StaticValidator:
             lower_line = line.lower()
             if any(fragment in lower_line for fragment in blocked):
                 blocked_lines.append(line)
-            if allowed and not line.startswith(allowed):
+            if (
+                allowed
+                and not line.startswith(allowed)
+                and not any(pattern.match(line) for pattern in allowed_patterns)
+            ):
                 unexpected_lines.append(line)
         if blocked_lines:
             return self._fail(
@@ -518,6 +523,7 @@ class StaticValidator:
                 f"Rendered config contains lines outside the allowed {intent.change_type} scope.",
                 unexpected_lines=unexpected_lines,
                 allowed_prefixes=list(allowed),
+                allowed_patterns=list(spec.allow_patterns),
             )
         return self._pass(
             "render_scope",

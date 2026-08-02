@@ -62,6 +62,7 @@ class ChangeTypeSpec:
     policy_checks: list[str]          # StaticValidator method names
     verify_method: str               # AristaEOSLabAdapter method name
     allow_prefixes: list[str]        # render-scope allow-list ("" empty => free-form)
+    allow_patterns: list[str] = field(default_factory=list)  # anchored render-scope regexes
     block_carveouts: list[str] = field(default_factory=list)  # blocked fragments to un-block for this type
     production_write: bool = False
 
@@ -476,6 +477,7 @@ register(ChangeTypeSpec(
     verification_hint=lambda i: {"check": "running_config_contains", "params": {"section": f"ip access-list {i.acl.name}"}},
     policy_checks=["_acl_policy"], verify_method="_verify_acl",
     allow_prefixes=["ip access-list ", "   remark ", "   permit ", "   deny "],
+    allow_patterns=[r"^\s+\d+\s+(?:permit|deny)\s+"],
     block_carveouts=["ip access-list"],
 ))
 
