@@ -80,7 +80,10 @@ class JobRunner:
         org_id: str = DEFAULT_ORG_ID,
     ) -> dict[str, object]:
         if apply:
-            require_production_writes(org_id=org_id)
+            raise PermissionError(
+                "Direct full-run apply is retired. Use the governed draft, "
+                "dry-run, human approval, and apply workflow."
+            )
         change = self.store.create_change(intent_path, device_id, org_id=org_id)
         job = self.store.create_job(change.id, "arista_full_run")
         self.store.update_job(job.id, "running", "Running static validation and Arista lab phases")

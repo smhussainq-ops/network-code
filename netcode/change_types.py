@@ -25,6 +25,7 @@ from netcode.models import (
     Intent,
     InterfaceConfigIntent,
     NtpStandardizeIntent,
+    OspfInterfaceIntent,
     OsUpgradeIntent,
     RoutingRedistributionIntent,
     SiteDeviceIntent,
@@ -185,6 +186,97 @@ register(ChangeTypeSpec(
     verification_hint=lambda i: {"check": "running_config_contains", "params": {"section": f"interface {i.interface.name}"}},
     policy_checks=["_interface_policy"], verify_method="_verify_interface",
     allow_prefixes=["interface ", "   description ", "   switchport ", "   no switchport", "   ip address ", "   shutdown", "   no shutdown"],
+))
+
+
+# ── ospf_interface ─────────────────────────────────────────────────────────
+def _build_ospf_interface(common: dict, values: dict, device_id: str) -> dict:
+    for field_name in ("passive", "current_passive"):
+        if type(values.get(field_name)) is not bool:
+            raise ValueError(f"{field_name} must be a boolean")
+    common["ospf_interface"] = {
+        "process_id": int(values["process_id"]),
+        "interface": str(values["interface"]),
+        "passive": values["passive"],
+        "current_passive": values["current_passive"],
+    }
+    return common
+
+
+def _ospf_interface_statement(intent: OspfInterfaceIntent, passive: bool) -> str:
+    prefix = "" if passive else "no "
+    return f"{prefix}passive-interface {intent.ospf_interface.interface}"
+
+
+register(ChangeTypeSpec(
+    key="ospf_interface",
+    label="OSPF Interface State",
+    model=OspfInterfaceIntent,
+    template="ospf_interface.j2",
+    risk="Medium: changes OSPF hello exchange and adjacency formation on one interface",
+    lab_write=True,
+    build=_build_ospf_interface,
+    title=lambda i: (
+        f"Set OSPF {i.ospf_interface.process_id} "
+        f"{i.ospf_interface.interface} "
+        f"{'passive' if i.ospf_interface.passive else 'active'}"
+    ),
+    slug=lambda i: (
+        f"{i.site}-ospf-{i.ospf_interface.process_id}-"
+        f"{safe_name(i.ospf_interface.interface)}"
+    ),
+    rollback=lambda i: (
+        f"router ospf {i.ospf_interface.process_id}\n"
+        f"   {_ospf_interface_statement(i, i.ospf_interface.current_passive)}\n"
+    ),
+    rollback_confidence=lambda i: {
+        "level": "medium",
+        "reason": (
+            "Restores the signed, human-reviewed pre-change passive-interface "
+            "state. Live prestate verification is not wired yet."
+        ),
+    },
+    blast_objects=lambda i: [
+        f"OSPF process {i.ospf_interface.process_id}",
+        f"Interface {i.ospf_interface.interface}",
+    ],
+    checks=lambda i: {
+        "pre": [{
+            "id": "ospf_interface_prestate",
+            "description": (
+                f"Confirm OSPF {i.ospf_interface.process_id} "
+                f"{i.ospf_interface.interface} currently has passive="
+                f"{str(i.ospf_interface.current_passive).lower()}."
+            ),
+            "executable": False,
+            "note": "Live pre-check not wired yet.",
+        }],
+        "post": [{
+            "id": "ospf_interface_state",
+            "description": (
+                f"Confirm OSPF {i.ospf_interface.process_id} "
+                f"{i.ospf_interface.interface} has passive="
+                f"{str(i.ospf_interface.passive).lower()}."
+            ),
+            "executable": True,
+        }],
+    },
+    verification_hint=lambda i: {
+        "check": "ospf_interface_passive",
+        "params": {
+            "process_id": i.ospf_interface.process_id,
+            "interface": i.ospf_interface.interface,
+            "passive": i.ospf_interface.passive,
+        },
+    },
+    policy_checks=["_ospf_interface_policy"],
+    verify_method="_verify_ospf_interface",
+    allow_prefixes=[
+        "router ospf ",
+        "   passive-interface ",
+        "   no passive-interface ",
+    ],
+    block_carveouts=["router ospf"],
 ))
 
 

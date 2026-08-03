@@ -720,6 +720,7 @@ def _websocket_principal(ws: WebSocket) -> Principal:
 _RCA_ALLOWED_CHANGE_TYPES = {
     "add_vlan",
     "interface_config",
+    "ospf_interface",
     "bgp_neighbor",
     "acl_rule",
     "site_device_intent",
@@ -747,6 +748,7 @@ _RCA_NON_ACTIONABLE_PREFIXES = ("CI_", "DATA_GAP", "XL_")
 _RCA_TOP_LEVEL_SECTIONS = {
     "add_vlan": "vlan",
     "interface_config": "interface",
+    "ospf_interface": "ospf_interface",
     "bgp_neighbor": "bgp",
     "acl_rule": "acl",
     "site_device_intent": "device",
@@ -782,6 +784,12 @@ _RCA_EXECUTABLE_FIELD_NAMES = {
 _RCA_AGENT_REQUIRED_VALUE_FIELDS = {
     "add_vlan": {"vlan_id", "name", "subnet", "svi_enabled"},
     "interface_config": {"interface", "enabled", "apply_scope"},
+    "ospf_interface": {
+        "process_id",
+        "interface",
+        "passive",
+        "current_passive",
+    },
     "bgp_neighbor": {"asn", "neighbor", "remote_as", "shutdown"},
     "acl_rule": {
         "acl_name",
@@ -803,6 +811,12 @@ _RCA_AGENT_ALLOWED_VALUE_FIELDS = {
         "gateway_ip",
     },
     "interface_config": {"interface", "enabled", "apply_scope"},
+    "ospf_interface": {
+        "process_id",
+        "interface",
+        "passive",
+        "current_passive",
+    },
     "bgp_neighbor": {
         "asn",
         "neighbor",
@@ -1176,6 +1190,12 @@ def _require_agent_recommendation_evidence(
             "interface": str,
             "enabled": bool,
             "apply_scope": str,
+        },
+        "ospf_interface": {
+            "process_id": int,
+            "interface": str,
+            "passive": bool,
+            "current_passive": bool,
         },
         "bgp_neighbor": {
             "asn": int,
@@ -2815,6 +2835,7 @@ def desired_state_plan(request: DesiredStatePlanRequest, http_request: Request) 
             domain_by_change = {
                 "add_vlan": "topology",
                 "interface_config": "topology",
+                "ospf_interface": "routing",
                 "bgp_neighbor": "routing",
                 "routing_redistribution": "route_propagation",
                 "acl_rule": "security_policy",
@@ -2993,16 +3014,13 @@ def api_lab_rollback(request: IntentPathRequest, http_request: Request) -> dict[
 
 @app.post("/api/lab/full-run")
 def api_lab_full_run(request: IntentPathRequest, http_request: Request) -> dict[str, object]:
-    require_production_writes(org_id=_request_principal(http_request).org_id)
-    try:
-        return JobRunner(paths()).run_full_arista(
-            Path(request.intent_path),
-            request.device_id,
-            apply=True,
-            org_id=_request_principal(http_request).org_id,
-        )
-    except Exception as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    raise HTTPException(
+        status_code=410,
+        detail=(
+            "The direct full-run endpoint is retired. Create a draft, run the "
+            "dry-run, record human approval, then use the governed apply path."
+        ),
+    )
 
 
 @app.get("/api/adapters")

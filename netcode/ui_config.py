@@ -137,6 +137,40 @@ DEFAULT_UI_CONFIG: dict[str, Any] = {
                     {"name": "enabled", "label": "No shutdown", "type": "checkbox", "value": True},
                 ],
             },
+            "ospf_interface": {
+                "label": "OSPF Interface State",
+                "outcome": "Set one interface passive or active in one OSPF process.",
+                "risk": "Medium: changes OSPF adjacency behavior on one interface",
+                "lab_write_supported": True,
+                "production_write_supported": False,
+                "fields": [
+                    {
+                        "name": "process_id",
+                        "label": "OSPF process",
+                        "type": "number",
+                        "value": 1,
+                        "min": 1,
+                    },
+                    {
+                        "name": "interface",
+                        "label": "Interface",
+                        "type": "text",
+                        "value": "Ethernet1",
+                    },
+                    {
+                        "name": "passive",
+                        "label": "Passive interface",
+                        "type": "checkbox",
+                        "value": False,
+                    },
+                    {
+                        "name": "current_passive",
+                        "label": "Current passive state",
+                        "type": "checkbox",
+                        "value": True,
+                    },
+                ],
+            },
             "bgp_neighbor": {
                 "label": "BGP Neighbor",
                 "outcome": "Define routing adjacency intent and generated router BGP commands.",

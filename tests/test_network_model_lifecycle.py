@@ -462,6 +462,31 @@ def test_unstructured_cli_never_becomes_network_model_intent():
     assert domains == []
 
 
+def test_ospf_interface_intent_projects_into_routing_model():
+    patch, domains = model_patch_from_intent(
+        {
+            "change_type": "ospf_interface",
+            "site": "site-101",
+            "ospf_interface": {
+                "process_id": 1,
+                "interface": "Ethernet3",
+                "passive": False,
+                "current_passive": True,
+            },
+        },
+        device_id="edge-1",
+    )
+
+    assert domains == ["routing"]
+    modeled = patch["sites"]["site-101"]["devices"]["edge-1"]["intent"]
+    assert modeled["routing"]["ospf_interfaces"]["1:Ethernet3"] == {
+        "process_id": 1,
+        "interface": "Ethernet3",
+        "passive": False,
+        "current_passive": True,
+    }
+
+
 def test_active_model_drives_scoped_plan_without_returning_full_model_on_summary(tmp_path: Path, monkeypatch):
     workspace, store, repository = _setup(tmp_path)
     monkeypatch.chdir(tmp_path)

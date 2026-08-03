@@ -116,7 +116,7 @@ orb -m clab bash -lc "cd /tmp/netcode-platform-test && python3 -m netcode.cli ad
 Run the complete Arista lab path:
 
 ```bash
-orb -m clab bash -lc "cd /tmp/netcode-platform-test && python3 -m netcode.cli lab full-run intents/examples/add_guest_vlan.yaml --device v2-store1 --apply"
+orb -m clab bash -lc "cd /tmp/netcode-platform-test && python3 -m netcode.cli lab full-run intents/examples/add_guest_vlan.yaml --device v2-store1 --dry-run-only"
 ```
 
 Rollback the lab VLAN:

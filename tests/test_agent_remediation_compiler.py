@@ -1105,6 +1105,17 @@ def test_real_interface_admin_down_payload_reaches_compiler_without_resigning(
             "shutdown",
         ),
         (
+            "ospf_interface",
+            {
+                "process_id": 1,
+                "interface": "Ethernet3",
+                "passive": False,
+                "current_passive": True,
+            },
+            "no passive-interface Ethernet3",
+            "passive-interface Ethernet3",
+        ),
+        (
             "bgp_neighbor",
             {
                 "asn": 65000,

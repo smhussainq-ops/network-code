@@ -35,6 +35,7 @@ class AdapterRegistry:
             "supported_change_types": [
                 "add_vlan",
                 "interface_config",
+                "ospf_interface",
                 "bgp_neighbor",
                 "routing_redistribution",
                 "acl_rule",

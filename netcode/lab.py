@@ -18,7 +18,7 @@ from netcode.adapters.registry import AdapterRegistry
 from netcode.change_types import redistribution_items, spec_for
 from netcode.inventory import Device, Inventory
 from netcode.intent_utils import lab_write_supported, report_stem, rollback_config
-from netcode.models import AclRuleIntent, AddVlanIntent, BgpNeighborIntent, CustomConfigIntent, EndToEndArtifacts, EndToEndResult, Intent, InterfaceConfigIntent, NtpStandardizeIntent, OsUpgradeIntent, PhaseResult, RoutingRedistributionIntent, load_intent
+from netcode.models import AclRuleIntent, AddVlanIntent, BgpNeighborIntent, CustomConfigIntent, EndToEndArtifacts, EndToEndResult, Intent, InterfaceConfigIntent, NtpStandardizeIntent, OspfInterfaceIntent, OsUpgradeIntent, PhaseResult, RoutingRedistributionIntent, load_intent
 from netcode.paths import WorkspacePaths
 from netcode.rendering import render_intent
 from netcode.reporting import write_end_to_end_reports
@@ -804,6 +804,43 @@ class AristaEOSLabAdapter(ExecutionAdapter):
             device_id=self.device.id,
             message=f"Interface {intent.interface.name} rollback {'was verified' if absent else 'still shows desired fragments'}.",
             evidence={"commands": {command: output}},
+        )
+
+    def _verify_ospf_interface(
+        self,
+        intent: OspfInterfaceIntent,
+        present: bool,
+    ) -> LabResult:
+        command = (
+            "show running-config | section "
+            f"router ospf {intent.ospf_interface.process_id}"
+        )
+        output = self.show(command)
+        expected_passive = (
+            intent.ospf_interface.passive
+            if present
+            else intent.ospf_interface.current_passive
+        )
+        statement = f"passive-interface {intent.ospf_interface.interface}"
+        passive_seen = re.search(
+            rf"(?m)^\s*{re.escape(statement)}\s*$",
+            output,
+        ) is not None
+        matched = passive_seen == expected_passive
+        return LabResult(
+            status="pass" if matched else "fail",
+            action="verify" if present else "verify_rollback",
+            device_id=self.device.id,
+            message=(
+                f"OSPF {intent.ospf_interface.process_id} interface "
+                f"{intent.ospf_interface.interface} passive state "
+                f"{'matches' if matched else 'does not match'} the expected "
+                f"{str(expected_passive).lower()} value."
+            ),
+            evidence={
+                "commands": {command: output},
+                "expected_passive": expected_passive,
+            },
         )
 
     def _verify_bgp(self, intent: BgpNeighborIntent, present: bool) -> LabResult:

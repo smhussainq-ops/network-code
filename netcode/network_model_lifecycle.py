@@ -25,6 +25,7 @@ ROLLBACK_CHANGE_STATES = {"rolled_back"}
 CHANGE_MODEL_DOMAINS = {
     "add_vlan": "topology",
     "interface_config": "topology",
+    "ospf_interface": "routing",
     "bgp_neighbor": "routing",
     "acl_rule": "security_policy",
     "site_device_intent": "identity",
@@ -88,6 +89,16 @@ def model_patch_from_intent(
         interface = _dict(intent.get("interface"))
         identity = str(interface.get("name") or "").strip()
         domain_intent = {"interfaces": {identity: interface}} if identity and interface else {}
+    elif change_type == "ospf_interface":
+        ospf_interface = _dict(intent.get("ospf_interface"))
+        process_id = str(ospf_interface.get("process_id") or "").strip()
+        interface = str(ospf_interface.get("interface") or "").strip()
+        identity = f"{process_id}:{interface}" if process_id and interface else ""
+        domain_intent = (
+            {"ospf_interfaces": {identity: ospf_interface}}
+            if identity and ospf_interface
+            else {}
+        )
     elif change_type == "bgp_neighbor":
         bgp = _dict(intent.get("bgp"))
         identity = str(bgp.get("neighbor_ip") or bgp.get("neighbor") or "").strip()

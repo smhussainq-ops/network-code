@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from ipaddress import ip_address, ip_network
 from pathlib import Path
+import re
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator, model_validator
@@ -119,6 +120,37 @@ class InterfaceConfigIntent(BaseModel):
     site: str
     targets: TargetSpec
     interface: InterfaceSpec
+    policy: PolicySpec = Field(default_factory=PolicySpec)
+    metadata: IntentMetadata = Field(default_factory=IntentMetadata)
+
+
+class OspfInterfaceSpec(BaseModel):
+    process_id: int
+    interface: str
+    passive: bool
+    current_passive: bool
+
+    @field_validator("process_id")
+    @classmethod
+    def process_id_range(cls, value: int) -> int:
+        if value < 1 or value > 65535:
+            raise ValueError("OSPF process ID must be between 1 and 65535")
+        return value
+
+    @field_validator("interface")
+    @classmethod
+    def interface_name(cls, value: str) -> str:
+        value = value.strip()
+        if not re.fullmatch(r"[A-Za-z][A-Za-z0-9./:_-]{0,63}", value):
+            raise ValueError("OSPF interface name is invalid")
+        return value
+
+
+class OspfInterfaceIntent(BaseModel):
+    change_type: Literal["ospf_interface"] = "ospf_interface"
+    site: str
+    targets: TargetSpec
+    ospf_interface: OspfInterfaceSpec
     policy: PolicySpec = Field(default_factory=PolicySpec)
     metadata: IntentMetadata = Field(default_factory=IntentMetadata)
 
@@ -498,7 +530,7 @@ class OsUpgradeIntent(BaseModel):
     metadata: IntentMetadata = Field(default_factory=IntentMetadata)
 
 
-Intent = AddVlanIntent | InterfaceConfigIntent | BgpNeighborIntent | RoutingRedistributionIntent | AclRuleIntent | SiteDeviceIntent | CustomConfigIntent | NtpStandardizeIntent | OsUpgradeIntent
+Intent = AddVlanIntent | InterfaceConfigIntent | OspfInterfaceIntent | BgpNeighborIntent | RoutingRedistributionIntent | AclRuleIntent | SiteDeviceIntent | CustomConfigIntent | NtpStandardizeIntent | OsUpgradeIntent
 
 
 class CheckResult(BaseModel):

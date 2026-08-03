@@ -113,9 +113,17 @@ def lab_rollback(intent_path: Path, device: Optional[str] = typer.Option(None, "
 def lab_full_run(
     intent_path: Path,
     device: Optional[str] = typer.Option(None, "--device"),
-    apply: bool = typer.Option(True, "--apply/--dry-run-only", help="Commit to the lab after dry-run passes."),
+    apply: bool = typer.Option(
+        False,
+        "--apply/--dry-run-only",
+        help="Direct apply is retired; this command supports dry-run only.",
+    ),
 ) -> None:
-    """Run static validation, Arista dry-run, optional lab apply, verify, and write reports."""
+    """Run static validation and an Arista dry-run without committing."""
+    if apply:
+        raise typer.BadParameter(
+            "Direct full-run apply is retired. Use the governed approval workflow."
+        )
     result = JobRunner(paths()).run_full_arista(intent_path, device, apply=apply)
     console.print_json(json.dumps(result, indent=2))
 

@@ -8,7 +8,7 @@ from netcode.lab import (
     offline_dry_run,
     run_lab_action_for_device,
 )
-from netcode.models import NtpStandardizeIntent, TargetSpec
+from netcode.models import NtpStandardizeIntent, TargetSpec, load_intent_data
 
 
 class _Render:
@@ -103,6 +103,55 @@ def test_verify_vlan_absent_ignores_error_text_with_vlan_id():
     result = _adapter(outputs).verify_vlan_absent(90)
 
     assert result.status == "pass"
+
+
+def test_verify_ospf_interface_and_exact_rollback_state():
+    command = "show running-config | section router ospf 1"
+    intent = load_intent_data(
+        {
+            "change_type": "ospf_interface",
+            "site": "branch",
+            "targets": {"device_ids": ["v2-store1"]},
+            "ospf_interface": {
+                "process_id": 1,
+                "interface": "Ethernet3",
+                "passive": False,
+                "current_passive": True,
+            },
+        }
+    )
+
+    applied = _adapter({command: "router ospf 1\n"}).verify_intent(
+        intent,
+        present=True,
+    )
+    restored = _adapter(
+        {command: "router ospf 1\n   passive-interface Ethernet3\n"}
+    ).verify_intent(intent, present=False)
+
+    assert applied.status == "pass"
+    assert restored.status == "pass"
+    assert restored.evidence["expected_passive"] is True
+
+
+def test_ospf_interface_name_rejects_cli_metacharacters():
+    for interface in ("Ethernet3 ; shutdown", "Ethernet3 | include x"):
+        payload = {
+            "change_type": "ospf_interface",
+            "site": "branch",
+            "targets": {"device_ids": ["edge-1"]},
+            "ospf_interface": {
+                "process_id": 1,
+                "interface": interface,
+                "passive": False,
+                "current_passive": True,
+            },
+        }
+        try:
+            load_intent_data(payload)
+        except ValueError:
+            continue
+        raise AssertionError(f"unsafe interface name was accepted: {interface}")
 
 
 def test_eos_dry_run_records_native_session_kind():

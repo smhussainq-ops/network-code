@@ -32,7 +32,12 @@ _PACKS: list[dict[str, Any]] = [
         "id": "controlled-routing-acl-update",
         "name": "Controlled Routing / ACL Update",
         "description": "Plan and gate BGP neighbor or ACL changes where blast radius and rollback proof are mandatory.",
-        "change_types": ["bgp_neighbor", "routing_redistribution", "acl_rule"],
+        "change_types": [
+            "bgp_neighbor",
+            "ospf_interface",
+            "routing_redistribution",
+            "acl_rule",
+        ],
         "target_selector": ["site", "device_id", "device_group"],
         "default_gates": ["plan", "validate", "dry_run", "peer_review", "canary", "verify", "rollback"],
         "diagnostics_handoff": True,

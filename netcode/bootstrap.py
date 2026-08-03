@@ -44,6 +44,15 @@ INTERFACE_CONFIG_TEMPLATE = """interface {{ interface.name }}
 """
 
 
+OSPF_INTERFACE_TEMPLATE = """router ospf {{ ospf_interface.process_id }}
+{% if ospf_interface.passive %}
+   passive-interface {{ ospf_interface.interface }}
+{% else %}
+   no passive-interface {{ ospf_interface.interface }}
+{% endif %}
+"""
+
+
 BGP_NEIGHBOR_TEMPLATE = """router bgp {{ bgp.asn }}
 {% if bgp.router_id %}
    router-id {{ bgp.router_id }}
@@ -181,6 +190,7 @@ def init_workspace(
     files: list[tuple[Path, str]] = [
         (paths.templates / "arista" / "add_vlan.j2", ADD_VLAN_TEMPLATE),
         (paths.templates / "arista" / "interface_config.j2", INTERFACE_CONFIG_TEMPLATE),
+        (paths.templates / "arista" / "ospf_interface.j2", OSPF_INTERFACE_TEMPLATE),
         (paths.templates / "arista" / "bgp_neighbor.j2", BGP_NEIGHBOR_TEMPLATE),
         (paths.templates / "arista" / "routing_redistribution.j2", ROUTING_REDISTRIBUTION_TEMPLATE),
         (paths.templates / "arista" / "acl_rule.j2", ACL_RULE_TEMPLATE),
@@ -271,6 +281,11 @@ def init_workspace(
                 "   ip address ",
                 "   shutdown",
                 "   no shutdown",
+            ],
+            "ospf_interface_allowed_prefixes": [
+                "router ospf ",
+                "   passive-interface ",
+                "   no passive-interface ",
             ],
             "bgp_neighbor_allowed_prefixes": [
                 "router bgp ",

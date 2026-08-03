@@ -1,0 +1,6 @@
+router ospf {{ ospf_interface.process_id }}
+{% if ospf_interface.passive %}
+   passive-interface {{ ospf_interface.interface }}
+{% else %}
+   no passive-interface {{ ospf_interface.interface }}
+{% endif %}

@@ -17,6 +17,7 @@ from netcode.models import (
     CustomConfigIntent,
     Intent,
     InterfaceConfigIntent,
+    OspfInterfaceIntent,
     OsUpgradeIntent,
     RenderResult,
     SiteDeviceIntent,
@@ -239,6 +240,41 @@ class StaticValidator:
             interface=intent.interface.name,
             mode=intent.interface.mode,
             apply_scope=intent.interface.apply_scope,
+        )
+
+    def _ospf_interface_policy(
+        self,
+        intent: OspfInterfaceIntent,
+        render: RenderResult,
+    ) -> CheckResult:
+        expected = (
+            "" if intent.ospf_interface.passive else "no "
+        ) + f"passive-interface {intent.ospf_interface.interface}"
+        lines = {
+            line.strip()
+            for line in render.config.splitlines()
+            if line.strip()
+        }
+        if (
+            f"router ospf {intent.ospf_interface.process_id}" not in lines
+            or expected not in lines
+        ):
+            return self._fail(
+                "ospf_interface_policy",
+                "OSPF Interface Policy",
+                "Rendered configuration does not match the exact OSPF interface intent.",
+                process_id=intent.ospf_interface.process_id,
+                interface=intent.ospf_interface.interface,
+                passive=intent.ospf_interface.passive,
+            )
+        return self._pass(
+            "ospf_interface_policy",
+            "OSPF Interface Policy",
+            "The change is limited to one OSPF process and one interface passive state.",
+            process_id=intent.ospf_interface.process_id,
+            interface=intent.ospf_interface.interface,
+            current_passive=intent.ospf_interface.current_passive,
+            expected_passive=intent.ospf_interface.passive,
         )
 
     def _bgp_policy(self, intent: BgpNeighborIntent, render: RenderResult) -> CheckResult:

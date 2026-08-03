@@ -6,6 +6,7 @@ import zipfile
 from io import BytesIO
 from pathlib import Path
 
+import pytest
 from fastapi.testclient import TestClient
 
 from netcode.adapters.registry import AdapterRegistry
@@ -2117,7 +2118,16 @@ def test_desired_state_catalog_and_dynamic_plans(tmp_path: Path, monkeypatch):
     ids = {item["id"] for item in catalog.json()["change_types"]}
 
     assert catalog.status_code == 200
-    assert {"add_vlan", "interface_config", "bgp_neighbor", "routing_redistribution", "acl_rule", "site_device_intent", "os_upgrade"}.issubset(ids)
+    assert {
+        "add_vlan",
+        "interface_config",
+        "ospf_interface",
+        "bgp_neighbor",
+        "routing_redistribution",
+        "acl_rule",
+        "site_device_intent",
+        "os_upgrade",
+    }.issubset(ids)
 
     interface_plan = client.post(
         "/api/desired-state/plan",
@@ -2132,6 +2142,21 @@ def test_desired_state_catalog_and_dynamic_plans(tmp_path: Path, monkeypatch):
                 "mode": "access",
                 "access_vlan": 90,
                 "enabled": True,
+            },
+        },
+    )
+    ospf_plan = client.post(
+        "/api/desired-state/plan",
+        json={
+            "change_type": "ospf_interface",
+            "site": "store-1842",
+            "device_id": "v2-store1",
+            "requested_by": "unit",
+            "values": {
+                "process_id": 1,
+                "interface": "Ethernet1",
+                "passive": False,
+                "current_passive": True,
             },
         },
     )
@@ -2189,6 +2214,20 @@ def test_desired_state_catalog_and_dynamic_plans(tmp_path: Path, monkeypatch):
     assert interface_plan.json()["ok"] is True
     assert interface_plan.json()["plan"]["lab_write_supported"] is True
     assert "interface Ethernet1" in interface_plan.json()["pipeline"]["render"]["config"]
+    assert ospf_plan.status_code == 200, ospf_plan.text
+    assert (
+        "router ospf 1\n   no passive-interface Ethernet1"
+        in ospf_plan.json()["pipeline"]["render"]["config"]
+    )
+    assert (
+        "router ospf 1\n   passive-interface Ethernet1"
+        in ospf_plan.json()["plan"]["rollback"]["commands"]
+    )
+    assert ospf_plan.json()["plan"]["rollback"]["confidence"]["level"] == "medium"
+    assert (
+        ospf_plan.json()["plan"]["checks"]["pre"][0]["executable"]
+        is False
+    )
     assert bgp_plan.status_code == 200
     assert "router bgp 65001" in bgp_plan.json()["pipeline"]["render"]["config"]
     assert acl_plan.status_code == 200
@@ -3861,7 +3900,18 @@ def test_change_type_registry_contract_is_complete():
     from netcode.lab import AristaEOSLabAdapter
     from netcode.validation import StaticValidator
 
-    assert set(REGISTRY) == {"add_vlan", "interface_config", "bgp_neighbor", "routing_redistribution", "acl_rule", "site_device_intent", "custom_config", "ntp_standardize", "os_upgrade"}
+    assert set(REGISTRY) == {
+        "add_vlan",
+        "interface_config",
+        "ospf_interface",
+        "bgp_neighbor",
+        "routing_redistribution",
+        "acl_rule",
+        "site_device_intent",
+        "custom_config",
+        "ntp_standardize",
+        "os_upgrade",
+    }
     for key, spec in REGISTRY.items():
         assert spec.template.endswith(".j2"), key
         assert spec.policy_checks, f"{key} has no policy checks"
@@ -3870,6 +3920,53 @@ def test_change_type_registry_contract_is_complete():
         assert hasattr(AristaEOSLabAdapter, spec.verify_method), f"{key}: adapter is missing {spec.verify_method}"
         # the pure callables must run against a minimally-built intent without raising
         assert callable(spec.build) and callable(spec.title) and callable(spec.slug)
+
+
+def test_direct_full_run_endpoint_is_retired(tmp_path: Path, monkeypatch):
+    init_workspace(WorkspacePaths(tmp_path))
+    monkeypatch.chdir(tmp_path)
+
+    response = TestClient(api.app).post(
+        "/api/lab/full-run",
+        json={"intent_path": "intents/example.yaml", "device_id": "edge-1"},
+    )
+
+    assert response.status_code == 410
+    assert "approval" in response.json()["detail"].lower()
+
+
+def test_direct_full_run_runner_cannot_apply_without_governed_approval(tmp_path: Path):
+    with pytest.raises(PermissionError, match="governed"):
+        JobRunner(WorkspacePaths(tmp_path)).run_full_arista(
+            tmp_path / "intent.yaml",
+            "edge-1",
+            apply=True,
+        )
+
+
+@pytest.mark.parametrize(
+    ("field_name", "field_value"),
+    [
+        ("passive", "false"),
+        ("current_passive", "true"),
+    ],
+)
+def test_ospf_interface_plan_rejects_string_boolean_prestate(
+    field_name: str,
+    field_value: str,
+):
+    from netcode.change_types import spec_for
+
+    values = {
+        "process_id": 1,
+        "interface": "Ethernet1",
+        "passive": False,
+        "current_passive": True,
+    }
+    values[field_name] = field_value
+
+    with pytest.raises(ValueError, match="must be a boolean"):
+        spec_for("ospf_interface").build({}, values, "edge-1")
 
 
 def test_custom_config_ingests_any_config_with_rollback_discipline(tmp_path: Path, monkeypatch):
