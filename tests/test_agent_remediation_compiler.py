@@ -8,14 +8,16 @@ from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 from netcode import api
+from netcode.auth import Principal, hash_password, mint_session, token_hash
 from netcode.bootstrap import init_workspace
-from netcode.network_model import NETWORK_MODEL_SCHEMA
+from netcode.network_model import NETWORK_MODEL_SCHEMA, NetworkModelError
 from netcode.network_model_lifecycle import activate_verified_revision, approve_with_git
 from netcode.network_model_store import NetworkModelRepository
 from netcode.paths import WorkspacePaths
 from netcode.models import RenderResult, load_intent_data
 from netcode.store import PlatformStore
 from netcode.validation import StaticValidator
+from netcode.workflow import require_action_allowed
 
 
 ORG_ID = "org_default"
@@ -154,6 +156,17 @@ def _refresh_integrity(payload: dict) -> dict:
     return payload
 
 
+def _sign_current_proof(payload: dict) -> dict:
+    proof = payload["evidence_contract"]
+    unsigned = {key: value for key, value in proof.items() if key != "signature"}
+    proof["signature"] = hmac.new(
+        SIGNING_SECRET,
+        api._canonical_json(unsigned).encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+    return payload
+
+
 def _proposal(*, root_atom_id: str = "NORMALIZED_CONFIRMED_ROOT") -> dict:
     payload = {
         "source": "rez",
@@ -201,6 +214,632 @@ def _proposal(*, root_atom_id: str = "NORMALIZED_CONFIRMED_ROOT") -> dict:
         },
     }
     return _refresh_integrity(payload)
+
+
+def _review_proposal() -> dict:
+    payload = _proposal(root_atom_id="NORMALIZED_ROUTING_ROOT")
+    payload.update(
+        {
+            "suggested_pack": "routing_policy",
+            "draft_mode": "needs_input",
+            "expected_outcome": "Restore the approved route without shadowing.",
+            "verification_checks": [
+                "The approved prefix resolves through the intended next hop",
+                "Round-trip reachability succeeds",
+            ],
+            "unresolved_inputs": [
+                "Select the supported Netcode change type",
+                "Supply exact forward and rollback intent",
+            ],
+            "proposed_intent": {
+                "change_type": "routing_policy",
+                "site": "branch",
+                "targets": {"device_ids": [DEVICE_ID]},
+                "values": {
+                    "desired_outcome": "Restore the approved route without shadowing.",
+                },
+            },
+        }
+    )
+    payload["evidence_contract"].update(
+        {
+            "change_type": "routing_policy",
+            "draft_mode": "needs_input",
+            "sufficient_for_review": True,
+            "sufficient_for_execution": False,
+            "unresolved_inputs": payload["unresolved_inputs"],
+            "expected_outcome": payload["expected_outcome"],
+            "verification_checks": payload["verification_checks"],
+        }
+    )
+    return _refresh_integrity(payload)
+
+
+def _auth_header(
+    store: PlatformStore,
+    *,
+    org_id: str = ORG_ID,
+    email: str,
+    role: str,
+) -> dict[str, str]:
+    if org_id != ORG_ID:
+        store.ensure_org(org_id, org_id, org_id)
+    user = store.create_user(
+        org_id,
+        email,
+        hash_password("review-contract-password"),
+        role=role,
+    )
+    return {"Authorization": f"Bearer {mint_session(store, user.id, org_id)}"}
+
+
+def _activate_replacement_model(tmp_path: Path) -> None:
+    workspace = WorkspacePaths(tmp_path.resolve())
+    store = PlatformStore(workspace)
+    repository = NetworkModelRepository(store)
+    active = repository.active_revision(ORG_ID, ENVIRONMENT_ID)
+    assert active is not None
+    replacement_id = "branch-approved-v2"
+    repository.create_revision(
+        {
+            "schema": NETWORK_MODEL_SCHEMA,
+            "org_id": ORG_ID,
+            "environment_id": ENVIRONMENT_ID,
+            "revision_id": replacement_id,
+            "parent_revision_id": REVISION_ID,
+            "status": "proposed",
+            "source": {
+                "type": "manual_review",
+                "reference": f"approved:{replacement_id}",
+            },
+            "coverage": copy.deepcopy(active["coverage"]),
+            "authority_bindings": copy.deepcopy(active["authority_bindings"]),
+            "model": copy.deepcopy(active["model"]),
+        },
+        created_by="intent-reviewer",
+    )
+    approve_with_git(
+        repository,
+        org_id=ORG_ID,
+        environment_id=ENVIRONMENT_ID,
+        revision_id=replacement_id,
+        approved_by="intent-reviewer",
+        git_root=workspace.git_workspace,
+    )
+    activate_verified_revision(
+        repository,
+        store,
+        org_id=ORG_ID,
+        environment_id=ENVIRONMENT_ID,
+        revision_id=replacement_id,
+        actor="intent-reviewer",
+        git_root=workspace.git_workspace,
+        reviewed_intent_update=True,
+        expected_current_revision_id=REVISION_ID,
+    )
+
+
+def _completion_payload() -> dict:
+    return {
+        "proposed_intent": {
+            "change_type": "custom_config",
+            "site": "branch",
+            "targets": {"device_ids": [DEVICE_ID]},
+            "config_lines": "interface Ethernet3\n   description REVIEWED_UPLINK\n",
+            "rollback_lines": "interface Ethernet3\n   no description\n",
+            "verify_contains": "description REVIEWED_UPLINK",
+        },
+        "expected_outcome": "The approved uplink intent is restored.",
+        "verification_checks": [
+            "Running configuration contains the reviewed description",
+            "Approved reachability succeeds",
+        ],
+    }
+
+
+def test_incomplete_agent_recommendation_creates_one_review_only_change(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    init_workspace(WorkspacePaths(tmp_path))
+    _activate_model(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    client = TestClient(api.app)
+    payload = _review_proposal()
+
+    first = client.post("/api/changes/from-rca", json=payload)
+    replay = client.post("/api/changes/from-rca", json=payload)
+
+    assert first.status_code == 200, first.text
+    assert replay.status_code == 200, replay.text
+    body = first.json()
+    assert replay.json()["idempotent_replay"] is True
+    assert replay.json()["change_id"] == body["change_id"]
+    assert "source_request" not in replay.json()["review_draft"]
+    assert body["draft_mode"] == "needs_input"
+    assert body["change"]["workflow_state"] == "needs_input"
+    assert body["review_draft"]["expected_outcome"]
+    assert body["review_draft"]["unresolved_inputs"] == payload["unresolved_inputs"]
+    assert body["review_draft"]["commands"] == []
+    assert body["review_draft"]["rollback"] == []
+    assert body["workflow"]["allowed_actions"] == []
+    assert "source_request" not in body["change"]["result"]["review_draft"]
+    record = client.get(f"/api/change/{body['change_id']}/record")
+    assert record.status_code == 200, record.text
+    assert record.json()["review_draft"]["expected_outcome"]
+    assert "source_request" not in record.json()["review_draft"]
+    workflow = client.get(f"/api/workflow/change/{body['change_id']}")
+    assert workflow.status_code == 200, workflow.text
+    assert (
+        "source_request"
+        not in workflow.json()["change"]["result"]["review_draft"]
+    )
+
+    with pytest.raises(ValueError, match="blocked in workflow state needs_input"):
+        require_action_allowed("needs_input", "dry_run")
+    with pytest.raises(ValueError, match="blocked in workflow state needs_input"):
+        require_action_allowed("needs_input", "apply")
+
+    store = PlatformStore(WorkspacePaths(tmp_path.resolve()))
+    assert len(store.list_changes(org_id=ORG_ID)) == 1
+    assert "source_request" in (
+        store.get_change(body["change_id"]).result or {}
+    )["review_draft"]
+    assert store.list_jobs(org_id=ORG_ID) == []
+
+
+def test_review_only_mode_requires_signed_agent_source(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    init_workspace(WorkspacePaths(tmp_path))
+    _activate_model(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    payload = copy.deepcopy(_review_proposal())
+    payload["proposal_source"] = "rez_structured_rca"
+
+    response = TestClient(api.app).post("/api/changes/from-rca", json=payload)
+
+    assert response.status_code == 400
+    assert "signed Rez agent recommendation" in response.json()["detail"]
+    store = PlatformStore(WorkspacePaths(tmp_path.resolve()))
+    assert store.list_changes(org_id=ORG_ID) == []
+    assert store.list_jobs(org_id=ORG_ID) == []
+
+
+def test_authenticated_engineer_completes_same_review_draft_before_dry_run(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    init_workspace(WorkspacePaths(tmp_path))
+    _activate_model(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    client = TestClient(api.app)
+    created = client.post("/api/changes/from-rca", json=_review_proposal())
+    assert created.status_code == 200, created.text
+    change_id = created.json()["change_id"]
+
+    completed = client.post(
+        f"/api/change/{change_id}/complete-rca-draft",
+        json=_completion_payload(),
+    )
+
+    assert completed.status_code == 200, completed.text
+    body = completed.json()
+    assert body["change_id"] == change_id
+    assert body["change"]["workflow_state"] == "validated"
+    assert body["draft_mode"] == "executable"
+    assert "description REVIEWED_UPLINK" in body["change"]["result"]["plan"]["commands"]
+    assert "no description" in body["change"]["result"]["plan"]["rollback"]
+    assert body["change"]["result"]["completed_by"]
+    assert body["change"]["result"]["device_write_performed"] is False
+    assert body["intent_path"].endswith("-completed.yaml")
+    assert PlatformStore(WorkspacePaths(tmp_path.resolve())).list_jobs(org_id=ORG_ID) == []
+
+
+@pytest.mark.parametrize(
+    ("root_atom_id", "change_type"),
+    [
+        ("CP_ROUTE_BLACKHOLE", "routing_policy"),
+        ("CP_REDISTRIBUTION_GAP", "routing_redistribution"),
+    ],
+)
+def test_specialized_evidence_gates_defer_signed_review_only_drafts(
+    tmp_path: Path,
+    monkeypatch,
+    root_atom_id: str,
+    change_type: str,
+) -> None:
+    init_workspace(WorkspacePaths(tmp_path))
+    _activate_model(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    payload = copy.deepcopy(_review_proposal())
+    payload["root_atom_id"] = root_atom_id
+    payload["suggested_pack"] = change_type
+    payload["proposed_intent"]["change_type"] = change_type
+    payload["evidence_contract"]["root_atom_id"] = root_atom_id
+    payload["evidence_contract"]["change_type"] = change_type
+    _refresh_integrity(payload)
+
+    response = TestClient(api.app).post("/api/changes/from-rca", json=payload)
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["draft_mode"] == "needs_input"
+    assert body["change"]["workflow_state"] == "needs_input"
+    assert body["workflow"]["allowed_actions"] == []
+    assert PlatformStore(WorkspacePaths(tmp_path.resolve())).list_jobs(org_id=ORG_ID) == []
+
+
+def test_review_completion_authentication_and_tenant_contracts(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    init_workspace(WorkspacePaths(tmp_path))
+    _activate_model(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("NETCODE_AUTH", raising=False)
+    client = TestClient(api.app)
+    created = client.post("/api/changes/from-rca", json=_review_proposal())
+    assert created.status_code == 200, created.text
+    change_id = created.json()["change_id"]
+    store = PlatformStore(WorkspacePaths(tmp_path.resolve()))
+    viewer = _auth_header(
+        store,
+        email="viewer@example.invalid",
+        role="viewer",
+    )
+    operator = _auth_header(
+        store,
+        email="operator@example.invalid",
+        role="operator",
+    )
+    other_operator = _auth_header(
+        store,
+        org_id="org-other",
+        email="other-operator@example.invalid",
+        role="operator",
+    )
+    revoked = _auth_header(
+        store,
+        email="revoked@example.invalid",
+        role="operator",
+    )
+    revoked_token = revoked["Authorization"].removeprefix("Bearer ")
+    store.revoke_session(token_hash(revoked_token))
+    monkeypatch.setenv("NETCODE_AUTH", "1")
+
+    assert client.post(
+        f"/api/change/{change_id}/complete-rca-draft",
+        json=_completion_payload(),
+    ).status_code == 401
+    assert client.post(
+        f"/api/change/{change_id}/complete-rca-draft",
+        headers=viewer,
+        json=_completion_payload(),
+    ).status_code == 403
+    assert client.post(
+        f"/api/change/{change_id}/complete-rca-draft",
+        headers=revoked,
+        json=_completion_payload(),
+    ).status_code == 401
+    assert client.post(
+        f"/api/change/{change_id}/complete-rca-draft",
+        headers=other_operator,
+        json=_completion_payload(),
+    ).status_code == 404
+
+    completed = client.post(
+        f"/api/change/{change_id}/complete-rca-draft",
+        headers=operator,
+        json=_completion_payload(),
+    )
+    replay = client.post(
+        f"/api/change/{change_id}/complete-rca-draft",
+        headers=operator,
+        json=_completion_payload(),
+    )
+    assert completed.status_code == 200, completed.text
+    assert replay.status_code == 409
+    assert store.list_jobs(org_id=ORG_ID) == []
+
+
+def test_review_completion_rejects_stale_active_model_with_auth_on(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    init_workspace(WorkspacePaths(tmp_path))
+    _activate_model(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("NETCODE_AUTH", raising=False)
+    client = TestClient(api.app)
+    created = client.post("/api/changes/from-rca", json=_review_proposal())
+    assert created.status_code == 200, created.text
+    change_id = created.json()["change_id"]
+    original_path = created.json()["intent_path"]
+    _activate_replacement_model(tmp_path)
+    store = PlatformStore(WorkspacePaths(tmp_path.resolve()))
+    operator = _auth_header(
+        store,
+        email="operator@example.invalid",
+        role="operator",
+    )
+    monkeypatch.setenv("NETCODE_AUTH", "1")
+
+    response = client.post(
+        f"/api/change/{change_id}/complete-rca-draft",
+        headers=operator,
+        json=_completion_payload(),
+    )
+
+    assert response.status_code == 409
+    change = store.get_change(change_id)
+    assert change.workflow_state == "needs_input"
+    assert change.intent_path == original_path
+    assert store.list_jobs(org_id=ORG_ID) == []
+
+
+@pytest.mark.parametrize(
+    ("mutation", "expected_status"),
+    [
+        ("signature", 400),
+        ("organization", 403),
+        ("intent_digest", 400),
+    ],
+)
+def test_signed_review_intake_rejects_tampering_with_auth_on(
+    tmp_path: Path,
+    monkeypatch,
+    mutation: str,
+    expected_status: int,
+) -> None:
+    init_workspace(WorkspacePaths(tmp_path))
+    _activate_model(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    store = PlatformStore(WorkspacePaths(tmp_path.resolve()))
+    operator = _auth_header(
+        store,
+        email="operator@example.invalid",
+        role="operator",
+    )
+    payload = copy.deepcopy(_review_proposal())
+    if mutation == "signature":
+        payload["evidence_contract"]["signature"] = "f" * 64
+    elif mutation == "organization":
+        payload["evidence_contract"]["org_id"] = "org-other"
+        _sign_current_proof(payload)
+    else:
+        proof = payload["evidence_contract"]
+        proof["intent_digest"] = "b" * 64
+        proof["recommendation_fingerprint"] = hashlib.sha256(
+            "|".join(
+                (
+                    payload["incident_id"],
+                    payload["root_atom_id"],
+                    payload["target_device"],
+                    proof["root_digest"],
+                    proof["intent_digest"],
+                )
+            ).encode("utf-8")
+        ).hexdigest()
+        _sign_current_proof(payload)
+    monkeypatch.setenv("NETCODE_AUTH", "1")
+
+    response = TestClient(api.app).post(
+        "/api/changes/from-rca",
+        headers=operator,
+        json=payload,
+    )
+
+    assert response.status_code == expected_status
+    assert store.list_changes(org_id=ORG_ID) == []
+    assert store.list_jobs(org_id=ORG_ID) == []
+
+
+def test_failed_completion_preserves_review_artifact_and_can_retry(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    init_workspace(WorkspacePaths(tmp_path))
+    _activate_model(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    client = TestClient(api.app, raise_server_exceptions=False)
+    created = client.post("/api/changes/from-rca", json=_review_proposal())
+    assert created.status_code == 200, created.text
+    change_id = created.json()["change_id"]
+    review_path = Path(created.json()["intent_path"])
+    review_bytes = review_path.read_bytes()
+    real_pipeline = api.run_static_pipeline
+
+    def fail_pipeline(*_args, **_kwargs):
+        raise RuntimeError("simulated compiler interruption")
+
+    monkeypatch.setattr(api, "run_static_pipeline", fail_pipeline)
+    failed = client.post(
+        f"/api/change/{change_id}/complete-rca-draft",
+        json=_completion_payload(),
+    )
+
+    assert failed.status_code == 500
+    store = PlatformStore(WorkspacePaths(tmp_path.resolve()))
+    unchanged = store.get_change(change_id)
+    assert unchanged.workflow_state == "needs_input"
+    assert unchanged.intent_path == str(review_path)
+    assert review_path.read_bytes() == review_bytes
+    assert store.list_jobs(org_id=ORG_ID) == []
+
+    monkeypatch.setattr(api, "run_static_pipeline", real_pipeline)
+    retried = client.post(
+        f"/api/change/{change_id}/complete-rca-draft",
+        json=_completion_payload(),
+    )
+    assert retried.status_code == 200, retried.text
+    assert retried.json()["change"]["workflow_state"] == "validated"
+
+
+def test_model_candidate_failure_keeps_review_state(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    init_workspace(WorkspacePaths(tmp_path))
+    _activate_model(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    client = TestClient(api.app)
+    created = client.post("/api/changes/from-rca", json=_review_proposal())
+    assert created.status_code == 200, created.text
+    change_id = created.json()["change_id"]
+    original_path = created.json()["intent_path"]
+
+    def reject_candidate(*_args, **_kwargs):
+        raise NetworkModelError("simulated model rejection")
+
+    monkeypatch.setattr(api, "create_candidate_for_change_intent", reject_candidate)
+    response = client.post(
+        f"/api/change/{change_id}/complete-rca-draft",
+        json=_completion_payload(),
+    )
+
+    assert response.status_code == 409
+    store = PlatformStore(WorkspacePaths(tmp_path.resolve()))
+    change = store.get_change(change_id)
+    assert change.workflow_state == "needs_input"
+    assert change.intent_path == original_path
+    assert store.list_jobs(org_id=ORG_ID) == []
+
+
+def test_engineer_completed_redistribution_compiles_reversible_plan_only(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    init_workspace(WorkspacePaths(tmp_path))
+    _activate_model(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    payload = copy.deepcopy(_review_proposal())
+    payload["root_atom_id"] = "CP_REDISTRIBUTION_GAP"
+    payload["suggested_pack"] = "routing_redistribution"
+    payload["proposed_intent"]["change_type"] = "routing_redistribution"
+    payload["evidence_contract"]["root_atom_id"] = "CP_REDISTRIBUTION_GAP"
+    payload["evidence_contract"]["change_type"] = "routing_redistribution"
+    _refresh_integrity(payload)
+    client = TestClient(api.app)
+    created = client.post("/api/changes/from-rca", json=payload)
+    assert created.status_code == 200, created.text
+    change_id = created.json()["change_id"]
+
+    completed = client.post(
+        f"/api/change/{change_id}/complete-rca-draft",
+        json={
+            "proposed_intent": {
+                "change_type": "routing_redistribution",
+                "site": "branch",
+                "targets": {"device_ids": [DEVICE_ID]},
+                "redistribution": {
+                    "from_protocol": "bgp",
+                    "to_protocol": "ospf",
+                    "target_process": "1",
+                    "route_map": "BRANCH-BGP-TO-OSPF",
+                    "prefix_list": "BRANCH-APPROVED-PREFIXES",
+                    "prefixes": ["198.51.100.0/24"],
+                    "route_tag": 65000,
+                },
+            },
+            "expected_outcome": "The reviewed prefix is eligible for redistribution.",
+            "verification_checks": [
+                "The prefix list contains the reviewed entry",
+                "The approved route is present downstream",
+            ],
+        },
+    )
+
+    assert completed.status_code == 200, completed.text
+    body = completed.json()
+    checks = body["change"]["result"]["pipeline"]["validation"]["checks"]
+    assert body["change"]["workflow_state"] == "validated", [
+        (check["id"], check.get("message"), check.get("evidence"))
+        for check in checks
+        if check["status"] != "pass"
+    ]
+    assert "ip prefix-list BRANCH-APPROVED-PREFIXES" in body["change"]["result"]["plan"]["commands"]
+    assert "no ip prefix-list BRANCH-APPROVED-PREFIXES" in body["change"]["result"]["plan"]["rollback"]
+    assert "dry_run" in body["workflow"]["allowed_actions"]
+    assert "apply" not in body["workflow"]["allowed_actions"]
+    assert body["device_write_performed"] is False
+    assert PlatformStore(WorkspacePaths(tmp_path.resolve())).list_jobs(org_id=ORG_ID) == []
+
+
+def test_netcode_ui_exposes_review_completion_without_auto_apply() -> None:
+    app_js = (
+        Path(__file__).resolve().parents[1] / "static" / "app.js"
+    ).read_text(encoding="utf-8")
+
+    assert "Engineer input required" in app_js
+    assert "complete-rca-draft" in app_js
+    assert "Validate reversible intent" in app_js
+    assert "No device write was queued" in app_js
+
+
+def test_review_completion_is_tenant_scoped_and_replay_safe(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    init_workspace(WorkspacePaths(tmp_path))
+    _activate_model(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    client = TestClient(api.app)
+    created = client.post("/api/changes/from-rca", json=_review_proposal())
+    assert created.status_code == 200, created.text
+    change_id = created.json()["change_id"]
+    completion = {
+        "proposed_intent": {
+            "change_type": "custom_config",
+            "site": "branch",
+            "targets": {"device_ids": [DEVICE_ID]},
+            "config_lines": "interface Ethernet3\n   description REVIEWED_UPLINK\n",
+            "rollback_lines": "interface Ethernet3\n   no description\n",
+            "verify_contains": "description REVIEWED_UPLINK",
+        },
+        "verification_checks": ["Running configuration matches reviewed intent"],
+    }
+
+    monkeypatch.setattr(
+        api,
+        "_request_principal",
+        lambda _request: Principal(
+            kind="user",
+            org_id="org-other",
+            role="operator",
+            user_id="other-user",
+            email="other@example.invalid",
+        ),
+    )
+    cross_tenant = client.post(
+        f"/api/change/{change_id}/complete-rca-draft",
+        json=completion,
+    )
+    assert cross_tenant.status_code == 404
+
+    monkeypatch.setattr(
+        api,
+        "_request_principal",
+        lambda _request: Principal(
+            kind="user",
+            org_id=ORG_ID,
+            role="operator",
+            user_id="reviewer-user",
+            email="reviewer@example.invalid",
+        ),
+    )
+    first = client.post(
+        f"/api/change/{change_id}/complete-rca-draft",
+        json=completion,
+    )
+    replay = client.post(
+        f"/api/change/{change_id}/complete-rca-draft",
+        json=completion,
+    )
+    assert first.status_code == 200, first.text
+    assert replay.status_code == 409
+    assert PlatformStore(WorkspacePaths(tmp_path.resolve())).list_jobs(org_id=ORG_ID) == []
 
 
 def test_agent_desired_state_compiles_to_one_draft_with_rollback_and_risk(

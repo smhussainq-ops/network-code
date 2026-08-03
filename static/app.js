@@ -2097,6 +2097,94 @@ function recordBlock(title, lines) {
   return `<article class="record-block"><h5>${escapeHtml(title)}</h5>${body || "<p>Not available.</p>"}</article>`;
 }
 
+function reviewDraftBlock(record) {
+  const draft = record.review_draft;
+  if (!draft || record.workflow_state !== "needs_input") return "";
+  const esc = escapeHtml;
+  const unresolved = (draft.unresolved_inputs || [])
+    .map((item) => `<li>${esc(item)}</li>`)
+    .join("");
+  const checks = (draft.verification_checks || []).join("\n");
+  return `<article class="record-block">
+    <h5>Engineer input required</h5>
+    <p><strong>Rez recommendation:</strong> ${esc(draft.expected_outcome || "Review the confirmed RCA and define the exact reversible intent.")}</p>
+    ${unresolved ? `<p>Before validation:</p><ul>${unresolved}</ul>` : ""}
+    <p>No command, dry-run, approval, or device action is available until this form passes Netcode validation.</p>
+    <div class="form-grid">
+      <label class="wide">Forward configuration
+        <textarea id="rca-forward-lines" spellcheck="false" placeholder="Exact reviewed configuration lines"></textarea>
+      </label>
+      <label class="wide">Exact rollback
+        <textarea id="rca-rollback-lines" spellcheck="false" placeholder="Exact inverse configuration lines"></textarea>
+      </label>
+      <label>Verification target
+        <input id="rca-verify-contains" placeholder="Exact running-config text to verify" />
+      </label>
+      <label>Expected outcome
+        <input id="rca-expected-outcome" value="${esc(draft.expected_outcome || "")}" />
+      </label>
+      <label class="wide">Post-change checks
+        <textarea id="rca-verification-checks">${esc(checks)}</textarea>
+      </label>
+    </div>
+    <button id="complete-rca-draft" class="primary" type="button">Validate reversible intent</button>
+  </article>`;
+}
+
+async function completeRcaDraft(changeId) {
+  const button = $("complete-rca-draft");
+  if (button) button.disabled = true;
+  try {
+    const record = appState.changeRecord || {};
+    const req = record.request || {};
+    const forward = $("rca-forward-lines")?.value || "";
+    const rollback = $("rca-rollback-lines")?.value || "";
+    const verifyContains = $("rca-verify-contains")?.value?.trim() || "";
+    const expectedOutcome = $("rca-expected-outcome")?.value?.trim() || "";
+    const verificationChecks = ($("rca-verification-checks")?.value || "")
+      .split("\n")
+      .map((item) => item.trim())
+      .filter(Boolean);
+    const data = await postJson(`/api/change/${changeId}/complete-rca-draft`, {
+      proposed_intent: {
+        change_type: "custom_config",
+        site: req.site || "rca-remediation",
+        targets: { device_ids: [req.device_id] },
+        config_lines: forward,
+        rollback_lines: rollback,
+        verify_contains: verifyContains,
+      },
+      expected_outcome: expectedOutcome,
+      verification_checks: verificationChecks,
+    });
+    await refreshAudit();
+    await loadChangeRecord(changeId);
+    setOutcome({
+      state: data.change?.workflow_state === "validated" ? "Passed" : "Review",
+      status: data.change?.workflow_state === "validated" ? "pass" : "warn",
+      title: data.change?.workflow_state === "validated"
+        ? "Reversible intent validated."
+        : "Intent needs correction.",
+      summary: "Netcode compiled and checked the engineer-reviewed intent. No device write was queued.",
+      expected: "Exact forward, rollback, and verification intent passes static validation.",
+      actual: `Workflow state: ${data.change?.workflow_state || "unknown"}.`,
+      artifact: `Change ${changeId}`,
+      device: "No device configuration was changed.",
+      next: data.change?.workflow_state === "validated"
+        ? "Run dry-run proof before approval."
+        : "Review the failed checks and correct the intent.",
+    });
+  } catch (error) {
+    failOutcome(
+      "Review draft was not completed.",
+      error,
+      "Correct the exact forward, rollback, and verification fields."
+    );
+  } finally {
+    if (button) button.disabled = false;
+  }
+}
+
 function renderChangeRecord() {
   const container = $("change-record");
   if (!container) return;
@@ -2120,6 +2208,7 @@ function renderChangeRecord() {
       ? `${esc(label)}: ${esc(proof.status || "")} — ${esc(proof.message || "")} (${(proof.commands || []).length} device commands)`
       : `${esc(label)}: not run`;
   container.innerHTML = [
+    reviewDraftBlock(record),
     recordBlock("Request", [
       `<strong>${esc(req.title || "")}</strong> (${esc(req.change_type || "")})`,
       `Site ${esc(req.site || "-")} · device ${esc(req.device_id || "-")} · requested by ${esc(req.requested_by || "-")}`,
@@ -2168,6 +2257,12 @@ function renderChangeRecord() {
       )
     ),
   ].join("");
+  if (record.workflow_state === "needs_input" && $("complete-rca-draft")) {
+    $("complete-rca-draft").addEventListener(
+      "click",
+      () => completeRcaDraft(record.change_id)
+    );
+  }
 }
 
 function renderEvidence() {

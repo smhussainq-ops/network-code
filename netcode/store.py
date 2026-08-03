@@ -986,6 +986,52 @@ class PlatformStore:
                 )
         return self.get_change(change_id)
 
+    def complete_change_intent(
+        self,
+        change_id: str,
+        *,
+        intent_path: Path,
+        status: str,
+        result: dict[str, Any],
+        workflow_state: str,
+    ) -> ChangeRecord:
+        """Atomically replace a review artifact after compilation succeeds."""
+        now = utc_now()
+        result_json = json.dumps(result)
+        title = str(result.get("title") or "").strip()[:240]
+        raw_source = str(result.get("source") or "").strip().lower()
+        source = {
+            "netcode_ansible": "ansible",
+            "rez": "rez_rca",
+        }.get(raw_source, raw_source)[:80]
+        workflow_type = str(result.get("change_type") or "").strip()[:120]
+        with self._connect() as conn:
+            cursor = conn.execute(
+                "UPDATE changes SET intent_path = ?, status = ?, workflow_state = ?, "
+                "updated_at = ?, result_json = ?, "
+                "title = CASE WHEN ? <> '' THEN ? ELSE title END, "
+                "source = CASE WHEN ? <> '' THEN ? ELSE source END, "
+                "workflow_type = CASE WHEN ? <> '' THEN ? ELSE workflow_type END "
+                "WHERE id = ? AND workflow_state = 'needs_input'",
+                (
+                    str(intent_path),
+                    status,
+                    workflow_state,
+                    now,
+                    result_json,
+                    title,
+                    title,
+                    source,
+                    source,
+                    workflow_type,
+                    workflow_type,
+                    change_id,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("review draft is no longer awaiting input")
+        return self.get_change(change_id)
+
     def record_workflow_event(
         self,
         change_id: str,
@@ -3704,6 +3750,19 @@ def redact_secrets(value: Any) -> Any:
     return value
 
 
+def _public_change_result(value: Any) -> Any:
+    """Remove stored verification material that is never part of the public API."""
+    if isinstance(value, dict):
+        return {
+            key: _public_change_result(item)
+            for key, item in value.items()
+            if str(key) != "source_request"
+        }
+    if isinstance(value, list):
+        return [_public_change_result(item) for item in value]
+    return value
+
+
 def record_to_dict(
     record: ChangeRecord | JobRecord | WorkflowEventRecord | ExecutionEventRecord,
 ) -> dict[str, Any]:
@@ -3711,6 +3770,7 @@ def record_to_dict(
     data.pop("lease_token", None)
     if isinstance(record, ChangeRecord):
         data["rez_change_id"] = change_audit_id(record.id, record.created_at)
+        data["result"] = _public_change_result(data.get("result"))
     if "payload" in data and data["payload"]:
         data["payload"] = redact_secrets(data["payload"])
     return data

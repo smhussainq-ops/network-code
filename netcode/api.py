@@ -496,9 +496,19 @@ class RcaRemediationProposalRequest(BaseModel):
     environment_id: str = ""
     model_revision_id: str = ""
     evidence_contract: dict[str, object] = {}
+    draft_mode: str = "executable"
+    expected_outcome: str = ""
+    verification_checks: list[str] = []
+    unresolved_inputs: list[str] = []
     intent_reviewed: bool = False
     reviewed_by: str = ""
     review_candidate_id: str = ""
+
+
+class RcaDraftCompletionRequest(BaseModel):
+    proposed_intent: dict[str, object]
+    expected_outcome: str = ""
+    verification_checks: list[str] = []
 
 
 class LoginRequest(BaseModel):
@@ -815,6 +825,13 @@ _RCA_AGENT_ALLOWED_VALUE_FIELDS = {
 }
 
 
+def _is_agent_review_draft(request: RcaRemediationProposalRequest) -> bool:
+    return (
+        request.proposal_source.strip() == "rez_agent_recommendation"
+        and request.draft_mode.strip() == "needs_input"
+    )
+
+
 def _safe_slug(value: str, default: str = "rca-remediation") -> str:
     slug = re.sub(r"[^a-zA-Z0-9_.-]+", "-", value.strip()).strip("-._").lower()
     return slug[:80] or default
@@ -855,12 +872,21 @@ def _require_agent_recommendation_evidence(
     store: PlatformStore,
     org_id: str,
 ) -> str:
-    """Verify an agent recommendation before Netcode compiles desired state."""
+    """Verify a signed agent recommendation before review or compilation."""
     if request.proposal_source.strip() != "rez_agent_recommendation":
         return ""
     proof = _safe_proposal_dict(request.evidence_contract)
     proposed = _safe_proposal_dict(request.proposed_intent)
     change_type = str(proposed.get("change_type") or "").strip()
+    draft_mode = request.draft_mode.strip() or "executable"
+    if draft_mode not in {"executable", "needs_input"}:
+        raise HTTPException(status_code=400, detail="Unknown RCA draft mode.")
+    proof_mode = str(proof.get("draft_mode") or "executable").strip()
+    if proof_mode != draft_mode:
+        raise HTTPException(
+            status_code=400,
+            detail="The RCA draft mode does not match its signed evidence.",
+        )
 
     secret = (
         os.environ.get("REZ_REMEDIATION_REVIEW_SECRET", "").strip()
@@ -919,9 +945,23 @@ def _require_agent_recommendation_evidence(
             char in value for char in ("\r", "\n", "\x00")
         )
 
+    sufficient_for_review = (
+        proof.get("sufficient_for_review") is True
+        or (
+            draft_mode == "executable"
+            and proof.get("sufficient_for_draft") is True
+        )
+    )
+    sufficient_for_execution = (
+        proof.get("sufficient_for_execution") is True
+        if "sufficient_for_execution" in proof
+        else draft_mode == "executable"
+    )
     if (
         proof.get("schema") != "rez.agent-remediation-evidence.v1"
         or proof.get("sufficient_for_draft") is not True
+        or not sufficient_for_review
+        or sufficient_for_execution != (draft_mode == "executable")
         or proof.get("fresh") is not True
         or proof.get("live_root_confirmed") is not True
         or str(proof.get("root_atom_id") or "").strip() != request.root_atom_id.strip()
@@ -936,6 +976,153 @@ def _require_agent_recommendation_evidence(
             status_code=400,
             detail="Exact fresh agent recommendation evidence is required.",
         )
+    if not re.fullmatch(r"[a-z][a-z0-9_]{0,63}", change_type):
+        raise HTTPException(
+            status_code=400,
+            detail="Agent recommendations require a stable lowercase change type.",
+        )
+    if contains_executable_field(proposed):
+        raise HTTPException(
+            status_code=400,
+            detail="Agent recommendations must contain desired state only; Netcode generates commands and rollback.",
+        )
+    if contains_control_text(proposed):
+        raise HTTPException(
+            status_code=400,
+            detail="Agent recommendation values cannot contain multiline or control-character content.",
+        )
+
+    if draft_mode == "needs_input":
+        unresolved = [
+            str(item).strip()
+            for item in request.unresolved_inputs
+            if str(item).strip()
+        ]
+        signed_unresolved = [
+            str(item).strip()
+            for item in (proof.get("unresolved_inputs") or [])
+            if str(item).strip()
+        ]
+        signed_checks = [
+            str(item).strip()
+            for item in (proof.get("verification_checks") or [])
+            if str(item).strip()
+        ]
+        request_checks = [
+            str(item).strip()
+            for item in request.verification_checks
+            if str(item).strip()
+        ]
+        expected_outcome = request.expected_outcome.strip()
+        if (
+            not unresolved
+            or unresolved != signed_unresolved
+            or not expected_outcome
+            or expected_outcome != str(proof.get("expected_outcome") or "").strip()
+            or not request_checks
+            or request_checks != signed_checks
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "A review-only recommendation requires signed expected outcome, "
+                    "verification checks, and unresolved inputs."
+                ),
+            )
+
+    environment_id = request.environment_id.strip()
+    revision_id = request.model_revision_id.strip()
+    if (
+        not environment_id
+        or not revision_id
+        or str(proof.get("environment_id") or "").strip() != environment_id
+        or str(proof.get("model_revision_id") or "").strip() != revision_id
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="Agent recommendation evidence is not bound to this environment and model.",
+        )
+    intent_digest = hashlib.sha256(_canonical_json(proposed).encode("utf-8")).hexdigest()
+    if not hmac.compare_digest(
+        str(proof.get("intent_digest") or ""),
+        intent_digest,
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="The recommended desired state does not match its evidence digest.",
+        )
+    root_digest = str(proof.get("root_digest") or "").strip().lower()
+    recommendation_fingerprint = str(
+        proof.get("recommendation_fingerprint") or ""
+    ).strip().lower()
+    expected_fingerprint = hashlib.sha256(
+        "|".join(
+            (
+                request.incident_id.strip(),
+                request.root_atom_id.strip(),
+                request.target_device.strip(),
+                root_digest,
+                intent_digest,
+            )
+        ).encode("utf-8")
+    ).hexdigest()
+    if (
+        not re.fullmatch(r"[0-9a-f]{64}", root_digest)
+        or not hmac.compare_digest(recommendation_fingerprint, expected_fingerprint)
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="The recommendation fingerprint does not match its incident and evidence.",
+        )
+
+    active = NetworkModelRepository(store).active_revision(org_id, environment_id)
+    if (
+        not active
+        or active.get("status") != "active"
+        or active.get("revision_id") != revision_id
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail="Agent recommendation evidence must reference the current active approved model.",
+        )
+    model = active.get("model") if isinstance(active.get("model"), dict) else {}
+    sites = model.get("sites") if isinstance(model.get("sites"), dict) else {}
+    site_id = str(proposed.get("site") or "").strip()
+    site = sites.get(site_id) if isinstance(sites.get(site_id), dict) else {}
+    site_devices = site.get("devices") if isinstance(site.get("devices"), dict) else {}
+    target_device = request.target_device.strip()
+    targets = _proposal_targets(request)
+    if (
+        not site
+        or target_device not in site_devices
+        or targets.get("device_ids") != [target_device]
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="The recommended target is not one exact device in the approved site.",
+        )
+    modeled_device = (
+        site_devices.get(target_device)
+        if isinstance(site_devices.get(target_device), dict)
+        else {}
+    )
+    modeled_platform = str(modeled_device.get("platform") or "").strip().lower()
+    catalog_device = store.resolve_device(org_id, target_device)
+    catalog_platform = str((catalog_device or {}).get("platform") or "").strip().lower()
+    if modeled_platform and catalog_platform and modeled_platform != catalog_platform:
+        raise HTTPException(
+            status_code=409,
+            detail="The approved model and connector catalog disagree on target platform.",
+        )
+    platform = catalog_platform or modeled_platform
+    if not platform:
+        raise HTTPException(
+            status_code=400,
+            detail="The recommended target platform is not proven.",
+        )
+    if draft_mode == "needs_input":
+        return platform
+
     if change_type not in _RCA_ALLOWED_CHANGE_TYPES or change_type == "custom_config":
         raise HTTPException(
             status_code=400,
@@ -1060,106 +1247,6 @@ def _require_agent_recommendation_evidence(
         raise HTTPException(
             status_code=400,
             detail="Agent NTP recommendations require an explicit non-empty server list.",
-        )
-    if contains_executable_field(proposed):
-        raise HTTPException(
-            status_code=400,
-            detail="Agent recommendations must contain desired state only; Netcode generates commands and rollback.",
-        )
-    if contains_control_text(proposed):
-        raise HTTPException(
-            status_code=400,
-            detail="Agent recommendation values cannot contain multiline or control-character content.",
-        )
-    environment_id = request.environment_id.strip()
-    revision_id = request.model_revision_id.strip()
-    if (
-        not environment_id
-        or not revision_id
-        or str(proof.get("environment_id") or "").strip() != environment_id
-        or str(proof.get("model_revision_id") or "").strip() != revision_id
-    ):
-        raise HTTPException(
-            status_code=400,
-            detail="Agent recommendation evidence is not bound to this environment and model.",
-        )
-    intent_digest = hashlib.sha256(_canonical_json(proposed).encode("utf-8")).hexdigest()
-    if not hmac.compare_digest(
-        str(proof.get("intent_digest") or ""),
-        intent_digest,
-    ):
-        raise HTTPException(
-            status_code=400,
-            detail="The recommended desired state does not match its evidence digest.",
-        )
-    root_digest = str(proof.get("root_digest") or "").strip().lower()
-    recommendation_fingerprint = str(
-        proof.get("recommendation_fingerprint") or ""
-    ).strip().lower()
-    expected_fingerprint = hashlib.sha256(
-        "|".join(
-            (
-                request.incident_id.strip(),
-                request.root_atom_id.strip(),
-                request.target_device.strip(),
-                root_digest,
-                intent_digest,
-            )
-        ).encode("utf-8")
-    ).hexdigest()
-    if (
-        not re.fullmatch(r"[0-9a-f]{64}", root_digest)
-        or not hmac.compare_digest(recommendation_fingerprint, expected_fingerprint)
-    ):
-        raise HTTPException(
-            status_code=400,
-            detail="The recommendation fingerprint does not match its incident and evidence.",
-        )
-
-    active = NetworkModelRepository(store).active_revision(org_id, environment_id)
-    if (
-        not active
-        or active.get("status") != "active"
-        or active.get("revision_id") != revision_id
-    ):
-        raise HTTPException(
-            status_code=409,
-            detail="Agent recommendation evidence must reference the current active approved model.",
-        )
-    model = active.get("model") if isinstance(active.get("model"), dict) else {}
-    sites = model.get("sites") if isinstance(model.get("sites"), dict) else {}
-    site_id = str(proposed.get("site") or "").strip()
-    site = sites.get(site_id) if isinstance(sites.get(site_id), dict) else {}
-    site_devices = site.get("devices") if isinstance(site.get("devices"), dict) else {}
-    target_device = request.target_device.strip()
-    targets = _proposal_targets(request)
-    if (
-        not site
-        or target_device not in site_devices
-        or targets.get("device_ids") != [target_device]
-    ):
-        raise HTTPException(
-            status_code=400,
-            detail="The recommended target is not one exact device in the approved site.",
-        )
-    modeled_device = (
-        site_devices.get(target_device)
-        if isinstance(site_devices.get(target_device), dict)
-        else {}
-    )
-    modeled_platform = str(modeled_device.get("platform") or "").strip().lower()
-    catalog_device = store.resolve_device(org_id, target_device)
-    catalog_platform = str((catalog_device or {}).get("platform") or "").strip().lower()
-    if modeled_platform and catalog_platform and modeled_platform != catalog_platform:
-        raise HTTPException(
-            status_code=409,
-            detail="The approved model and connector catalog disagree on target platform.",
-        )
-    platform = catalog_platform or modeled_platform
-    if not platform:
-        raise HTTPException(
-            status_code=400,
-            detail="The recommended target platform is not proven.",
         )
     return platform
 
@@ -1637,6 +1724,10 @@ def _require_redistribution_evidence(
     proposed = _safe_proposal_dict(request.proposed_intent)
     if str(proposed.get("change_type") or "") != "routing_redistribution":
         return ""
+    if _is_agent_review_draft(request):
+        # Review-only recommendations contain no commands. The generic signed
+        # agent contract validates their scope and provenance below.
+        return ""
     if request.proposal_source.strip() != "site_operational_context":
         raise HTTPException(
             status_code=400,
@@ -1873,6 +1964,10 @@ def _require_route_shadow_evidence(
 ) -> str:
     root_atom = request.root_atom_id.strip().upper()
     if root_atom not in _RCA_ROUTE_SHADOW_ROOTS:
+        return ""
+    if _is_agent_review_draft(request):
+        # Preserve this root as review context without pretending the agent
+        # supplied an exact reversible route operation.
         return ""
     proposed = _safe_proposal_dict(request.proposed_intent)
     proof = _safe_proposal_dict(request.evidence_contract)
@@ -7305,6 +7400,14 @@ def api_change_from_rca(request: RcaRemediationProposalRequest, http_request: Re
             status_code=403,
             detail="An authenticated operator is required to create a recommendation draft.",
         )
+    if (
+        request.draft_mode.strip() == "needs_input"
+        and request.proposal_source.strip() != "rez_agent_recommendation"
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="Review-only drafts require a signed Rez agent recommendation.",
+        )
     target_platform = _require_redistribution_evidence(
         request,
         store=store,
@@ -7327,11 +7430,6 @@ def api_change_from_rca(request: RcaRemediationProposalRequest, http_request: Re
                 status_code=403,
                 detail="The authenticated operator must match the expected-state reviewer.",
             )
-    intent = _intent_from_rca_proposal(request)
-    try:
-        load_intent_data(intent)
-    except Exception as exc:
-        raise HTTPException(status_code=400, detail=f"Invalid remediation intent: {exc}") from exc
     existing = _existing_agent_recommendation_change(
         store=store,
         org_id=principal.org_id,
@@ -7351,7 +7449,19 @@ def api_change_from_rca(request: RcaRemediationProposalRequest, http_request: Re
             "change_id": existing.id,
             "change": serialized,
             "intent_path": existing.intent_path,
-            "intent": intent,
+            "intent": existing_result.get("intent"),
+            "draft_mode": existing_result.get("draft_mode", "executable"),
+            "review_draft": (
+                {
+                    key: value
+                    for key, value in dict(
+                        existing_result.get("review_draft") or {}
+                    ).items()
+                    if key != "source_request"
+                }
+                if isinstance(existing_result.get("review_draft"), dict)
+                else None
+            ),
             "workflow": workflow_snapshot(existing.workflow_state).as_dict(),
             "network_model": existing_result.get("network_model"),
             "risk_assessment": existing_result.get("risk_assessment"),
@@ -7359,6 +7469,147 @@ def api_change_from_rca(request: RcaRemediationProposalRequest, http_request: Re
 
     incident_slug = _safe_slug(request.incident_id)
     intent_path = p.intents / "rca" / f"{incident_slug}-{uuid.uuid4().hex[:8]}.yaml"
+    title = request.title.strip() or f"Rez RCA remediation for {request.incident_id.strip()}"
+    target_device = request.target_device.strip() or None
+    requested_by = request.requested_by.strip() or "rez-rca"
+    environment_id = request.environment_id.strip()
+    model_revision_id = request.model_revision_id.strip()
+    if bool(environment_id) != bool(model_revision_id):
+        raise HTTPException(
+            status_code=400,
+            detail="environment_id and model_revision_id must be supplied together.",
+        )
+
+    if request.draft_mode.strip() == "needs_input":
+        review_draft = {
+            "schema": "netcode.rca-review-draft.v1",
+            "requested_change_type": request.suggested_pack.strip(),
+            "proposed_intent": _safe_proposal_dict(request.proposed_intent),
+            "expected_outcome": request.expected_outcome.strip(),
+            "verification_checks": [
+                str(item).strip()
+                for item in request.verification_checks
+                if str(item).strip()
+            ],
+            "unresolved_inputs": [
+                str(item).strip()
+                for item in request.unresolved_inputs
+                if str(item).strip()
+            ],
+            "commands": [],
+            "rollback": [],
+            "source_request": _strip_sensitive_proposal_fields(
+                request.model_dump(mode="json")
+            ),
+        }
+        review_artifact = {
+            "schema": "netcode.rca-review-draft.v1",
+            "change_type": request.suggested_pack.strip(),
+            "site": str(
+                _safe_proposal_dict(request.proposed_intent).get("site")
+                or "rca-remediation"
+            ).strip(),
+            "targets": _proposal_targets(request),
+            "metadata": {
+                "title": title,
+                "source": "rez_rca",
+                "ticket_id": request.incident_id.strip(),
+                "requested_by": requested_by,
+                "human_approval_required": True,
+                "device_write_performed": False,
+            },
+            "review_draft": {
+                key: value
+                for key, value in review_draft.items()
+                if key != "source_request"
+            },
+        }
+        write_yaml(intent_path, review_artifact)
+        change = store.create_change(
+            intent_path,
+            target_device,
+            requested_by=requested_by,
+            org_id=principal.org_id,
+            created_by_user_id=principal.user_id,
+        )
+        evidence = {
+            "source": "rez_rca",
+            "title": title,
+            "draft_only": True,
+            "draft_mode": "needs_input",
+            "human_approval_required": True,
+            "device_write_performed": False,
+            "incident_id": request.incident_id.strip(),
+            "target_device": target_device,
+            "suggested_pack": request.suggested_pack.strip(),
+            "change_type": request.suggested_pack.strip(),
+            "rationale": request.rationale,
+            "confidence": request.confidence,
+            "evidence_refs": request.evidence_refs,
+            "recommendation_evidence": _safe_proposal_dict(
+                request.evidence_contract
+            ),
+            "review_draft": review_draft,
+            "network_model": {
+                "environment_id": environment_id,
+                "parent_revision_id": model_revision_id,
+                "candidate_revision_id": "",
+            },
+            "plan": {
+                "commands": "",
+                "rollback": "",
+                "validation_status": "not_run",
+                "checks": [],
+            },
+        }
+        store.update_change(
+            change.id,
+            "needs_input",
+            evidence,
+            workflow_state="needs_input",
+        )
+        store.record_workflow_event(
+            change.id,
+            "rca_proposal",
+            "draft",
+            "needs_input",
+            (
+                "Recorded a confirmed Rez recommendation for engineer completion. "
+                "No commands were generated and no device action is available."
+            ),
+            {
+                "incident_id": request.incident_id.strip(),
+                "unresolved_inputs": review_draft["unresolved_inputs"],
+                "device_write_performed": False,
+            },
+        )
+        change = store.get_change(change.id)
+        serialized = record_to_dict(change)
+        return {
+            "ok": True,
+            "draft_only": True,
+            "draft_mode": "needs_input",
+            "human_approval_required": True,
+            "rez_change_id": serialized["rez_change_id"],
+            "change_id": change.id,
+            "change": serialized,
+            "intent_path": str(intent_path),
+            "intent": None,
+            "review_draft": {
+                key: value
+                for key, value in review_draft.items()
+                if key != "source_request"
+            },
+            "workflow": workflow_snapshot("needs_input").as_dict(),
+            "network_model": evidence["network_model"],
+            "risk_assessment": None,
+        }
+
+    intent = _intent_from_rca_proposal(request)
+    try:
+        load_intent_data(intent)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid remediation intent: {exc}") from exc
     write_yaml(intent_path, intent)
     pipeline = run_static_pipeline(
         p,
@@ -7374,22 +7625,11 @@ def api_change_from_rca(request: RcaRemediationProposalRequest, http_request: Re
         org_id=principal.org_id,
     )
 
-    title = request.title.strip() or f"Rez RCA remediation for {request.incident_id.strip()}"
-    target_device = request.target_device.strip() or None
-    requested_by = request.requested_by.strip() or "rez-rca"
     target_ids = [
         str(item).strip()
         for item in ((intent.get("targets") or {}).get("device_ids") or [])
         if str(item).strip()
     ]
-    environment_id = request.environment_id.strip()
-    model_revision_id = request.model_revision_id.strip()
-    if bool(environment_id) != bool(model_revision_id):
-        raise HTTPException(
-            status_code=400,
-            detail="environment_id and model_revision_id must be supplied together.",
-        )
-
     if pipeline.status == "pass" and intent.get("change_type") == "routing_redistribution" and len(target_ids) > 1:
         redistribution = dict(intent.get("redistribution") or {})
         if isinstance(intent.get("reverse_redistribution"), dict):
@@ -7573,6 +7813,246 @@ def api_change_from_rca(request: RcaRemediationProposalRequest, http_request: Re
         "workflow": workflow_snapshot(change.workflow_state).as_dict(),
         "network_model": evidence["network_model"],
         "risk_assessment": risk_assessment,
+    }
+
+
+@app.post("/api/change/{change_id}/complete-rca-draft")
+def api_complete_rca_draft(
+    change_id: str,
+    request: RcaDraftCompletionRequest,
+    http_request: Request,
+) -> dict[str, object]:
+    """Turn a review-only RCA recommendation into validated reversible intent."""
+    principal = _request_principal(http_request)
+    if not principal.has_role("operator"):
+        raise HTTPException(
+            status_code=403,
+            detail="An authenticated operator is required to complete a review draft.",
+        )
+    p = paths()
+    store = PlatformStore(p)
+    try:
+        change = store.get_change(change_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Unknown change") from exc
+    if change.org_id != principal.org_id:
+        raise HTTPException(status_code=404, detail="Unknown change")
+    if change.workflow_state != "needs_input":
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Only a review draft awaiting engineer input can be completed "
+                f"(current state: {change.workflow_state})."
+            ),
+        )
+    stored = dict(change.result or {})
+    review_draft = (
+        dict(stored.get("review_draft"))
+        if isinstance(stored.get("review_draft"), dict)
+        else {}
+    )
+    source_request = (
+        dict(review_draft.get("source_request"))
+        if isinstance(review_draft.get("source_request"), dict)
+        else {}
+    )
+    if review_draft.get("schema") != "netcode.rca-review-draft.v1" or not source_request:
+        raise HTTPException(
+            status_code=409,
+            detail="The change does not contain a verifiable Rez review draft.",
+        )
+    try:
+        original = RcaRemediationProposalRequest.model_validate(source_request)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=409,
+            detail="The stored Rez review contract is invalid.",
+        ) from exc
+    target_platform = _require_agent_recommendation_evidence(
+        original,
+        store=store,
+        org_id=principal.org_id,
+    )
+
+    proposed_intent = _safe_proposal_dict(request.proposed_intent)
+    change_type = str(proposed_intent.get("change_type") or "").strip()
+    if change_type not in _RCA_ALLOWED_CHANGE_TYPES:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Unsupported Netcode change type: {change_type}. "
+                "Choose a supported typed operation or exact custom configuration."
+            ),
+        )
+    completed_payload = original.model_dump(mode="json")
+    completed_payload.update(
+        {
+            "draft_mode": "executable",
+            "suggested_pack": change_type,
+            "proposed_intent": proposed_intent,
+            "expected_outcome": (
+                request.expected_outcome.strip()
+                or original.expected_outcome.strip()
+            ),
+            "verification_checks": [
+                str(item).strip()
+                for item in request.verification_checks
+                if str(item).strip()
+            ],
+            "unresolved_inputs": [],
+            "intent_reviewed": True,
+            "reviewed_by": str(
+                principal.email or principal.user_id or "netcode-operator"
+            ).strip(),
+            "review_candidate_id": change.id,
+        }
+    )
+    completed = RcaRemediationProposalRequest.model_validate(completed_payload)
+    completed_targets = _proposal_targets(completed).get("device_ids")
+    if completed_targets != [str(change.device_id or "").strip()]:
+        raise HTTPException(
+            status_code=400,
+            detail="Engineer completion cannot change the reviewed target device.",
+        )
+    if not completed.verification_checks:
+        raise HTTPException(
+            status_code=400,
+            detail="Engineer completion requires explicit post-change verification checks.",
+        )
+
+    intent = _intent_from_rca_proposal(completed)
+    try:
+        typed_intent = load_intent_data(intent)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid completed remediation intent: {exc}",
+        ) from exc
+    review_intent_path = Path(change.intent_path)
+    intent_path = review_intent_path.with_name(
+        f"{review_intent_path.stem}-completed{review_intent_path.suffix}"
+    )
+    write_yaml(intent_path, intent)
+    pipeline = run_static_pipeline(
+        p,
+        intent_path,
+        org_id=principal.org_id,
+        platform=target_platform or "arista_eos",
+    )
+    risk_assessment = _rca_plan_risk_assessment(
+        request=completed,
+        intent=intent,
+        pipeline=pipeline,
+        store=store,
+        org_id=principal.org_id,
+    )
+    candidate = None
+    if completed.environment_id.strip() and pipeline.status == "pass":
+        try:
+            candidate = create_candidate_for_change_intent(
+                NetworkModelRepository(store),
+                store,
+                org_id=principal.org_id,
+                environment_id=completed.environment_id.strip(),
+                parent_revision_id=completed.model_revision_id.strip(),
+                change_id=change.id,
+                intent=intent,
+                device_id=str(change.device_id or ""),
+                created_by=(
+                    principal.email
+                    or principal.user_id
+                    or "netcode-operator"
+                ),
+            )
+        except NetworkModelError as exc:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Network Model candidate rejected: {exc}",
+            ) from exc
+
+    actor = str(
+        principal.email or principal.user_id or "netcode-operator"
+    ).strip()
+    evidence = {
+        **stored,
+        "draft_mode": "executable",
+        "change_type": intent.get("change_type"),
+        "suggested_pack": change_type,
+        "expected_outcome": completed.expected_outcome,
+        "verification_checks": completed.verification_checks,
+        "completed_by": actor,
+        "completed_by_user_id": principal.user_id,
+        "completed_proposed_intent": proposed_intent,
+        "device_write_performed": False,
+        "risk_assessment": risk_assessment,
+        "network_model": {
+            "environment_id": completed.environment_id.strip(),
+            "parent_revision_id": completed.model_revision_id.strip(),
+            "candidate_revision_id": candidate["revision_id"] if candidate else "",
+        },
+        "pipeline": pipeline.model_dump(),
+        "plan": {
+            "commands": pipeline.render.config,
+            "rollback": rollback_config(typed_intent),
+            "validation_status": pipeline.status,
+            "checks": [
+                check.model_dump()
+                for check in pipeline.validation.checks
+            ],
+            "artifacts": (
+                pipeline.artifacts.model_dump()
+                if pipeline.artifacts
+                else None
+            ),
+            "risk_assessment": risk_assessment,
+        },
+    }
+    workflow = state_after_static_validation(pipeline.status == "pass")
+    try:
+        store.complete_change_intent(
+            change.id,
+            intent_path=intent_path,
+            status="validated" if pipeline.status == "pass" else "blocked",
+            result=evidence,
+            workflow_state=workflow.state,
+        )
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail="The review draft was already completed by another request.",
+        ) from exc
+    store.record_workflow_event(
+        change.id,
+        "complete_rca_draft",
+        "needs_input",
+        workflow.state,
+        (
+            "An authenticated engineer completed the reversible intent. "
+            f"{workflow.message}"
+        ),
+        {
+            "completed_by": actor,
+            "completed_by_user_id": principal.user_id,
+            "change_type": change_type,
+            "validation_status": pipeline.status,
+            "device_write_performed": False,
+        },
+    )
+    change = store.get_change(change.id)
+    serialized = record_to_dict(change)
+    return {
+        "ok": True,
+        "draft_only": True,
+        "draft_mode": "executable",
+        "human_approval_required": True,
+        "change_id": change.id,
+        "rez_change_id": serialized["rez_change_id"],
+        "change": serialized,
+        "intent_path": str(intent_path),
+        "intent": intent,
+        "workflow": workflow_snapshot(change.workflow_state).as_dict(),
+        "risk_assessment": risk_assessment,
+        "device_write_performed": False,
     }
 
 
@@ -7800,6 +8280,21 @@ def api_change_record(change_id: str, request: Request) -> dict[str, object]:
         link_type="change",
         external_id=change.id,
     )
+    review_draft = (
+        {
+            key: value
+            for key, value in dict(result.get("review_draft") or {}).items()
+            if key != "source_request"
+        }
+        if isinstance(result.get("review_draft"), dict)
+        else None
+    )
+    review_proposed = (
+        dict(review_draft.get("proposed_intent") or {})
+        if isinstance(review_draft, dict)
+        and isinstance(review_draft.get("proposed_intent"), dict)
+        else {}
+    )
 
     return {
         "ok": True,
@@ -7808,9 +8303,16 @@ def api_change_record(change_id: str, request: Request) -> dict[str, object]:
         "workflow_state": change_dict.get("workflow_state"),
         "status": change_dict.get("status"),
         "request": {
-            "title": plan.get("title") or slug,
-            "change_type": plan.get("change_type") or intent_info.get("change_type"),
-            "site": intent_info.get("site"),
+            "title": plan.get("title") or result.get("title") or slug,
+            "change_type": (
+                plan.get("change_type")
+                or intent_info.get("change_type")
+                or result.get("change_type")
+            ),
+            "site": (
+                intent_info.get("site")
+                or review_proposed.get("site")
+            ),
             "device_id": change_dict.get("device_id"),
             "requested_by": change_dict.get("requested_by"),
             "created_at": change_dict.get("created_at"),
@@ -7818,7 +8320,11 @@ def api_change_record(change_id: str, request: Request) -> dict[str, object]:
             "intent_yaml": result.get("intent_yaml") or "",
         },
         "plan": {
-            "commands": render.get("config") or "",
+            "commands": (
+                render.get("config")
+                or (result.get("plan") or {}).get("commands")
+                or ""
+            ),
             "risk": plan.get("risk"),
             "blast_radius": plan.get("blast_radius") or {},
             "risk_assessment": (
@@ -7849,6 +8355,7 @@ def api_change_record(change_id: str, request: Request) -> dict[str, object]:
         "verify_proof": verify_proof(),
         "rollback_record": proof_for("rollback"),
         "diagnostics_handoffs": list(result.get("diagnostics_handoffs") or []),
+        "review_draft": review_draft,
         "network_model": {
             "revisions": [
                 {
