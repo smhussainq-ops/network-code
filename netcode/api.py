@@ -776,6 +776,7 @@ _RCA_EXECUTABLE_FIELD_NAMES = {
     "rollback",
     "rollback_line",
     "rollback_lines",
+    "acknowledge_no_rollback",
     "cli",
 }
 _RCA_AGENT_REQUIRED_VALUE_FIELDS = {
@@ -1309,6 +1310,25 @@ def _rca_plan_risk_assessment(
         if str(getattr(check, "status", "") or "").lower() == "fail"
     ]
     rollback = str((metadata.get("rollback") or {}).get("commands") or "").strip()
+    rollback_confidence = dict(
+        (metadata.get("rollback") or {}).get("confidence") or {}
+    )
+    rollback_level = str(rollback_confidence.get("level") or "").strip().lower()
+    custom_section = (
+        intent.get("custom")
+        if isinstance(intent.get("custom"), dict)
+        else {}
+    )
+    rollback_risk_accepted = (
+        not rollback
+        and custom_section.get("acknowledge_no_rollback") is True
+    )
+    if not rollback:
+        rollback_status = "unavailable"
+    elif rollback_level == "high":
+        rollback_status = "exact"
+    else:
+        rollback_status = "partial"
     post_checks = list((metadata.get("checks") or {}).get("post") or [])
     active = (
         NetworkModelRepository(store).active_revision(
@@ -1339,8 +1359,18 @@ def _rca_plan_risk_assessment(
     if request.proposal_source.strip() == "rez_agent_recommendation":
         unknowns.append(
             "The reviewer must confirm the recommended desired state matches approved intent; "
-            "Netcode validated target scope, syntax, policy, and reversibility."
+            "Netcode validated target scope, syntax, and policy. Rollback coverage is "
+            "reported separately."
         )
+        if not rollback:
+            unknowns.append(
+                (
+                    "Automatic rollback is unavailable. The reviewer explicitly accepted "
+                    "this risk."
+                )
+                if rollback_risk_accepted
+                else "Automatic rollback is unavailable and was not explicitly accepted."
+            )
     return {
         "schema": "netcode.change-risk.v1",
         "level": level,
@@ -1351,7 +1381,9 @@ def _rca_plan_risk_assessment(
         "changed_objects": list((metadata.get("blast_radius") or {}).get("objects") or []),
         "modeled_dependency_count": dependency_count,
         "rollback_available": bool(rollback),
-        "rollback_confidence": dict((metadata.get("rollback") or {}).get("confidence") or {}),
+        "rollback_status": rollback_status,
+        "rollback_confidence": rollback_confidence,
+        "rollback_risk_accepted": rollback_risk_accepted,
         "verification_check_count": len(post_checks),
         "validation_status": str(getattr(pipeline, "status", "") or ""),
         "failed_checks": failed_checks,
@@ -2196,7 +2228,11 @@ def _typed_proposal_section(change_type: str, proposed: dict[str, object]) -> di
     return {}
 
 
-def _intent_from_rca_proposal(request: RcaRemediationProposalRequest) -> dict[str, object]:
+def _intent_from_rca_proposal(
+    request: RcaRemediationProposalRequest,
+    *,
+    allow_rollback_acknowledgment: bool = False,
+) -> dict[str, object]:
     proposed = _safe_proposal_dict(request.proposed_intent or {})
     if request.root_atom_id.strip().upper() == "L1_INTERFACE_ADMIN_DOWN":
         interface_section = proposed.get("interface") if isinstance(proposed.get("interface"), dict) else {}
@@ -2263,16 +2299,24 @@ def _intent_from_rca_proposal(request: RcaRemediationProposalRequest) -> dict[st
             or _proposal_lines(proposed.get("config"))
         )
         rollback_lines = _proposal_lines(proposed.get("rollback_lines") or proposed.get("rollback"))
+        acknowledge_no_rollback = (
+            not rollback_lines
+            and allow_rollback_acknowledgment
+            and proposed.get("acknowledge_no_rollback") is True
+        )
         verify_contains = str(proposed.get("verify_contains") or "").strip()
         if not config_lines:
             raise HTTPException(
                 status_code=400,
                 detail="Rez custom configuration requires explicit forward configuration.",
             )
-        if not rollback_lines:
+        if not rollback_lines and not acknowledge_no_rollback:
             raise HTTPException(
                 status_code=400,
-                detail="Rez custom configuration requires explicit rollback configuration.",
+                detail=(
+                    "Custom configuration requires rollback commands or explicit "
+                    "acknowledgment that automatic rollback is unavailable."
+                ),
             )
         if not verify_contains:
             raise HTTPException(
@@ -2289,7 +2333,7 @@ def _intent_from_rca_proposal(request: RcaRemediationProposalRequest) -> dict[st
                 "verify_contains": verify_contains,
                 "verify_absent": bool(proposed.get("verify_absent", False)),
                 "description": request.rationale.strip() or request.title.strip() or "Draft created from Rez RCA.",
-                "acknowledge_no_rollback": False,
+                "acknowledge_no_rollback": acknowledge_no_rollback,
             },
             "policy": policy,
             "metadata": metadata,
@@ -7822,7 +7866,7 @@ def api_complete_rca_draft(
     request: RcaDraftCompletionRequest,
     http_request: Request,
 ) -> dict[str, object]:
-    """Turn a review-only RCA recommendation into validated reversible intent."""
+    """Turn a review-only RCA recommendation into validated operator intent."""
     principal = _request_principal(http_request)
     if not principal.has_role("operator"):
         raise HTTPException(
@@ -7920,7 +7964,10 @@ def api_complete_rca_draft(
             detail="Engineer completion requires explicit post-change verification checks.",
         )
 
-    intent = _intent_from_rca_proposal(completed)
+    intent = _intent_from_rca_proposal(
+        completed,
+        allow_rollback_acknowledgment=True,
+    )
     try:
         typed_intent = load_intent_data(intent)
     except Exception as exc:
@@ -7983,6 +8030,9 @@ def api_complete_rca_draft(
         "completed_by": actor,
         "completed_by_user_id": principal.user_id,
         "completed_proposed_intent": proposed_intent,
+        "rollback_risk_accepted": bool(
+            risk_assessment.get("rollback_risk_accepted", False)
+        ),
         "device_write_performed": False,
         "risk_assessment": risk_assessment,
         "network_model": {
@@ -8027,7 +8077,7 @@ def api_complete_rca_draft(
         "needs_input",
         workflow.state,
         (
-            "An authenticated engineer completed the reversible intent. "
+            "An authenticated engineer completed the reviewed intent and rollback disclosure. "
             f"{workflow.message}"
         ),
         {
@@ -8035,6 +8085,8 @@ def api_complete_rca_draft(
             "completed_by_user_id": principal.user_id,
             "change_type": change_type,
             "validation_status": pipeline.status,
+            "rollback_status": risk_assessment.get("rollback_status"),
+            "rollback_risk_accepted": evidence["rollback_risk_accepted"],
             "device_write_performed": False,
         },
     )
@@ -8331,6 +8383,17 @@ def api_change_record(change_id: str, request: Request) -> dict[str, object]:
                 result.get("risk_assessment")
                 or (result.get("plan") or {}).get("risk_assessment")
                 or {}
+            ),
+            "rollback_risk_accepted": bool(
+                result.get("rollback_risk_accepted", False)
+                or (
+                    (intent_info.get("custom") or {}).get(
+                        "acknowledge_no_rollback",
+                        False,
+                    )
+                    if isinstance(intent_info.get("custom"), dict)
+                    else False
+                )
             ),
             "rollback": rollback_plan,
             "checks": plan.get("checks") or {},

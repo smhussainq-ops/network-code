@@ -2,6 +2,7 @@ import copy
 import hashlib
 import hmac
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from fastapi import HTTPException
@@ -18,6 +19,7 @@ from netcode.models import RenderResult, load_intent_data
 from netcode.store import PlatformStore
 from netcode.validation import StaticValidator
 from netcode.workflow import require_action_allowed
+from netcode.yamlio import read_yaml
 
 
 ORG_ID = "org_default"
@@ -419,9 +421,11 @@ def test_authenticated_engineer_completes_same_review_draft_before_dry_run(
     assert created.status_code == 200, created.text
     change_id = created.json()["change_id"]
 
+    completion_payload = _completion_payload()
+    completion_payload["proposed_intent"]["acknowledge_no_rollback"] = True
     completed = client.post(
         f"/api/change/{change_id}/complete-rca-draft",
-        json=_completion_payload(),
+        json=completion_payload,
     )
 
     assert completed.status_code == 200, completed.text
@@ -431,10 +435,107 @@ def test_authenticated_engineer_completes_same_review_draft_before_dry_run(
     assert body["draft_mode"] == "executable"
     assert "description REVIEWED_UPLINK" in body["change"]["result"]["plan"]["commands"]
     assert "no description" in body["change"]["result"]["plan"]["rollback"]
+    assert (
+        body["change"]["result"]["risk_assessment"]["rollback_status"]
+        == "partial"
+    )
+    assert body["change"]["result"]["rollback_risk_accepted"] is False
+    assert any(
+        "recommended desired state matches approved intent" in item
+        for item in body["change"]["result"]["risk_assessment"]["unknowns"]
+    )
     assert body["change"]["result"]["completed_by"]
     assert body["change"]["result"]["device_write_performed"] is False
     assert body["intent_path"].endswith("-completed.yaml")
+    completed_intent = read_yaml(Path(body["intent_path"]))
+    assert completed_intent["custom"]["acknowledge_no_rollback"] is False
     assert PlatformStore(WorkspacePaths(tmp_path.resolve())).list_jobs(org_id=ORG_ID) == []
+
+
+def test_engineer_may_accept_unavailable_rollback_without_weakening_other_gates(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    init_workspace(WorkspacePaths(tmp_path))
+    _activate_model(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    client = TestClient(api.app)
+    created = client.post("/api/changes/from-rca", json=_review_proposal())
+    assert created.status_code == 200, created.text
+    change_id = created.json()["change_id"]
+    payload = _completion_payload()
+    payload["proposed_intent"]["rollback_lines"] = ""
+
+    missing_acknowledgment = client.post(
+        f"/api/change/{change_id}/complete-rca-draft",
+        json=payload,
+    )
+    assert missing_acknowledgment.status_code == 400
+    assert "explicit acknowledgment" in missing_acknowledgment.json()["detail"]
+
+    for invalid_acknowledgment in ("true", "True", 1, []):
+        payload["proposed_intent"][
+            "acknowledge_no_rollback"
+        ] = invalid_acknowledgment
+        invalid_response = client.post(
+            f"/api/change/{change_id}/complete-rca-draft",
+            json=payload,
+        )
+        assert invalid_response.status_code == 400
+        assert (
+            "explicit acknowledgment"
+            in invalid_response.json()["detail"]
+        )
+
+    payload["proposed_intent"]["acknowledge_no_rollback"] = True
+    completed = client.post(
+        f"/api/change/{change_id}/complete-rca-draft",
+        json=payload,
+    )
+
+    assert completed.status_code == 200, completed.text
+    body = completed.json()
+    result = body["change"]["result"]
+    assert body["change"]["workflow_state"] == "validated"
+    assert result["plan"]["rollback"] == ""
+    assert result["risk_assessment"]["rollback_status"] == "unavailable"
+    assert result["risk_assessment"]["rollback_available"] is False
+    assert result["rollback_risk_accepted"] is True
+    assert result["device_write_performed"] is False
+    assert any(
+        "recommended desired state matches approved intent" in item
+        for item in result["risk_assessment"]["unknowns"]
+    )
+    assert any(
+        "reviewer explicitly accepted" in item
+        for item in result["risk_assessment"]["unknowns"]
+    )
+    assert "dry_run" in body["workflow"]["allowed_actions"]
+    assert "apply" not in body["workflow"]["allowed_actions"]
+    store = PlatformStore(WorkspacePaths(tmp_path.resolve()))
+    assert store.list_jobs(org_id=ORG_ID) == []
+    events = store.list_workflow_events(change_id)
+    completion = [
+        event for event in events if event.action == "complete_rca_draft"
+    ]
+    assert len(completion) == 1
+    assert completion[0].evidence["rollback_status"] == "unavailable"
+    assert completion[0].evidence["rollback_risk_accepted"] is True
+    record = client.get(f"/api/change/{change_id}/record")
+    assert record.status_code == 200, record.text
+    assert record.json()["plan"]["risk_assessment"]["rollback_status"] == "unavailable"
+    assert record.json()["plan"]["rollback_risk_accepted"] is True
+    completed_intent = read_yaml(Path(body["intent_path"]))
+    assert completed_intent["custom"]["acknowledge_no_rollback"] is True
+    store.update_change(
+        change_id,
+        "completed",
+        {"status": "pass"},
+        workflow_state="rollback_available",
+    )
+    durable_record = client.get(f"/api/change/{change_id}/record")
+    assert durable_record.status_code == 200, durable_record.text
+    assert durable_record.json()["plan"]["rollback_risk_accepted"] is True
 
 
 @pytest.mark.parametrize(
@@ -774,8 +875,79 @@ def test_netcode_ui_exposes_review_completion_without_auto_apply() -> None:
 
     assert "Engineer input required" in app_js
     assert "complete-rca-draft" in app_js
-    assert "Validate reversible intent" in app_js
+    assert "Validate change package" in app_js
+    assert "rca-acknowledge-no-rollback" in app_js
+    assert 'class="wide check-row"' in app_js
+    assert 'id="rca-acknowledge-no-rollback" type="checkbox" />' in app_js
+    assert "automatic rollback is unavailable" in app_js
+    assert "Automatic rollback is unavailable for this approved change package." in app_js
+    assert "appState.plan?.plan?.rollback?.commands" in app_js
+    assert "appState.plan?.pipeline?.metadata?.rollback?.commands" not in app_js
     assert "No device write was queued" in app_js
+
+
+def test_machine_review_draft_rejects_rollback_risk_acknowledgment(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    init_workspace(WorkspacePaths(tmp_path))
+    _activate_model(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    payload = _review_proposal()
+    payload["proposed_intent"]["acknowledge_no_rollback"] = True
+    _refresh_integrity(payload)
+
+    response = TestClient(api.app).post(
+        "/api/changes/from-rca",
+        json=payload,
+    )
+
+    assert response.status_code == 400
+    assert "desired state only" in response.json()["detail"]
+    store = PlatformStore(WorkspacePaths(tmp_path.resolve()))
+    assert store.list_changes(org_id=ORG_ID) == []
+    assert store.list_jobs(org_id=ORG_ID) == []
+
+
+def test_non_custom_plan_without_rollback_does_not_claim_risk_acceptance(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    init_workspace(WorkspacePaths(tmp_path))
+    _activate_model(tmp_path)
+    payload = _proposal()
+    request = api.RcaRemediationProposalRequest.model_validate(payload)
+    intent = api._intent_from_rca_proposal(request)
+    monkeypatch.setattr(
+        api,
+        "plan_metadata",
+        lambda _intent: {
+            "risk": "medium",
+            "rollback": {"commands": "", "confidence": {}},
+            "checks": {"post": []},
+            "blast_radius": {
+                "devices": [DEVICE_ID],
+                "site": "branch",
+                "objects": [],
+            },
+        },
+    )
+
+    risk = api._rca_plan_risk_assessment(
+        request=request,
+        intent=intent,
+        pipeline=SimpleNamespace(
+            status="pass",
+            validation=SimpleNamespace(checks=[]),
+        ),
+        store=PlatformStore(WorkspacePaths(tmp_path.resolve())),
+        org_id=ORG_ID,
+    )
+
+    assert risk["rollback_status"] == "unavailable"
+    assert risk["rollback_risk_accepted"] is False
+    assert any("was not explicitly accepted" in item for item in risk["unknowns"])
+    assert not any("reviewer explicitly accepted" in item for item in risk["unknowns"])
 
 
 def test_review_completion_is_tenant_scoped_and_replay_safe(

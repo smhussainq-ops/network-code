@@ -490,7 +490,7 @@ def test_route_shadow_remediation_is_exact_reversible_and_draft_only(
     ("missing_field", "expected_detail"),
     [
         ("config_lines", "forward configuration"),
-        ("rollback_lines", "rollback configuration"),
+        ("rollback_lines", "rollback commands or explicit acknowledgment"),
         ("verify_contains", "post-change verification target"),
     ],
 )
@@ -526,6 +526,38 @@ def test_rez_custom_config_requires_forward_rollback_and_verification(
     store = PlatformStore(WorkspacePaths(tmp_path.resolve()))
     assert response.status_code == 400
     assert expected_detail in response.json()["detail"]
+    assert store.list_changes() == []
+    assert store.list_jobs() == []
+
+
+def test_machine_rca_payload_cannot_self_acknowledge_missing_rollback(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    init_workspace(WorkspacePaths(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    response = TestClient(api.app).post(
+        "/api/changes/from-rca",
+        json=_confirmed_proposal({
+            "source": "rez",
+            "incident_id": "INC-MACHINE-ROLLBACK-ACK",
+            "target_device": "v2-store1",
+            "suggested_pack": "custom_config",
+            "rationale": "Rez proposed a reviewed configuration draft.",
+            "proposed_intent": {
+                "change_type": "custom_config",
+                "site": "store-1842",
+                "config_lines": "vlan 992\n   name RCA_DRYRUN\n",
+                "rollback_lines": "",
+                "acknowledge_no_rollback": True,
+                "verify_contains": "vlan 992",
+            },
+        }),
+    )
+
+    store = PlatformStore(WorkspacePaths(tmp_path.resolve()))
+    assert response.status_code == 400
+    assert "explicit acknowledgment" in response.json()["detail"]
     assert store.list_changes() == []
     assert store.list_jobs() == []
 

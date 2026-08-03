@@ -1395,7 +1395,18 @@ function renderApply() {
   const verifyBtn = $("verify-change");
   verifyBtn.disabled = !(appState.apply?.ok && appState.changeLive);
   verifyBtn.title = "";
-  $("rollback-change").disabled = !(appState.apply?.ok && appState.changeLive);
+  const rollbackCommands =
+    appState.plan?.plan?.rollback?.commands || "";
+  const rollbackBtn = $("rollback-change");
+  rollbackBtn.disabled = !(
+    appState.apply?.ok &&
+    appState.changeLive &&
+    rollbackCommands.trim()
+  );
+  rollbackBtn.title =
+    appState.plan && !rollbackCommands.trim()
+      ? "Automatic rollback is unavailable for this approved change package."
+      : "";
   // Commit/push only once we're on a change branch, so artifacts never land on the base branch.
   const onChangeBranch = Boolean((appState.gitBranches?.current || "").startsWith("change/"));
   $("commit-artifacts").disabled = !(appState.plan && appState.git?.available && onChangeBranch);
@@ -2107,15 +2118,19 @@ function reviewDraftBlock(record) {
   const checks = (draft.verification_checks || []).join("\n");
   return `<article class="record-block">
     <h5>Engineer input required</h5>
-    <p><strong>Rez recommendation:</strong> ${esc(draft.expected_outcome || "Review the confirmed RCA and define the exact reversible intent.")}</p>
+    <p><strong>Rez recommendation:</strong> ${esc(draft.expected_outcome || "Review the confirmed RCA and define the change package and rollback status.")}</p>
     ${unresolved ? `<p>Before validation:</p><ul>${unresolved}</ul>` : ""}
     <p>No command, dry-run, approval, or device action is available until this form passes Netcode validation.</p>
     <div class="form-grid">
       <label class="wide">Forward configuration
         <textarea id="rca-forward-lines" spellcheck="false" placeholder="Exact reviewed configuration lines"></textarea>
       </label>
-      <label class="wide">Exact rollback
-        <textarea id="rca-rollback-lines" spellcheck="false" placeholder="Exact inverse configuration lines"></textarea>
+      <label class="wide">Rollback commands (optional)
+        <textarea id="rca-rollback-lines" spellcheck="false" placeholder="Exact or operator-reviewed rollback configuration, when available"></textarea>
+      </label>
+      <label class="wide check-row">
+        <input id="rca-acknowledge-no-rollback" type="checkbox" />
+        I understand that automatic rollback is unavailable if no rollback commands are supplied.
       </label>
       <label>Verification target
         <input id="rca-verify-contains" placeholder="Exact running-config text to verify" />
@@ -2127,7 +2142,7 @@ function reviewDraftBlock(record) {
         <textarea id="rca-verification-checks">${esc(checks)}</textarea>
       </label>
     </div>
-    <button id="complete-rca-draft" class="primary" type="button">Validate reversible intent</button>
+    <button id="complete-rca-draft" class="primary" type="button">Validate change package</button>
   </article>`;
 }
 
@@ -2139,6 +2154,8 @@ async function completeRcaDraft(changeId) {
     const req = record.request || {};
     const forward = $("rca-forward-lines")?.value || "";
     const rollback = $("rca-rollback-lines")?.value || "";
+    const acknowledgeNoRollback =
+      $("rca-acknowledge-no-rollback")?.checked || false;
     const verifyContains = $("rca-verify-contains")?.value?.trim() || "";
     const expectedOutcome = $("rca-expected-outcome")?.value?.trim() || "";
     const verificationChecks = ($("rca-verification-checks")?.value || "")
@@ -2152,6 +2169,8 @@ async function completeRcaDraft(changeId) {
         targets: { device_ids: [req.device_id] },
         config_lines: forward,
         rollback_lines: rollback,
+        acknowledge_no_rollback:
+          !rollback.trim() && acknowledgeNoRollback,
         verify_contains: verifyContains,
       },
       expected_outcome: expectedOutcome,
@@ -2163,10 +2182,10 @@ async function completeRcaDraft(changeId) {
       state: data.change?.workflow_state === "validated" ? "Passed" : "Review",
       status: data.change?.workflow_state === "validated" ? "pass" : "warn",
       title: data.change?.workflow_state === "validated"
-        ? "Reversible intent validated."
+        ? "Change package validated."
         : "Intent needs correction.",
       summary: "Netcode compiled and checked the engineer-reviewed intent. No device write was queued.",
-      expected: "Exact forward, rollback, and verification intent passes static validation.",
+      expected: "Forward configuration, rollback disclosure, and verification intent pass static validation.",
       actual: `Workflow state: ${data.change?.workflow_state || "unknown"}.`,
       artifact: `Change ${changeId}`,
       device: "No device configuration was changed.",
@@ -2178,7 +2197,7 @@ async function completeRcaDraft(changeId) {
     failOutcome(
       "Review draft was not completed.",
       error,
-      "Correct the exact forward, rollback, and verification fields."
+      "Correct the forward configuration, rollback disclosure, and verification fields."
     );
   } finally {
     if (button) button.disabled = false;
@@ -2203,6 +2222,14 @@ function renderChangeRecord() {
   const safety = record.safety || {};
   const investigations = (record.events || []).filter((event) => String(event.action || "") === "troubleshoot");
   const failedChecks = (safety.checks || []).filter((check) => check.status !== "pass");
+  const rollbackStatus =
+    plan.risk_assessment?.rollback_status ||
+    (plan.rollback?.commands ? "available" : "unavailable");
+  const rollbackDisclosure = plan.rollback?.commands
+    ? `Status: ${esc(rollbackStatus)}.`
+    : `Status: unavailable. Engineer risk acknowledgment: ${
+        plan.rollback_risk_accepted ? "recorded" : "not recorded"
+      }.`;
   const proofLine = (proof, label) =>
     proof?.present
       ? `${esc(label)}: ${esc(proof.status || "")} — ${esc(proof.message || "")} (${(proof.commands || []).length} device commands)`
@@ -2238,7 +2265,7 @@ function renderChangeRecord() {
           })
         : ["No read-only investigation is attached yet."]
     ),
-    `<article class="record-block"><h5>Rollback</h5><p>${
+    `<article class="record-block"><h5>Rollback</h5><p>${rollbackDisclosure}</p><p>${
       record.rollback_record?.present
         ? proofLine(record.rollback_record, "Rollback executed")
         : `Planned before apply — ${esc(plan.rollback?.confidence?.level || "unknown")} confidence.`

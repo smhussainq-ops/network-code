@@ -131,7 +131,7 @@ def state_after_lab_action(action: str, passed: bool) -> WorkflowSnapshot:
 def _required_evidence(state: WorkflowState) -> list[str]:
     requirements = {
         "draft": ["intent request"],
-        "needs_input": ["engineer-completed reversible intent"],
+        "needs_input": ["engineer-reviewed change package and rollback disclosure"],
         "intent_created": ["rendered config", "static validation"],
         "rendered": ["static validation"],
         "validated": ["lab dry-run proof"],
@@ -156,7 +156,8 @@ def _message(state: WorkflowState) -> str:
         "draft": "No safe network action is available until an intent is checked.",
         "needs_input": (
             "Rez supplied a confirmed recommendation, but an engineer must complete "
-            "the exact reversible intent before validation or device action."
+            "the reviewed change package and rollback disclosure before validation "
+            "or device action."
         ),
         "intent_created": "Intent exists, but validation has not completed.",
         "rendered": "Candidate config exists, but validation has not completed.",
@@ -179,7 +180,10 @@ def _message(state: WorkflowState) -> str:
 
 def _blocked_reason(action: str, state: WorkflowState) -> str:
     if state == "needs_input":
-        return "An engineer must complete exact reversible intent before any device workflow."
+        return (
+            "An engineer must complete the reviewed change package and rollback "
+            "disclosure before any device workflow."
+        )
     if action == "dry_run":
         return "Static validation must pass first." if state in {"draft", "intent_created", "rendered", "blocked"} else "Action is not valid in this workflow state."
     if action == "apply":
