@@ -75,6 +75,44 @@ def _emit_progress(
         return
 
 
+def _running_config_contains_fragment(
+    running_config: str,
+    fragment: str,
+) -> bool:
+    """Match line-bounded fragments without treating negation as affirmation."""
+    config_lines = [
+        line.strip()
+        for line in running_config.splitlines()
+        if line.strip()
+    ]
+    fragment_lines = [
+        line.strip()
+        for line in fragment.splitlines()
+        if line.strip()
+    ]
+    if not fragment_lines or len(fragment_lines) > len(config_lines):
+        return False
+    width = len(fragment_lines)
+
+    def line_matches(config_line: str, fragment_line: str) -> bool:
+        if fragment_line not in config_line:
+            return False
+        fragment_is_negated = fragment_line.startswith("no ")
+        config_is_negated = config_line.startswith("no ")
+        return fragment_is_negated == config_is_negated
+
+    return any(
+        all(
+            line_matches(config_line, fragment_line)
+            for config_line, fragment_line in zip(
+                config_lines[index : index + width],
+                fragment_lines,
+            )
+        )
+        for index in range(len(config_lines) - width + 1)
+    )
+
+
 DRY_RUN_CAPABILITIES: dict[str, dict[str, str]] = {
     "arista_eos": {
         "tier": "native",
@@ -830,7 +868,11 @@ class AristaEOSLabAdapter(ExecutionAdapter):
             needle = lines[0] if lines else ""
         command = "show running-config"
         output = self.show(command)
-        found = needle in output if needle else False
+        found = (
+            _running_config_contains_fragment(output, needle)
+            if needle
+            else False
+        )
         expected_found = present != intent.custom.verify_absent
         seen = found is expected_found
         expected_state = "present" if expected_found else "absent"
