@@ -257,6 +257,23 @@ def _review_proposal() -> dict:
     return _refresh_integrity(payload)
 
 
+def _agent_evidence_review_proposal() -> dict:
+    payload = _review_proposal()
+    payload["root_confirmed"] = False
+    payload["unresolved_inputs"] = [
+        "Deterministic validation did not select a canonical root; an engineer must confirm the recommendation before compilation."
+    ]
+    payload["evidence_contract"].update(
+        {
+            "live_root_confirmed": False,
+            "canonical_root_available": False,
+            "agent_evidence_backed": True,
+            "unresolved_inputs": payload["unresolved_inputs"],
+        }
+    )
+    return _refresh_integrity(payload)
+
+
 def _auth_header(
     store: PlatformStore,
     *,
@@ -387,6 +404,73 @@ def test_incomplete_agent_recommendation_creates_one_review_only_change(
     assert "source_request" in (
         store.get_change(body["change_id"]).result or {}
     )["review_draft"]
+    assert store.list_jobs(org_id=ORG_ID) == []
+
+
+def test_evidence_backed_agent_recommendation_without_math_root_is_visible_review_draft(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    init_workspace(WorkspacePaths(tmp_path))
+    _activate_model(tmp_path)
+    monkeypatch.chdir(tmp_path)
+
+    response = TestClient(api.app).post(
+        "/api/changes/from-rca",
+        json=_agent_evidence_review_proposal(),
+    )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["draft_mode"] == "needs_input"
+    assert body["change"]["workflow_state"] == "needs_input"
+    assert body["review_draft"]["commands"] == []
+    assert body["review_draft"]["rollback"] == []
+    assert body["workflow"]["allowed_actions"] == []
+    store = PlatformStore(WorkspacePaths(tmp_path.resolve()))
+    assert len(store.list_changes(org_id=ORG_ID)) == 1
+    assert store.list_jobs(org_id=ORG_ID) == []
+
+
+def test_unconfirmed_agent_recommendation_cannot_be_executable(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    init_workspace(WorkspacePaths(tmp_path))
+    _activate_model(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    payload = _agent_evidence_review_proposal()
+    payload["draft_mode"] = "executable"
+    payload["evidence_contract"]["draft_mode"] = "executable"
+    payload["evidence_contract"]["sufficient_for_execution"] = True
+    payload["evidence_contract"]["unresolved_inputs"] = []
+    payload["unresolved_inputs"] = []
+    _sign_current_proof(payload)
+
+    response = TestClient(api.app).post("/api/changes/from-rca", json=payload)
+
+    assert response.status_code == 400
+    store = PlatformStore(WorkspacePaths(tmp_path.resolve()))
+    assert store.list_changes(org_id=ORG_ID) == []
+    assert store.list_jobs(org_id=ORG_ID) == []
+
+
+def test_unconfirmed_review_draft_requires_signed_agent_evidence(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    init_workspace(WorkspacePaths(tmp_path))
+    _activate_model(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    payload = _agent_evidence_review_proposal()
+    payload["evidence_contract"]["agent_evidence_backed"] = False
+    _sign_current_proof(payload)
+
+    response = TestClient(api.app).post("/api/changes/from-rca", json=payload)
+
+    assert response.status_code == 400
+    store = PlatformStore(WorkspacePaths(tmp_path.resolve()))
+    assert store.list_changes(org_id=ORG_ID) == []
     assert store.list_jobs(org_id=ORG_ID) == []
 
 

@@ -858,7 +858,8 @@ def _require_confirmed_rca_provenance(request: RcaRemediationProposalRequest) ->
         raise HTTPException(status_code=400, detail="A structured Netcode remediation proposal is required.")
     if request.proposal_source.strip() not in _RCA_PROPOSAL_SOURCES:
         raise HTTPException(status_code=400, detail="The RCA proposal source is not trusted for remediation.")
-    if not request.root_confirmed or not atom_id:
+    review_only_agent_draft = _is_agent_review_draft(request)
+    if not atom_id or (not request.root_confirmed and not review_only_agent_draft):
         raise HTTPException(status_code=400, detail="A confirmed primary root cause is required before creating a draft.")
     if atom_id in _RCA_NON_ACTIONABLE_ROOTS or atom_id.startswith(_RCA_NON_ACTIONABLE_PREFIXES):
         raise HTTPException(status_code=400, detail="The confirmed root is not an actionable device condition.")
@@ -972,13 +973,25 @@ def _require_agent_recommendation_evidence(
         if "sufficient_for_execution" in proof
         else draft_mode == "executable"
     )
+    confirmed_root_evidence = (
+        request.root_confirmed is True
+        and proof.get("live_root_confirmed") is True
+        and proof.get("canonical_root_available") is not False
+    )
+    review_only_agent_evidence = (
+        draft_mode == "needs_input"
+        and request.root_confirmed is False
+        and proof.get("live_root_confirmed") is False
+        and proof.get("canonical_root_available") is False
+        and proof.get("agent_evidence_backed") is True
+    )
     if (
         proof.get("schema") != "rez.agent-remediation-evidence.v1"
         or proof.get("sufficient_for_draft") is not True
         or not sufficient_for_review
         or sufficient_for_execution != (draft_mode == "executable")
         or proof.get("fresh") is not True
-        or proof.get("live_root_confirmed") is not True
+        or not (confirmed_root_evidence or review_only_agent_evidence)
         or str(proof.get("root_atom_id") or "").strip() != request.root_atom_id.strip()
         or str(proof.get("target_device") or "").strip() != request.target_device.strip()
         or str(proof.get("change_type") or "").strip() != change_type
@@ -7636,7 +7649,7 @@ def api_change_from_rca(request: RcaRemediationProposalRequest, http_request: Re
             "draft",
             "needs_input",
             (
-                "Recorded a confirmed Rez recommendation for engineer completion. "
+                "Recorded an evidence-backed Rez recommendation for engineer completion. "
                 "No commands were generated and no device action is available."
             ),
             {
