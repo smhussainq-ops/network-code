@@ -19,6 +19,7 @@ from typing import Any
 import yaml
 
 from netcode.change_types import redistribution_items, spec_for
+from netcode.config_policy import prohibited_custom_config_lines
 from netcode.models import Intent, RenderResult
 from netcode.validation import StaticValidator
 
@@ -86,6 +87,18 @@ def local_policy_gate(
         return {"ok": False, "message": "Control-plane policy could not be parsed (fail-closed)."}
 
     change_type = intent.change_type
+    if change_type == "custom_config":
+        custom = getattr(intent, "custom", None)
+        prohibited = prohibited_custom_config_lines(getattr(custom, "config_lines", ""))
+        prohibited.extend(prohibited_custom_config_lines(getattr(custom, "rollback_lines", "")))
+        if prohibited:
+            return {
+                "ok": False,
+                "message": "Custom config contains prohibited unattended commands.",
+                "blocked_lines": [item["line"] for item in prohibited],
+                "unexpected_lines": [],
+                "prohibited": prohibited,
+            }
     payload_scope = payload_policy.get("render_scope", {}) if isinstance(payload_policy, dict) else {}
     local_scope = local_policy.get("render_scope", {}) if isinstance(local_policy, dict) else {}
 

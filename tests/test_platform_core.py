@@ -569,6 +569,7 @@ def test_runner_read_job_routing_roundtrip(tmp_path: Path, monkeypatch):
     enroll = client.post("/api/runner/enroll", json={"join_token": client.post("/api/runners/join-token", json={"pool": "store-lab"}).json()["join_token"], "name": "r1"}).json()
     token, secret = enroll["runner_token"], enroll["hmac_secret"]
     auth = {"Authorization": f"Bearer {token}"}
+    PlatformStore(WorkspacePaths(tmp_path)).touch_runner(enroll["runner_id"], status="online")
 
     # A stand-in runner: claim the queued read job, return a canned readiness result.
     canned = {"ok": True, "tested": 3, "readable": 3, "devices": [{"id": "v2-store1", "ok": True, "error": ""}], "message": "3/3 trusted devices are readable."}

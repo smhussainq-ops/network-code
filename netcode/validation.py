@@ -8,6 +8,7 @@ from ipaddress import ip_network
 from pathlib import Path
 
 from netcode.change_types import redistribution_items, spec_for
+from netcode.config_policy import prohibited_custom_config_lines
 from netcode.inventory import Inventory
 from netcode.models import (
     AclRuleIntent,
@@ -469,6 +470,15 @@ class StaticValidator:
         lines = [line for line in intent.custom.config_lines.splitlines() if line.strip()]
         if not lines:
             return self._fail("custom_policy", "Custom Config Policy", "Custom config has no config lines.")
+        prohibited = prohibited_custom_config_lines(intent.custom.config_lines)
+        prohibited.extend(prohibited_custom_config_lines(intent.custom.rollback_lines))
+        if prohibited:
+            return self._fail(
+                "custom_policy",
+                "Custom Config Policy",
+                "Custom config contains a prohibited lifecycle, persistence, shell, or chained command.",
+                prohibited=prohibited,
+            )
         has_rollback = bool(intent.custom.rollback_lines.strip())
         if not has_rollback and not intent.custom.acknowledge_no_rollback:
             return self._fail(

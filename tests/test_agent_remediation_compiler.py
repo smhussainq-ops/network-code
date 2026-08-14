@@ -531,6 +531,9 @@ def test_authenticated_engineer_completes_same_review_draft_before_dry_run(
     assert body["change"]["result"]["completed_by"]
     assert body["change"]["result"]["device_write_performed"] is False
     assert body["intent_path"].endswith("-completed.yaml")
+    record = client.get(f"/api/change/{change_id}/record")
+    assert record.status_code == 200
+    assert "dry_run" in record.json()["workflow"]["allowed_actions"]
     completed_intent = read_yaml(Path(body["intent_path"]))
     assert completed_intent["custom"]["acknowledge_no_rollback"] is False
     assert PlatformStore(WorkspacePaths(tmp_path.resolve())).list_jobs(org_id=ORG_ID) == []

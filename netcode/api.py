@@ -4638,6 +4638,54 @@ def _resolve_targeted_refresh_runner(
     return None, "Multiple Local Connectors are online. Partition the refresh by connector."
 
 
+def _resolve_selected_device_runner(
+    store: PlatformStore,
+    org_id: str,
+    device_ids: list[str],
+) -> tuple[str | None, str | None]:
+    """Resolve a selected-device read to exactly one online tenant connector."""
+    resolved_runner_ids: set[str] = set()
+    unknown: list[str] = []
+    for device_id in dict.fromkeys(device_ids):
+        catalog_device = store.resolve_device(org_id, device_id)
+        if catalog_device is None:
+            unknown.append(device_id)
+            continue
+        runner_id = str(catalog_device.get("runner_id") or "").strip()
+        if not runner_id:
+            unknown.append(device_id)
+            continue
+        resolved_runner_ids.add(runner_id)
+
+    if unknown:
+        return None, f"Selected target is not assigned to a Local Connector: {', '.join(unknown)}."
+    if len(resolved_runner_ids) > 1:
+        return None, "Selected targets span multiple Local Connectors. Run one connector scope at a time."
+
+    if resolved_runner_ids:
+        runner_id = next(iter(resolved_runner_ids))
+        try:
+            runner = store.get_runner(runner_id)
+        except ValueError:
+            return None, "The selected Local Connector is unknown."
+        if runner.org_id != org_id:
+            return None, "The selected Local Connector is unknown."
+        if runner.status != "online" or runner.drain_requested:
+            return None, "The selected Local Connector is not online."
+        return runner.id, None
+
+    online = [
+        runner
+        for runner in store.list_runners(org_id=org_id)
+        if runner.status == "online" and not runner.drain_requested
+    ]
+    if len(online) == 1:
+        return online[0].id, None
+    if not online:
+        return None, "No online Local Connector is available for this organization."
+    return None, "Multiple Local Connectors are online. Select at least one target device."
+
+
 def _runner_read(
     p,
     action: str,
@@ -5092,11 +5140,32 @@ def api_readiness_devices(
         if str(value).strip()
     ]
     if execution_mode() == "runner":
+        principal = _request_principal(request)
+        target_runner_id, route_error = _resolve_selected_device_runner(
+            PlatformStore(p),
+            principal.org_id,
+            requested_ids,
+        )
+        if route_error:
+            return {
+                "ok": False,
+                "requested": len(requested_ids),
+                "tested": 0,
+                "readable": 0,
+                "excluded": 0,
+                "devices": [
+                    {"id": device_id, "ok": False, "eligible": False, "error": route_error}
+                    for device_id in requested_ids
+                ],
+                "message": route_error,
+                "scope_rejected": True,
+            }
         return _runner_read(
             p,
             "readiness",
             {"device_ids": requested_ids},
-            _request_principal(request).org_id,
+            principal.org_id,
+            target_runner_id=target_runner_id,
         )
     inventory = Inventory(configured_inventory_path(p))
     missing: list[str] = []
@@ -8385,6 +8454,7 @@ def api_change_record(change_id: str, request: Request) -> dict[str, object]:
         "rez_change_id": change_dict.get("rez_change_id"),
         "workflow_state": change_dict.get("workflow_state"),
         "status": change_dict.get("status"),
+        "workflow": workflow_snapshot(change.workflow_state).as_dict(),
         "request": {
             "title": plan.get("title") or result.get("title") or slug,
             "change_type": (
@@ -8449,7 +8519,14 @@ def api_change_record(change_id: str, request: Request) -> dict[str, object]:
         "verify_proof": verify_proof(),
         "rollback_record": proof_for("rollback"),
         "diagnostics_handoffs": list(result.get("diagnostics_handoffs") or []),
-        "review_draft": review_draft,
+        "review_draft": (
+            {
+                **review_draft,
+                "supported_change_types": sorted(_RCA_ALLOWED_CHANGE_TYPES),
+            }
+            if review_draft
+            else None
+        ),
         "network_model": {
             "revisions": [
                 {
