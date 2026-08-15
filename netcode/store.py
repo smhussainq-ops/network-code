@@ -1066,6 +1066,53 @@ class PlatformStore:
             raise KeyError(f"Unknown change {change_id}")
         return self._change(row)
 
+    def archive_change(self, change_id: str, *, org_id: str, actor: str) -> ChangeRecord:
+        """Remove an idle change from normal work queues without deleting audit data."""
+        now = utc_now()
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM changes WHERE id = ? AND org_id = ?",
+                (change_id, org_id),
+            ).fetchone()
+            if not row:
+                raise KeyError(f"Unknown change {change_id}")
+            workflow_state = str(row["workflow_state"] or "").lower()
+            if workflow_state == "archived":
+                return self._change(row)
+            if workflow_state in {"applying", "rolling_back"}:
+                raise ValueError("A change that is applying or rolling back cannot be archived.")
+            active = conn.execute(
+                "SELECT id FROM jobs WHERE change_id = ? AND org_id = ? "
+                "AND status IN ('queued', 'running', 'completing') LIMIT 1",
+                (change_id, org_id),
+            ).fetchone()
+            if active:
+                raise ValueError("A change with an active job cannot be archived.")
+            from_state = str(row["workflow_state"] or row["status"] or "draft")
+            conn.execute(
+                """
+                INSERT INTO workflow_events
+                (id, change_id, action, from_state, to_state, message, created_at, evidence_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    str(uuid.uuid4()),
+                    change_id,
+                    "archive",
+                    from_state,
+                    "archived",
+                    "Change archived from the active work queue; audit evidence retained.",
+                    now,
+                    json.dumps({"actor": actor, "record_deleted": False}),
+                ),
+            )
+            conn.execute(
+                "UPDATE changes SET workflow_state = 'archived', updated_at = ? "
+                "WHERE id = ? AND org_id = ?",
+                (now, change_id, org_id),
+            )
+        return self.get_change(change_id)
+
     def get_job(self, job_id: str) -> JobRecord:
         with self._connect() as conn:
             row = conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
@@ -1124,6 +1171,8 @@ class PlatformStore:
             clauses.append("(LOWER(status) = ? OR LOWER(workflow_state) = ?)")
             normalized_state = state.strip().lower()
             params.extend([normalized_state, normalized_state])
+        else:
+            clauses.append("LOWER(COALESCE(workflow_state, 'draft')) <> 'archived'")
         if source.strip():
             normalized_source = source.strip().lower()
             if normalized_source == "rez_rca":

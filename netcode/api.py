@@ -7520,6 +7520,29 @@ def api_changes(
     }
 
 
+@app.post("/api/changes/{change_id}/archive")
+def api_change_archive(change_id: str, request: Request) -> dict[str, object]:
+    principal = _request_principal(request)
+    actor = principal.email or principal.user_id or "netcode-user"
+    try:
+        change = PlatformStore(paths()).archive_change(
+            change_id,
+            org_id=principal.org_id,
+            actor=actor,
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=f"Unknown change {change_id}") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return {
+        "ok": True,
+        "change": change_summary_to_dict(change),
+        "record_deleted": False,
+        "audit_retained": True,
+        "device_connections_opened": 0,
+    }
+
+
 @app.post("/api/changes/from-rca")
 def api_change_from_rca(request: RcaRemediationProposalRequest, http_request: Request) -> dict[str, object]:
     """Create a Netcode draft change from a Rez RCA remediation proposal.

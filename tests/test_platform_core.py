@@ -135,6 +135,74 @@ def test_change_history_search_is_indexed_bounded_and_tenant_scoped(tmp_path: Pa
     assert len(serialized) < 2_500
 
 
+def test_change_archive_hides_idle_record_but_retains_audit(tmp_path: Path, monkeypatch):
+    workspace = WorkspacePaths(tmp_path)
+    init_workspace(workspace)
+    monkeypatch.chdir(tmp_path)
+    store = PlatformStore(workspace)
+    intent_path = workspace.intents / "history" / "stale-draft.yaml"
+    intent_path.parent.mkdir(parents=True, exist_ok=True)
+    write_yaml(
+        intent_path,
+        {
+            "change_type": "custom_config",
+            "site": "campus",
+            "targets": {"device_ids": ["campus-edge-1"]},
+            "custom": {"config_lines": "description reviewed"},
+        },
+    )
+    change = store.create_change(intent_path, "campus-edge-1", requested_by="marcus")
+    job = store.create_job(change.id, "lab_dry-run")
+
+    with pytest.raises(ValueError, match="active job"):
+        store.archive_change(change.id, org_id="org_default", actor="marcus")
+
+    store.update_job(job.id, "failed", "stale test job")
+    response = TestClient(api.app).post(f"/api/changes/{change.id}/archive")
+
+    assert response.status_code == 200
+    assert response.json()["record_deleted"] is False
+    assert response.json()["audit_retained"] is True
+    assert store.get_change(change.id).workflow_state == "archived"
+    assert store.get_job(job.id).status == "failed"
+    events = store.list_workflow_events(change.id)
+    assert events[-1].action == "archive"
+    assert events[-1].evidence == {"actor": "netcode-user", "record_deleted": False}
+
+    visible, visible_total = store.search_changes(org_id="org_default")
+    archived, archived_total = store.search_changes(org_id="org_default", state="archived")
+    assert visible_total == 0
+    assert visible == []
+    assert archived_total == 1
+    assert archived[0].id == change.id
+
+
+def test_change_archive_is_tenant_scoped(tmp_path: Path):
+    workspace = WorkspacePaths(tmp_path)
+    init_workspace(workspace)
+    store = PlatformStore(workspace)
+    intent_path = workspace.intents / "history" / "other-org.yaml"
+    intent_path.parent.mkdir(parents=True, exist_ok=True)
+    write_yaml(
+        intent_path,
+        {
+            "change_type": "custom_config",
+            "site": "private",
+            "targets": {"device_ids": ["other-edge"]},
+            "custom": {"config_lines": "description reviewed"},
+        },
+    )
+    change = store.create_change(
+        intent_path,
+        "other-edge",
+        requested_by="other",
+        org_id="org_other",
+    )
+
+    with pytest.raises(KeyError, match="Unknown change"):
+        store.archive_change(change.id, org_id="org_default", actor="marcus")
+
+
 def test_rez_bridge_degrades_cleanly_when_unavailable(tmp_path: Path):
     bridge = RezAdapterBridge(root=tmp_path / "missing-rez")
 
