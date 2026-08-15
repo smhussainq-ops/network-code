@@ -23,6 +23,7 @@ WorkflowState = Literal[
     "rolled_back",
     "failed",
     "blocked",
+    "archived",
 ]
 
 
@@ -147,6 +148,7 @@ def _required_evidence(state: WorkflowState) -> list[str]:
         "rolled_back": ["rollback audit report"],
         "failed": ["operator review"],
         "blocked": ["fix failed validation or missing evidence"],
+        "archived": ["retained audit evidence"],
     }
     return requirements[state]
 
@@ -174,6 +176,7 @@ def _message(state: WorkflowState) -> str:
         "rolled_back": "Rollback completed and was verified.",
         "failed": "The workflow failed. Later actions are blocked until reviewed.",
         "blocked": "The workflow is blocked by failed or missing evidence.",
+        "archived": "The change is archived. Its audit and execution evidence remain available read-only.",
     }
     return messages[state]
 

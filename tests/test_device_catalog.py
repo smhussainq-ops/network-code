@@ -209,6 +209,57 @@ def test_catalog_change_routes_to_exact_connector_even_when_pool_is_shared(tmp_p
     assert claimed.id == result["job"]["id"]
 
 
+def test_runner_mode_prefers_tenant_catalog_when_legacy_yaml_has_same_device(tmp_path: Path, monkeypatch):
+    workspace = WorkspacePaths(tmp_path)
+    init_workspace(workspace)
+    monkeypatch.setenv("NETCODE_EXECUTION", "runner")
+    monkeypatch.setenv("NETCODE_RUNNER_POOL", "legacy-default")
+    write_yaml(workspace.inventories / "lab.yaml", {
+        "defaults": {"platform": "arista_eos", "port": 22},
+        "devices": [{
+            "id": "v2-campus-core",
+            "host": "198.51.100.10",
+            "platform": "arista_eos",
+            "site": "campus",
+        }],
+    })
+    store = PlatformStore(workspace)
+    assigned_runner, _ = _runner(store, "tenant-connector", "tenant-pool")
+    store.sync_runner_devices(
+        assigned_runner,
+        [_device("v2-campus-core", "192.0.2.20", site="campus", role="core")],
+        revision="catalog-current",
+    )
+    intent_path = workspace.intents / "catalog-wins.yaml"
+    write_yaml(intent_path, {
+        "change_type": "interface_config",
+        "site": "campus",
+        "targets": {"device_ids": ["v2-campus-core"]},
+        "interface": {
+            "name": "Ethernet2",
+            "description": "Restore intended operational dependency",
+            "enabled": True,
+            "mode": "routed",
+            "ip_address": "10.3.2.1/30",
+        },
+    })
+    change = store.create_change(intent_path, "v2-campus-core")
+    store.update_change(change.id, "validated", {"unit": True}, workflow_state="validated")
+
+    result = JobRunner(workspace, store=store).run_lab_action(
+        intent_path,
+        "dry-run",
+        "v2-campus-core",
+        change.id,
+    )
+
+    assert result["job"]["pool"] == "tenant-pool"
+    assert result["job"]["target_runner_id"] == assigned_runner.id
+    assert result["job"]["payload"]["device"]["host"] == "192.0.2.20"
+    assert store.claim_next_job(DEFAULT_ORG_ID, "legacy-default", assigned_runner.id) is None
+    assert store.claim_next_job(DEFAULT_ORG_ID, "tenant-pool", assigned_runner.id) is not None
+
+
 def test_catalog_read_routes_to_exact_connector_even_when_pool_is_shared(tmp_path: Path):
     workspace = WorkspacePaths(tmp_path)
     init_workspace(workspace)

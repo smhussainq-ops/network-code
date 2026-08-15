@@ -463,7 +463,15 @@ class JobRunner:
         if not requested_id and intent.targets.device_ids:
             requested_id = str(intent.targets.device_ids[0]).strip()
 
-        device = inventory.find_device(requested_id) if requested_id else None
+        catalog_device = self.store.resolve_device(org_id, requested_id) if requested_id else None
+        # In runner mode the tenant catalog is authoritative for connector
+        # routing. A legacy YAML row may describe the same device, but it does
+        # not carry the tenant-bound runner identity needed for safe dispatch.
+        device = (
+            inventory.find_device(requested_id)
+            if requested_id and not (execution_mode() == "runner" and catalog_device is not None)
+            else None
+        )
         target_runner_id: str | None = None
         pool = runner_pool()
         if device is not None:
@@ -474,7 +482,6 @@ class JobRunner:
                 "port": device.port,
             }
         else:
-            catalog_device = self.store.resolve_device(org_id, requested_id) if requested_id else None
             if catalog_device is None:
                 # Group-only legacy intents still resolve through the YAML source
                 # of truth. Catalog-backed execution requires one exact target.

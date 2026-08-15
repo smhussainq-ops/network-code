@@ -175,6 +175,21 @@ def test_change_archive_hides_idle_record_but_retains_audit(tmp_path: Path, monk
     assert visible == []
     assert archived_total == 1
     assert archived[0].id == change.id
+    retained = TestClient(api.app).get(f"/api/change/{change.id}/record")
+    assert retained.status_code == 200
+    assert retained.json()["workflow"] == {
+        "state": "archived",
+        "allowed_actions": [],
+        "blocked_actions": {
+            "check_safety": "Action is not valid in this workflow state.",
+            "collect_state": "State collection requires a validated target.",
+            "dry_run": "Action is not valid in this workflow state.",
+            "apply": "Dry-run proof is required before apply.",
+            "rollback": "Rollback is only available after a successful apply.",
+        },
+        "required_evidence": ["retained audit evidence"],
+        "message": "The change is archived. Its audit and execution evidence remain available read-only.",
+    }
 
 
 def test_change_archive_is_tenant_scoped(tmp_path: Path):
