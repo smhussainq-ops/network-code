@@ -10,7 +10,7 @@ from jinja2 import Environment, FileSystemLoader, StrictUndefined
 
 from netcode.intent_utils import config_filename, template_for_intent
 from netcode.adapters.registry import AdapterRegistry
-from netcode.models import Intent, RenderResult
+from netcode.models import CustomConfigIntent, Intent, RenderResult
 from netcode.paths import WorkspacePaths
 from netcode.ui_config import configured_template_dir
 
@@ -34,6 +34,17 @@ def render_intent(
     *,
     platform: str = "arista_eos",
 ) -> RenderResult:
+    if isinstance(intent, CustomConfigIntent):
+        # Custom configuration is already vendor-native, reviewed CLI. Requiring
+        # one pass-through Jinja file per platform made transport support look
+        # like a feature compiler and needlessly blocked otherwise valid plans.
+        config = intent.custom.config_lines.strip() + "\n"
+        return RenderResult(
+            template_path="builtin/custom_config",
+            config=config,
+            variables=_variables(intent),
+        )
+
     template_name = template_for_intent(intent)
     normalized_platform = AdapterRegistry.normalize_execution_platform(platform)
     template_family = "arista" if normalized_platform == "arista_eos" else normalized_platform

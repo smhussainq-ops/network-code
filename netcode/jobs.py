@@ -393,7 +393,7 @@ class JobRunner:
             },
         }
 
-    def _ntp_state_from_job(self, change_id: str, action: str, org_id: str) -> dict[str, object] | None:
+    def _reviewed_state_from_job(self, change_id: str, action: str, org_id: str) -> dict[str, object] | None:
         expected_action = f"lab_{action}"
         for job in self.store.list_jobs(limit=500, org_id=org_id):
             if job.change_id != change_id or job.action != expected_action:
@@ -410,6 +410,10 @@ class JobRunner:
             return None
         return None
 
+    def _ntp_state_from_job(self, change_id: str, action: str, org_id: str) -> dict[str, object] | None:
+        """Compatibility wrapper for existing NTP workflow callers/tests."""
+        return self._reviewed_state_from_job(change_id, action, org_id)
+
     def _operation_context(
         self,
         *,
@@ -418,15 +422,22 @@ class JobRunner:
         action: str,
         change_type: str,
     ) -> dict[str, object]:
-        if change_type != "ntp_standardize":
+        if change_type not in {"ntp_standardize", "custom_config"}:
             return {}
-        source_action = "dry-run" if action == "apply" else "apply" if action == "rollback" else ""
+        source_action = (
+            "dry-run"
+            if action == "apply"
+            else "apply"
+            if action == "rollback" and change_type == "ntp_standardize"
+            else ""
+        )
         if not source_action:
             return {}
-        state = self._ntp_state_from_job(change_id, source_action, org_id)
+        state = self._reviewed_state_from_job(change_id, source_action, org_id)
         if state is None:
+            evidence_name = "Exact pre-change NTP" if change_type == "ntp_standardize" else "Reviewed pre-change"
             raise ValueError(
-                "Exact pre-change NTP evidence is unavailable; run dry-run again before apply or rollback."
+                f"{evidence_name} evidence is unavailable; run dry-run again before apply or rollback."
             )
         key = "approved_pre_change_state" if action == "apply" else "rollback_state"
         return {key: state}

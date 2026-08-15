@@ -154,6 +154,54 @@ def test_apply_is_blocked_when_reviewed_dry_run_state_is_missing(tmp_path: Path)
         )
 
 
+def test_custom_apply_carries_reviewed_dry_run_state_and_rollback_uses_reviewed_commands(
+    tmp_path: Path,
+) -> None:
+    paths = _workspace(tmp_path)
+    store = PlatformStore(paths)
+    intent_path = create_desired_state_intent(
+        paths,
+        change_type="custom_config",
+        site="site-101",
+        device_id="gns3-r1",
+        requested_by="marcus",
+        values={
+            "description": "reviewed logging change",
+            "config_lines": "service timestamps log datetime msec",
+            "rollback_lines": "no service timestamps log datetime msec",
+            "verify_contains": "service timestamps log datetime msec",
+        },
+    )
+    change = store.create_change(intent_path, "gns3-r1", requested_by="marcus")
+    state = {
+        "schema": "netcode.custom-config-pre-change.v1",
+        "device_id": "gns3-r1",
+        "platform": "cisco_ios",
+        "running_config_fingerprint": "a" * 64,
+    }
+    dry_job = store.create_job(change.id, "lab_dry-run")
+    store.update_job(
+        dry_job.id,
+        "completed",
+        "passed",
+        {"status": "pass", "evidence": {"rollback_state": state}},
+    )
+    runner = JobRunner(paths, store=store)
+
+    assert runner._operation_context(
+        change_id=change.id,
+        org_id=change.org_id,
+        action="apply",
+        change_type="custom_config",
+    ) == {"approved_pre_change_state": state}
+    assert runner._operation_context(
+        change_id=change.id,
+        org_id=change.org_id,
+        action="rollback",
+        change_type="custom_config",
+    ) == {}
+
+
 def test_newer_failed_dry_run_invalidates_older_successful_evidence(tmp_path: Path) -> None:
     paths = _workspace(tmp_path)
     runner = JobRunner(paths, store=PlatformStore(paths))

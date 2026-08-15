@@ -130,9 +130,9 @@ DRY_RUN_CAPABILITIES: dict[str, dict[str, str]] = {
         "mechanism": "read running-config + static validation + generated diff; canary before wider rollout",
     },
     "cisco_nxos": {
-        "tier": "planned_native",
-        "dry_run_kind": "canary_only",
-        "mechanism": "native session support is planned; use canary verification until implemented",
+        "tier": "offline",
+        "dry_run_kind": "offline_validation",
+        "mechanism": "read running-config + static validation + generated diff; canary before wider rollout",
     },
     "cisco_xr": {
         "tier": "planned_native",
@@ -158,6 +158,39 @@ def normalize_platform(platform: str) -> str:
 
 
 _NTP_STATE_SCHEMA = "netcode.ntp-pre-change.v1"
+_CUSTOM_CONFIG_STATE_SCHEMA = "netcode.custom-config-pre-change.v1"
+
+
+def _normalized_running_config(output: str) -> str:
+    return str(output or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+
+
+def _capture_custom_config_state(device: Device, output: str) -> dict[str, object]:
+    normalized = _normalized_running_config(output)
+    return {
+        "schema": _CUSTOM_CONFIG_STATE_SCHEMA,
+        "device_id": device.id,
+        "platform": normalize_platform(device.platform),
+        "running_config_fingerprint": hashlib.sha256(normalized.encode("utf-8")).hexdigest(),
+    }
+
+
+def _validated_custom_config_state(device: Device, state: object) -> dict[str, object]:
+    if not isinstance(state, dict) or state.get("schema") != _CUSTOM_CONFIG_STATE_SCHEMA:
+        raise ValueError("Reviewed custom-config pre-change evidence is missing; run dry-run again.")
+    if str(state.get("device_id") or "").strip().lower() != device.id.strip().lower():
+        raise ValueError("Custom-config pre-change evidence belongs to a different device.")
+    if normalize_platform(str(state.get("platform") or "")) != normalize_platform(device.platform):
+        raise ValueError("Custom-config pre-change evidence belongs to a different platform.")
+    fingerprint = str(state.get("running_config_fingerprint") or "").strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{64}", fingerprint):
+        raise ValueError("Custom-config pre-change evidence has an invalid fingerprint.")
+    return {**state, "running_config_fingerprint": fingerprint}
+
+
+def _custom_config_state_matches(output: str, state: dict[str, object]) -> bool:
+    current = hashlib.sha256(_normalized_running_config(output).encode("utf-8")).hexdigest()
+    return hmac.compare_digest(current, str(state["running_config_fingerprint"]))
 
 
 def _ntp_line_map(output: str, managed_servers: list[str]) -> dict[str, str]:
@@ -377,6 +410,9 @@ class AristaEOSLabAdapter(ExecutionAdapter):
             if isinstance(intent, NtpStandardizeIntent):
                 current = self.show("show running-config | include ntp server")
                 rollback_state = _capture_ntp_state(self.device, intent, current)
+            elif isinstance(intent, CustomConfigIntent):
+                current = self.show("show running-config")
+                rollback_state = _capture_custom_config_state(self.device, current)
             result = self.config_session(render.config, "dry-run")
             if rollback_state is not None:
                 result.evidence["rollback_state"] = rollback_state
@@ -418,6 +454,29 @@ class AristaEOSLabAdapter(ExecutionAdapter):
                         action="apply",
                         device_id=self.device.id,
                         message="Live NTP state changed after the approved dry-run; re-run validation before applying.",
+                        evidence={"write_started": False, "approved_pre_change_state": rollback_state},
+                    )
+            elif isinstance(intent, CustomConfigIntent):
+                current = self.show("show running-config")
+                try:
+                    rollback_state = _validated_custom_config_state(
+                        self.device,
+                        self.operation_context.get("approved_pre_change_state"),
+                    )
+                except ValueError as exc:
+                    return LabResult(
+                        status="fail",
+                        action="apply",
+                        device_id=self.device.id,
+                        message=str(exc),
+                        evidence={"write_started": False},
+                    )
+                if not _custom_config_state_matches(current, rollback_state):
+                    return LabResult(
+                        status="fail",
+                        action="apply",
+                        device_id=self.device.id,
+                        message="Running configuration changed after the approved dry-run; re-run validation before applying.",
                         evidence={"write_started": False, "approved_pre_change_state": rollback_state},
                     )
             session = self.config_session(render.config, "apply")
@@ -1068,7 +1127,7 @@ class CiscoIOSNtpAdapter(AristaEOSLabAdapter):
             error_pattern=r"%\s*(?:Invalid input|Incomplete command|Ambiguous command|Authorization failed|Configuration failed)",
         )
         if self._cli_error(output):
-            raise RuntimeError(f"Cisco IOS rejected the reviewed configuration batch: {output}")
+            raise RuntimeError(f"Network device rejected the reviewed configuration batch: {output}")
         transcript: list[dict[str, str]] = []
         for index, command in enumerate(commands, start=1):
             transcript.append({
@@ -1088,10 +1147,10 @@ class CiscoIOSNtpAdapter(AristaEOSLabAdapter):
 
     def _save_verified_config(self, phase: str) -> str:
         if not self._conn or not hasattr(self._conn, "save_config"):
-            raise RuntimeError("Cisco IOS connector cannot save the verified running configuration.")
+            raise RuntimeError("Network CLI connector cannot save the verified running configuration.")
         output = str(self._conn.save_config())
         if self._cli_error(output):
-            raise RuntimeError(f"Cisco IOS rejected the save operation: {output}")
+            raise RuntimeError(f"Network device rejected the save operation: {output}")
         _emit_progress(
             self.progress,
             phase=phase,
@@ -1166,8 +1225,175 @@ class CiscoIOSNtpAdapter(AristaEOSLabAdapter):
             )
             return evidence
 
+    def _restore_custom_config(
+        self,
+        intent: CustomConfigIntent,
+        *,
+        persist: bool = False,
+    ) -> dict[str, object]:
+        rollback = intent.custom.rollback_lines.strip()
+        if not rollback:
+            return {
+                "attempted": False,
+                "status": "unavailable",
+                "reason": "No engineer-reviewed rollback commands were supplied.",
+            }
+        evidence: dict[str, object] = {
+            "attempted": True,
+            "status": "failed",
+            "startup_config_saved": False,
+        }
+        try:
+            _, transcript = self._configure(rollback, self.operation, reverse=True)
+            verify = self.verify_intent(
+                intent,
+                present=False,
+                progress_phase=self.operation,
+                progress_stage="previous_state_check",
+            )
+            evidence.update({
+                "commands": transcript,
+                "verification": verify.evidence,
+                "status": "pass" if verify.status == "pass" else "failed",
+            })
+            if verify.status != "pass":
+                evidence["error"] = verify.message
+                return evidence
+            if persist:
+                evidence["save_output"] = self._save_verified_config(self.operation)
+                evidence["startup_config_saved"] = True
+            return evidence
+        except Exception as exc:
+            evidence["error"] = f"{type(exc).__name__}: {exc}"
+            return evidence
+
+    def _apply_custom_config(self, intent: CustomConfigIntent, render) -> LabResult:
+        current = self.show("show running-config")
+        try:
+            reviewed_state = _validated_custom_config_state(
+                self.device,
+                self.operation_context.get("approved_pre_change_state"),
+            )
+        except ValueError as exc:
+            return LabResult(
+                status="fail",
+                action="apply",
+                device_id=self.device.id,
+                message=str(exc),
+                evidence={"write_started": False},
+            )
+        if not _custom_config_state_matches(current, reviewed_state):
+            return LabResult(
+                status="fail",
+                action="apply",
+                device_id=self.device.id,
+                message="Running configuration changed after the approved dry-run; re-run validation before applying.",
+                evidence={"write_started": False, "approved_pre_change_state": reviewed_state},
+            )
+
+        transcript: list[dict[str, str]] = []
+        try:
+            _, transcript = self._configure(render.config, "apply")
+        except Exception as exc:
+            compensation = self._restore_custom_config(intent)
+            return LabResult(
+                status="fail",
+                action="apply",
+                device_id=self.device.id,
+                message=f"Custom configuration failed before verification: {exc}",
+                evidence={
+                    "transcript": transcript,
+                    "approved_pre_change_state": reviewed_state,
+                    "automatic_rollback": compensation,
+                    "running_config_may_be_modified": compensation.get("status") != "pass",
+                    "startup_config_saved": False,
+                },
+            )
+
+        verify = self.verify_intent(
+            intent,
+            present=True,
+            progress_phase="apply",
+            progress_stage="safety_check",
+        )
+        if verify.status != "pass":
+            compensation = self._restore_custom_config(intent)
+            return LabResult(
+                status="fail",
+                action="apply",
+                device_id=self.device.id,
+                message="Custom configuration was accepted, but live verification failed.",
+                evidence={
+                    "transcript": transcript,
+                    "verification": verify.evidence,
+                    "approved_pre_change_state": reviewed_state,
+                    "automatic_rollback": compensation,
+                    "running_config_may_be_modified": compensation.get("status") != "pass",
+                    "startup_config_saved": False,
+                },
+            )
+        try:
+            save_output = self._save_verified_config("apply")
+        except Exception as exc:
+            compensation = self._restore_custom_config(intent, persist=True)
+            return LabResult(
+                status="fail",
+                action="apply",
+                device_id=self.device.id,
+                message=f"Live verification passed, but startup-config save failed: {exc}",
+                evidence={
+                    "transcript": transcript,
+                    "verification": verify.evidence,
+                    "approved_pre_change_state": reviewed_state,
+                    "automatic_rollback": compensation,
+                    "running_config_may_be_modified": compensation.get("status") != "pass",
+                    "startup_config_saved": False,
+                },
+            )
+        return LabResult(
+            status="pass",
+            action="apply",
+            device_id=self.device.id,
+            message="Custom configuration applied, verified live, and saved.",
+            evidence={
+                "transcript": transcript,
+                "verification": verify.evidence,
+                "approved_pre_change_state": reviewed_state,
+                "startup_config_saved": True,
+                "save_output": save_output,
+            },
+        )
+
+    def _rollback_custom_config(self, intent: CustomConfigIntent) -> LabResult:
+        if not intent.custom.rollback_lines.strip():
+            return LabResult(
+                status="fail",
+                action="rollback",
+                device_id=self.device.id,
+                message="No engineer-reviewed rollback commands were supplied for this custom change.",
+                evidence={"write_started": False, "rollback_confidence": "none"},
+            )
+        restoration = self._restore_custom_config(intent, persist=True)
+        return LabResult(
+            status="pass" if restoration.get("status") == "pass" else "fail",
+            action="rollback",
+            device_id=self.device.id,
+            message=(
+                "Engineer-reviewed rollback applied, verified live, and saved."
+                if restoration.get("status") == "pass"
+                else "Engineer-reviewed rollback could not be verified; manual reconciliation is required."
+            ),
+            evidence=restoration,
+        )
+
     def apply(self, intent: Intent, render) -> LabResult:
         self.operation = "apply"
+        if isinstance(intent, CustomConfigIntent):
+            self.connect()
+            try:
+                return self._apply_custom_config(intent, render)
+            finally:
+                self.disconnect()
         if not isinstance(intent, NtpStandardizeIntent):
             return LabResult(
                 status="fail",
@@ -1299,6 +1525,12 @@ class CiscoIOSNtpAdapter(AristaEOSLabAdapter):
 
     def rollback(self, intent: Intent, render) -> LabResult:
         self.operation = "rollback"
+        if isinstance(intent, CustomConfigIntent):
+            self.connect()
+            try:
+                return self._rollback_custom_config(intent)
+            finally:
+                self.disconnect()
         if not isinstance(intent, NtpStandardizeIntent):
             return LabResult(
                 status="fail",
@@ -1371,6 +1603,47 @@ class CiscoIOSNtpAdapter(AristaEOSLabAdapter):
             )
         finally:
             self.disconnect()
+
+
+class CiscoNXOSCustomConfigAdapter(CiscoIOSNtpAdapter):
+    """Governed custom configuration over the existing NX-OS Netmiko transport."""
+
+    metadata = ExecutionAdapterMetadata(
+        name="netcode.cisco_nxos_governed_cli",
+        platform="cisco_nxos",
+        capabilities=["dry_run", "diff", "apply", "rollback", "verify"],
+        safe_write_model="offline validation, reviewed pre-change fingerprint, verify-before-save, engineer-reviewed rollback",
+        production_ready=False,
+    )
+
+    def connect(self) -> None:
+        try:
+            from netmiko import ConnectHandler
+        except Exception as exc:
+            raise RuntimeError(f"netmiko is required for Cisco NX-OS operations: {exc}") from exc
+
+        self._conn = ConnectHandler(
+            device_type="cisco_nxos",
+            host=self.device.host,
+            username=self.device.username,
+            password=self.device.password,
+            port=self.device.port,
+            fast_cli=False,
+            conn_timeout=self.timeout,
+            auth_timeout=self.timeout,
+            banner_timeout=self.timeout,
+        )
+        try:
+            self._conn.enable()
+        except Exception as exc:
+            raise RuntimeError(f"Could not enter Cisco NX-OS privileged mode: {exc}") from exc
+        self._send("terminal length 0")
+        _emit_progress(
+            self.progress,
+            phase=self.operation,
+            stage="connected",
+            message=f"Connected to {self.device.id} through the Local Connector.",
+        )
 
 
 def _netmiko_device_type(platform: str) -> str:
@@ -1533,6 +1806,8 @@ def offline_dry_run(
             **(
                 {"rollback_state": _capture_ntp_state(device, intent, current_config)}
                 if isinstance(intent, NtpStandardizeIntent)
+                else {"rollback_state": _capture_custom_config_state(device, current_config)}
+                if isinstance(intent, CustomConfigIntent)
                 else {}
             ),
         },
@@ -1589,7 +1864,13 @@ def run_lab_action_for_device(
             evidence={"dry_run_capability": capability},
             dry_run_kind="canary_only",
         )
-    adapter_class = AristaEOSLabAdapter if platform == "arista_eos" else CiscoIOSNtpAdapter
+    adapter_class = (
+        AristaEOSLabAdapter
+        if platform == "arista_eos"
+        else CiscoNXOSCustomConfigAdapter
+        if platform == "cisco_nxos"
+        else CiscoIOSNtpAdapter
+    )
     adapter = adapter_class(
         device,
         progress=progress,

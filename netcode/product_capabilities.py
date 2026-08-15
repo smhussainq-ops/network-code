@@ -146,7 +146,14 @@ def _reviewed_capabilities(platform: str) -> dict[str, dict[str, str]]:
         for feature in ("write", "verify", "rollback"):
             capabilities[feature] = _status(
                 "contract-tested",
-                "Community Golden Baseline NTP workflow only; live Cisco GNS3 proof is still required.",
+                "Typed NTP and engineer-reviewed custom CLI are contract-tested; live Cisco proof is still required.",
+            )
+    elif platform == "cisco_nxos":
+        capabilities["dry_run"] = _status("contract-tested", "Offline validation and generated diff; no native candidate commit claim.")
+        for feature in ("write", "verify", "rollback"):
+            capabilities[feature] = _status(
+                "contract-tested",
+                "Engineer-reviewed custom CLI is contract-tested; live NX-OS proof is still required.",
             )
     elif platform in {"fortimanager", "panorama"}:
         capabilities["manager_execution"] = _status(
@@ -171,7 +178,7 @@ def product_support_matrix(registry: AdapterRegistry | None = None) -> dict[str,
             "runtime_adapter_available": platform in runtime_platforms,
             "read_transports": list(READ_TRANSPORTS[platform]),
             "capabilities": capabilities,
-            "supported_change_types": list(execution.get("supported_change_types", [])),
+            "supported_change_types": AdapterRegistry.supported_change_types(platform),
             "evidence": list(_EVIDENCE.get(platform, [])),
         })
     return {

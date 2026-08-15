@@ -1,8 +1,4 @@
-"""Platform adapter registry.
-
-The execution adapter remains intentionally small for the first workflow, while
-state collection and multi-vendor inventory support come from Rez drivers.
-"""
+"""Platform adapter registry for read and governed-write capabilities."""
 
 from __future__ import annotations
 
@@ -32,6 +28,7 @@ class AdapterRegistry:
             "write_supported": True,
             "safe_write_model": "EOS config session with abortable dry-run and explicit commit",
             "production_ready": False,
+            "generic_config_supported": True,
             "supported_change_types": [
                 "add_vlan",
                 "interface_config",
@@ -45,21 +42,24 @@ class AdapterRegistry:
             ],
         },
         "cisco_ios": {
-            "name": "netcode.cisco_ios_ntp",
+            "name": "netcode.cisco_ios_governed_cli",
             "capabilities": ["dry_run", "diff", "apply", "rollback", "verify"],
             "status": "contract_tested",
             "write_supported": True,
-            "safe_write_model": "offline validation, first-device proof, verify-before-save, exact pre-change rollback",
+            "safe_write_model": "offline validation, reviewed pre-change fingerprint, verify-before-save, engineer-reviewed rollback",
             "production_ready": False,
+            "generic_config_supported": True,
             "supported_change_types": ["ntp_standardize"],
         },
         "cisco_nxos": {
-            "name": "netcode.cisco_nxos_execution_stub",
-            "capabilities": [],
-            "status": "planned_stub",
-            "write_supported": False,
-            "safe_write_model": "requires adapter SDK implementation",
+            "name": "netcode.cisco_nxos_governed_cli",
+            "capabilities": ["dry_run", "diff", "apply", "rollback", "verify"],
+            "status": "contract_tested",
+            "write_supported": True,
+            "safe_write_model": "offline validation, reviewed pre-change fingerprint, verify-before-save, engineer-reviewed rollback",
             "production_ready": False,
+            "generic_config_supported": True,
+            "supported_change_types": [],
         },
         "juniper_junos": {
             "name": "netcode.juniper_junos_execution_stub",
@@ -96,16 +96,25 @@ class AdapterRegistry:
         return cls.PLATFORM_ALIASES.get(normalized, normalized or "unknown")
 
     @classmethod
-    def execution_support(cls, platform: str, change_type: str) -> dict[str, object]:
+    def supported_change_types(cls, platform: str) -> list[str]:
         normalized = cls.normalize_execution_platform(platform)
         adapter = cls.EXECUTION_ADAPTERS.get(normalized)
         supported = set(adapter.get("supported_change_types", [])) if adapter else set()
+        if adapter and adapter.get("generic_config_supported"):
+            supported.add("custom_config")
+        return sorted(supported)
+
+    @classmethod
+    def execution_support(cls, platform: str, change_type: str) -> dict[str, object]:
+        normalized = cls.normalize_execution_platform(platform)
+        adapter = cls.EXECUTION_ADAPTERS.get(normalized)
+        supported = cls.supported_change_types(normalized)
         return {
             "platform": normalized,
             "change_type": str(change_type or "").strip(),
             "adapter": adapter,
             "supported": bool(adapter and adapter.get("write_supported") and change_type in supported),
-            "supported_change_types": sorted(supported),
+            "supported_change_types": supported,
         }
 
     @classmethod

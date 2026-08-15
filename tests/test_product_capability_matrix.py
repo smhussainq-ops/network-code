@@ -61,7 +61,17 @@ def test_cisco_community_write_scope_is_explicit_and_not_overclaimed() -> None:
     rows = {row["platform"]: row for row in product_support_matrix()["rows"]}
     cisco = rows["cisco_ios"]
 
-    assert cisco["supported_change_types"] == ["ntp_standardize"]
+    assert cisco["supported_change_types"] == ["custom_config", "ntp_standardize"]
     assert cisco["capabilities"]["dry_run"]["status"] == "contract-tested"
     assert cisco["capabilities"]["write"]["status"] == "contract-tested"
     assert cisco["capabilities"]["write"]["status"] != "pilot-certified"
+
+
+def test_nxos_custom_write_scope_is_contract_tested_not_pilot_certified() -> None:
+    rows = {row["platform"]: row for row in product_support_matrix()["rows"]}
+    nxos = rows["cisco_nxos"]
+
+    assert nxos["supported_change_types"] == ["custom_config"]
+    assert nxos["capabilities"]["dry_run"]["status"] == "contract-tested"
+    assert nxos["capabilities"]["write"]["status"] == "contract-tested"
+    assert nxos["capabilities"]["write"]["status"] != "pilot-certified"
